@@ -12,6 +12,8 @@ use gpui_kit::SharedString;
 /// thread. Replaced wholesale when the repository changes.
 #[derive(Debug)]
 pub struct Snapshot {
+    /// Clone it for each background read.
+    pub repository: Repository,
     pub name: SharedString,
     /// The working tree, or the git directory of a bare repository.
     pub path: PathBuf,
@@ -72,6 +74,7 @@ impl Snapshot {
                 .work_dir()
                 .unwrap_or_else(|| repository.git_dir())
                 .to_owned(),
+            repository,
             refs,
             tracking,
         })

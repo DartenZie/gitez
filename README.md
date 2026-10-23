@@ -25,8 +25,9 @@ command palette (`⌘K`) that runs any git command.
 The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 
 > **Status:** early development. The current build opens a repository and
-> shows its branches, remotes, tags and stashes in the sidebar, and the
-> current branch in the status bar. The commit history is not shown yet.
+> shows its history as a commit graph, with branches, remotes, tags and
+> stashes in the sidebar and the selected commit's details beside it. Nothing
+> can be changed from GitEZ yet.
 
 ## Technology
 

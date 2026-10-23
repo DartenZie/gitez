@@ -1,6 +1,10 @@
 //! The main window: toolbar, repository sidebar, history, commit detail and
 //! status bar, laid out as in the `Main.dc.html` artboard.
 
+mod detail;
+mod graph;
+mod history;
+mod labels;
 mod sidebar;
 mod status_bar;
 mod toolbar;
@@ -16,7 +20,11 @@ use gpui_kit::*;
 
 use crate::repository::Snapshot;
 use crate::theme::{self, color};
+use detail::CommitDetail;
+use history::History;
 use sidebar::Sidebar;
+
+pub use history::key_bindings as history_key_bindings;
 
 actions!(workspace, [OpenRepository]);
 
@@ -31,6 +39,8 @@ pub struct Workspace {
     /// repository is open.
     error: Option<SharedString>,
     sidebar: Entity<Sidebar>,
+    history: Entity<History>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl Workspace {
@@ -38,12 +48,17 @@ impl Workspace {
     pub fn new(path: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
+        let history = cx.new(History::new);
+        // The detail pane shows the selected commit.
+        let subscriptions = vec![cx.subscribe(&history, |_, _, _, cx| cx.notify())];
         let mut workspace = Self {
             focus_handle,
             snapshot: None,
             loading: None,
             error: None,
             sidebar: cx.new(|_| Sidebar::new()),
+            history,
+            _subscriptions: subscriptions,
         };
         if let Some(path) = path {
             workspace.open(path, window, cx);
@@ -116,6 +131,9 @@ impl Workspace {
         window.set_window_title(&format!("{} — GitEZ", snapshot.name));
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.set_snapshot(snapshot.clone(), cx));
+        self.history
+            .update(cx, |history, cx| history.load(&snapshot, cx));
+        window.focus(&self.history.focus_handle(cx), cx);
         self.snapshot = Some(snapshot);
         self.error = None;
         cx.notify();
@@ -171,7 +189,7 @@ impl Render for Workspace {
                                 .size(px(360.))
                                 .size_range(px(280.)..px(560.))
                                 .fixed()
-                                .child(detail_pane(snapshot.is_some())),
+                                .child(self.render_detail(cx)),
                         ),
                 ),
             )
@@ -179,105 +197,59 @@ impl Render for Workspace {
     }
 }
 
-/// Column widths of the history list, shared by its header and its rows.
-mod columns {
-    use gpui_kit::{Pixels, px};
-
-    pub const GRAPH: Pixels = px(112.);
-    pub const AUTHOR: Pixels = px(150.);
-    pub const DATE: Pixels = px(96.);
-    pub const SHA: Pixels = px(70.);
-    pub const GAP: Pixels = px(12.);
-}
-
 impl Workspace {
-    /// The commit history: a title bar, the column header and the commit list.
-    fn render_history(&self) -> impl IntoElement {
-        let column = |width: Pixels, label: &'static str| div().w(width).flex_none().child(label);
-
-        let body = if let Some((path, _)) = &self.loading {
-            empty_state(
+    /// The history list, or what to show while no repository is open.
+    fn render_history(&self) -> AnyElement {
+        if self.snapshot.is_some() {
+            return self.history.clone().into_any_element();
+        }
+        if let Some((path, _)) = &self.loading {
+            return empty_state(
                 "Opening repository…",
                 path.display().to_string(),
                 None::<Button>,
             )
-            .into_any_element()
-        } else if self.snapshot.is_some() {
-            empty_state(
-                "History is not shown yet",
-                "The commit graph is the next part of GitEZ to be built.",
-                None::<Button>,
-            )
-            .into_any_element()
-        } else if let Some(error) = &self.error {
-            empty_state(
+            .into_any_element();
+        }
+        if let Some(error) = &self.error {
+            return empty_state(
                 "Could not open the repository",
                 error.clone(),
                 Some(open_button("open-repository-retry", "Open another…")),
             )
-            .into_any_element()
-        } else {
-            empty_state(
-                "No repository open",
-                "Open a repository to see its history.",
-                Some(open_button("open-repository", "Open repository…")),
-            )
-            .into_any_element()
-        };
-
-        div()
-            .v_flex()
-            .size_full()
-            .min_w_0()
-            .child(
-                div()
-                    .h_flex()
-                    .flex_none()
-                    .h(px(46.))
-                    .px(px(14.))
-                    .gap(px(8.))
-                    .border_b_1()
-                    .border_color(rgb(color::BORDER))
-                    .child(
-                        div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("All branches"),
-                    ),
-            )
-            .child(
-                div()
-                    .h_flex()
-                    .flex_none()
-                    .h(px(28.))
-                    .pr(px(14.))
-                    .gap(columns::GAP)
-                    .border_b_1()
-                    .border_color(rgb(color::BORDER))
-                    .text_size(px(11.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(color::TEXT_FAINT))
-                    .child(column(columns::GRAPH, "GRAPH").pl(px(14.)))
-                    .child(div().flex_1().min_w_0().child("DESCRIPTION"))
-                    .child(column(columns::AUTHOR, "AUTHOR"))
-                    .child(column(columns::DATE, "DATE"))
-                    .child(column(columns::SHA, "SHA")),
-            )
-            .child(body)
+            .into_any_element();
+        }
+        empty_state(
+            "No repository open",
+            "Open a repository to see its history.",
+            Some(open_button("open-repository", "Open repository…")),
+        )
+        .into_any_element()
     }
-}
 
-/// Details of the selected commit.
-fn detail_pane(has_repository: bool) -> impl IntoElement {
-    let detail = if has_repository {
-        "Select a commit to see its message and changed files."
-    } else {
-        "Commit details appear here once a repository is open."
-    };
-    div()
-        .v_flex()
-        .size_full()
-        .bg(rgb(color::PANEL))
-        .child(empty_state("No commit selected", detail, None::<Button>))
+    /// Details of the selected commit.
+    fn render_detail(&self, cx: &App) -> impl IntoElement {
+        let selected = self
+            .snapshot
+            .as_ref()
+            .and_then(|_| self.history.read(cx).selected())
+            .map(|(commit, labels)| CommitDetail {
+                commit: commit.clone(),
+                labels: labels.to_vec(),
+            });
+        let pane = div().v_flex().size_full().bg(rgb(color::PANEL));
+        match selected {
+            Some(detail) => pane.child(detail),
+            None => {
+                let detail = if self.snapshot.is_some() {
+                    "Select a commit to see its details."
+                } else {
+                    "Commit details appear here once a repository is open."
+                };
+                pane.child(empty_state("No commit selected", detail, None::<Button>))
+            }
+        }
+    }
 }
 
 fn open_button(id: &'static str, label: &'static str) -> Button {

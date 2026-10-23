@@ -49,6 +49,34 @@ pub mod color {
 
     /// Text selection: the accent at 30 % opacity.
     pub const SELECTION: u32 = 0xe8_b0_4b_4d;
+
+    /// Initials avatar behind an author name.
+    pub const AVATAR: u32 = 0x2c2c32;
+    pub const AVATAR_TEXT: u32 = TEXT_SECONDARY;
+    /// Author names in the history list.
+    pub const AUTHOR_TEXT: u32 = 0xb8_b5_ac;
+    /// Ref labels: remote-tracking branches are outlined, tags dashed.
+    pub const REMOTE_LABEL_BORDER: u32 = 0x3a_3a_40;
+    pub const REMOTE_LABEL_TEXT: u32 = 0xa8_a6_9e;
+    pub const TAG_LABEL_BORDER: u32 = 0x5a_57_4f;
+    /// Text on the small HEAD badge, which takes the branch colour.
+    pub const HEAD_BADGE_TEXT: u32 = 0x0e_1a_28;
+}
+
+/// Colours of the commit graph's lines, indexed by the layout's colour
+/// identities modulo the length.
+pub const GRAPH_COLORS: [u32; 4] = [
+    color::ACCENT,
+    color::BRANCH_BLUE,
+    color::BRANCH_VIOLET,
+    color::BRANCH_TEAL,
+];
+
+/// `hex` (`0xRRGGBB`) at `alpha` opacity, for tinted backgrounds.
+pub fn with_alpha(hex: u32, alpha: f32) -> Rgba {
+    let mut color = rgb(hex);
+    color.a = alpha;
+    color
 }
 
 /// The colour of a branch: amber for the default branch, otherwise one of the

@@ -49,6 +49,16 @@ pub fn relative(time: Timestamp, now: i64) -> String {
     }
 }
 
+/// The full date and time of `time` in its own UTC offset, such as
+/// "Oct 14, 2026 · 16:42".
+pub fn absolute(time: Timestamp) -> String {
+    let (year, month, day) = civil_date(time.seconds, time.offset);
+    let seconds_of_day = (time.seconds + i64::from(time.offset)).rem_euclid(DAY);
+    let (hour, minute) = (seconds_of_day / HOUR, seconds_of_day % HOUR / MINUTE);
+    let month = MONTHS[month as usize - 1];
+    format!("{month} {day}, {year} · {hour:02}:{minute:02}")
+}
+
 /// The calendar date `(year, month 1–12, day 1–31)` of `seconds` since the
 /// epoch at UTC offset `offset`.
 fn civil_date(seconds: i64, offset: i32) -> (i64, u32, u32) {
@@ -96,6 +106,20 @@ mod tests {
         assert_eq!(ago(DAY), "yesterday");
         assert_eq!(ago(2 * DAY), "2 days ago");
         assert_eq!(ago(6 * DAY + 23 * HOUR), "6 days ago");
+    }
+
+    #[test]
+    fn absolute_times_use_the_timestamp_offset() {
+        let time = Timestamp {
+            seconds: NOW,
+            offset: 2 * 3600 + 30 * 60,
+        };
+        assert_eq!(absolute(time), "Oct 23, 2026 · 14:30");
+        let time = Timestamp {
+            seconds: NOW,
+            offset: -13 * 3600,
+        };
+        assert_eq!(absolute(time), "Oct 22, 2026 · 23:00");
     }
 
     #[test]
