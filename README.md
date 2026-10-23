@@ -24,8 +24,9 @@ command palette (`⌘K`) that runs any git command.
 
 The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 
-> **Status:** early development. The current build opens a styled window and
-> nothing more.
+> **Status:** early development. The current build shows the main window
+> (toolbar, sidebar, history, commit detail and status bar) with every pane
+> empty. Opening a repository is not implemented yet.
 
 ## Technology
 
@@ -79,6 +80,12 @@ Performance is a primary goal: large repositories must stay smooth.
    supported.
 
 Windows support is planned but not yet available.
+
+### Fonts (optional)
+
+GitEZ is designed for [Geist](https://vercel.com/font) and
+[JetBrains Mono](https://www.jetbrains.com/lp/mono/). If they are installed,
+GitEZ uses them; otherwise it falls back to the system UI and monospace fonts.
 
 ## Build and run
 
