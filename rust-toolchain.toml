@@ -1,0 +1,5 @@
+[toolchain]
+# GPUI tracks the latest stable Rust; keep this in step with the pinned Zed rev.
+channel = "1.99.1"
+profile = "minimal"
+components = ["rustfmt", "clippy", "rust-analyzer", "rust-src"]

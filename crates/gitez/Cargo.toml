@@ -1,0 +1,21 @@
+[package]
+name = "gitez"
+description = "A fast visual git client with local pull requests for reviewing agent-written code."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "gitez"
+path = "src/main.rs"
+
+[dependencies]
+gpui-kit.workspace = true
+anyhow.workspace = true
+
+[lints]
+workspace = true

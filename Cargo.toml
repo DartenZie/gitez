@@ -1,0 +1,48 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+default-members = ["crates/gitez"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+repository = "https://github.com/miroslavpasek/gitez"
+authors = ["Miroslav Pašek <miroslav.pasek@email.cz>"]
+
+[workspace.dependencies]
+# gpui-kit (GPUI Component) is the UI toolkit. It pins the GPUI snapshot it is
+# built against (`gpui-pre` on crates.io) and re-exports it as `gpui_kit::*`,
+# so GPUI itself is never listed here. Bump gpui-kit to move GPUI (see
+# CLAUDE.md, "Updating GPUI").
+gpui-kit = "=0.8.0"
+
+anyhow = "1"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+todo = "warn"
+
+# GPUI is unusably slow in an unoptimized build; optimise dependencies even in dev.
+[profile.dev]
+debug = "limited"
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.gpui-pre]
+opt-level = 3
+
+[profile.dev.package.gpui-pre-platform]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = "limited"
