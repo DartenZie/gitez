@@ -1,0 +1,20 @@
+[package]
+name = "gitez-git"
+description = "Read-only access to git repositories for GitEZ, built on gitoxide."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+gix.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

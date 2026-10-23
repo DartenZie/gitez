@@ -103,12 +103,19 @@ cargo test               # run tests
 ```
 Cargo.toml          workspace: dependency versions, lints, build profiles
 crates/gitez/       the application binary
+crates/gitez-git/   read-only repository access on gitoxide: refs, history, graph layout
 rust-toolchain.toml pinned Rust toolchain
 CLAUDE.md           instructions for Claude Code when working in this repository
 ```
 
-More crates (git backend, review storage, UI components) will be added under
-`crates/` as the application grows.
+More crates (review storage, agent integration, UI components) will be added
+under `crates/` as the application grows.
+
+To time history loading on a repository:
+
+```sh
+cargo run --release -p gitez-git --example history -- <path-to-repository>
+```
 
 ## License
 
