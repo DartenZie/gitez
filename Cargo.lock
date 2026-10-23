@@ -2030,7 +2030,9 @@ name = "gitez"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "gitez-git",
  "gpui-kit",
+ "tempfile",
 ]
 
 [[package]]

@@ -51,6 +51,20 @@ pub mod color {
     pub const SELECTION: u32 = 0xe8_b0_4b_4d;
 }
 
+/// The colour of a branch: amber for the default branch, otherwise one of the
+/// branch colours, picked from the name so it stays the same between runs.
+pub fn branch_color(name: &str) -> u32 {
+    const COLORS: [u32; 3] = [color::BRANCH_BLUE, color::BRANCH_TEAL, color::BRANCH_VIOLET];
+    if matches!(name, "main" | "master") {
+        return color::ACCENT;
+    }
+    // FNV-1a: stable across runs and Rust releases, unlike `DefaultHasher`.
+    let hash = name.bytes().fold(0x811c_9dc5_u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+    });
+    COLORS[hash as usize % COLORS.len()]
+}
+
 /// The UI typeface. Used only when installed; otherwise the system font.
 pub const UI_FONT: &str = "Geist";
 /// The typeface for code, SHAs and keyboard hints. Used only when installed.

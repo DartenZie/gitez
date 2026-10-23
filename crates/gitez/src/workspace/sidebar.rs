@@ -1,18 +1,129 @@
 //! The repository sidebar: views, then local PRs, branches, remotes, tags and
 //! stashes.
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use gitez_git::{Branch, Stash};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::repository::{Snapshot, Tracking};
 use crate::theme::{self, color};
+use crate::time;
 
-#[derive(IntoElement)]
-pub struct Sidebar;
+/// Tags start collapsed when a repository has more than this many, so a long
+/// release history does not push the stashes out of sight.
+const COLLAPSE_TAGS_OVER: usize = 30;
 
-impl RenderOnce for Sidebar {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+/// Text size of sidebar rows.
+const ROW_TEXT_SIZE: Pixels = px(12.5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Section {
+    LocalPullRequests,
+    Branches,
+    Remotes,
+    Tags,
+    Stashes,
+}
+
+pub struct Sidebar {
+    snapshot: Option<Arc<Snapshot>>,
+    collapsed: HashSet<Section>,
+}
+
+impl Sidebar {
+    pub fn new() -> Self {
+        Self {
+            snapshot: None,
+            collapsed: HashSet::new(),
+        }
+    }
+
+    /// Shows `snapshot`. Collapsed sections reset when the repository changes.
+    pub fn set_snapshot(&mut self, snapshot: Arc<Snapshot>, cx: &mut Context<Self>) {
+        let same_repository = self
+            .snapshot
+            .as_ref()
+            .is_some_and(|current| current.path == snapshot.path);
+        if !same_repository {
+            self.collapsed.clear();
+            if snapshot.refs.tags.len() > COLLAPSE_TAGS_OVER {
+                self.collapsed.insert(Section::Tags);
+            }
+        }
+        self.snapshot = Some(snapshot);
+        cx.notify();
+    }
+
+    fn toggle(&mut self, section: Section, cx: &mut Context<Self>) {
+        if !self.collapsed.remove(&section) {
+            self.collapsed.insert(section);
+        }
+        cx.notify();
+    }
+
+    /// A titled, collapsible group of rows. `rows` is only called while the
+    /// section is expanded.
+    fn section(
+        &self,
+        section: Section,
+        title: &'static str,
+        count: usize,
+        empty: &'static str,
+        rows: impl FnOnce() -> Vec<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let collapsed = self.collapsed.contains(&section);
+        div()
+            .v_flex()
+            .child(
+                div()
+                    .id(("sidebar-section", section as usize))
+                    .h_flex()
+                    .gap(px(6.))
+                    .pt(px(14.))
+                    .px(px(14.))
+                    .pb(px(6.))
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(color::TEXT_FAINT))
+                    .hover(|style| style.text_color(rgb(color::TEXT_SECONDARY)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle(section, cx)))
+                    .child(div().flex_1().child(title.to_uppercase()))
+                    .when(count > 0, |this| {
+                        this.child(
+                            div()
+                                .font_weight(FontWeight::NORMAL)
+                                .child(count.to_string()),
+                        )
+                    })
+                    .child(
+                        Icon::new(if collapsed {
+                            IconName::ChevronRight
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .size(px(12.)),
+                    ),
+            )
+            .when(!collapsed, |this| {
+                if count == 0 {
+                    this.child(row().text_color(rgb(color::TEXT_FAINT)).child(empty))
+                } else {
+                    this.children(rows())
+                }
+            })
+    }
+}
+
+impl Render for Sidebar {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let snapshot = self.snapshot.clone();
+
         div()
             .id("sidebar")
             .v_flex()
@@ -35,11 +146,81 @@ impl RenderOnce for Sidebar {
                         false,
                     )),
             )
-            .child(section("Local pull requests", "No local pull requests"))
-            .child(section("Branches", "No branches"))
-            .child(section("Remotes", "No remotes"))
-            .child(section("Tags", "No tags"))
-            .child(section("Stashes", "No stashes"))
+            .when_some(snapshot, |this, snapshot| {
+                let refs = &snapshot.refs;
+                let mut remotes: Vec<(&str, usize)> = Vec::new();
+                for branch in &refs.remote_branches {
+                    match remotes.last_mut() {
+                        Some((remote, count)) if *remote == branch.remote => *count += 1,
+                        _ => remotes.push((&branch.remote, 1)),
+                    }
+                }
+                let now = time::now();
+
+                this.child(self.section(
+                    Section::LocalPullRequests,
+                    "Local pull requests",
+                    0,
+                    "No local pull requests",
+                    Vec::new,
+                    cx,
+                ))
+                .child(self.section(
+                    Section::Branches,
+                    "Branches",
+                    refs.branches.len(),
+                    "No branches",
+                    || {
+                        refs.branches
+                            .iter()
+                            .map(|branch| {
+                                branch_row(branch, snapshot.tracking.get(&branch.name))
+                                    .into_any_element()
+                            })
+                            .collect()
+                    },
+                    cx,
+                ))
+                .child(self.section(
+                    Section::Remotes,
+                    "Remotes",
+                    remotes.len(),
+                    "No remotes",
+                    || {
+                        remotes
+                            .iter()
+                            .map(|&(remote, count)| remote_row(remote, count).into_any_element())
+                            .collect()
+                    },
+                    cx,
+                ))
+                .child(self.section(
+                    Section::Tags,
+                    "Tags",
+                    refs.tags.len(),
+                    "No tags",
+                    || {
+                        refs.tags
+                            .iter()
+                            .map(|tag| row().child(label(tag.name.clone())).into_any_element())
+                            .collect()
+                    },
+                    cx,
+                ))
+                .child(self.section(
+                    Section::Stashes,
+                    "Stashes",
+                    refs.stashes.len(),
+                    "No stashes",
+                    || {
+                        refs.stashes
+                            .iter()
+                            .map(|stash| stash_row(stash, now).into_any_element())
+                            .collect()
+                    },
+                    cx,
+                ))
+            })
     }
 }
 
@@ -57,7 +238,7 @@ fn nav_item(
         .px(px(6.))
         .gap(px(8.))
         .rounded(theme::RADIUS)
-        .text_size(px(12.5))
+        .text_size(ROW_TEXT_SIZE)
         .map(|this| {
             if active {
                 this.bg(rgb(color::NAV_ACTIVE)).text_color(rgb(color::TEXT))
@@ -70,27 +251,110 @@ fn nav_item(
         .child(label)
 }
 
-/// A titled group of sidebar rows. Shows `empty` while the group has none.
-fn section(title: &'static str, empty: &'static str) -> impl IntoElement {
+/// A single-line sidebar row.
+fn row() -> Div {
+    div()
+        .h_flex()
+        .h(theme::NAV_ROW_HEIGHT)
+        .px(px(14.))
+        .gap(px(8.))
+        .text_size(ROW_TEXT_SIZE)
+        .text_color(rgb(color::TEXT_SECONDARY))
+        .hover(|style| style.bg(rgb(color::NAV_HOVER)).text_color(rgb(color::TEXT)))
+}
+
+/// Text that takes the free width of a row and is cut with an ellipsis.
+fn label(text: impl Into<SharedString>) -> Div {
+    div()
+        .flex_1()
+        .min_w_0()
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_ellipsis()
+        .child(text.into())
+}
+
+/// Right-aligned detail at the end of a row: counts, ahead/behind.
+fn trailing(text: impl Into<SharedString>) -> Div {
+    div()
+        .flex_none()
+        .text_size(theme::SMALL_TEXT_SIZE)
+        .text_color(rgb(color::TEXT_FAINT))
+        .child(text.into())
+}
+
+fn branch_row(branch: &Branch, tracking: Option<&Tracking>) -> impl IntoElement {
+    let branch_color = rgb(theme::branch_color(&branch.name));
+    let dot = div().size(px(8.)).rounded_full().bg(branch_color);
+    let marker = div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(px(14.))
+        .rounded_full()
+        .when(branch.is_head, |this| {
+            this.border_1().border_color(branch_color)
+        })
+        .child(dot);
+
+    let ahead_behind = tracking
+        .map(|tracking| {
+            let mut parts = Vec::new();
+            if tracking.ahead > 0 {
+                parts.push(format!("↑{}", tracking.ahead));
+            }
+            if tracking.behind > 0 {
+                parts.push(format!("↓{}", tracking.behind));
+            }
+            parts.join(" ")
+        })
+        .filter(|text| !text.is_empty());
+
+    row()
+        .gap(px(5.))
+        .when(branch.is_head, |this| {
+            this.text_color(rgb(color::TEXT))
+                .font_weight(FontWeight::MEDIUM)
+        })
+        .child(marker)
+        .child(label(branch.name.clone()))
+        .when_some(ahead_behind, |this, text| {
+            this.child(trailing(text).font_weight(FontWeight::NORMAL))
+        })
+}
+
+fn remote_row(remote: &str, branches: usize) -> impl IntoElement {
+    let count = if branches == 1 {
+        "1 branch".to_owned()
+    } else {
+        format!("{branches} branches")
+    };
+    row()
+        .child(Icon::new(IconName::Cloud).size(px(14.)))
+        .child(label(remote.to_owned()))
+        .child(trailing(count))
+}
+
+fn stash_row(stash: &Stash, now: i64) -> impl IntoElement {
+    let when = time::relative(stash.time, now);
+    let detail = match &stash.branch {
+        Some(branch) => format!("on {branch} · {when}"),
+        None => when,
+    };
     div()
         .v_flex()
+        .gap(px(2.))
+        .py(px(5.))
+        .px(px(14.))
+        .text_size(ROW_TEXT_SIZE)
+        .text_color(rgb(color::TEXT_SECONDARY))
+        .hover(|style| style.bg(rgb(color::NAV_HOVER)).text_color(rgb(color::TEXT)))
+        .child(label(stash.message.clone()))
         .child(
             div()
-                .pt(px(14.))
-                .px(px(14.))
-                .pb(px(6.))
                 .text_size(px(11.))
-                .font_weight(FontWeight::SEMIBOLD)
                 .text_color(rgb(color::TEXT_FAINT))
-                .child(title.to_uppercase()),
-        )
-        .child(
-            div()
-                .h_flex()
-                .h(theme::NAV_ROW_HEIGHT)
-                .px(px(14.))
-                .text_size(px(12.5))
-                .text_color(rgb(color::TEXT_FAINT))
-                .child(empty),
+                .child(detail),
         )
 }

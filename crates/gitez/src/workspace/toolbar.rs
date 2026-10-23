@@ -6,6 +6,7 @@ use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::*;
 use gpui_kit::*;
 
+use super::OpenRepository;
 use crate::theme::{self, color};
 
 /// Height of toolbar buttons in the design.
@@ -14,13 +15,21 @@ const BUTTON_HEIGHT: Pixels = px(30.);
 /// Repository switcher, undo and redo, remote operations, branch and stash,
 /// the command palette entry and "New local PR".
 ///
-/// Every action needs an open repository, so all of them are disabled until
-/// one can be opened.
+/// Only the repository switcher works so far; the git actions are disabled
+/// until their write paths exist.
 #[derive(IntoElement)]
-pub struct Toolbar;
+pub struct Toolbar {
+    /// Name of the open repository.
+    pub repository_name: Option<SharedString>,
+    /// Whether a repository is being opened.
+    pub loading: bool,
+}
 
 impl RenderOnce for Toolbar {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        let repository_label = self
+            .repository_name
+            .unwrap_or_else(|| "Open repository…".into());
         div()
             .h_flex()
             .flex_none()
@@ -31,10 +40,17 @@ impl RenderOnce for Toolbar {
             .border_b_1()
             .border_color(rgb(color::BORDER))
             .child(
-                div().h_flex().gap(px(8.)).pl(px(6.)).child(logo()).child(
-                    div()
+                div().h_flex().gap(px(2.)).pl(px(6.)).child(logo()).child(
+                    Button::new("repository")
+                        .ghost()
+                        .h(BUTTON_HEIGHT)
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child("No repository"),
+                        .label(repository_label)
+                        .loading(self.loading)
+                        .tooltip("Open a repository")
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(OpenRepository), cx)
+                        }),
                 ),
             )
             .child(

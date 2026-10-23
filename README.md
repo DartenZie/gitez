@@ -24,9 +24,9 @@ command palette (`⌘K`) that runs any git command.
 
 The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 
-> **Status:** early development. The current build shows the main window
-> (toolbar, sidebar, history, commit detail and status bar) with every pane
-> empty. Opening a repository is not implemented yet.
+> **Status:** early development. The current build opens a repository and
+> shows its branches, remotes, tags and stashes in the sidebar, and the
+> current branch in the status bar. The commit history is not shown yet.
 
 ## Technology
 
@@ -90,7 +90,8 @@ GitEZ uses them; otherwise it falls back to the system UI and monospace fonts.
 ## Build and run
 
 ```sh
-cargo run
+cargo run                         # then open a repository with ⌘O (Ctrl+O on Linux)
+cargo run -- <path-to-repository> # open a repository straight away
 ```
 
 The first build compiles GPUI and gpui-kit from source and takes several

@@ -1,19 +1,57 @@
-//! GitEZ entry point: installs the theme and opens the main window.
+//! GitEZ entry point: installs the theme, menus and key bindings, and opens
+//! the main window.
+//!
+//! `gitez [path]` opens the repository containing `path` straight away.
 
+mod repository;
 mod theme;
+mod time;
 mod workspace;
+
+use std::path::PathBuf;
 
 use gpui_kit::*;
 
-use workspace::Workspace;
+use workspace::{OpenRepository, Workspace};
+
+actions!(gitez, [Quit]);
 
 fn main() {
+    let path = std::env::args_os()
+        .nth(1)
+        .map(|arg| std::path::absolute(PathBuf::from(&arg)).unwrap_or_else(|_| arg.into()));
+
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
-        .run(|cx: &mut App| {
+        .run(move |cx: &mut App| {
             // Must run before any gpui-kit component is used.
             gpui_kit::init(cx);
             theme::init(cx);
+
+            cx.on_action(|_: &Quit, cx| cx.quit());
+            cx.bind_keys([
+                KeyBinding::new("secondary-o", OpenRepository, None),
+                KeyBinding::new("secondary-q", Quit, None),
+            ]);
+            cx.set_menus([
+                Menu {
+                    name: "GitEZ".into(),
+                    items: vec![MenuItem::action("Quit GitEZ", Quit)],
+                    disabled: false,
+                },
+                Menu {
+                    name: "File".into(),
+                    items: vec![MenuItem::action("Open Repository…", OpenRepository)],
+                    disabled: false,
+                },
+            ]);
+            // One window per process for now, so closing it ends the app.
+            cx.on_window_closed(|cx, _| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
 
             let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
             let options = WindowOptions {
@@ -26,7 +64,7 @@ fn main() {
                 ..Default::default()
             };
             gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| Workspace::new(window, cx))
+                cx.new(|cx| Workspace::new(path, window, cx))
             })
             .expect("failed to open the main window");
             cx.activate(true);

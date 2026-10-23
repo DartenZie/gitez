@@ -15,7 +15,11 @@ path = "src/main.rs"
 
 [dependencies]
 gpui-kit.workspace = true
+gitez-git.workspace = true
 anyhow.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true
