@@ -27,6 +27,7 @@ icon_assets!(
         GitPullRequestArrow,
         ListTree,
         LoaderCircle,
+        Pencil,
         Square,
         Terminal
     ]

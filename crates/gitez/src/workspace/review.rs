@@ -25,6 +25,7 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+mod edit;
 mod merge;
 mod prompt;
 mod threads;
@@ -347,6 +348,8 @@ struct PullRequestSubject {
     checking_out: Option<Task<()>>,
     /// Set while the merge dialog is open.
     merge_dialog: Option<Subscription>,
+    /// Set while the edit dialog is open.
+    edit_dialog: Option<Subscription>,
 }
 
 pub struct Review {
@@ -481,6 +484,7 @@ impl Review {
             panel,
             checking_out: None,
             merge_dialog: None,
+            edit_dialog: None,
         }));
         let mut review = Self::with_subject(repository, subject, load, cx);
         review.find_run(cx);
@@ -1934,7 +1938,33 @@ impl Review {
             .items_start()
             .gap(px(20.))
             .child(
-                title(pull_request.title.clone()).flex_1().min_w_0().child(
+                div()
+                    .v_flex()
+                    .gap(px(8.))
+                    .max_w(px(900.))
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .h_flex()
+                            .items_baseline()
+                            .gap(px(8.))
+                            .text_size(px(22.))
+                            .line_height(relative(1.3))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(pull_request.title.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_color(rgb(color::TEXT_MUTED))
+                                    .child(format!("#{}", pull_request.number)),
+                            ),
+                    )
+                    .child(
                     byline()
                         .child(state_chip(pull_request.state))
                         .child(branch(&pull_request.head.branch))
@@ -1956,13 +1986,48 @@ impl Review {
                             (!missing.is_empty())
                                 .then(|| muted(format!("· {}", missing.join(", ")))),
                         ),
-                ),
+                    )
+                    .when(!pull_request.description.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .pt(px(2.))
+                                .text_size(px(13.))
+                                .line_height(relative(1.55))
+                                .text_color(rgb(color::TEXT_SECONDARY))
+                                .child(pull_request.description.clone()),
+                        )
+                    }),
             )
             .child(
                 div()
                     .h_flex()
                     .flex_none()
                     .gap(px(6.))
+                    .child(
+                        Button::new("pull-request-edit")
+                            .ghost()
+                            .h(px(30.))
+                            .icon(IconName::Pencil)
+                            .label("Edit")
+                            .on_click(cx.listener(|this, _, window, cx| this.open_edit(window, cx))),
+                    )
+                    .when(pull_request.state != State::Merged, |this| {
+                        let open = pull_request.state == State::Open;
+                        this.child(
+                            Button::new("pull-request-close")
+                                .ghost()
+                                .h(px(30.))
+                                .label(if open { "Close" } else { "Reopen" })
+                                .tooltip(if open {
+                                    "Close without merging; it keeps its comments and can be reopened"
+                                } else {
+                                    "Reopen to review the branch as it is now"
+                                })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.set_open(!open, cx)
+                                })),
+                        )
+                    })
                     .child(
                         Button::new("pull-request-checkout")
                             .h(px(30.))
