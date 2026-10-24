@@ -39,6 +39,8 @@ icon_assets!(
         Move,
         Pencil,
         Play,
+        Rewind,
+        RotateCcw,
         ShieldCheck,
         Square,
         Tag,

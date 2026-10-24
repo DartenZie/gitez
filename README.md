@@ -128,7 +128,12 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 > or the palette, tags it: with a message the tag is annotated, without
 > one it is lightweight. Click a tag in the sidebar to show its commit, or
 > right-click it to push it to the remote, delete it, or delete it from
-> the remote (after you confirm). **Stash** puts your uncommitted changes aside, new
+> the remote (after you confirm). **Revert** on a commit adds a commit to
+> the branch checked out that takes it back (a merge against its first
+> parent); one that conflicts is given up. **Reset…** moves the branch
+> checked out to the commit, keeping what the later commits changed
+> staged or unstaged, or discarding it along with your uncommitted
+> changes to tracked files. **Stash** puts your uncommitted changes aside, new
 > files too unless you untick that, with an optional message; right-click
 > a stash in the sidebar to pop it, apply it and keep it, or drop it. A
 > stash that conflicts with your files is kept, with the conflicts marked
@@ -139,7 +144,7 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 > button on the notification) takes back what GitEZ last did: a commit or
 > amend (its changes come back staged), a checkout, a branch created,
 > renamed or deleted, a tag created or deleted, a pull, merge, rebase,
-> cherry-pick or rewrite, a stash made or dropped, changes discarded, and a local pull request
+> cherry-pick, revert, reset or rewrite, a stash made or dropped, changes discarded, and a local pull request
 > marked merged. **Redo**
 > (`⇧⌘Z`) does it again. GitEZ keeps its own list of these steps while it
 > runs, and refuses one when a branch it would move has moved since, so

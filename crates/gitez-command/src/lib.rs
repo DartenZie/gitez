@@ -191,9 +191,23 @@ pub enum ResetMode {
     /// Leaves both as they are, so the difference shows as staged changes
     /// (`--soft`).
     Soft,
+    /// Leaves the files as they are and unstages the difference
+    /// (`--mixed`).
+    Mixed,
+    /// Makes the index and the tracked files match the commit, throwing
+    /// away their changes (`--hard`).
+    Hard,
     /// Updates the files that differ between the commits and keeps local
     /// changes, refusing if one would be lost (`--keep`).
     Keep,
+}
+
+/// How [`Git::revert`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevertOutcome {
+    Reverted,
+    /// It conflicted with the branch, so nothing changed.
+    Conflicts,
 }
 
 /// Runs `git` in one working tree.
@@ -584,9 +598,31 @@ impl Git {
     pub fn reset(&self, commit: &str, mode: ResetMode) -> Result<()> {
         let flag = match mode {
             ResetMode::Soft => "--soft",
+            ResetMode::Mixed => "--mixed",
+            ResetMode::Hard => "--hard",
             ResetMode::Keep => "--keep",
         };
         self.run(["reset", "--quiet", flag, commit], None).map(drop)
+    }
+
+    /// Adds a commit that takes back what `commit` changed, like `git
+    /// revert --no-edit`; `mainline` picks the parent of a merge commit to
+    /// keep (`-m`). A revert that conflicts is given up, changing nothing.
+    pub fn revert(&self, commit: &str, mainline: Option<u32>) -> Result<RevertOutcome> {
+        let mainline = mainline.map(|parent| parent.to_string());
+        let mut args = vec!["revert", "--no-edit"];
+        if let Some(parent) = &mainline {
+            args.extend(["-m", parent]);
+        }
+        args.push(commit);
+        match self.run(args, None) {
+            Ok(_) => Ok(RevertOutcome::Reverted),
+            Err(_) if self.conflicted().is_ok_and(|paths| !paths.is_empty()) => {
+                self.run(["revert", "--abort"], None)?;
+                Ok(RevertOutcome::Conflicts)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Checks out `commit` without a branch, like `git switch --detach`.
@@ -948,20 +984,27 @@ impl Git {
     /// list; its id, returned, brings them back with
     /// [`Git::restore_discarded`]. `None` when there was nothing to discard.
     pub fn discard(&self, paths: Option<&[String]>) -> Result<Option<String>> {
+        self.discard_changes(paths, true)
+    }
+
+    /// Like [`Git::discard`] for every file, but leaves the files git does
+    /// not track alone, as `git reset --hard` does.
+    pub fn discard_tracked(&self) -> Result<Option<String>> {
+        self.discard_changes(None, false)
+    }
+
+    fn discard_changes(&self, paths: Option<&[String]>, untracked: bool) -> Result<Option<String>> {
         let top = || {
             self.run(["rev-parse", "--quiet", "--verify", "refs/stash"], None)
                 .ok()
                 .map(|id| String::from_utf8_lossy(&id).trim().to_owned())
         };
         let before = top();
-        let args = [
-            "stash",
-            "push",
-            "--quiet",
-            "--include-untracked",
-            "-m",
-            "GitEZ: discarded changes",
-        ];
+        let mut args = vec!["stash", "push", "--quiet"];
+        if untracked {
+            args.push("--include-untracked");
+        }
+        args.extend(["-m", "GitEZ: discarded changes"]);
         // Literal pathspecs stop `git stash` from cleaning the untracked
         // files it stashed, so each path is marked literal instead.
         let literal = [("GIT_LITERAL_PATHSPECS", "0")];

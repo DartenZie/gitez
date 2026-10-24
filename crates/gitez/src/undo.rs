@@ -84,6 +84,9 @@ pub enum Discard {
     },
     /// One hunk of a file's unstaged changes, as a patch.
     Hunk { patch: String },
+    /// The changes to every tracked file, kept in the stash commit
+    /// `saved`, as a hard reset throws them away.
+    Tracked { saved: String },
 }
 
 /// What one change did.
@@ -191,6 +194,11 @@ impl Change {
         let now = repository.ref_state()?;
         if let Some(why_not) = self.why_not(&now, direction) {
             bail!(why_not);
+        }
+        // Changes thrown away before the references moved are thrown away
+        // first again, and brought back last.
+        if direction == Direction::Redo {
+            self.apply_discard(git, direction)?;
         }
         let ends = |before: Option<Oid>, after: Option<Oid>| match direction {
             Direction::Undo => (after, before),
@@ -301,14 +309,27 @@ impl Change {
             review.store.save(&pull_request)?;
         }
 
+        if direction == Direction::Undo {
+            self.apply_discard(git, direction)?;
+        }
+        Ok(())
+    }
+
+    /// Throws the discarded changes away again, or brings them back.
+    fn apply_discard(&mut self, git: &Git, direction: Direction) -> anyhow::Result<()> {
         match (&mut self.discard, direction) {
-            (Some(Discard::Files { saved, .. }), Direction::Undo) => {
+            (Some(Discard::Files { saved, .. } | Discard::Tracked { saved }), Direction::Undo) => {
                 git.restore_discarded(saved)?;
             }
             (Some(Discard::Files { paths, saved }), Direction::Redo) => {
                 // Discarding again keeps them in a new stash commit.
                 *saved = git
                     .discard(paths.as_deref())?
+                    .context("There are no changes to discard again.")?;
+            }
+            (Some(Discard::Tracked { saved }), Direction::Redo) => {
+                *saved = git
+                    .discard_tracked()?
                     .context("There are no changes to discard again.")?;
             }
             (Some(Discard::Hunk { patch }), direction) => {
@@ -381,6 +402,12 @@ pub struct Recorded {
 }
 
 impl Recorded {
+    /// Also brings back the changes `discard` threw away before it.
+    pub fn with_discard(mut self, discard: Discard) -> Self {
+        self.change.discard = Some(discard);
+        self
+    }
+
     /// The changes `discard` threw away in the repository in `dir`.
     pub fn discard(dir: &Path, discard: Discard) -> Option<Self> {
         let key = Repository::open(dir).ok()?.common_dir();
@@ -775,6 +802,37 @@ mod tests {
             deleted.why_not(&now, Direction::Redo).as_deref(),
             Some("Tag v1 has moved since.")
         );
+    }
+
+    #[test]
+    fn undoes_a_hard_reset_with_uncommitted_changes() {
+        let dir = repository();
+        let root = dir.path();
+        let tool = Git::new(root);
+        let first = git(root, &["rev-parse", "HEAD"]);
+        std::fs::write(root.join("a.txt"), "a\nb\n").expect("write");
+        git(root, &["commit", "--quiet", "-am", "b"]);
+        std::fs::write(root.join("a.txt"), "a\nb\nlocal\n").expect("write");
+        let before = state(root);
+        let recorder = Recorder::start(root);
+        let saved = tool
+            .discard_tracked()
+            .expect("discard")
+            .expect("there were changes");
+        tool.reset(&first, ResetMode::Hard).expect("reset");
+        let after = state(root);
+        let mut change = recorder
+            .finish(ResetMode::Hard)
+            .expect("main moved")
+            .with_discard(Discard::Tracked { saved })
+            .change;
+
+        change.apply(&tool, Direction::Undo).expect("undo");
+        assert_eq!(state(root), before);
+        change.apply(&tool, Direction::Redo).expect("redo");
+        assert_eq!(state(root), after);
+        change.apply(&tool, Direction::Undo).expect("undo again");
+        assert_eq!(state(root), before);
     }
 
     #[test]

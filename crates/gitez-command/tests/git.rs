@@ -2,8 +2,8 @@ use std::path::Path;
 use std::process::Command;
 
 use gitez_command::{
-    Error, Git, PullMethod, PullOutcome, PushRejection, RefUpdate, ResetMode, UnstashOutcome,
-    not_merged,
+    Error, Git, PullMethod, PullOutcome, PushRejection, RefUpdate, ResetMode, RevertOutcome,
+    UnstashOutcome, not_merged,
 };
 
 /// `git <args>` in `dir`, returning its trimmed output.
@@ -1020,4 +1020,79 @@ fn creates_pushes_and_deletes_tags() {
 
     a.delete_tag("v1").expect("delete");
     assert_eq!(git(root, &["tag", "-l"]), "v2");
+}
+
+#[test]
+fn reverts_a_commit_and_gives_up_on_a_conflict() {
+    let dir = repository();
+    let root = dir.path();
+    let git_ = Git::new(root);
+    std::fs::write(root.join("a.txt"), "one\n").expect("write");
+    git_.stage_all().expect("stage");
+    git_.commit("One").expect("commit");
+    std::fs::write(root.join("a.txt"), "two\n").expect("write");
+    git_.stage_all().expect("stage");
+    git_.commit("Two").expect("commit");
+    let two = git(root, &["rev-parse", "HEAD"]);
+    std::fs::write(root.join("a.txt"), "three\n").expect("write");
+    git_.stage_all().expect("stage");
+    git_.commit("Three").expect("commit");
+    let three = git(root, &["rev-parse", "HEAD"]);
+
+    // "Two" changed a line "Three" changed again.
+    assert_eq!(
+        git_.revert(&two, None).expect("revert"),
+        RevertOutcome::Conflicts
+    );
+    assert_eq!(git(root, &["rev-parse", "HEAD"]), three);
+    assert_eq!(status(root), "");
+
+    assert_eq!(
+        git_.revert(&three, None).expect("revert"),
+        RevertOutcome::Reverted
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).expect("read"),
+        "two\n"
+    );
+    assert_eq!(git(root, &["log", "-1", "--format=%s"]), "Revert \"Three\"");
+}
+
+#[test]
+fn resets_three_ways_and_discards_only_tracked_files() {
+    let dir = repository();
+    let root = dir.path();
+    let git_ = Git::new(root);
+    std::fs::write(root.join("a.txt"), "one\n").expect("write");
+    git_.stage_all().expect("stage");
+    git_.commit("One").expect("commit");
+    let one = git(root, &["rev-parse", "HEAD"]);
+    std::fs::write(root.join("a.txt"), "two\n").expect("write");
+    git_.stage_all().expect("stage");
+    git_.commit("Two").expect("commit");
+    let two = git(root, &["rev-parse", "HEAD"]);
+
+    git_.reset(&one, ResetMode::Soft).expect("soft");
+    assert_eq!(status(root), "M  a.txt");
+    git_.reset(&two, ResetMode::Soft).expect("back");
+    git_.reset(&one, ResetMode::Mixed).expect("mixed");
+    assert_eq!(status(root), "M a.txt");
+    git_.reset(&two, ResetMode::Mixed).expect("back");
+    assert_eq!(status(root), "");
+
+    std::fs::write(root.join("a.txt"), "local\n").expect("write");
+    std::fs::write(root.join("new.txt"), "new\n").expect("write");
+    let saved = git_
+        .discard_tracked()
+        .expect("discard")
+        .expect("there were changes");
+    assert_eq!(status(root), "?? new.txt");
+    git_.reset(&one, ResetMode::Hard).expect("hard");
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).expect("read"),
+        "one\n"
+    );
+    git_.reset(&two, ResetMode::Hard).expect("back");
+    git_.restore_discarded(&saved).expect("restore");
+    assert_eq!(status(root), "M a.txt\n?? new.txt");
 }

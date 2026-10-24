@@ -11,6 +11,7 @@ mod labels;
 mod new_pull_request;
 mod palette;
 mod remote;
+mod reset;
 mod review;
 mod rewrite;
 mod sidebar;
@@ -238,6 +239,8 @@ impl Workspace {
                 DetailEvent::Reword(id) => this.open_rewrite(*id, Some(*id), false, window, cx),
                 DetailEvent::NewBranch(id) => this.new_branch_at(*id, window, cx),
                 DetailEvent::NewTag(id) => this.new_tag_at(*id, window, cx),
+                DetailEvent::Revert(id) => this.revert_commit(*id, window, cx),
+                DetailEvent::Reset(id) => this.reset_to(*id, window, cx),
             }),
             // Files change outside GitEZ; read the status again on return.
             // The toolbar names the next undo and redo steps.

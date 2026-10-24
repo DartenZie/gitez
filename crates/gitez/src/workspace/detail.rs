@@ -38,6 +38,10 @@ pub enum DetailEvent {
     NewBranch(Oid),
     /// Ask for a tag on this commit.
     NewTag(Oid),
+    /// Take back what this commit changed, in a new commit.
+    Revert(Oid),
+    /// Ask how to reset the branch checked out to this commit.
+    Reset(Oid),
 }
 
 /// The selected commit: SHA, parents, message, author, refs and changed files.
@@ -254,8 +258,8 @@ fn actions(id: Oid, cx: &mut Context<DetailPane>) -> impl IntoElement {
     let action = |name: &'static str, icon: IconName, label: &'static str| {
         Button::new(name)
             .flex_1()
-            // Two to a row: four do not fit beside each other.
-            .flex_basis(relative(0.4))
+            // Three to a row: six do not fit beside each other.
+            .flex_basis(relative(0.3))
             .h(px(30.))
             .icon(Icon::new(icon).size(px(14.)))
             .label(label)
@@ -286,6 +290,16 @@ fn actions(id: Oid, cx: &mut Context<DetailPane>) -> impl IntoElement {
             action("commit-tag", IconName::Tag, "Tag…")
                 .tooltip("New tag on this commit")
                 .on_click(cx.listener(move |_, _, _, cx| cx.emit(DetailEvent::NewTag(id)))),
+        )
+        .child(
+            action("commit-revert", IconName::RotateCcw, "Revert")
+                .tooltip("Add a commit to the branch checked out that takes this one back")
+                .on_click(cx.listener(move |_, _, _, cx| cx.emit(DetailEvent::Revert(id)))),
+        )
+        .child(
+            action("commit-reset", IconName::Rewind, "Reset…")
+                .tooltip("Move the branch checked out to this commit")
+                .on_click(cx.listener(move |_, _, _, cx| cx.emit(DetailEvent::Reset(id)))),
         )
 }
 
