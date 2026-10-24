@@ -7,7 +7,8 @@ use std::process::Command;
 use gitez_git::graph::GraphLayout;
 use gitez_git::{
     Affected, ChangeKind, Commit, DiffContent, DiffLine, DiffOptions, FileChange, FileStatus, Head,
-    Hunk, LineCounts, LineKind, Oid, Order, RefKind, Repository, Staging, WorktreeChange,
+    Hunk, LineCounts, LineKind, LineSource, NewSide, Oid, Order, RefKind, Repository, Staging,
+    WorktreeChange,
 };
 use tempfile::TempDir;
 
@@ -769,6 +770,10 @@ fn diff_numbers_lines_and_keeps_three_lines_of_context() {
             ],
             staging: None,
             patchable: false,
+            new_side: Some(NewSide {
+                source: LineSource::Blob(fixture.rev("HEAD:new.txt")),
+                lines: 2,
+            }),
         }])
     );
 
@@ -800,6 +805,68 @@ fn diff_numbers_lines_and_keeps_three_lines_of_context() {
     assert_eq!(hunk.lines, expected);
     let counts = diffs[3].line_counts().expect("text has line counts");
     assert_eq!((counts.added, counts.removed), (1, 2));
+
+    // The whole new file, for showing the lines around the hunk.
+    let new_side = hunk.new_side.as_ref().expect("text.txt has a new side");
+    assert_eq!(
+        new_side.source,
+        LineSource::Blob(fixture.rev("HEAD:text.txt"))
+    );
+    assert_eq!(new_side.lines as usize, changed.len());
+    assert_eq!(
+        fixture.open().lines(&new_side.source).expect("lines"),
+        changed
+    );
+}
+
+#[test]
+fn uncommitted_hunks_know_the_file_their_lines_are_from() {
+    let fixture = Fixture::new();
+    std::fs::write(fixture.root.join("a.txt"), "1\n2\n3\n4\n5\n6\n7\n8\n9\n").expect("write");
+    std::fs::write(fixture.root.join("gone.txt"), "bye\n").expect("write");
+    fixture.git(&["add", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "first"]);
+
+    std::fs::write(fixture.root.join("a.txt"), "one\n2\n3\n4\n5\n6\n7\n8\n9\n").expect("write");
+    fixture.git(&["add", "a.txt"]);
+    std::fs::write(
+        fixture.root.join("a.txt"),
+        "one\n2\n3\n4\n5\n6\n7\n8\nnine\r\nten\n",
+    )
+    .expect("write");
+    std::fs::remove_file(fixture.root.join("gone.txt")).expect("remove");
+
+    let repository = fixture.open();
+    let diffs = repository
+        .working_tree_diff(DiffOptions::default())
+        .expect("diff");
+    let sides: Vec<Vec<Option<NewSide>>> = diffs
+        .iter()
+        .map(|diff| match &diff.content {
+            DiffContent::Text(hunks) => hunks.iter().map(|hunk| hunk.new_side.clone()).collect(),
+            other => panic!("a text diff: {other:?}"),
+        })
+        .collect();
+    let staged = NewSide {
+        source: LineSource::Blob(fixture.rev(":a.txt")),
+        lines: 9,
+    };
+    let on_disk = NewSide {
+        source: LineSource::WorkingTree("a.txt".to_owned()),
+        lines: 10,
+    };
+    assert_eq!(
+        sides,
+        [
+            vec![Some(staged.clone()), Some(on_disk.clone())],
+            vec![None]
+        ]
+    );
+    assert_eq!(repository.lines(&staged.source).expect("lines")[0], "one");
+    assert_eq!(
+        repository.lines(&on_disk.source).expect("lines")[8..],
+        ["nine", "ten"]
+    );
 }
 
 #[test]

@@ -67,6 +67,8 @@ pub mod color {
     pub const DIFF_HUNK_TEXT: u32 = 0x93_a9_c6;
     pub const DIFF_TEXT: u32 = 0xd8_d5_cc;
     pub const DIFF_LINE_NUMBER: u32 = 0x85_83_7b;
+    /// The bar that shows unchanged lines left out of a diff.
+    pub const DIFF_GAP: u32 = 0x18_18_1b;
     /// The "new file" label on a diff card.
     pub const DIFF_ADDED_TEXT: u32 = 0x8f_d6_a7;
     /// The selected file in a review's file list.

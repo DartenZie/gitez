@@ -15,6 +15,12 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+    #[error("could not read {path}")]
+    ReadFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("could not compute a diff")]
     Diff(#[source] std::io::Error),
     #[error("could not watch the repository for changes")]

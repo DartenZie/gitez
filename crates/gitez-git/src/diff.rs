@@ -101,6 +101,26 @@ pub struct Hunk {
     /// Whether [`Hunk::patch`] stages or unstages exactly this hunk: the
     /// file exists on both sides and its text is UTF-8.
     pub patchable: bool,
+    /// The file the hunk's new lines are from, to show the unchanged lines
+    /// around it; `None` when there is none, as for a deleted file.
+    pub new_side: Option<NewSide>,
+}
+
+/// The new version of a file a hunk is from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewSide {
+    pub source: LineSource,
+    /// How many lines it has.
+    pub lines: u32,
+}
+
+/// Where a version of a file is stored; see [`Repository::lines`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum LineSource {
+    /// A blob: committed or staged.
+    Blob(Oid),
+    /// The file in the working tree at this path from the repository root.
+    WorkingTree(String),
 }
 
 /// Which part of the uncommitted changes a hunk belongs to.
@@ -301,6 +321,11 @@ impl Repository {
                 Some(metadata) if is_executable(metadata) => EntryKind::BlobExecutable,
                 _ => EntryKind::Blob,
             };
+            // The file on disk, unless it is gone or a symlink.
+            let on_disk = metadata
+                .as_ref()
+                .filter(|metadata| metadata.is_file())
+                .map(|_| LineSource::WorkingTree(file.path.clone()));
             let is_file = |kind: EntryKind| {
                 matches!(
                     kind,
@@ -326,7 +351,7 @@ impl Repository {
                     (id, old_kind, old_path),
                     (null, worktree_kind, &file.path),
                 )?;
-                prepared_content(&mut worktree_cache, &mut budget, options)?
+                prepared_content(&mut worktree_cache, &mut budget, options, on_disk)?
             } else {
                 let staged = match &file.staged {
                     Some(_) => {
@@ -338,7 +363,11 @@ impl Repository {
                             (old_id, old_kind, old_path),
                             (new_id, new_kind, &file.path),
                         )?;
-                        let content = prepared_content(&mut staged_cache, &mut budget, options)?;
+                        let staged_blob = indexed
+                            .filter(|&(_, kind)| kind != EntryKind::Link)
+                            .map(|(id, _)| LineSource::Blob(id));
+                        let content =
+                            prepared_content(&mut staged_cache, &mut budget, options, staged_blob)?;
                         let patchable = head.is_some() && indexed.is_some();
                         Some(with_staging(content, Some(Staging::Staged), patchable))
                     }
@@ -353,7 +382,12 @@ impl Repository {
                             (old_id, old_kind, &file.path),
                             (null, worktree_kind, &file.path),
                         )?;
-                        let content = prepared_content(&mut worktree_cache, &mut budget, options)?;
+                        let content = prepared_content(
+                            &mut worktree_cache,
+                            &mut budget,
+                            options,
+                            on_disk.clone(),
+                        )?;
                         let patchable = indexed.is_some() && metadata.is_some();
                         Some(with_staging(content, Some(Staging::Unstaged), patchable))
                     }
@@ -368,6 +402,24 @@ impl Repository {
             });
         }
         Ok(files)
+    }
+}
+
+impl Repository {
+    /// The lines of the file stored at `source`, without line endings, as
+    /// numbered in a diff.
+    pub fn lines(&self, source: &LineSource) -> Result<Vec<String>> {
+        let data = match source {
+            LineSource::Blob(id) => self.local().find_object(*id)?.detach().data,
+            LineSource::WorkingTree(path) => {
+                let path = self.work_dir().unwrap_or(self.git_dir()).join(path);
+                std::fs::read(&path).map_err(|source| Error::ReadFile { path, source })?
+            }
+        };
+        Ok(data
+            .lines()
+            .map(|line| line.to_str_lossy().into_owned())
+            .collect())
     }
 }
 
@@ -463,15 +515,21 @@ fn content(
         return Ok(DiffContent::Unchanged);
     }
     change.diff(cache)?;
-    prepared_content(cache, budget, options)
+    let source = match change {
+        Change::Deletion { .. } => None,
+        _ if change.entry_mode().is_link() => None,
+        _ => Some(LineSource::Blob(change.id().detach())),
+    };
+    prepared_content(cache, budget, options, source)
 }
 
 /// The diff of the two resources set in `cache`, using at most `budget`
-/// lines.
+/// lines. The new resource is stored at `new_source`, if anywhere.
 fn prepared_content(
     cache: &mut gix::diff::blob::Platform,
     budget: &mut usize,
     options: DiffOptions,
+    new_source: Option<LineSource>,
 ) -> Result<DiffContent> {
     cache.options.skip_internal_diff_if_external_is_configured = false;
     let prepared = cache.prepare_diff().map_err(gix::Error::from)?;
@@ -510,6 +568,10 @@ fn prepared_content(
                 .into_iter()
                 .map(|mut hunk| {
                     hunk.patchable &= !options.ignore_whitespace;
+                    hunk.new_side = new_source.clone().map(|source| NewSide {
+                        source,
+                        lines: input.after.len() as u32,
+                    });
                     hunk
                 })
                 .collect::<Vec<_>>();
@@ -615,6 +677,7 @@ impl ConsumeHunk for Hunks {
             staging: None,
             // Set for uncommitted changes, where it matters.
             patchable: exact,
+            new_side: None,
         });
         Ok(())
     }

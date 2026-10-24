@@ -3,14 +3,15 @@
 //! `Commit.dc.html` artboard. The uncommitted changes can be staged and
 //! committed from here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::sync::Arc;
 
 use gitez_command::Git;
 use gitez_git::{
     ChangeKind, Commit, CommitDetails, DiffContent, DiffLine, DiffOptions, FileDiff, FileStatus,
-    LineKind, Oid, RefKind, RefLabel, Repository, Staging, WorkingTreeStatus, WorktreeChange,
+    Hunk, LineKind, LineSource, Oid, RefKind, RefLabel, Repository, Staging, WorkingTreeStatus,
+    WorktreeChange,
 };
 use gpui_kit::component::button::*;
 use gpui_kit::component::checkbox::Checkbox;
@@ -62,7 +63,7 @@ const OVERDRAW: Pixels = px(600.);
 const TAB: &str = "    ";
 
 /// A row of the diff list.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Row {
     /// The header of the file at this index.
     File(usize),
@@ -73,6 +74,11 @@ enum Row {
     /// In the split layout, a line's old side beside a line's new side:
     /// file, hunk, and the indices of the two lines, if any.
     Pair(usize, usize, Option<usize>, Option<usize>),
+    /// Unchanged lines left out of a file's diff, which can be shown: file
+    /// and where.
+    Gap(usize, GapAt),
+    /// One of those lines, shown: file, where, and the index in the gap.
+    Context(usize, GapAt, u32),
     /// Why a file has no lines to show: binary, too large, unchanged.
     Notice(usize),
     /// The bottom edge of a file's card.
@@ -88,11 +94,94 @@ impl Row {
             | Row::Hunk(file, _)
             | Row::Line(file, _, _)
             | Row::Pair(file, _, _, _)
+            | Row::Gap(file, _)
+            | Row::Context(file, _, _)
             | Row::Notice(file)
             | Row::FileEnd(file) => Some(file),
             Row::End => None,
         }
     }
+
+    /// The same row in the file at index `file`.
+    fn in_file(self, file: usize) -> Self {
+        match self {
+            Row::File(_) => Row::File(file),
+            Row::Hunk(_, hunk) => Row::Hunk(file, hunk),
+            Row::Line(_, hunk, line) => Row::Line(file, hunk, line),
+            Row::Pair(_, hunk, old, new) => Row::Pair(file, hunk, old, new),
+            Row::Notice(_) => Row::Notice(file),
+            Row::FileEnd(_) => Row::FileEnd(file),
+            Row::Gap(_, at) => Row::Gap(file, at),
+            Row::Context(_, at, line) => Row::Context(file, at, line),
+            Row::End => Row::End,
+        }
+    }
+}
+
+/// Where unchanged lines are left out of a file's diff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum GapAt {
+    /// Before the hunk at this index.
+    Before(usize),
+    /// After the hunk at this index, to the end of the file.
+    After(usize),
+}
+
+/// Unchanged lines left out of a diff: `len` lines from line `new` of the
+/// new file, which is line `old` of the old file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Gap {
+    old: u32,
+    new: u32,
+    len: u32,
+}
+
+/// The lines left out at `at` in `hunks`, if any. Hunks from different
+/// files, as staged and unstaged hunks are, have no gap between them.
+fn gap(hunks: &[Hunk], at: GapAt) -> Option<Gap> {
+    // The first line of a range; an empty one starts after the line before.
+    let first = |start: u32, len: u32| if len == 0 { start + 1 } else { start };
+    let after = |hunk: &Hunk| {
+        (
+            first(hunk.old_start, hunk.old_len) + hunk.old_len,
+            first(hunk.new_start, hunk.new_len) + hunk.new_len,
+        )
+    };
+    let same_file = |a: &Hunk, b: &Hunk| a.staging == b.staging && a.new_side == b.new_side;
+    let gap = match at {
+        GapAt::Before(index) => {
+            let hunk = hunks.get(index)?;
+            hunk.new_side.as_ref()?;
+            let (old, new) = match index.checked_sub(1).and_then(|index| hunks.get(index)) {
+                Some(previous) if same_file(previous, hunk) => after(previous),
+                _ => (1, 1),
+            };
+            let end = first(hunk.new_start, hunk.new_len);
+            Gap {
+                old,
+                new,
+                len: end.saturating_sub(new),
+            }
+        }
+        GapAt::After(index) => {
+            let hunk = hunks.get(index)?;
+            let side = hunk.new_side.as_ref()?;
+            if hunks
+                .get(index + 1)
+                .is_some_and(|next| same_file(hunk, next))
+            {
+                // Shown as the gap before the next hunk.
+                return None;
+            }
+            let (old, new) = after(hunk);
+            Gap {
+                old,
+                new,
+                len: (side.lines + 1).saturating_sub(new),
+            }
+        }
+    };
+    (gap.len > 0).then_some(gap)
 }
 
 /// How reviews show diffs. One setting for the whole app, so it carries
@@ -125,6 +214,17 @@ pub enum DiffLayout {
     Unified,
     /// The old file on the left, the new file on the right.
     Split,
+}
+
+/// Where the list is scrolled to, kept across changes to its rows.
+struct Anchor {
+    /// The file at the top of the list.
+    path: String,
+    /// The row at the top.
+    row: Row,
+    /// The index of that row within the file's rows.
+    index: usize,
+    offset_in_item: Pixels,
 }
 
 /// What is being reviewed.
@@ -215,7 +315,15 @@ pub struct Review {
     /// The files marked viewed, by path, with the [`fingerprint`] of their
     /// diff then: a file that changes since counts as not viewed again.
     viewed: HashMap<String, u64>,
+    /// The gaps shown in full, by file path, with the [`fingerprint`] of
+    /// the file's diff then.
+    expanded: HashMap<String, (u64, HashSet<GapAt>)>,
+    /// The lines of the files read to fill gaps.
+    sources: HashMap<LineSource, Arc<Vec<String>>>,
+    /// Why reading the lines of a file failed.
+    sources_error: Option<SharedString>,
     _load: Task<()>,
+    _load_sources: Task<()>,
 }
 
 impl EventEmitter<ReviewEvent> for Review {}
@@ -328,7 +436,11 @@ impl Review {
             list,
             current_file: 0,
             viewed: HashMap::new(),
+            expanded: HashMap::new(),
+            sources: HashMap::new(),
+            sources_error: None,
             _load: load,
+            _load_sources: Task::ready(()),
         }
     }
 
@@ -387,7 +499,11 @@ impl Review {
                 }
                 let anchor = self.scroll_anchor();
                 self.files = Some(Ok(Arc::new(files)));
+                // Files on disk may have changed; blobs cannot.
+                self.sources
+                    .retain(|source, _| matches!(source, LineSource::Blob(_)));
                 self.rebuild_rows(anchor, cx);
+                self.load_sources(cx);
             }
             Err(error) => {
                 self.files = Some(Err(format!(
@@ -402,7 +518,7 @@ impl Review {
 
     /// Lays out the rows of the files again, then scrolls back to `anchor`,
     /// from [`Self::scroll_anchor`] before the change.
-    fn rebuild_rows(&mut self, anchor: Option<(String, usize, Pixels)>, cx: &App) {
+    fn rebuild_rows(&mut self, anchor: Option<Anchor>, cx: &App) {
         let Some(Ok(files)) = &self.files else {
             return;
         };
@@ -410,20 +526,31 @@ impl Review {
         (self.rows, self.file_rows) = rows(
             &files,
             |file| self.is_viewed(file),
+            |file, at| self.is_expanded(file, at),
             ReviewSettings::get(cx).layout,
         );
         self.list.reset(self.rows.len());
-        if let Some((path, row, offset_in_item)) = anchor
+        if let Some(Anchor {
+            path,
+            row,
+            index,
+            offset_in_item,
+        }) = anchor
             && let Some(file) = files.iter().position(|file| file.path == path)
         {
-            // The same row of the same file, or the file's last row if it
-            // got shorter.
+            // The same row of the same file; or the row at the same place
+            // in the file, or its last row if it got shorter.
+            let start = self.file_rows[file];
             let end = self
                 .file_rows
                 .get(file + 1)
                 .copied()
                 .unwrap_or(self.rows.len());
-            let item_ix = (self.file_rows[file] + row).min(end.saturating_sub(1));
+            let row = row.in_file(file);
+            let item_ix = match self.rows[start..end].iter().position(|&other| other == row) {
+                Some(found) => start + found,
+                None => (start + index).min(end.saturating_sub(1)),
+            };
             self.list.scroll_to(ListOffset {
                 item_ix,
                 offset_in_item,
@@ -432,6 +559,143 @@ impl Review {
         } else {
             self.current_file = 0;
         }
+    }
+
+    /// Whether the lines left out at `at` in `file` are shown: asked for,
+    /// read, and the file has not changed since.
+    fn is_expanded(&self, file: &FileDiff, at: GapAt) -> bool {
+        let DiffContent::Text(hunks) = &file.content else {
+            return false;
+        };
+        let index = match at {
+            GapAt::Before(index) | GapAt::After(index) => index,
+        };
+        let loaded = hunks
+            .get(index)
+            .and_then(|hunk| hunk.new_side.as_ref())
+            .is_some_and(|side| self.sources.contains_key(&side.source));
+        loaded
+            && self
+                .expanded
+                .get(&file.path)
+                .is_some_and(|(print, gaps)| *print == fingerprint(file) && gaps.contains(&at))
+    }
+
+    /// Every gap in `files`, by file index.
+    fn all_gaps(files: &[FileDiff]) -> impl Iterator<Item = (usize, GapAt)> + '_ {
+        files.iter().enumerate().flat_map(|(file, diff)| {
+            let hunks: &[Hunk] = match &diff.content {
+                DiffContent::Text(hunks) => hunks,
+                _ => &[],
+            };
+            (0..hunks.len())
+                .flat_map(|index| [GapAt::Before(index), GapAt::After(index)])
+                .filter(move |&at| gap(hunks, at).is_some())
+                .map(move |at| (file, at))
+        })
+    }
+
+    /// Shows the lines left out at each of `gaps`, reading the files they
+    /// are from first.
+    fn expand(&mut self, gaps: Vec<(usize, GapAt)>, cx: &mut Context<Self>) {
+        let Some(Ok(files)) = &self.files else {
+            return;
+        };
+        for (file, at) in gaps {
+            let Some(file) = files.get(file) else {
+                continue;
+            };
+            let print = fingerprint(file);
+            let (shown_print, shown) = self
+                .expanded
+                .entry(file.path.clone())
+                .or_insert_with(|| (print, HashSet::new()));
+            if *shown_print != print {
+                *shown_print = print;
+                shown.clear();
+            }
+            shown.insert(at);
+        }
+        self.load_sources(cx);
+        let anchor = self.scroll_anchor();
+        self.rebuild_rows(anchor, cx);
+        cx.notify();
+    }
+
+    /// Hides every line shown by [`Self::expand`].
+    fn collapse_all(&mut self, cx: &mut Context<Self>) {
+        self.expanded.clear();
+        let anchor = self.scroll_anchor();
+        self.rebuild_rows(anchor, cx);
+        cx.notify();
+    }
+
+    /// Reads, in the background, the files that expanded gaps need and
+    /// are not read yet, then shows their lines.
+    fn load_sources(&mut self, cx: &mut Context<Self>) {
+        let Some(Ok(files)) = &self.files else {
+            return;
+        };
+        let mut needed = HashSet::new();
+        for file in files.iter() {
+            let (Some((print, gaps)), DiffContent::Text(hunks)) =
+                (self.expanded.get(&file.path), &file.content)
+            else {
+                continue;
+            };
+            if *print != fingerprint(file) {
+                continue;
+            }
+            for at in gaps {
+                let (GapAt::Before(index) | GapAt::After(index)) = *at;
+                if let Some(side) = hunks.get(index).and_then(|hunk| hunk.new_side.as_ref())
+                    && !self.sources.contains_key(&side.source)
+                {
+                    needed.insert(side.source.clone());
+                }
+            }
+        }
+        if needed.is_empty() {
+            return;
+        }
+        let repository = self.repository.clone();
+        self._load_sources = cx.spawn(async move |this, cx| {
+            let read = cx
+                .background_executor()
+                .spawn(async move {
+                    needed
+                        .into_iter()
+                        .map(|source| {
+                            let lines = repository.lines(&source);
+                            (source, lines)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.sources_error = None;
+                for (source, lines) in read {
+                    match lines {
+                        Ok(lines) => {
+                            this.sources.insert(source, Arc::new(lines));
+                        }
+                        Err(error) => {
+                            this.sources_error = Some(
+                                format!(
+                                    "Could not read the unchanged lines: {:#}",
+                                    anyhow::Error::from(error)
+                                )
+                                .into(),
+                            );
+                        }
+                    }
+                }
+                let anchor = this.scroll_anchor();
+                this.rebuild_rows(anchor, cx);
+                cx.notify();
+            })
+            .ok();
+        });
     }
 
     /// Whether `file` is marked viewed and has not changed since.
@@ -454,13 +718,14 @@ impl Review {
         } else {
             self.viewed.remove(&file_path);
         }
-        if let Some((path, row, offset)) = &mut anchor
-            && *path == file_path
+        if let Some(anchor) = &mut anchor
+            && anchor.path == file_path
         {
             // Scrolled into the file being collapsed: keep its header in
             // view, with the next file below it.
-            *row = 0;
-            *offset = px(0.);
+            anchor.row = Row::File(index);
+            anchor.index = 0;
+            anchor.offset_in_item = px(0.);
         }
         self.rebuild_rows(anchor, cx);
         cx.notify();
@@ -496,19 +761,20 @@ impl Review {
         cx.notify();
     }
 
-    /// The file at the top of the list, the row within it and the offset
-    /// into that row.
-    fn scroll_anchor(&self) -> Option<(String, usize, Pixels)> {
+    /// The row at the top of the list.
+    fn scroll_anchor(&self) -> Option<Anchor> {
         let Some(Ok(files)) = &self.files else {
             return None;
         };
         let top = self.list.logical_scroll_top();
-        let file = self.rows.get(top.item_ix)?.file()?;
-        Some((
-            files[file].path.clone(),
-            top.item_ix - self.file_rows[file],
-            top.offset_in_item,
-        ))
+        let row = *self.rows.get(top.item_ix)?;
+        let file = row.file()?;
+        Some(Anchor {
+            path: files[file].path.clone(),
+            row,
+            index: top.item_ix - self.file_rows[file],
+            offset_in_item: top.offset_in_item,
+        })
     }
 
     fn scrolled_to(&mut self, first_row: usize, cx: &mut Context<Self>) {
@@ -1047,6 +1313,71 @@ impl Review {
                 )
                 .into_any_element()
             }
+            Some(Row::Gap(file, at)) => {
+                let DiffContent::Text(hunks) = &files[file].content else {
+                    return div().into_any_element();
+                };
+                let Some(gap) = gap(hunks, at) else {
+                    return div().into_any_element();
+                };
+                let (index, label) = match (at, gap.len) {
+                    (GapAt::Before(index), 1) => (index * 2, "Show 1 more line".to_owned()),
+                    (GapAt::Before(index), len) => (index * 2, format!("Show {len} more lines")),
+                    (GapAt::After(index), 1) => {
+                        (index * 2 + 1, "Show 1 line to end of file".to_owned())
+                    }
+                    (GapAt::After(index), len) => {
+                        (index * 2 + 1, format!("Show {len} lines to end of file"))
+                    }
+                };
+                card_row()
+                    .id(("gap", file * 100_000 + index))
+                    .h(px(30.))
+                    .justify_center()
+                    .bg(rgb(color::DIFF_GAP))
+                    .border_t_1()
+                    .border_b_1()
+                    .text_size(px(12.))
+                    .text_color(rgb(color::TEXT_MUTED))
+                    .cursor_pointer()
+                    .hover(|style| style.text_color(rgb(color::TEXT)))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| this.expand(vec![(file, at)], cx)))
+                    .into_any_element()
+            }
+            Some(Row::Context(file, at, line)) => {
+                let DiffContent::Text(hunks) = &files[file].content else {
+                    return div().into_any_element();
+                };
+                let (GapAt::Before(index) | GapAt::After(index)) = at;
+                let (Some(gap), Some(side)) = (
+                    gap(hunks, at),
+                    hunks.get(index).and_then(|hunk| hunk.new_side.as_ref()),
+                ) else {
+                    return div().into_any_element();
+                };
+                let new = gap.new + line;
+                let text = self
+                    .sources
+                    .get(&side.source)
+                    .and_then(|lines| lines.get(new as usize - 1))
+                    .cloned()
+                    .unwrap_or_default();
+                let line = DiffLine {
+                    kind: LineKind::Context,
+                    old: Some(gap.old + line),
+                    new: Some(new),
+                    text,
+                    crlf: false,
+                    no_newline: false,
+                };
+                match ReviewSettings::get(cx).layout {
+                    DiffLayout::Unified => diff_line(&line, mono).into_any_element(),
+                    DiffLayout::Split => {
+                        split_line(Some(&line), Some(&line), mono).into_any_element()
+                    }
+                }
+            }
             Some(Row::Notice(file)) => card_row()
                 .px(px(14.))
                 .py(px(10.))
@@ -1324,6 +1655,18 @@ impl Review {
                         this.set_hide_whitespace(*checked, cx)
                     })),
             )
+            .child(self.expand_all_button(files, cx))
+            .when_some(self.sources_error.clone(), |this, error| {
+                this.child(
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_color(rgb(color::DIFF_REMOVED))
+                        .child(error),
+                )
+            })
             .child(
                 div()
                     .h_flex()
@@ -1346,6 +1689,29 @@ impl Review {
                     )
                     .child(format!("{viewed} of {total}")),
             )
+    }
+
+    /// "Expand all context", or "Collapse context" once every gap is shown.
+    fn expand_all_button(&self, files: &[FileDiff], cx: &mut Context<Self>) -> Button {
+        let mut gaps = Self::all_gaps(files).peekable();
+        let any = gaps.peek().is_some();
+        let all_shown = any && gaps.all(|(file, at)| self.is_expanded(&files[file], at));
+        let button = Button::new("expand-all").ghost().small();
+        if all_shown {
+            button
+                .label("Collapse context")
+                .on_click(cx.listener(|this, _, _, cx| this.collapse_all(cx)))
+        } else {
+            button
+                .label("Expand all context")
+                .disabled(!any)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if let Some(Ok(files)) = &this.files {
+                        let gaps = Self::all_gaps(files).collect();
+                        this.expand(gaps, cx);
+                    }
+                }))
+        }
     }
 
     /// The changed files by directory; clicking one scrolls to it.
@@ -1527,11 +1893,22 @@ impl Render for Review {
 
 /// The rows of the diff list for `files`, and the row of each file's header.
 /// A file that is `viewed` shows only its header.
+/// The lines left out at a gap are shown where `expanded`.
 fn rows(
     files: &[FileDiff],
     viewed: impl Fn(&FileDiff) -> bool,
+    expanded: impl Fn(&FileDiff, GapAt) -> bool,
     layout: DiffLayout,
 ) -> (Vec<Row>, Vec<usize>) {
+    let gap_rows = |rows: &mut Vec<Row>, file: usize, hunks: &[Hunk], at: GapAt| {
+        if let Some(gap) = gap(hunks, at) {
+            if expanded(&files[file], at) {
+                rows.extend((0..gap.len).map(|line| Row::Context(file, at, line)));
+            } else {
+                rows.push(Row::Gap(file, at));
+            }
+        }
+    };
     let mut rows = Vec::new();
     let mut file_rows = Vec::with_capacity(files.len());
     for (file, diff) in files.iter().enumerate() {
@@ -1541,6 +1918,7 @@ fn rows(
             _ if viewed(diff) => {}
             DiffContent::Text(hunks) => {
                 for (hunk_index, hunk) in hunks.iter().enumerate() {
+                    gap_rows(&mut rows, file, hunks, GapAt::Before(hunk_index));
                     rows.push(Row::Hunk(file, hunk_index));
                     match layout {
                         DiffLayout::Unified => rows.extend(
@@ -1552,6 +1930,7 @@ fn rows(
                                 .map(|(old, new)| Row::Pair(file, hunk_index, old, new)),
                         ),
                     }
+                    gap_rows(&mut rows, file, hunks, GapAt::After(hunk_index));
                 }
             }
             DiffContent::TooLarge(_)
@@ -1960,9 +2339,11 @@ fn message(text: impl Into<SharedString>) -> impl IntoElement {
 
 #[cfg(test)]
 mod tests {
-    use gitez_git::{ChangeKind, DiffContent, DiffLine, FileDiff, Hunk, LineKind, Staging};
+    use gitez_git::{
+        ChangeKind, DiffContent, DiffLine, FileDiff, Hunk, LineKind, LineSource, NewSide, Staging,
+    };
 
-    use super::{DiffLayout, fingerprint, rows, split_pairs};
+    use super::{DiffLayout, Gap, GapAt, Row, fingerprint, gap, rows, split_pairs};
 
     fn line(kind: LineKind, text: &str) -> DiffLine {
         DiffLine {
@@ -1984,7 +2365,80 @@ mod tests {
             lines,
             staging: Some(staging),
             patchable: true,
+            new_side: None,
         }
+    }
+
+    /// A hunk from `old_start,old_len` to `new_start,new_len` of a file
+    /// with `lines` lines, which `staged` tells apart.
+    fn ranged(
+        (old_start, old_len): (u32, u32),
+        (new_start, new_len): (u32, u32),
+        staged: bool,
+        lines: u32,
+    ) -> Hunk {
+        Hunk {
+            old_start,
+            old_len,
+            new_start,
+            new_len,
+            lines: Vec::new(),
+            staging: Some(if staged {
+                Staging::Staged
+            } else {
+                Staging::Unstaged
+            }),
+            patchable: true,
+            new_side: Some(NewSide {
+                source: LineSource::WorkingTree(format!("{staged}")),
+                lines,
+            }),
+        }
+    }
+
+    #[test]
+    fn gaps_lie_between_hunks_of_the_same_file() {
+        let hunks = [
+            // Staged: two lines added at the start of a 10-line file.
+            ranged((0, 0), (1, 2), true, 10),
+            // Unstaged, in a 30-line file.
+            ranged((4, 3), (4, 4), false, 30),
+            ranged((15, 3), (16, 3), false, 30),
+        ];
+        let gap = |at| gap(&hunks, at);
+        let at = |old, new, len| Some(Gap { old, new, len });
+        assert_eq!(gap(GapAt::Before(0)), None);
+        assert_eq!(gap(GapAt::After(0)), at(1, 3, 8));
+        assert_eq!(gap(GapAt::Before(1)), at(1, 1, 3));
+        assert_eq!(gap(GapAt::After(1)), None);
+        assert_eq!(gap(GapAt::Before(2)), at(7, 8, 8));
+        assert_eq!(gap(GapAt::After(2)), at(18, 19, 12));
+    }
+
+    #[test]
+    fn an_expanded_gap_shows_its_lines() {
+        let files = [FileDiff {
+            path: "f".to_owned(),
+            kind: ChangeKind::Modified,
+            content: DiffContent::Text(vec![ranged((3, 1), (3, 1), false, 3)]),
+        }];
+        let (rows, _) = rows(
+            &files,
+            |_| false,
+            |_, at| at == GapAt::Before(0),
+            DiffLayout::Unified,
+        );
+        assert_eq!(
+            rows,
+            [
+                Row::File(0),
+                Row::Context(0, GapAt::Before(0), 0),
+                Row::Context(0, GapAt::Before(0), 1),
+                Row::Hunk(0, 0),
+                Row::FileEnd(0),
+                Row::End,
+            ]
+        );
     }
 
     fn file(path: &str, hunks: Vec<Hunk>) -> FileDiff {
@@ -2044,7 +2498,12 @@ mod tests {
                 vec![hunk(1, Staging::Unstaged, vec![line(LineKind::Added, "y")])],
             ),
         ];
-        let (rows, file_rows) = rows(&files, |file| file.path == "a", DiffLayout::Unified);
+        let (rows, file_rows) = rows(
+            &files,
+            |file| file.path == "a",
+            |_, _| false,
+            DiffLayout::Unified,
+        );
         let rows: Vec<String> = rows.iter().map(|row| format!("{row:?}")).collect();
         assert_eq!(
             rows,

@@ -30,9 +30,10 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 > Enter or double-click a commit to review its full diff, file by file; `[`
 > and `]` step to the newer and older commit, Esc goes back. Diffs show
 > unified or split side by side, optionally hiding whitespace changes
-> (single hunks can't be staged then). Mark a file viewed to collapse it and
-> track progress; it opens again if it changes. Uncommitted
-> changes appear as a row above the current commit; open it the same way to
+> (single hunks can't be staged then), and show the unchanged lines
+> between hunks one gap at a time or all at once. Mark a file viewed to
+> collapse it and track progress; it opens again if it changes.
+> Uncommitted changes appear as a row above the current commit; open it the same way to
 > review them, with each file marked staged, partly staged or untracked.
 > Stage or unstage whole files or single hunks there (staged hunks are
 > marked and listed first) and commit them with a message (⌘↵), or
