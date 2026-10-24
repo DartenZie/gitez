@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use gitez_git::{Branch, Oid, Stash};
+use gitez_git::{Branch, Oid, RemoteBranch, Stash};
 use gitez_review::{PullRequest, State};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
@@ -33,6 +33,7 @@ enum Section {
 }
 
 /// What the sidebar asks of the window.
+#[derive(Clone)]
 pub enum SidebarEvent {
     /// Show the local pull request with this number.
     OpenPullRequest(u32),
@@ -42,6 +43,17 @@ pub enum SidebarEvent {
     NewBranchFrom(Oid),
     RenameBranch(String),
     DeleteBranch(String),
+    /// Check out remote branch `remote`/`name` as a local branch tracking
+    /// it.
+    CheckOutRemote {
+        remote: String,
+        name: String,
+    },
+    /// Delete branch `name` on `remote`.
+    DeleteRemoteBranch {
+        remote: String,
+        name: String,
+    },
     /// Bring stash `index` back, dropping it if `pop`.
     Unstash {
         index: usize,
@@ -55,6 +67,8 @@ pub struct Sidebar {
     /// Files with uncommitted changes, once read.
     changed_files: Option<usize>,
     collapsed: HashSet<Section>,
+    /// Remotes whose branches are listed.
+    expanded_remotes: HashSet<String>,
 }
 
 impl Sidebar {
@@ -63,6 +77,7 @@ impl Sidebar {
             snapshot: None,
             changed_files: None,
             collapsed: HashSet::new(),
+            expanded_remotes: HashSet::new(),
         }
     }
 
@@ -82,11 +97,19 @@ impl Sidebar {
             .is_some_and(|current| current.path == snapshot.path);
         if !same_repository {
             self.collapsed.clear();
+            self.expanded_remotes.clear();
             if snapshot.refs.tags.len() > COLLAPSE_TAGS_OVER {
                 self.collapsed.insert(Section::Tags);
             }
         }
         self.snapshot = Some(snapshot);
+        cx.notify();
+    }
+
+    fn toggle_remote(&mut self, remote: &str, cx: &mut Context<Self>) {
+        if !self.expanded_remotes.remove(remote) {
+            self.expanded_remotes.insert(remote.to_owned());
+        }
         cx.notify();
     }
 
@@ -188,11 +211,26 @@ impl Render for Sidebar {
             )
             .when_some(snapshot, |this, snapshot| {
                 let refs = &snapshot.refs;
-                let mut remotes: Vec<(&str, usize)> = Vec::new();
+                let mut remotes: Vec<(&str, Vec<&RemoteBranch>)> = Vec::new();
                 for branch in &refs.remote_branches {
                     match remotes.last_mut() {
-                        Some((remote, count)) if *remote == branch.remote => *count += 1,
-                        _ => remotes.push((&branch.remote, 1)),
+                        Some((remote, branches)) if *remote == branch.remote => {
+                            branches.push(branch)
+                        }
+                        _ => remotes.push((&branch.remote, vec![branch])),
+                    }
+                }
+                let mut remote_rows = Vec::new();
+                for (remote, branches) in &remotes {
+                    let expanded = self.expanded_remotes.contains(*remote);
+                    remote_rows
+                        .push(remote_row(remote, branches.len(), expanded, cx).into_any_element());
+                    if expanded {
+                        remote_rows.extend(
+                            branches
+                                .iter()
+                                .map(|branch| remote_branch_row(branch, cx).into_any_element()),
+                        );
                     }
                 }
                 let now = time::now();
@@ -236,12 +274,7 @@ impl Render for Sidebar {
                     "Remotes",
                     remotes.len(),
                     "No remotes",
-                    || {
-                        remotes
-                            .iter()
-                            .map(|&(remote, count)| remote_row(remote, count).into_any_element())
-                            .collect()
-                    },
+                    || remote_rows,
                     cx,
                 ))
                 .child(self.section(
@@ -484,16 +517,89 @@ fn pull_request_row(pull_request: &PullRequest, cx: &mut Context<Sidebar>) -> im
         )
 }
 
-fn remote_row(remote: &str, branches: usize) -> impl IntoElement {
+/// A remote; click to list its branches.
+fn remote_row(
+    remote: &str,
+    branches: usize,
+    expanded: bool,
+    cx: &mut Context<Sidebar>,
+) -> impl IntoElement {
     let count = if branches == 1 {
         "1 branch".to_owned()
     } else {
         format!("{branches} branches")
     };
+    let name = remote.to_owned();
     row()
+        .id(SharedString::from(format!("remote-{remote}")))
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, _, _, cx| this.toggle_remote(&name, cx)))
         .child(Icon::new(IconName::Cloud).size(px(14.)))
         .child(label(remote.to_owned()))
         .child(trailing(count))
+        .child(
+            Icon::new(if expanded {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            })
+            .size(px(12.))
+            .text_color(rgb(color::TEXT_FAINT)),
+        )
+}
+
+/// A branch on a remote, under its remote: double-click checks it out as a
+/// local branch tracking it, right-click shows what else can be done.
+fn remote_branch_row(branch: &RemoteBranch, cx: &mut Context<Sidebar>) -> impl IntoElement {
+    let (remote, name, tip) = (branch.remote.clone(), branch.name.clone(), branch.target);
+    row()
+        .pl(px(36.))
+        .child(label(branch.name.clone()))
+        .id(SharedString::from(format!(
+            "remote-branch-{}",
+            branch.short_name()
+        )))
+        .on_click({
+            let (remote, name) = (remote.clone(), name.clone());
+            cx.listener(move |_, event: &ClickEvent, _, cx| {
+                if event.click_count() == 2 {
+                    cx.emit(SidebarEvent::CheckOutRemote {
+                        remote: remote.clone(),
+                        name: name.clone(),
+                    });
+                }
+            })
+        })
+        .context_menu({
+            let sidebar = cx.entity().downgrade();
+            move |menu, _, _| {
+                let item = |label: SharedString, event: SidebarEvent| {
+                    let sidebar = sidebar.clone();
+                    PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                        sidebar.update(cx, |_, cx| cx.emit(event.clone())).ok();
+                    })
+                };
+                menu.item(item(
+                    "Check out".into(),
+                    SidebarEvent::CheckOutRemote {
+                        remote: remote.clone(),
+                        name: name.clone(),
+                    },
+                ))
+                .item(item(
+                    "New branch from here…".into(),
+                    SidebarEvent::NewBranchFrom(tip),
+                ))
+                .separator()
+                .item(item(
+                    format!("Delete from {remote}…").into(),
+                    SidebarEvent::DeleteRemoteBranch {
+                        remote: remote.clone(),
+                        name: name.clone(),
+                    },
+                ))
+            }
+        })
 }
 
 /// A stash entry; right-click to pop, apply or drop it.

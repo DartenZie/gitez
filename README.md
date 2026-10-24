@@ -119,8 +119,12 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 > unless you untick that; the name is checked as you type. Double-click a
 > branch in the sidebar to check it out, or right-click it to start a
 > branch from it, rename it or delete it. A branch whose commits are on
-> no other branch is deleted only after you confirm. Branches of an open local pull request cannot be
-> renamed or deleted. **Stash** puts your uncommitted changes aside, new
+> no other branch is deleted only after you confirm. Branches of an open
+> local pull request cannot be renamed or deleted. Click a remote in the
+> sidebar to list its branches; double-click one, or find it in the
+> palette, to check it out as a local branch that tracks it, or
+> right-click it to start a branch from it or delete it from the remote
+> (after you confirm; that one cannot be undone). **Stash** puts your uncommitted changes aside, new
 > files too unless you untick that, with an optional message; right-click
 > a stash in the sidebar to pop it, apply it and keep it, or drop it. A
 > stash that conflicts with your files is kept, with the conflicts marked

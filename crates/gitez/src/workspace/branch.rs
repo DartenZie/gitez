@@ -354,6 +354,112 @@ impl Workspace {
         );
     }
 
+    /// Checks out remote branch `remote`/`name` as local branch `name`,
+    /// tracking it; just checks out `name` when it already does.
+    pub(super) fn check_out_remote(
+        &mut self,
+        remote: String,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let upstream = format!("{remote}/{name}");
+        if let Some(local) = snapshot
+            .refs
+            .branches
+            .iter()
+            .find(|branch| branch.name == name)
+        {
+            let tracks = snapshot
+                .tracking
+                .get(&name)
+                .is_some_and(|tracking| tracking.upstream == upstream);
+            if !tracks {
+                window.push_notification(
+                    Notification::info(format!(
+                        "A local branch {name} already exists and does not track {upstream}."
+                    )),
+                    cx,
+                );
+            } else if !local.is_head {
+                self.switch_branch(name, window, cx);
+            }
+            return;
+        }
+        let (track_remote, track_name) = (remote.clone(), name.clone());
+        self.run_git(
+            Some(format!("Check out {upstream}")),
+            move |git| git.track(&track_remote, &track_name),
+            move |this, result, step, window, cx| match result {
+                Ok(()) => this.notify_done(
+                    Notification::success(format!("Checked out {name}, tracking {upstream}")),
+                    step,
+                    window,
+                    cx,
+                ),
+                Err(error) => window.push_notification(
+                    Notification::error(format!("Could not check out {upstream}: {error}")),
+                    cx,
+                ),
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Deletes branch `name` on `remote` once `confirmed`; until then, asks.
+    /// It cannot be undone from here: the remote has changed.
+    pub(super) fn delete_remote_branch(
+        &mut self,
+        remote: String,
+        name: String,
+        confirmed: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !confirmed {
+            let (again_remote, again_name) = (remote.clone(), name.clone());
+            self.notify_with_action(
+                Notification::warning(format!(
+                    "Delete {name} from {remote}? Everyone who fetches from {remote} loses \
+                     it, and GitEZ cannot undo this."
+                )),
+                "Delete",
+                move |this, window, cx| {
+                    this.delete_remote_branch(
+                        again_remote.clone(),
+                        again_name.clone(),
+                        true,
+                        window,
+                        cx,
+                    )
+                },
+                window,
+                cx,
+            );
+            return;
+        }
+        let (on, branch) = (remote.clone(), name.clone());
+        self.run_git(
+            None,
+            move |git| git.delete_remote_branch(&on, &branch),
+            move |_, result, _, window, cx| {
+                let notification = match result {
+                    Ok(()) => Notification::success(format!("Deleted {name} from {remote}")),
+                    Err(error) => Notification::error(format!(
+                        "Could not delete {name} from {remote}: {error}"
+                    )),
+                };
+                window.push_notification(notification, cx);
+            },
+            window,
+            cx,
+        );
+    }
+
     /// The open local pull request that branch `branch` is the head or base
     /// of, if one is.
     fn pull_request_on(&self, branch: &str) -> Option<u32> {

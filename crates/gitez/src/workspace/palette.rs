@@ -69,6 +69,12 @@ pub enum PaletteCommand {
     Push,
     Undo,
     Redo,
+    /// Check out remote branch `remote`/`name` as a local branch tracking
+    /// it.
+    CheckOutRemote {
+        remote: String,
+        name: String,
+    },
     /// Rewrite the commits after `base`, a revision as typed, folding in
     /// fixups if `autosquash`.
     RewriteSince {
@@ -96,6 +102,9 @@ pub struct PaletteContext {
     pub changed: Vec<String>,
     /// Local branches.
     pub branches: Vec<String>,
+    /// Remote branches, as remote and name, with no local branch of the
+    /// same name.
+    pub remote_branches: Vec<(String, String)>,
     /// What fetch, pull and push would do.
     pub remote: Option<RemoteActions>,
     /// Entries in the stash.
@@ -674,11 +683,11 @@ impl Palette {
 
     fn branch_items(&self, query: &str, limit: usize) -> Vec<Item> {
         let query = query.to_lowercase();
-        self.context
+        let local = self
+            .context
             .branches
             .iter()
             .filter(|branch| branch.to_lowercase().contains(&query))
-            .take(limit)
             .map(|branch| {
                 let checked_out = self.context.branch.as_ref() == Some(branch);
                 Item {
@@ -695,8 +704,31 @@ impl Palette {
                     run: Run::Command(PaletteCommand::Switch(branch.clone())),
                     fill: Some(branch.clone()),
                 }
-            })
-            .collect()
+            });
+        let remote = self
+            .context
+            .remote_branches
+            .iter()
+            .map(|(remote, name)| (format!("{remote}/{name}"), remote, name))
+            .filter(|(full, _, _)| full.to_lowercase().contains(&query))
+            .map(|(full, remote, name)| Item {
+                section: "Branches".into(),
+                kind: Tab::Branches,
+                icon: IconName::Cloud,
+                primary: false,
+                title: full.clone().into(),
+                sha: None,
+                subtitle: None,
+                detail: Some("check out and track".into()),
+                disabled: None,
+                keys: &[],
+                run: Run::Command(PaletteCommand::CheckOutRemote {
+                    remote: remote.clone(),
+                    name: name.clone(),
+                }),
+                fill: Some(full),
+            });
+        local.chain(remote).take(limit).collect()
     }
 
     fn file_items(&self, query: &str, limit: usize) -> Vec<Item> {

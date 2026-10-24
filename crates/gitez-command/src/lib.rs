@@ -282,6 +282,27 @@ impl Git {
         self.run(["branch", flag, name], None).map(drop)
     }
 
+    /// Creates local branch `name` from remote-tracking branch `remote`/
+    /// `name`, set to track it, and checks it out, like `git switch
+    /// --track`.
+    pub fn track(&self, remote: &str, name: &str) -> Result<()> {
+        let upstream = format!("refs/remotes/{remote}/{name}");
+        self.run(
+            ["switch", "--quiet", "--create", name, "--track", &upstream],
+            None,
+        )
+        .map(drop)
+    }
+
+    /// Deletes branch `name` on `remote`, like `git push <remote>
+    /// --delete`, and the remote-tracking branch with it. Credential
+    /// helpers and hooks run as usual.
+    pub fn delete_remote_branch(&self, remote: &str, name: &str) -> Result<()> {
+        let branch = format!("refs/heads/{name}");
+        self.run(["push", "--quiet", remote, "--delete", &branch], None)
+            .map(drop)
+    }
+
     /// Brings the commits of branch `head` into branch `base` the way `how`
     /// says, and leaves `base` checked out. A merge commit that conflicts
     /// stops with the conflicts in the working tree, to be resolved and

@@ -960,3 +960,36 @@ fn discards_a_hunk_from_the_working_tree_and_brings_it_back() {
     git_.apply_to_worktree(patch, false).expect("bring it back");
     assert_eq!(status(dir.path()), "M a.txt");
 }
+
+#[test]
+fn checks_out_a_remote_branch_and_deletes_it_on_the_remote() {
+    let (_dir, a, b) = remote_and_clones();
+    git(a.work_dir(), &["switch", "--quiet", "-c", "feature/x"]);
+    commit_file(&a, "x.txt", "x\n");
+    a.push("feature/x", Some("origin"), false).expect("publish");
+    b.fetch().expect("fetch");
+
+    b.track("origin", "feature/x").expect("track");
+    let root = b.work_dir();
+    assert_eq!(git(root, &["branch", "--show-current"]), "feature/x");
+    assert_eq!(
+        git(root, &["rev-parse", "--abbrev-ref", "feature/x@{upstream}"]),
+        "origin/feature/x"
+    );
+    assert!(b.track("origin", "feature/x").is_err(), "it exists already");
+
+    b.delete_remote_branch("origin", "feature/x")
+        .expect("delete");
+    assert_eq!(
+        git(root, &["branch", "--remotes", "--list", "origin/feature/x"]),
+        ""
+    );
+    a.fetch().expect("fetch");
+    assert_eq!(
+        git(
+            a.work_dir(),
+            &["ls-remote", "--heads", "origin", "feature/x"]
+        ),
+        ""
+    );
+}

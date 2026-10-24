@@ -185,6 +185,12 @@ impl Workspace {
                 SidebarEvent::DeleteBranch(branch) => {
                     this.delete_branch(branch.clone(), false, window, cx)
                 }
+                SidebarEvent::CheckOutRemote { remote, name } => {
+                    this.check_out_remote(remote.clone(), name.clone(), window, cx)
+                }
+                SidebarEvent::DeleteRemoteBranch { remote, name } => {
+                    this.delete_remote_branch(remote.clone(), name.clone(), false, window, cx)
+                }
                 SidebarEvent::Unstash { index, pop } => this.unstash(*index, *pop, window, cx),
                 SidebarEvent::DropStash(index) => this.drop_stash(*index, window, cx),
             }),
@@ -1117,6 +1123,19 @@ impl Workspace {
                 .iter()
                 .map(|branch| branch.name.clone())
                 .collect(),
+            remote_branches: snapshot
+                .refs
+                .remote_branches
+                .iter()
+                .filter(|remote| {
+                    !snapshot
+                        .refs
+                        .branches
+                        .iter()
+                        .any(|branch| branch.name == remote.name)
+                })
+                .map(|remote| (remote.remote.clone(), remote.name.clone()))
+                .collect(),
             remote: Some(RemoteActions::of(snapshot)),
             stashes: snapshot.refs.stashes.len(),
             undo: self.next_step(Direction::Undo, cx).map(|step| step.label),
@@ -1191,6 +1210,9 @@ impl Workspace {
             PaletteCommand::Fetch => self.fetch(&Fetch, window, cx),
             PaletteCommand::Pull => self.pull(&Pull, window, cx),
             PaletteCommand::Push => self.push(&Push, window, cx),
+            PaletteCommand::CheckOutRemote { remote, name } => {
+                self.check_out_remote(remote, name, window, cx)
+            }
             PaletteCommand::Undo => self.undo_step(&UndoStep, window, cx),
             PaletteCommand::Redo => self.redo_step(&RedoStep, window, cx),
             PaletteCommand::SelectCommit(id) => {
