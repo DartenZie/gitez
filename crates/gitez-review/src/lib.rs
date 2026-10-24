@@ -8,10 +8,12 @@
 //! layout. This crate is the only reader and writer of those files.
 
 mod error;
+mod follow;
 mod model;
 mod store;
 
 pub use error::{Error, Result};
+pub use follow::{FileUpdate, HeadMoved, LineChange};
 pub use model::{
     Anchor, Comment, PromptOptions, PullRequest, Resolution, ResolvedBy, Side, State, Template,
     Thread, Tip,

@@ -12,6 +12,7 @@ mod commits;
 mod details;
 mod diff;
 mod error;
+mod follow;
 pub mod graph;
 mod refs;
 mod repository;
@@ -24,6 +25,7 @@ pub use diff::{
     DiffContent, DiffLine, DiffOptions, FileDiff, Hunk, LineKind, LineSource, NewSide, Staging,
 };
 pub use error::{Error, Result};
+pub use follow::{ChangedLines, Followed};
 pub use refs::{Branch, Head, RefKind, RefLabel, Refs, RemoteBranch, Stash, Tag};
 pub use repository::Repository;
 pub use status::{FileStatus, WorkingTreeStatus, WorktreeChange};

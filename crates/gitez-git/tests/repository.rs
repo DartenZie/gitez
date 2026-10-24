@@ -1209,3 +1209,74 @@ fn worktrees_share_the_common_git_directory() {
         canonical(main.common_dir())
     );
 }
+
+#[test]
+fn lines_are_followed_from_one_commit_to_another() {
+    use gitez_git::{ChangedLines, Followed};
+
+    let fixture = Fixture::new();
+    let numbered = |prefix: &str, count: u32| -> Vec<String> {
+        (1..=count).map(|n| format!("{prefix} line {n}")).collect()
+    };
+    let write = |path: &str, lines: &[String]| {
+        std::fs::write(fixture.root.join(path), lines.join("\n") + "\n").expect("write");
+    };
+    let anchor = numbered("anchor", 30);
+    let store = numbered("store", 20);
+    write("anchor.txt", &anchor);
+    write("store.txt", &store);
+    write("gone.txt", &numbered("gone", 3));
+    write("same.txt", &numbered("same", 3));
+    std::fs::write(fixture.root.join("image.bin"), [0u8, 1, 2, 3]).expect("write");
+    fixture.git(&["add", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "first"]);
+    let from = fixture.rev("HEAD");
+
+    // Two lines inserted before line 3; lines 5–7 rewritten as four.
+    let mut edited = anchor.clone();
+    edited.splice(4..7, numbered("rewritten", 4));
+    edited.splice(2..2, numbered("inserted", 2));
+    write("anchor.txt", &edited);
+    // Renamed, with its first line changed.
+    let mut moved = store.clone();
+    moved[0] = "store line one".to_owned();
+    std::fs::remove_file(fixture.root.join("store.txt")).expect("remove");
+    write("storage.txt", &moved);
+    std::fs::remove_file(fixture.root.join("gone.txt")).expect("remove");
+    std::fs::write(fixture.root.join("image.bin"), [0u8, 9, 9]).expect("write");
+    fixture.git(&["add", "--all"]);
+    fixture.git(&["commit", "--quiet", "-m", "second"]);
+    let to = fixture.rev("HEAD");
+
+    let repository = fixture.open();
+    let follow = |path: &str| repository.follow_lines(path, from, to).expect("follow");
+    assert_eq!(
+        follow("anchor.txt"),
+        Followed::Changed {
+            path: "anchor.txt".to_owned(),
+            lines: vec![
+                ChangedLines {
+                    old: 2..2,
+                    new: 2..4
+                },
+                ChangedLines {
+                    old: 4..7,
+                    new: 6..10
+                },
+            ],
+        }
+    );
+    assert_eq!(
+        follow("store.txt"),
+        Followed::Changed {
+            path: "storage.txt".to_owned(),
+            lines: vec![ChangedLines {
+                old: 0..1,
+                new: 0..1
+            }],
+        }
+    );
+    assert_eq!(follow("gone.txt"), Followed::Gone);
+    assert_eq!(follow("image.bin"), Followed::Gone);
+    assert_eq!(follow("same.txt"), Followed::Unchanged);
+}

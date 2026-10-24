@@ -253,3 +253,179 @@ fn agent_runs_are_kept_as_transcripts() {
     assert_eq!(first_line["gitez"], "run");
     assert_eq!(first_line["started"], "2026-10-24T13:20:05Z");
 }
+
+#[test]
+fn moving_the_head_resolves_changed_threads_and_moves_the_rest() {
+    use gitez_review::{FileUpdate, HeadMoved, LineChange};
+
+    let (_dir, store) = store();
+    let mut pull_request = store
+        .create(new_pull_request("Follow"), time("2026-10-24T13:00:00Z"))
+        .expect("create");
+    let old_head = pull_request.head.commit.clone();
+    let new_head = "b0b0b0b0".repeat(5);
+    let at = time("2026-10-24T15:00:00Z");
+    let on = |path: &str, lines: (u32, u32)| Anchor {
+        path: path.to_owned(),
+        ..anchor(lines)
+    };
+    let comment = |text: &str| text.to_owned();
+    let t0 = time("2026-10-24T13:05:00Z");
+
+    // In anchor.ts, lines 5–7 are rewritten and two lines are inserted
+    // before line 3.
+    let edited = pull_request.add_thread(on("src/anchor.ts", (5, 6)), comment("a"), t0);
+    let below = pull_request.add_thread(on("src/anchor.ts", (20, 21)), comment("b"), t0);
+    let resolved_below = pull_request.add_thread(on("src/anchor.ts", (30, 30)), comment("c"), t0);
+    let resolved_edited = pull_request.add_thread(on("src/anchor.ts", (6, 6)), comment("d"), t0);
+    for thread in [resolved_below, resolved_edited] {
+        pull_request
+            .set_resolution(
+                thread,
+                Some(Resolution {
+                    by: ResolvedBy::You,
+                    commit: old_head.clone(),
+                    at: t0,
+                }),
+            )
+            .expect("resolve");
+    }
+    // store.ts is renamed without touching the commented line; gone.ts is
+    // deleted; same.ts does not change.
+    let renamed = pull_request.add_thread(on("src/store.ts", (12, 15)), comment("e"), t0);
+    let deleted = pull_request.add_thread(on("src/gone.ts", (1, 1)), comment("f"), t0);
+    let same = pull_request.add_thread(on("src/same.ts", (3, 3)), comment("g"), t0);
+    // Not followed: on the base's side, or made on an older commit.
+    let old_side = pull_request.add_thread(
+        Anchor {
+            side: Side::Old,
+            ..on("src/anchor.ts", (5, 5))
+        },
+        comment("h"),
+        t0,
+    );
+    let older = pull_request.add_thread(
+        Anchor {
+            commit: "0ld0ld00".repeat(5),
+            ..on("src/anchor.ts", (5, 5))
+        },
+        comment("i"),
+        t0,
+    );
+
+    let mut asked = Vec::new();
+    let moved = pull_request
+        .move_head::<()>(&new_head, at, |path| {
+            asked.push(path.to_owned());
+            Ok(match path {
+                "src/anchor.ts" => FileUpdate::Changed {
+                    path: path.to_owned(),
+                    lines: vec![
+                        LineChange {
+                            old: 2..2,
+                            new: 2..4,
+                        },
+                        LineChange {
+                            old: 4..7,
+                            new: 6..10,
+                        },
+                    ],
+                },
+                "src/store.ts" => FileUpdate::Changed {
+                    path: "src/storage.ts".to_owned(),
+                    lines: vec![LineChange {
+                        old: 0..1,
+                        new: 0..1,
+                    }],
+                },
+                "src/gone.ts" => FileUpdate::Gone,
+                _ => FileUpdate::Unchanged,
+            })
+        })
+        .expect("move");
+
+    assert_eq!(
+        moved,
+        HeadMoved {
+            resolved: vec![edited, deleted],
+            followed: vec![below, resolved_below, renamed, same],
+        }
+    );
+    // Each file is read once.
+    assert_eq!(
+        asked,
+        [
+            "src/anchor.ts",
+            "src/store.ts",
+            "src/gone.ts",
+            "src/same.ts"
+        ]
+    );
+    assert_eq!(pull_request.head.commit, new_head);
+    assert_eq!(pull_request.updated, at);
+
+    let thread = |id| pull_request.thread(id).expect("thread");
+    let auto = Some(Resolution {
+        by: ResolvedBy::Auto,
+        commit: new_head.clone(),
+        at,
+    });
+    assert_eq!(thread(edited).resolved, auto);
+    assert_eq!(thread(deleted).resolved, auto);
+    // Two lines inserted above, three replaced by four: three lines down.
+    assert_eq!(thread(below).anchor.lines, (23, 24));
+    assert_eq!(thread(below).anchor.commit, new_head);
+    assert_eq!(thread(resolved_below).anchor.lines, (33, 33));
+    assert_eq!(thread(renamed).anchor.path, "src/storage.ts");
+    assert_eq!(thread(renamed).anchor.lines, (12, 15));
+    assert_eq!(thread(same).anchor.commit, new_head);
+    // Left alone.
+    assert_eq!(thread(resolved_edited).anchor.commit, old_head);
+    assert_eq!(
+        thread(resolved_edited).resolved.as_ref().map(|r| r.by),
+        Some(ResolvedBy::You)
+    );
+    assert_eq!(thread(old_side).anchor.commit, old_head);
+    assert!(thread(old_side).is_open());
+    assert!(thread(older).is_open());
+
+    // Moving to the same commit again changes nothing and reads nothing.
+    let again = pull_request
+        .move_head::<()>(&new_head, at, |_| panic!("nothing to read"))
+        .expect("move");
+    assert_eq!(again, HeadMoved::default());
+}
+
+#[test]
+fn a_failed_read_stops_the_move() {
+    use gitez_review::FileUpdate;
+
+    let (_dir, store) = store();
+    let mut pull_request = store
+        .create(new_pull_request("Error"), time("2026-10-24T13:00:00Z"))
+        .expect("create");
+    let t0 = time("2026-10-24T13:00:00Z");
+    pull_request.add_thread(anchor((1, 1)), "x".to_owned(), t0);
+    pull_request.add_thread(
+        Anchor {
+            path: "src/other.ts".to_owned(),
+            ..anchor((1, 1))
+        },
+        "y".to_owned(),
+        t0,
+    );
+    let before = pull_request.clone();
+    // The first file reads fine, the second does not.
+    let result = pull_request.move_head(
+        "new",
+        time("2026-10-24T15:00:00Z"),
+        |path| -> Result<FileUpdate, &str> {
+            match path {
+                "src/other.ts" => Err("no such commit"),
+                _ => Ok(FileUpdate::Gone),
+            }
+        },
+    );
+    assert_eq!(result, Err("no such commit"));
+    assert_eq!(pull_request, before);
+}
