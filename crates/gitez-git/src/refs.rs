@@ -62,6 +62,9 @@ pub struct Tag {
     /// The object the tag finally points to, after peeling annotated tags.
     /// Usually a commit.
     pub target: Oid,
+    /// What the tag reference itself points to: the tag object of an
+    /// annotated tag, otherwise `target`.
+    pub id: Oid,
     pub annotated: bool,
 }
 
@@ -219,6 +222,7 @@ impl Repository {
                         name: lossy(short),
                         annotated: target != direct,
                         target,
+                        id: direct,
                     });
                 }
                 _ => {}
@@ -340,6 +344,27 @@ pub fn branch_name_problem(name: &str) -> Option<&'static str> {
     if gix::refs::FullName::try_from(format!("refs/heads/{name}")).is_err() {
         return Some(
             "A branch name cannot contain “..”, “~”, “^”, “:”, “?”, “*”, “[”, “\\” or “@{”, \
+             or start or end with “/” or “.”, or end with “.lock”.",
+        );
+    }
+    None
+}
+
+/// Why `name` cannot name a tag, as `git check-ref-format` would refuse
+/// it; `None` when it can.
+pub fn tag_name_problem(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("Name the tag.");
+    }
+    if name.chars().any(char::is_whitespace) {
+        return Some("A tag name cannot contain spaces.");
+    }
+    if name.starts_with('-') {
+        return Some("A tag name cannot start with “-”.");
+    }
+    if gix::refs::FullName::try_from(format!("refs/tags/{name}")).is_err() {
+        return Some(
+            "A tag name cannot contain “..”, “~”, “^”, “:”, “?”, “*”, “[”, “\\” or “@{”, \
              or start or end with “/” or “.”, or end with “.lock”.",
         );
     }

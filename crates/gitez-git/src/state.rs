@@ -1,5 +1,5 @@
-//! What GitEZ's undo puts back: where `HEAD` is, the local branches and
-//! the stash.
+//! What GitEZ's undo puts back: where `HEAD` is, the local branches, the
+//! tags and the stash.
 
 use std::collections::BTreeMap;
 
@@ -24,18 +24,21 @@ pub struct StashEntry {
     pub untracked: bool,
 }
 
-/// `HEAD`, the local branches and the stash at one moment.
+/// `HEAD`, the local branches, the tags and the stash at one moment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefState {
     pub head: Option<HeadPlace>,
     /// Branch name to the commit it is on.
     pub branches: BTreeMap<String, Oid>,
+    /// Tag name to what the tag reference points to: the tag object of an
+    /// annotated tag.
+    pub tags: BTreeMap<String, Oid>,
     /// Newest first, as `git stash list` shows them.
     pub stashes: Vec<StashEntry>,
 }
 
 impl Repository {
-    /// Reads `HEAD`, the local branches and the stash.
+    /// Reads `HEAD`, the local branches, the tags and the stash.
     pub fn ref_state(&self) -> Result<RefState> {
         let refs = self.refs()?;
         let repo = self.local();
@@ -48,6 +51,11 @@ impl Repository {
             .branches
             .into_iter()
             .map(|branch| (branch.name, branch.target))
+            .collect();
+        let tags = refs
+            .tags
+            .into_iter()
+            .map(|tag| (tag.name, tag.id))
             .collect();
         let mut stashes = Vec::with_capacity(refs.stashes.len());
         for stash in refs.stashes {
@@ -62,6 +70,7 @@ impl Repository {
         Ok(RefState {
             head,
             branches,
+            tags,
             stashes,
         })
     }

@@ -1600,11 +1600,14 @@ fn branch_names_follow_git_rules() {
 }
 
 #[test]
-fn ref_state_reads_head_branches_and_stashes() {
+fn ref_state_reads_head_branches_tags_and_stashes() {
     use gitez_git::HeadPlace;
     let fx = Fixture::new();
     let first = fx.commit("a.txt", "first");
     fx.git(&["branch", "feature"]);
+    fx.git(&["tag", "light"]);
+    fx.git(&["tag", "-a", "-m", "Release", "v1"]);
+    let annotated = fx.git(&["rev-parse", "refs/tags/v1"]);
     std::fs::write(fx.root.join("a.txt"), "changed\n").expect("write");
     fx.git(&["stash", "push", "--quiet", "-m", "tracked only"]);
     std::fs::write(fx.root.join("new.txt"), "new\n").expect("write");
@@ -1615,6 +1618,18 @@ fn ref_state_reads_head_branches_and_stashes() {
     assert_eq!(
         state.branches.into_iter().collect::<Vec<_>>(),
         [("feature".to_owned(), first), ("main".to_owned(), first)]
+    );
+    let tags: Vec<(String, String)> = state
+        .tags
+        .iter()
+        .map(|(name, id)| (name.clone(), id.to_string()))
+        .collect();
+    assert_eq!(
+        tags,
+        [
+            ("light".to_owned(), first.to_string()),
+            ("v1".to_owned(), annotated.trim().to_owned())
+        ]
     );
     let stashes: Vec<(bool, &str)> = state
         .stashes

@@ -251,25 +251,30 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let from = self.describe_commit(start, cx);
+        self.open_branch_form(BranchFormKind::New { start, from }, window, cx);
+    }
+
+    /// Commit `id` as forms show it: "main · 4ff18e3 Render the commit
+    /// graph", with a branch on it, if any.
+    pub(super) fn describe_commit(&self, id: Oid, cx: &App) -> String {
         let history = self.history.read(cx);
         let branch = history
-            .labels_of(start)
+            .labels_of(id)
             .iter()
             .find(|label| label.kind == RefKind::Branch)
             .map(|label| label.name.clone());
         let summary = history
             .commits()
             .iter()
-            .find(|commit| commit.id == start)
+            .find(|commit| commit.id == id)
             .map(|commit| commit.summary.clone())
             .unwrap_or_default();
-        let commit = format!("{} {summary}", start.to_hex_with_len(7));
-        // "main · 4ff18e3 Render the commit graph"
-        let from = match branch {
+        let commit = format!("{} {summary}", id.to_hex_with_len(7));
+        match branch {
             Some(branch) => format!("{branch} · {commit}"),
             None => commit,
-        };
-        self.open_branch_form(BranchFormKind::New { start, from }, window, cx);
+        }
     }
 
     /// Asks for a new name for branch `branch`.

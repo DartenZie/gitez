@@ -993,3 +993,31 @@ fn checks_out_a_remote_branch_and_deletes_it_on_the_remote() {
         ""
     );
 }
+
+#[test]
+fn creates_pushes_and_deletes_tags() {
+    let (_dir, a, _b) = remote_and_clones();
+    let root = a.work_dir();
+    a.create_tag("v1", "HEAD", None).expect("lightweight");
+    a.create_tag("v2", "main", Some("Release two\n"))
+        .expect("annotated");
+    assert_eq!(git(root, &["cat-file", "-t", "v1"]), "commit");
+    assert_eq!(git(root, &["cat-file", "-t", "v2"]), "tag");
+    assert_eq!(
+        git(root, &["tag", "-l", "--format=%(contents)", "v2"]),
+        "Release two"
+    );
+    assert!(
+        a.create_tag("v1", "HEAD", None).is_err(),
+        "it exists already"
+    );
+
+    a.push_tag("origin", "v2").expect("push");
+    assert!(git(root, &["ls-remote", "--tags", "origin", "v2"]).ends_with("refs/tags/v2"));
+    a.delete_remote_tag("origin", "v2")
+        .expect("delete on the remote");
+    assert_eq!(git(root, &["ls-remote", "--tags", "origin", "v2"]), "");
+
+    a.delete_tag("v1").expect("delete");
+    assert_eq!(git(root, &["tag", "-l"]), "v2");
+}

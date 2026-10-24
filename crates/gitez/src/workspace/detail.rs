@@ -36,6 +36,8 @@ pub enum DetailEvent {
     Reword(Oid),
     /// Ask for a new branch starting at this commit.
     NewBranch(Oid),
+    /// Ask for a tag on this commit.
+    NewTag(Oid),
 }
 
 /// The selected commit: SHA, parents, message, author, refs and changed files.
@@ -252,12 +254,15 @@ fn actions(id: Oid, cx: &mut Context<DetailPane>) -> impl IntoElement {
     let action = |name: &'static str, icon: IconName, label: &'static str| {
         Button::new(name)
             .flex_1()
+            // Two to a row: four do not fit beside each other.
+            .flex_basis(relative(0.4))
             .h(px(30.))
             .icon(Icon::new(icon).size(px(14.)))
             .label(label)
     };
     div()
         .h_flex()
+        .flex_wrap()
         .gap(px(6.))
         .px(px(18.))
         .py(px(12.))
@@ -276,6 +281,11 @@ fn actions(id: Oid, cx: &mut Context<DetailPane>) -> impl IntoElement {
             action("commit-branch", IconName::GitBranch, "Branch…")
                 .tooltip("New branch starting at this commit")
                 .on_click(cx.listener(move |_, _, _, cx| cx.emit(DetailEvent::NewBranch(id)))),
+        )
+        .child(
+            action("commit-tag", IconName::Tag, "Tag…")
+                .tooltip("New tag on this commit")
+                .on_click(cx.listener(move |_, _, _, cx| cx.emit(DetailEvent::NewTag(id)))),
         )
 }
 

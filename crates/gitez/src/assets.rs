@@ -41,6 +41,7 @@ icon_assets!(
         Play,
         ShieldCheck,
         Square,
+        Tag,
         Terminal,
         TriangleAlert
     ]

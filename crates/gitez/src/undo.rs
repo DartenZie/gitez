@@ -1,15 +1,15 @@
 //! Undo and redo of what GitEZ did to a repository.
 //!
 //! Git has no undo of its own, so GitEZ keeps one: around each change it
-//! makes, it reads where `HEAD`, the local branches and the stash were
-//! before and after, and keeps the difference. Undo puts those references
+//! makes, it reads where `HEAD`, the local branches, the tags and the
+//! stash were before and after, and keeps the difference. Undo puts those references
 //! back, redo moves them forward again. Either runs only while the
 //! references are still where the change left them; one that moved since
 //! (a later commit, a command in a terminal) is never overwritten.
 //!
 //! The log lives in memory, per repository, for as long as GitEZ runs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
@@ -28,9 +28,9 @@ pub enum Direction {
     Redo,
 }
 
-/// How one branch moved.
+/// How one branch or tag moved.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct BranchChange {
+struct RefChange {
     name: String,
     /// `None` when it did not exist.
     before: Option<Oid>,
@@ -91,7 +91,8 @@ pub enum Discard {
 pub struct Change {
     /// Where `HEAD` was before and after, when it moved.
     head: Option<(Option<HeadPlace>, Option<HeadPlace>)>,
-    branches: Vec<BranchChange>,
+    branches: Vec<RefChange>,
+    tags: Vec<RefChange>,
     stash: Option<StashChange>,
     /// How the branch checked out moves back and forth.
     mode: ResetMode,
@@ -105,31 +106,16 @@ impl Change {
     /// for a commit, whose changes come back staged when it is undone.
     pub fn between(before: &RefState, after: &RefState, mode: ResetMode) -> Option<Self> {
         let head = (before.head != after.head).then(|| (before.head.clone(), after.head.clone()));
-        let mut names: Vec<&String> = before
-            .branches
-            .keys()
-            .chain(after.branches.keys())
-            .collect();
-        names.sort();
-        names.dedup();
-        let branches: Vec<BranchChange> = names
-            .into_iter()
-            .filter_map(|name| {
-                let (old, new) = (before.branches.get(name), after.branches.get(name));
-                (old != new).then(|| BranchChange {
-                    name: name.clone(),
-                    before: old.copied(),
-                    after: new.copied(),
-                })
-            })
-            .collect();
+        let branches = ref_changes(&before.branches, &after.branches);
+        let tags = ref_changes(&before.tags, &after.tags);
         let stash = stash_change(&before.stashes, &after.stashes);
-        if head.is_none() && branches.is_empty() && stash.is_none() {
+        if head.is_none() && branches.is_empty() && tags.is_empty() && stash.is_none() {
             return None;
         }
         Some(Self {
             head,
             branches,
+            tags,
             stash,
             mode,
             review: None,
@@ -170,6 +156,21 @@ impl Change {
                 });
             }
         }
+        for tag in &self.tags {
+            let expected = match direction {
+                Direction::Undo => tag.after,
+                Direction::Redo => tag.before,
+            };
+            if now.tags.get(&tag.name).copied() != expected {
+                return Some(match expected {
+                    Some(_) if now.tags.contains_key(&tag.name) => {
+                        format!("Tag {} has moved since.", tag.name)
+                    }
+                    Some(_) => format!("Tag {} has been deleted since.", tag.name),
+                    None => format!("A tag named {} exists again.", tag.name),
+                });
+            }
+        }
         let stash_moved = match (&self.stash, direction) {
             (Some(StashChange::Pushed(entry)), Direction::Undo) => {
                 now.stashes.first().map(|top| top.id) != Some(entry.id)
@@ -202,7 +203,7 @@ impl Change {
             .iter()
             .filter_map(|branch| {
                 let (from, to) = ends(branch.before, branch.after);
-                (from.is_none()).then(|| ref_update(&branch.name, from, to))
+                (from.is_none()).then(|| ref_update("refs/heads/", &branch.name, from, to))
             })
             .collect();
         if !creates.is_empty() {
@@ -241,9 +242,13 @@ impl Change {
                 (Some(_), Some(to)) if Some(branch.name.as_str()) == checked_out => {
                     git.reset(&to.to_string(), self.mode)?;
                 }
-                _ => others.push(ref_update(&branch.name, from, to)),
+                _ => others.push(ref_update("refs/heads/", &branch.name, from, to)),
             }
         }
+        others.extend(self.tags.iter().map(|tag| {
+            let (from, to) = ends(tag.before, tag.after);
+            ref_update("refs/tags/", &tag.name, from, to)
+        }));
         if !others.is_empty() {
             git.update_refs(&others)?;
         }
@@ -315,9 +320,28 @@ impl Change {
     }
 }
 
-fn ref_update(branch: &str, old: Option<Oid>, new: Option<Oid>) -> RefUpdate {
+/// How the references in `before` and `after`, by name, differ.
+fn ref_changes(before: &BTreeMap<String, Oid>, after: &BTreeMap<String, Oid>) -> Vec<RefChange> {
+    let mut names: Vec<&String> = before.keys().chain(after.keys()).collect();
+    names.sort();
+    names.dedup();
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let (old, new) = (before.get(name), after.get(name));
+            (old != new).then(|| RefChange {
+                name: name.clone(),
+                before: old.copied(),
+                after: new.copied(),
+            })
+        })
+        .collect()
+}
+
+/// Moving reference `prefix` + `name` from `old` to `new`.
+fn ref_update(prefix: &str, name: &str, old: Option<Oid>, new: Option<Oid>) -> RefUpdate {
     RefUpdate {
-        name: format!("refs/heads/{branch}"),
+        name: format!("{prefix}{name}"),
         old: old.map(|id| id.to_string()),
         new: new.map(|id| id.to_string()),
     }
@@ -365,6 +389,7 @@ impl Recorded {
             change: Change {
                 head: None,
                 branches: Vec::new(),
+                tags: Vec::new(),
                 stash: None,
                 mode: ResetMode::Keep,
                 review: None,
@@ -716,6 +741,40 @@ mod tests {
         change.apply(&tool, Direction::Redo).expect("redo");
         let again = store.load(opened.number).expect("load");
         assert_eq!(ReviewTips::of(&again), ReviewTips::of(&merged));
+    }
+
+    #[test]
+    fn undoes_creating_and_deleting_tags() {
+        let dir = repository();
+        let root = dir.path();
+        let tool = Git::new(root);
+        let tags = || git(root, &["tag", "--list"]).replace('\n', " ");
+        let mut created = record(root, ResetMode::Keep, || {
+            tool.create_tag("v1", "HEAD", Some("Release one"))
+                .expect("create");
+        });
+        let annotated = git(root, &["rev-parse", "refs/tags/v1"]);
+        let mut deleted = record(root, ResetMode::Keep, || {
+            tool.delete_tag("v1").expect("delete");
+        });
+
+        deleted.apply(&tool, Direction::Undo).expect("undo delete");
+        // The same tag object, message and all, is back.
+        assert_eq!(git(root, &["rev-parse", "refs/tags/v1"]), annotated);
+        created.apply(&tool, Direction::Undo).expect("undo create");
+        assert_eq!(tags(), "");
+        created.apply(&tool, Direction::Redo).expect("redo create");
+        assert_eq!(tags(), "v1");
+
+        git(root, &["tag", "--force", "v1", "HEAD"]);
+        let now = Repository::open(root)
+            .expect("open")
+            .ref_state()
+            .expect("state");
+        assert_eq!(
+            deleted.why_not(&now, Direction::Redo).as_deref(),
+            Some("Tag v1 has moved since.")
+        );
     }
 
     #[test]

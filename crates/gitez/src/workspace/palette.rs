@@ -61,6 +61,7 @@ pub enum PaletteCommand {
     ResolveConflicts,
     CherryPick,
     NewBranch,
+    NewTag,
     RenameBranch,
     StashChanges,
     PopStash,
@@ -227,6 +228,12 @@ fn actions() -> Vec<Action> {
             icon: IconName::GitBranch,
             keywords: &["branch", "switch", "checkout", "create"],
             command: PaletteCommand::NewBranch,
+        },
+        Action {
+            title: "New tag…",
+            icon: IconName::Tag,
+            keywords: &["tag", "release", "version", "annotate"],
+            command: PaletteCommand::NewTag,
         },
         Action {
             title: "Rename branch…",
@@ -427,7 +434,9 @@ impl Palette {
             {
                 Some("no branch checked out")
             }
-            PaletteCommand::NewBranch if context.head.is_none() => Some("no commits yet"),
+            PaletteCommand::NewBranch | PaletteCommand::NewTag if context.head.is_none() => {
+                Some("no commits yet")
+            }
             PaletteCommand::StashChanges if context.changed.is_empty() => Some("nothing to stash"),
             PaletteCommand::PopStash if context.stashes == 0 => Some("no stashes"),
             PaletteCommand::Undo if context.undo.is_none() => Some("nothing to undo"),

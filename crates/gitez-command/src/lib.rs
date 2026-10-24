@@ -303,6 +303,38 @@ impl Git {
             .map(drop)
     }
 
+    /// Creates tag `name` on `commit` (a full id or a ref): annotated, with
+    /// `message`, when there is one, like `git tag -a`; lightweight
+    /// otherwise.
+    pub fn create_tag(&self, name: &str, commit: &str, message: Option<&str>) -> Result<()> {
+        match message {
+            Some(message) => self.run(
+                ["tag", "--annotate", "--file=-", name, commit],
+                Some(message.as_bytes()),
+            ),
+            None => self.run(["tag", name, commit], None),
+        }
+        .map(drop)
+    }
+
+    /// Deletes tag `name`, like `git tag -d`.
+    pub fn delete_tag(&self, name: &str) -> Result<()> {
+        self.run(["tag", "--delete", name], None).map(drop)
+    }
+
+    /// Sends tag `name` to `remote`, like `git push <remote> <tag>`.
+    pub fn push_tag(&self, remote: &str, name: &str) -> Result<()> {
+        let tag = format!("refs/tags/{name}");
+        self.run(["push", "--quiet", remote, &tag], None).map(drop)
+    }
+
+    /// Deletes tag `name` on `remote`, like `git push <remote> --delete`.
+    pub fn delete_remote_tag(&self, remote: &str, name: &str) -> Result<()> {
+        let tag = format!("refs/tags/{name}");
+        self.run(["push", "--quiet", remote, "--delete", &tag], None)
+            .map(drop)
+    }
+
     /// Brings the commits of branch `head` into branch `base` the way `how`
     /// says, and leaves `base` checked out. A merge commit that conflicts
     /// stops with the conflicts in the working tree, to be resolved and

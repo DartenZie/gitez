@@ -17,6 +17,7 @@ mod sidebar;
 mod stash;
 mod status_bar;
 mod steps;
+mod tag;
 mod toolbar;
 
 use std::path::PathBuf;
@@ -59,6 +60,7 @@ use review::{
 use rewrite::{Rewrite, RewriteEvent};
 use sidebar::{Sidebar, SidebarEvent};
 use stash::StashForm;
+use tag::TagForm;
 
 actions!(
     workspace,
@@ -71,6 +73,7 @@ actions!(
         Pull,
         Push,
         NewBranch,
+        NewTag,
         StashChanges,
         UndoStep,
         RedoStep
@@ -138,6 +141,7 @@ pub struct Workspace {
     rewrite_command: Option<Task<()>>,
     /// The form creating or renaming a branch, while its dialog is open.
     branch_form: Option<(Entity<BranchForm>, Subscription)>,
+    tag_form: Option<(Entity<TagForm>, Subscription)>,
     /// The "Stash changes" form, while its dialog is open.
     stash_form: Option<(Entity<StashForm>, Subscription)>,
     /// Undoing or redoing a step.
@@ -179,6 +183,12 @@ impl Workspace {
                 }
                 SidebarEvent::CheckOut(branch) => this.switch_branch(branch.clone(), window, cx),
                 SidebarEvent::NewBranchFrom(tip) => this.new_branch_at(*tip, window, cx),
+                SidebarEvent::SelectCommit(id) => this.select_commit(*id, window, cx),
+                SidebarEvent::PushTag(name) => this.push_tag(name.clone(), window, cx),
+                SidebarEvent::DeleteTag(name) => this.delete_tag(name.clone(), window, cx),
+                SidebarEvent::DeleteRemoteTag(name) => {
+                    this.delete_remote_tag(name.clone(), false, window, cx)
+                }
                 SidebarEvent::RenameBranch(branch) => {
                     this.rename_branch(branch.clone(), window, cx)
                 }
@@ -227,6 +237,7 @@ impl Workspace {
                 }
                 DetailEvent::Reword(id) => this.open_rewrite(*id, Some(*id), false, window, cx),
                 DetailEvent::NewBranch(id) => this.new_branch_at(*id, window, cx),
+                DetailEvent::NewTag(id) => this.new_tag_at(*id, window, cx),
             }),
             // Files change outside GitEZ; read the status again on return.
             // The toolbar names the next undo and redo steps.
@@ -258,6 +269,7 @@ impl Workspace {
             rewrite_command: None,
             remote_op: None,
             branch_form: None,
+            tag_form: None,
             stash_form: None,
             git_command: None,
             stepping: None,
@@ -1196,6 +1208,7 @@ impl Workspace {
             PaletteCommand::ResolveConflicts => self.open_conflicts(window, cx),
             PaletteCommand::CherryPick => self.open_cherry_pick(window, cx),
             PaletteCommand::NewBranch => self.new_branch(&NewBranch, window, cx),
+            PaletteCommand::NewTag => self.new_tag(&NewTag, window, cx),
             PaletteCommand::RenameBranch => {
                 if let Some(Head::Branch { name, .. }) = self
                     .snapshot
@@ -1215,23 +1228,26 @@ impl Workspace {
             }
             PaletteCommand::Undo => self.undo_step(&UndoStep, window, cx),
             PaletteCommand::Redo => self.redo_step(&RedoStep, window, cx),
-            PaletteCommand::SelectCommit(id) => {
-                self.review = None;
-                self.rewrite = None;
-                let found = self
-                    .history
-                    .update(cx, |history, cx| history.select_commit(id, cx));
-                if !found {
-                    window.push_notification(
-                        Notification::info("That commit is not in the history shown."),
-                        cx,
-                    );
-                }
-                window.focus(&self.history.focus_handle(cx), cx);
-                cx.notify();
-            }
+            PaletteCommand::SelectCommit(id) => self.select_commit(id, window, cx),
             PaletteCommand::Switch(branch) => self.switch_branch(branch, window, cx),
         }
+    }
+
+    /// Shows the history with commit `id` selected.
+    fn select_commit(&mut self, id: Oid, window: &mut Window, cx: &mut Context<Self>) {
+        self.review = None;
+        self.rewrite = None;
+        let found = self
+            .history
+            .update(cx, |history, cx| history.select_commit(id, cx));
+        if !found {
+            window.push_notification(
+                Notification::info("That commit is not in the history shown."),
+                cx,
+            );
+        }
+        window.focus(&self.history.focus_handle(cx), cx);
+        cx.notify();
     }
 
     /// Shows the uncommitted changes to review and commit, scrolled to the
@@ -1414,6 +1430,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::pull))
             .on_action(cx.listener(Self::push))
             .on_action(cx.listener(Self::new_branch))
+            .on_action(cx.listener(Self::new_tag))
             .on_action(cx.listener(Self::stash_changes))
             .on_action(cx.listener(Self::undo_step))
             .on_action(cx.listener(Self::redo_step))

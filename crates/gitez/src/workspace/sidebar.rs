@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use gitez_git::{Branch, Oid, RemoteBranch, Stash};
+use gitez_git::{Branch, Oid, RemoteBranch, Stash, Tag};
 use gitez_review::{PullRequest, State};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
@@ -54,6 +54,13 @@ pub enum SidebarEvent {
         remote: String,
         name: String,
     },
+    /// Show this commit in the history.
+    SelectCommit(Oid),
+    /// Send the tag with this name to the remote.
+    PushTag(String),
+    DeleteTag(String),
+    /// Delete the tag with this name on the remote.
+    DeleteRemoteTag(String),
     /// Bring stash `index` back, dropping it if `pop`.
     Unstash {
         index: usize,
@@ -220,6 +227,17 @@ impl Render for Sidebar {
                         _ => remotes.push((&branch.remote, vec![branch])),
                     }
                 }
+                let remote = snapshot
+                    .remotes
+                    .iter()
+                    .find(|remote| *remote == "origin")
+                    .or(snapshot.remotes.first())
+                    .cloned();
+                let tag_rows = refs
+                    .tags
+                    .iter()
+                    .map(|tag| tag_row(tag, remote.clone(), cx).into_any_element())
+                    .collect::<Vec<_>>();
                 let mut remote_rows = Vec::new();
                 for (remote, branches) in &remotes {
                     let expanded = self.expanded_remotes.contains(*remote);
@@ -282,12 +300,7 @@ impl Render for Sidebar {
                     "Tags",
                     refs.tags.len(),
                     "No tags",
-                    || {
-                        refs.tags
-                            .iter()
-                            .map(|tag| row().child(label(tag.name.clone())).into_any_element())
-                            .collect()
-                    },
+                    || tag_rows,
                     cx,
                 ))
                 .child(self.section(
@@ -453,6 +466,45 @@ fn branch_row(
                         SidebarEvent::DeleteBranch(name.to_owned())
                     })
                     .disabled(is_head),
+                )
+            }
+        })
+}
+
+/// A tag: click to show its commit, right-click to push or delete it.
+/// `remote` is where tags are pushed, if anywhere.
+fn tag_row(tag: &Tag, remote: Option<String>, cx: &mut Context<Sidebar>) -> impl IntoElement {
+    let (name, target) = (tag.name.clone(), tag.target);
+    row()
+        .cursor_pointer()
+        .child(label(tag.name.clone()))
+        .id(SharedString::from(format!("tag-{}", tag.name)))
+        .on_click(cx.listener(move |_, _, _, cx| cx.emit(SidebarEvent::SelectCommit(target))))
+        .context_menu({
+            let sidebar = cx.entity().downgrade();
+            move |menu, _, _| {
+                let item = |label: SharedString, event: SidebarEvent| {
+                    let sidebar = sidebar.clone();
+                    PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                        sidebar.update(cx, |_, cx| cx.emit(event.clone())).ok();
+                    })
+                };
+                let to = remote.clone().unwrap_or_else(|| "a remote".to_owned());
+                menu.item(
+                    item(
+                        format!("Push to {to}").into(),
+                        SidebarEvent::PushTag(name.clone()),
+                    )
+                    .disabled(remote.is_none()),
+                )
+                .separator()
+                .item(item("Delete".into(), SidebarEvent::DeleteTag(name.clone())))
+                .item(
+                    item(
+                        format!("Delete from {to}…").into(),
+                        SidebarEvent::DeleteRemoteTag(name.clone()),
+                    )
+                    .disabled(remote.is_none()),
                 )
             }
         })
