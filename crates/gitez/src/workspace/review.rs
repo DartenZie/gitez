@@ -1,7 +1,6 @@
-//! Reviewing one commit, or the uncommitted changes: the commit's message,
-//! then the diff of every changed file, one after another, as in the
-//! `Commit.dc.html` artboard. The uncommitted changes can be staged and
-//! committed from here.
+//! The diff of one commit, or of the uncommitted changes: every changed
+//! file, one after another, as in the `Commit.dc.html` artboard. The
+//! uncommitted changes can be staged and committed from here.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
@@ -9,9 +8,8 @@ use std::sync::Arc;
 
 use gitez_command::Git;
 use gitez_git::{
-    ChangeKind, Commit, CommitDetails, DiffContent, DiffLine, DiffOptions, FileDiff, FileStatus,
-    Hunk, LineKind, LineSource, Oid, RefKind, RefLabel, Repository, Staging, WorkingTreeStatus,
-    WorktreeChange,
+    ChangeKind, Commit, DiffContent, DiffLine, DiffOptions, FileDiff, FileStatus, Hunk, LineKind,
+    LineSource, Oid, RefKind, RefLabel, Repository, Staging, WorkingTreeStatus, WorktreeChange,
 };
 use gpui_kit::component::button::*;
 use gpui_kit::component::checkbox::Checkbox;
@@ -23,7 +21,6 @@ use gpui_kit::*;
 
 use super::labels;
 use crate::theme::{self, color};
-use crate::time;
 
 actions!(review, [Close, Newer, Older, CommitStaged]);
 
@@ -297,7 +294,6 @@ struct CommitSubject {
     /// The commits before and after this one in the history, if any.
     newer: Option<Commit>,
     older: Option<Commit>,
-    details: Option<Arc<CommitDetails>>,
 }
 
 pub struct Review {
@@ -322,6 +318,8 @@ pub struct Review {
     sources: HashMap<LineSource, Arc<Vec<String>>>,
     /// Why reading the lines of a file failed.
     sources_error: Option<SharedString>,
+    /// The file to scroll to once the diff is read.
+    pending_file: Option<String>,
     _load: Task<()>,
     _load_sources: Task<()>,
 }
@@ -343,32 +341,20 @@ impl Review {
             labels,
             newer,
             older,
-            details: None,
         }));
         Self::with_subject(repository, subject, load, cx)
     }
 
-    /// Reads the details and diff of commit `id` in the background.
+    /// Reads the diff of commit `id` in the background.
     fn load_commit(repository: &Repository, id: Oid, cx: &mut Context<Self>) -> Task<()> {
         let repository = repository.clone();
         let options = ReviewSettings::get(cx).diff_options();
         cx.spawn(async move |this, cx| {
-            let (details, files) = cx
+            let files = cx
                 .background_executor()
-                .spawn(async move {
-                    (
-                        repository.commit_details(id),
-                        repository.commit_diff(id, options),
-                    )
-                })
+                .spawn(async move { repository.commit_diff(id, options) })
                 .await;
-            this.update(cx, |this, cx| {
-                if let Subject::Commit(subject) = &mut this.subject {
-                    subject.details = details.ok().map(Arc::new);
-                }
-                this.finish(files, cx);
-            })
-            .ok();
+            this.update(cx, |this, cx| this.finish(files, cx)).ok();
         })
     }
 
@@ -439,6 +425,7 @@ impl Review {
             expanded: HashMap::new(),
             sources: HashMap::new(),
             sources_error: None,
+            pending_file: None,
             _load: load,
             _load_sources: Task::ready(()),
         }
@@ -504,6 +491,9 @@ impl Review {
                     .retain(|source, _| matches!(source, LineSource::Blob(_)));
                 self.rebuild_rows(anchor, cx);
                 self.load_sources(cx);
+                if let Some(path) = self.pending_file.take() {
+                    self.show_file(path, cx);
+                }
             }
             Err(error) => {
                 self.files = Some(Err(format!(
@@ -786,6 +776,19 @@ impl Review {
         if file != self.current_file {
             self.current_file = file;
             cx.notify();
+        }
+    }
+
+    /// Scrolls to the file at `path`, now or once the diff is read.
+    pub fn show_file(&mut self, path: String, cx: &mut Context<Self>) {
+        match &self.files {
+            Some(Ok(files)) => {
+                if let Some(index) = files.iter().position(|file| file.path == path) {
+                    self.scroll_to_file(index, cx);
+                }
+            }
+            Some(Err(_)) => {}
+            None => self.pending_file = Some(path),
         }
     }
 
@@ -1476,92 +1479,68 @@ impl Review {
                     labels,
                     newer,
                     older,
-                    details,
+                    ..
                 } = &**subject;
                 let parent = match commit.parents.as_slice() {
                     [] => "root commit".to_owned(),
                     [parent, ..] => format!("parent {}", parent.to_hex_with_len(7)),
                 };
-                let mut when = format!("committed {}", time::absolute(commit.author.time));
-                if details.as_ref().is_some_and(|details| details.signed) {
-                    when.push_str(" · signed");
-                }
-                let body = details
-                    .as_ref()
-                    .map(|details| details.body.clone())
-                    .filter(|body| !body.is_empty());
-                header
-                    .child(
-                        breadcrumb
-                            .children(labels.first().map(crumb))
-                            .child(muted("/"))
-                            .child(
-                                div()
-                                    .font_family(mono.clone())
-                                    .text_color(rgb(color::ACCENT))
-                                    .child(commit.id.to_hex_with_len(7).to_string()),
-                            )
-                            .child(
-                                div()
-                                    .font_family(mono.clone())
-                                    .text_size(theme::SMALL_TEXT_SIZE)
-                                    .text_color(rgb(color::TEXT_MUTED))
-                                    .child(format!("({parent})")),
-                            )
-                            .child(
+                header.child(
+                    breadcrumb
+                        .children(labels.first().map(crumb))
+                        .child(muted("/"))
+                        .child(
+                            div()
+                                .font_family(mono.clone())
+                                .text_color(rgb(color::ACCENT))
+                                .child(commit.id.to_hex_with_len(7).to_string()),
+                        )
+                        .child(
+                            div()
+                                .font_family(mono.clone())
+                                .text_size(theme::SMALL_TEXT_SIZE)
+                                .text_color(rgb(color::TEXT_MUTED))
+                                .child(format!("({parent})")),
+                        )
+                        .when_some(totals, |this, totals| {
+                            this.child(
                                 div()
                                     .h_flex()
-                                    .ml_auto()
-                                    .gap(px(6.))
-                                    .child(
-                                        Button::new("review-newer")
-                                            .ghost()
-                                            .h(px(30.))
-                                            .label("Newer")
-                                            .tooltip("Review the next newer commit ([)")
-                                            .disabled(newer.is_none())
-                                            .on_click(cx.listener(|_, _, _, cx| {
-                                                cx.emit(ReviewEvent::Newer)
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("review-older")
-                                            .ghost()
-                                            .h(px(30.))
-                                            .label("Older")
-                                            .tooltip("Review the next older commit (])")
-                                            .disabled(older.is_none())
-                                            .on_click(cx.listener(|_, _, _, cx| {
-                                                cx.emit(ReviewEvent::Older)
-                                            })),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        title(commit.summary.clone())
-                            .when_some(body, |this, body| {
-                                this.child(
-                                    div()
-                                        .max_w(px(760.))
-                                        .line_height(relative(1.55))
-                                        .text_color(rgb(color::AUTHOR_TEXT))
-                                        .child(body),
+                                    .gap(px(10.))
+                                    .text_color(rgb(color::TEXT_MUTED))
+                                    .child("·")
+                                    .children(total_parts(totals, mono.clone())),
+                            )
+                        })
+                        .child(
+                            div()
+                                .h_flex()
+                                .ml_auto()
+                                .gap(px(6.))
+                                .child(
+                                    Button::new("review-newer")
+                                        .ghost()
+                                        .h(px(30.))
+                                        .label("Newer")
+                                        .tooltip("Review the next newer commit ([)")
+                                        .disabled(newer.is_none())
+                                        .on_click(
+                                            cx.listener(|_, _, _, cx| cx.emit(ReviewEvent::Newer)),
+                                        ),
                                 )
-                            })
-                            .child(
-                                byline()
-                                    .child(labels::avatar(&commit.author.name, px(22.)))
-                                    .child(
-                                        div()
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .child(commit.author.name.clone()),
-                                    )
-                                    .child(muted(when))
-                                    .when_some(totals, |this, totals| {
-                                        this.child(muted("·")).children(total_parts(totals, mono))
-                                    }),
-                            ),
-                    )
+                                .child(
+                                    Button::new("review-older")
+                                        .ghost()
+                                        .h(px(30.))
+                                        .label("Older")
+                                        .tooltip("Review the next older commit (])")
+                                        .disabled(older.is_none())
+                                        .on_click(
+                                            cx.listener(|_, _, _, cx| cx.emit(ReviewEvent::Older)),
+                                        ),
+                                ),
+                        ),
+                )
             }
             Subject::WorkingTree {
                 status,

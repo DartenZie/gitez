@@ -507,11 +507,22 @@ impl History {
             // Rows are laid out on their own and would otherwise be as wide
             // as their content, misaligning the columns.
             .w_full()
+            .relative()
             .h(ROW_HEIGHT)
             .pr(columns::END_PADDING)
             .gap(columns::GAP)
-            .border_b_1()
-            .border_color(rgb(color::ROW_BORDER))
+            // The divider is the first child, not a border: a border is
+            // painted over the children and would cut through the graph,
+            // which is painted over the divider instead.
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .h(px(1.))
+                    .bg(rgb(color::ROW_BORDER)),
+            )
             .map(|this| {
                 if selected {
                     this.bg(rgb(color::SELECTED))

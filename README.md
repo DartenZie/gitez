@@ -27,8 +27,9 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 > **Status:** early development. The current build opens a repository and
 > shows its history as a commit graph, with branches, remotes, tags and
 > stashes in the sidebar and the selected commit's details beside it. Press
-> Enter or double-click a commit to review its full diff, file by file; `[`
-> and `]` step to the newer and older commit, Esc goes back. Diffs show
+> Enter or double-click a commit to see its full diff, file by file, or
+> click a file in its details to jump straight to that file; `[` and `]`
+> step to the newer and older commit, Esc goes back. Diffs show
 > unified or split side by side, optionally hiding whitespace changes
 > (single hunks can't be staged then), and show the unchanged lines
 > between hunks one gap at a time or all at once. Mark a file viewed to

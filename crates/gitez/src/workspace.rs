@@ -26,7 +26,7 @@ use gitez_git::{Affected, Head, RefKind, RefLabel, Watcher, WorkingTreeStatus};
 
 use crate::repository::Snapshot;
 use crate::theme::{self, color};
-use detail::DetailPane;
+use detail::{DetailEvent, DetailPane};
 use history::{History, Selection};
 use review::{CommitDraft, LastCommit, Review, ReviewEvent};
 use sidebar::Sidebar;
@@ -83,9 +83,13 @@ impl Workspace {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
         let history = cx.new(History::new);
+        let detail = cx.new(|_| DetailPane::new());
         let subscriptions = vec![
             // The detail pane shows the selected commit.
             cx.subscribe(&history, |this, _, _, cx| this.show_selection(cx)),
+            cx.subscribe_in(&detail, window, |this, _, event, window, cx| match event {
+                DetailEvent::OpenFile(path) => this.open_review(Some(path.clone()), window, cx),
+            }),
             // Files change outside GitEZ; read the status again on return.
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
@@ -108,7 +112,7 @@ impl Workspace {
             commit_draft: None,
             sidebar: cx.new(|_| Sidebar::new()),
             history,
-            detail: cx.new(|_| DetailPane::new()),
+            detail,
             _subscriptions: subscriptions,
         };
         if let Some(path) = path {
@@ -372,6 +376,12 @@ impl Workspace {
     /// Reviews the commit or the uncommitted changes selected in the
     /// history.
     fn review_selected(&mut self, _: &ReviewSelected, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_review(None, window, cx);
+    }
+
+    /// Shows the diff of the commit selected in the history, or of the
+    /// uncommitted changes, scrolled to the file at `path` if given.
+    fn open_review(&mut self, path: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(snapshot) = &self.snapshot else {
             return;
         };
@@ -426,6 +436,9 @@ impl Workspace {
                 this.review_selected(&ReviewSelected, window, cx);
             }
         });
+        if let Some(path) = path {
+            review.update(cx, |review, cx| review.show_file(path, cx));
+        }
         window.focus(&review.focus_handle(cx), cx);
         self.review = Some((review, subscription));
         cx.notify();

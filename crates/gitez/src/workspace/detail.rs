@@ -26,8 +26,15 @@ const DEBOUNCE: Duration = Duration::from_millis(40);
 /// Files listed before the rest are summarised in one line.
 const MAX_FILES_SHOWN: usize = 500;
 
+/// What the detail pane asks of the window.
+pub enum DetailEvent {
+    /// Show the diff of the selection, scrolled to the file at this path.
+    OpenFile(String),
+}
+
 /// The selected commit: SHA, parents, message, author, refs and changed files.
 /// Or, with the uncommitted-changes row selected, the files they touch.
+/// Clicking a file opens its diff.
 pub struct DetailPane {
     working_tree: Option<Arc<WorkingTreeStatus>>,
     commit: Option<Commit>,
@@ -37,6 +44,8 @@ pub struct DetailPane {
     /// The read in flight. Dropping it before the debounce ends skips it.
     _load: Option<Task<()>>,
 }
+
+impl EventEmitter<DetailEvent> for DetailPane {}
 
 impl DetailPane {
     pub fn new() -> Self {
@@ -134,9 +143,9 @@ impl Render for DetailPane {
                         .v_flex()
                         .flex_1()
                         .overflow_y_scroll()
-                        .child(working_tree(status, mono)),
+                        .child(working_tree(status, mono, cx)),
                 )
-                .when(!status.is_clean(), |this| this.child(review_footer()));
+                .when(!status.is_clean(), |this| this.child(commit_footer()));
         }
         let Some(commit) = &self.commit else {
             return pane.child(
@@ -189,15 +198,16 @@ impl Render for DetailPane {
                             .child(error),
                     )
                 })
-                .when_some(details, |this, details| this.child(files(&details, mono))),
+                .when_some(details, |this, details| {
+                    this.child(files(&details, mono, cx))
+                }),
         )
-        .child(review_footer())
     }
 }
 
-/// "Review all changes", which opens the diff of the selected commit or of
-/// the uncommitted changes.
-fn review_footer() -> impl IntoElement {
+/// "Commit changes", which opens the uncommitted changes to stage and
+/// commit them.
+fn commit_footer() -> impl IntoElement {
     let enter = Keystroke::parse("enter").expect("enter is a valid keystroke");
     div()
         .v_flex()
@@ -208,11 +218,11 @@ fn review_footer() -> impl IntoElement {
         .border_t_1()
         .border_color(rgb(color::BORDER))
         .child(
-            Button::new("review-all-changes")
+            Button::new("commit-changes")
                 .primary()
                 .h(px(36.))
                 .w_full()
-                .label("Review all changes")
+                .label("Commit changes")
                 .icon(Icon::new(IconName::ArrowRight).size(px(14.)))
                 .on_click(|_, window, cx| {
                     window.dispatch_action(Box::new(super::ReviewSelected), cx)
@@ -359,7 +369,11 @@ fn header(
 }
 
 /// "N files changed +A −R" and one row per file.
-fn files(details: &CommitDetails, mono: SharedString) -> impl IntoElement {
+fn files(
+    details: &CommitDetails,
+    mono: SharedString,
+    cx: &Context<DetailPane>,
+) -> impl IntoElement {
     let (added, removed) = details.line_totals();
     let title = match details.files.len() {
         0 => "No files changed".to_owned(),
@@ -407,13 +421,25 @@ fn files(details: &CommitDetails, mono: SharedString) -> impl IntoElement {
                 .files
                 .iter()
                 .take(MAX_FILES_SHOWN)
-                .map(|file| commit_file_row(file, mono.clone())),
+                .enumerate()
+                .map(|(index, file)| {
+                    opens_file(
+                        ("commit-file", index),
+                        &file.path,
+                        commit_file_row(file, mono.clone()),
+                        cx,
+                    )
+                }),
         )
         .when(hidden > 0, |this| this.child(more_files(hidden)))
 }
 
 /// "Uncommitted changes", then the staged files and the other changes.
-fn working_tree(status: &WorkingTreeStatus, mono: SharedString) -> impl IntoElement {
+fn working_tree(
+    status: &WorkingTreeStatus,
+    mono: SharedString,
+    cx: &Context<DetailPane>,
+) -> impl IntoElement {
     let staged: Vec<&FileStatus> = status
         .files
         .iter()
@@ -424,30 +450,37 @@ fn working_tree(status: &WorkingTreeStatus, mono: SharedString) -> impl IntoElem
         .iter()
         .filter(|file| file.unstaged.is_some())
         .collect();
-    let group =
-        |title: &'static str, files: &[&FileStatus], row: &dyn Fn(&FileStatus) -> AnyElement| {
-            let hidden = files.len().saturating_sub(MAX_FILES_SHOWN);
-            div()
-                .v_flex()
-                .pb(px(8.))
-                .child(
-                    div()
-                        .h_flex()
-                        .gap(px(8.))
-                        .pt(px(12.))
-                        .px(px(16.))
-                        .pb(px(6.))
-                        .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
-                        .child(
-                            div()
-                                .text_size(px(12.))
-                                .text_color(rgb(color::TEXT_MUTED))
-                                .child(files.len().to_string()),
-                        ),
-                )
-                .children(files.iter().take(MAX_FILES_SHOWN).map(|file| row(file)))
-                .when(hidden > 0, |this| this.child(more_files(hidden)))
-        };
+    let group = |title: &'static str,
+                 files: &[&FileStatus],
+                 row: &dyn Fn(usize, &FileStatus) -> AnyElement| {
+        let hidden = files.len().saturating_sub(MAX_FILES_SHOWN);
+        div()
+            .v_flex()
+            .pb(px(8.))
+            .child(
+                div()
+                    .h_flex()
+                    .gap(px(8.))
+                    .pt(px(12.))
+                    .px(px(16.))
+                    .pb(px(6.))
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(color::TEXT_MUTED))
+                            .child(files.len().to_string()),
+                    ),
+            )
+            .children(
+                files
+                    .iter()
+                    .take(MAX_FILES_SHOWN)
+                    .enumerate()
+                    .map(|(index, file)| row(index, file)),
+            )
+            .when(hidden > 0, |this| this.child(more_files(hidden)))
+    };
 
     div()
         .v_flex()
@@ -474,28 +507,43 @@ fn working_tree(status: &WorkingTreeStatus, mono: SharedString) -> impl IntoElem
                 ),
         )
         .when(!staged.is_empty(), |this| {
-            this.child(group("Staged", &staged, &|file| {
+            this.child(group("Staged", &staged, &|index, file| {
                 let kind = file.staged.as_ref().unwrap_or(&ChangeKind::Modified);
                 let (letter, letter_color) = labels::change_letter(kind);
-                file_row(
+                let row = file_row(
                     letter,
                     letter_color,
                     &file.path,
                     rename_source(kind),
                     None,
                     mono.clone(),
-                )
-                .into_any_element()
+                );
+                opens_file(("staged-file", index), &file.path, row, cx).into_any_element()
             }))
         })
         .when(!unstaged.is_empty(), |this| {
-            this.child(group("Changes", &unstaged, &|file| {
+            this.child(group("Changes", &unstaged, &|index, file| {
                 let (letter, letter_color) =
                     worktree_letter(file.unstaged.unwrap_or(WorktreeChange::Modified));
-                file_row(letter, letter_color, &file.path, None, None, mono.clone())
-                    .into_any_element()
+                let row = file_row(letter, letter_color, &file.path, None, None, mono.clone());
+                opens_file(("unstaged-file", index), &file.path, row, cx).into_any_element()
             }))
         })
+}
+
+/// `row`, which opens the diff of the file at `path` when clicked.
+fn opens_file(
+    id: impl Into<ElementId>,
+    path: &str,
+    row: impl IntoElement,
+    cx: &Context<DetailPane>,
+) -> impl IntoElement {
+    let path = path.to_owned();
+    div()
+        .id(id)
+        .cursor_pointer()
+        .child(row)
+        .on_click(cx.listener(move |_, _, _, cx| cx.emit(DetailEvent::OpenFile(path.clone()))))
 }
 
 fn more_files(hidden: usize) -> impl IntoElement {
