@@ -1096,3 +1096,50 @@ fn resets_three_ways_and_discards_only_tracked_files() {
     git_.restore_discarded(&saved).expect("restore");
     assert_eq!(status(root), "M a.txt\n?? new.txt");
 }
+
+#[test]
+fn adds_renames_repoints_and_removes_remotes() {
+    let (dir, a, _b) = remote_and_clones();
+    let root = a.work_dir();
+    let url = dir.path().join("origin.git").display().to_string();
+    a.add_remote("mirror", &url).expect("add");
+    assert!(a.add_remote("mirror", &url).is_err(), "it exists already");
+    a.fetch_remote("mirror").expect("fetch");
+    assert!(
+        git(
+            root,
+            &["for-each-ref", "--format=%(refname)", "refs/remotes/mirror"]
+        )
+        .contains("refs/remotes/mirror/main")
+    );
+
+    a.set_upstream("main", Some("mirror/main"))
+        .expect("set upstream");
+    assert_eq!(
+        git(root, &["rev-parse", "--abbrev-ref", "main@{upstream}"]),
+        "mirror/main"
+    );
+    a.rename_remote("mirror", "backup").expect("rename");
+    assert_eq!(
+        git(root, &["rev-parse", "--abbrev-ref", "main@{upstream}"]),
+        "backup/main"
+    );
+    a.set_remote_url("backup", "https://example.com/x.git")
+        .expect("set url");
+    assert_eq!(
+        git(root, &["remote", "get-url", "backup"]),
+        "https://example.com/x.git"
+    );
+    a.set_upstream("main", None).expect("unset upstream");
+    assert!(!git(root, &["config", "--list"]).contains("branch.main.merge"));
+
+    a.remove_remote("backup").expect("remove");
+    assert_eq!(git(root, &["remote"]), "origin");
+    assert_eq!(
+        git(
+            root,
+            &["for-each-ref", "--format=%(refname)", "refs/remotes/backup"]
+        ),
+        ""
+    );
+}

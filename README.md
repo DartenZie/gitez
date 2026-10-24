@@ -124,7 +124,13 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 > sidebar to list its branches; double-click one, or find it in the
 > palette, to check it out as a local branch that tracks it, or
 > right-click it to start a branch from it or delete it from the remote
-> (after you confirm; that one cannot be undone). **Tag…** on a commit,
+> (after you confirm; that one cannot be undone). **+** beside Remotes,
+> or **Add remote…** in the palette, adds a remote and fetches it;
+> right-click a remote to fetch it alone, rename it or change its URL,
+> or remove it (after you confirm). **Set upstream…** on a branch's
+> right-click menu, or in the palette for the branch checked out, picks
+> the remote branch it pulls from and pushes to, or none. Remote and
+> upstream changes are not undone. **Tag…** on a commit,
 > or the palette, tags it: with a message the tag is annotated, without
 > one it is lightweight. Click a tag in the sidebar to show its commit, or
 > right-click it to push it to the remote, delete it, or delete it from
@@ -148,8 +154,8 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 > marked merged. **Redo**
 > (`⇧⌘Z`) does it again. GitEZ keeps its own list of these steps while it
 > runs, and refuses one when a branch it would move has moved since, so
-> nothing done elsewhere is overwritten. Fetch, push and commands run as
-> typed in the palette are not undone, and a branch brought back loses its
+> nothing done elsewhere is overwritten. Fetch, push, remote and upstream
+> changes, and commands run as typed in the palette are not undone, and a branch brought back loses its
 > upstream setting.
 
 ## Technology
@@ -253,7 +259,7 @@ crates/gitez-git/   read-only repository access on gitoxide: refs, history, grap
 crates/gitez-command/ changes made by running the user's git binary: staging,
                     unstaging files or hunks, committing, amending, switching branches,
                     merging and resolving conflicts, cherry-picking, rewriting history,
-                    setting config values
+                    adding and changing remotes, setting config values
 crates/gitez-review/ local pull requests, their comment threads and agent run
                     transcripts, stored in .git/gitez/reviews
 crates/gitez-agent/ coding agents a review prompt is sent to: Claude Code run as

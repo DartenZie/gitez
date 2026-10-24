@@ -507,6 +507,50 @@ impl Git {
         self.run(["fetch", "--all", "--quiet"], None).map(drop)
     }
 
+    /// Fetches remote `name` alone, like `git fetch <name>`.
+    pub fn fetch_remote(&self, name: &str) -> Result<()> {
+        self.run(["fetch", "--quiet", name], None).map(drop)
+    }
+
+    /// Adds remote `name` fetching from `url`, like `git remote add`. It is
+    /// not fetched.
+    pub fn add_remote(&self, name: &str, url: &str) -> Result<()> {
+        self.run(["remote", "add", "--", name, url], None).map(drop)
+    }
+
+    /// Renames remote `from` to `to`, like `git remote rename`: its
+    /// remote-tracking branches and the upstreams that name it follow.
+    pub fn rename_remote(&self, from: &str, to: &str) -> Result<()> {
+        self.run(["remote", "rename", "--", from, to], None)
+            .map(drop)
+    }
+
+    /// Points remote `name` at `url`, like `git remote set-url`.
+    pub fn set_remote_url(&self, name: &str, url: &str) -> Result<()> {
+        self.run(["remote", "set-url", "--", name, url], None)
+            .map(drop)
+    }
+
+    /// Removes remote `name`, like `git remote remove`, with its
+    /// remote-tracking branches and the upstreams that name it.
+    pub fn remove_remote(&self, name: &str) -> Result<()> {
+        self.run(["remote", "remove", "--", name], None).map(drop)
+    }
+
+    /// Sets the upstream of local branch `branch` to remote-tracking branch
+    /// `upstream` (such as `origin/main`), like `git branch
+    /// --set-upstream-to`; `None` unsets it.
+    pub fn set_upstream(&self, branch: &str, upstream: Option<&str>) -> Result<()> {
+        match upstream {
+            Some(upstream) => {
+                let flag = format!("--set-upstream-to=refs/remotes/{upstream}");
+                self.run(["branch", "--quiet", &flag, "--", branch], None)
+            }
+            None => self.run(["branch", "--unset-upstream", "--", branch], None),
+        }
+        .map(drop)
+    }
+
     /// Brings the upstream's new commits into the branch checked out, like
     /// `git pull`. A merge or rebase that conflicts stops with the conflicts
     /// in the working tree, to be resolved as after any merge or rebase.

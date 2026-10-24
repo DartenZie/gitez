@@ -79,6 +79,11 @@ impl Repository {
             .collect()
     }
 
+    /// The URL remote `name` fetches from (`remote.<name>.url`), if set.
+    pub fn remote_url(&self, name: &str) -> Option<String> {
+        self.config_string(&format!("remote.{name}.url"))
+    }
+
     /// When this working tree last fetched, as seconds since the Unix
     /// epoch: the time `FETCH_HEAD` was written. `None` before the first
     /// fetch.

@@ -11,6 +11,7 @@ mod labels;
 mod new_pull_request;
 mod palette;
 mod remote;
+mod remotes;
 mod reset;
 mod review;
 mod rewrite;
@@ -54,6 +55,7 @@ use history::{
 use new_pull_request::{FormEvent, NewPullRequestForm};
 use palette::{Palette, PaletteCommand, PaletteContext, PaletteEvent};
 use remote::{RemoteActions, RemoteOp};
+use remotes::RemoteForm;
 use review::{
     CommitDraft, LastCommit, MergeDialog, MergeEvent, MergedPullRequest, Merging, Review,
     ReviewEvent, Tips,
@@ -75,6 +77,7 @@ actions!(
         Push,
         NewBranch,
         NewTag,
+        AddRemote,
         StashChanges,
         UndoStep,
         RedoStep
@@ -143,6 +146,8 @@ pub struct Workspace {
     /// The form creating or renaming a branch, while its dialog is open.
     branch_form: Option<(Entity<BranchForm>, Subscription)>,
     tag_form: Option<(Entity<TagForm>, Subscription)>,
+    /// The form adding or editing a remote, while its dialog is open.
+    remote_form: Option<(Entity<RemoteForm>, Subscription)>,
     /// The "Stash changes" form, while its dialog is open.
     stash_form: Option<(Entity<StashForm>, Subscription)>,
     /// Undoing or redoing a step.
@@ -202,6 +207,13 @@ impl Workspace {
                 SidebarEvent::DeleteRemoteBranch { remote, name } => {
                     this.delete_remote_branch(remote.clone(), name.clone(), false, window, cx)
                 }
+                SidebarEvent::AddRemote => this.add_remote(&AddRemote, window, cx),
+                SidebarEvent::FetchRemote(name) => this.fetch_one_remote(name.clone(), window, cx),
+                SidebarEvent::EditRemote(name) => this.edit_remote(name.clone(), window, cx),
+                SidebarEvent::RemoveRemote(name) => {
+                    this.remove_remote(name.clone(), false, window, cx)
+                }
+                SidebarEvent::SetUpstream(branch) => this.set_upstream(branch.clone(), window, cx),
                 SidebarEvent::Unstash { index, pop } => this.unstash(*index, *pop, window, cx),
                 SidebarEvent::DropStash(index) => this.drop_stash(*index, window, cx),
             }),
@@ -273,6 +285,7 @@ impl Workspace {
             remote_op: None,
             branch_form: None,
             tag_form: None,
+            remote_form: None,
             stash_form: None,
             git_command: None,
             stepping: None,
@@ -1221,6 +1234,16 @@ impl Workspace {
                     self.rename_branch(name, window, cx);
                 }
             }
+            PaletteCommand::SetUpstream => {
+                if let Some(Head::Branch { name, .. }) = self
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.refs.head.clone())
+                {
+                    self.set_upstream(name, window, cx);
+                }
+            }
+            PaletteCommand::AddRemote => self.add_remote(&AddRemote, window, cx),
             PaletteCommand::StashChanges => self.stash_changes(&StashChanges, window, cx),
             PaletteCommand::PopStash => self.unstash(0, true, window, cx),
             PaletteCommand::Fetch => self.fetch(&Fetch, window, cx),
@@ -1434,6 +1457,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::push))
             .on_action(cx.listener(Self::new_branch))
             .on_action(cx.listener(Self::new_tag))
+            .on_action(cx.listener(Self::add_remote))
             .on_action(cx.listener(Self::stash_changes))
             .on_action(cx.listener(Self::undo_step))
             .on_action(cx.listener(Self::redo_step))

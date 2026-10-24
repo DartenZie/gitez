@@ -302,6 +302,9 @@ fn reads_remotes_upstreams_and_ahead_behind() {
         .collect();
     assert_eq!(remotes, ["origin/feature", "origin/main"]);
     assert_eq!(repo.remote_names(), ["origin"]);
+    let url = repo.remote_url("origin").expect("origin has a URL");
+    assert!(url.ends_with("/repo"), "{url}");
+    assert_eq!(repo.remote_url("nowhere"), None);
     assert_eq!(upstream.open().remote_names(), Vec::<String>::new());
     // A clone has not fetched; fetching writes `FETCH_HEAD`.
     assert_eq!(repo.last_fetch(), None);

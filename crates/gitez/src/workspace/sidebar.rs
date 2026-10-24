@@ -8,6 +8,7 @@ use gitez_git::{Branch, Oid, RemoteBranch, Stash, Tag};
 use gitez_review::{PullRequest, State};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -67,6 +68,15 @@ pub enum SidebarEvent {
         pop: bool,
     },
     DropStash(usize),
+    /// Ask for a remote to add.
+    AddRemote,
+    /// Fetch the remote with this name alone.
+    FetchRemote(String),
+    /// Ask for a new name or URL for the remote with this name.
+    EditRemote(String),
+    RemoveRemote(String),
+    /// Ask which remote branch the branch with this name tracks.
+    SetUpstream(String),
 }
 
 pub struct Sidebar {
@@ -138,6 +148,21 @@ impl Sidebar {
         rows: impl FnOnce() -> Vec<AnyElement>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        self.section_with(section, title, count, empty, None, rows, cx)
+    }
+
+    /// A section whose header also offers `action`, a button.
+    #[allow(clippy::too_many_arguments)]
+    fn section_with(
+        &self,
+        section: Section,
+        title: &'static str,
+        count: usize,
+        empty: &'static str,
+        action: Option<AnyElement>,
+        rows: impl FnOnce() -> Vec<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let collapsed = self.collapsed.contains(&section);
         div()
             .v_flex()
@@ -162,6 +187,7 @@ impl Sidebar {
                                 .child(count.to_string()),
                         )
                     })
+                    .children(action)
                     .child(
                         Icon::new(if collapsed {
                             IconName::ChevronRight
@@ -287,11 +313,12 @@ impl Render for Sidebar {
                     || branch_rows,
                     cx,
                 ))
-                .child(self.section(
+                .child(self.section_with(
                     Section::Remotes,
                     "Remotes",
                     remotes.len(),
                     "No remotes",
+                    Some(add_remote_button(cx).into_any_element()),
                     || remote_rows,
                     cx,
                 ))
@@ -460,6 +487,9 @@ fn branch_row(
                 .item(item("Rename…", |name, _| {
                     SidebarEvent::RenameBranch(name.to_owned())
                 }))
+                .item(item("Set upstream…", |name, _| {
+                    SidebarEvent::SetUpstream(name.to_owned())
+                }))
                 .separator()
                 .item(
                     item("Delete", |name, _| {
@@ -598,6 +628,42 @@ fn remote_row(
             .size(px(12.))
             .text_color(rgb(color::TEXT_FAINT)),
         )
+        .context_menu({
+            let sidebar = cx.entity().downgrade();
+            let name = remote.to_owned();
+            move |menu, _, _| {
+                let item = |label: &'static str, event: fn(String) -> SidebarEvent| {
+                    let (sidebar, name) = (sidebar.clone(), name.clone());
+                    PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                        sidebar
+                            .update(cx, |_, cx| cx.emit(event(name.clone())))
+                            .ok();
+                    })
+                };
+                menu.item(item("Fetch", SidebarEvent::FetchRemote))
+                    .item(item("Edit…", SidebarEvent::EditRemote))
+                    .separator()
+                    .item(item("Remove…", SidebarEvent::RemoveRemote))
+            }
+        })
+}
+
+/// The Remotes header's button that adds a remote.
+fn add_remote_button(cx: &mut Context<Sidebar>) -> impl IntoElement {
+    div()
+        .id("add-remote")
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(16.))
+        .rounded(px(3.))
+        .hover(|style| style.bg(rgb(color::NAV_HOVER)).text_color(rgb(color::TEXT)))
+        .tooltip(|window, cx| Tooltip::new("Add remote").build(window, cx))
+        .on_click(cx.listener(|_, _, _, cx| {
+            cx.stop_propagation();
+            cx.emit(SidebarEvent::AddRemote);
+        }))
+        .child(Icon::new(IconName::Plus).size(px(12.)))
 }
 
 /// A branch on a remote, under its remote: double-click checks it out as a

@@ -37,7 +37,7 @@ pub use merge::{MergeInProgress, MergePreview};
 pub use pick::PickTrial;
 pub use refs::{
     Branch, Head, RefKind, RefLabel, Refs, RemoteBranch, Stash, Tag, branch_name_problem,
-    tag_name_problem,
+    remote_name_problem, tag_name_problem,
 };
 pub use repository::Repository;
 pub use rewrite::{RebaseInProgress, Rewritable, RewriteBase, RewriteCommit};

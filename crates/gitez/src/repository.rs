@@ -36,6 +36,8 @@ pub struct Snapshot {
     pub rebase: Option<gitez_git::RebaseInProgress>,
     /// The configured remotes, sorted.
     pub remotes: Vec<String>,
+    /// Remote name to the URL it fetches from.
+    pub remote_urls: HashMap<String, String>,
     /// When this working tree last fetched, in seconds since the epoch.
     pub fetched: Option<i64>,
 }
@@ -96,6 +98,10 @@ impl Snapshot {
             .context("could not read the rebase in progress")?;
 
         let remotes = repository.remote_names();
+        let remote_urls = remotes
+            .iter()
+            .filter_map(|name| Some((name.clone(), repository.remote_url(name)?)))
+            .collect();
         let fetched = repository.last_fetch();
 
         Ok(Self {
@@ -114,6 +120,7 @@ impl Snapshot {
             merge,
             rebase,
             remotes,
+            remote_urls,
             fetched,
         })
     }

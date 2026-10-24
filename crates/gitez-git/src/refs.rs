@@ -350,6 +350,27 @@ pub fn branch_name_problem(name: &str) -> Option<&'static str> {
     None
 }
 
+/// Why `name` cannot name a remote, as `git remote add` would refuse it;
+/// `None` when it can.
+pub fn remote_name_problem(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("Name the remote.");
+    }
+    if name.chars().any(char::is_whitespace) {
+        return Some("A remote name cannot contain spaces.");
+    }
+    if name.starts_with('-') {
+        return Some("A remote name cannot start with “-”.");
+    }
+    if gix::refs::FullName::try_from(format!("refs/remotes/{name}/HEAD")).is_err() {
+        return Some(
+            "A remote name cannot contain “..”, “~”, “^”, “:”, “?”, “*”, “[”, “\\” or “@{”, \
+             or start or end with “/” or “.”.",
+        );
+    }
+    None
+}
+
 /// Why `name` cannot name a tag, as `git check-ref-format` would refuse
 /// it; `None` when it can.
 pub fn tag_name_problem(name: &str) -> Option<&'static str> {

@@ -63,6 +63,8 @@ pub enum PaletteCommand {
     NewBranch,
     NewTag,
     RenameBranch,
+    SetUpstream,
+    AddRemote,
     StashChanges,
     PopStash,
     Fetch,
@@ -240,6 +242,18 @@ fn actions() -> Vec<Action> {
             icon: IconName::Pencil,
             keywords: &["branch", "rename", "move"],
             command: PaletteCommand::RenameBranch,
+        },
+        Action {
+            title: "Set upstream…",
+            icon: IconName::GitBranch,
+            keywords: &["branch", "upstream", "track", "remote"],
+            command: PaletteCommand::SetUpstream,
+        },
+        Action {
+            title: "Add remote…",
+            icon: IconName::Cloud,
+            keywords: &["remote", "add", "origin", "url"],
+            command: PaletteCommand::AddRemote,
         },
         Action {
             title: "Stash changes…",
@@ -429,7 +443,9 @@ impl Palette {
             PaletteCommand::CommitChanges if context.changed.is_empty() => {
                 Some("nothing to commit")
             }
-            PaletteCommand::RewordLast | PaletteCommand::RenameBranch
+            PaletteCommand::RewordLast
+            | PaletteCommand::RenameBranch
+            | PaletteCommand::SetUpstream
                 if context.branch.is_none() =>
             {
                 Some("no branch checked out")
@@ -471,7 +487,9 @@ impl Palette {
                 })
             }),
             PaletteCommand::RewordLast => self.context.head.map(short),
-            PaletteCommand::RenameBranch => self.context.branch.clone(),
+            PaletteCommand::RenameBranch | PaletteCommand::SetUpstream => {
+                self.context.branch.clone()
+            }
             PaletteCommand::Undo => self.context.undo.clone(),
             PaletteCommand::Redo => self.context.redo.clone(),
             PaletteCommand::CommitChanges if !self.context.changed.is_empty() => Some(count(
