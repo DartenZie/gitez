@@ -18,6 +18,7 @@ gpui-kit.workspace = true
 gitez-git.workspace = true
 gitez-command.workspace = true
 gitez-review.workspace = true
+gitez-agent.workspace = true
 anyhow.workspace = true
 futures.workspace = true
 

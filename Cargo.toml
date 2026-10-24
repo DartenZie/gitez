@@ -39,6 +39,7 @@ serde_json = "1"
 gitez-git = { path = "crates/gitez-git" }
 gitez-command = { path = "crates/gitez-command" }
 gitez-review = { path = "crates/gitez-review" }
+gitez-agent = { path = "crates/gitez-agent" }
 
 [workspace.lints.rust]
 unsafe_code = "warn"

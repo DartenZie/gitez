@@ -2045,11 +2045,21 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures",
+ "gitez-agent",
  "gitez-command",
  "gitez-git",
  "gitez-review",
  "gpui-kit",
  "tempfile",
+]
+
+[[package]]
+name = "gitez-agent"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

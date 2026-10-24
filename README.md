@@ -49,8 +49,15 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 > click **+** (or drag from it across several lines) to comment; threads
 > show under their lines, with replies, Resolve and whether they go into
 > the agent prompt. A thread whose lines change in a new commit on the
-> branch resolves itself. The agent prompt panel comes next. Nothing else
-> can be changed from GitEZ yet.
+> branch resolves itself. The agent prompt panel beside the diff shows
+> the prompt built from the included threads, with the agent, a template
+> (fix the comments, or explain without changing anything) and whether to
+> quote code and run tests. **Copy** puts it on the clipboard; **Send to
+> Claude Code** runs `claude` headless in the working tree, with all
+> permissions, and streams what it does into the panel (it needs the
+> branch checked out, which **Checkout branch** does). Each run's
+> transcript is kept, and the last one shows when you come back. Nothing
+> else can be changed from GitEZ yet.
 
 ## Technology
 
@@ -65,6 +72,11 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 Performance is a primary goal: large repositories must stay smooth.
 
 ## Requirements
+
+To send prompts to an agent, install
+[Claude Code](https://docs.claude.com/en/docs/claude-code). GitEZ looks for
+`claude` on the `PATH` and in the places its installers use, such as
+`~/.local/bin`.
 
 ### macOS
 
@@ -144,14 +156,16 @@ crates/gitez-git/   read-only repository access on gitoxide: refs, history, grap
                     commit messages, changed files and diffs, working-tree status,
                     watching for changes
 crates/gitez-command/ changes made by running the user's git binary: staging,
-                    unstaging files or hunks, committing, amending
+                    unstaging files or hunks, committing, amending, switching branches
 crates/gitez-review/ local pull requests, their comment threads and agent run
                     transcripts, stored in .git/gitez/reviews
+crates/gitez-agent/ coding agents a review prompt is sent to: Claude Code run as
+                    `claude -p` with its streamed events parsed
 rust-toolchain.toml pinned Rust toolchain
 CLAUDE.md           instructions for Claude Code when working in this repository
 ```
 
-More crates (agent integration, UI components) will be added
+More crates (UI components) will be added
 under `crates/` as the application grows.
 
 To time reading refs, history, commit details and the working-tree status on a

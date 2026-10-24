@@ -14,11 +14,15 @@ icon_assets!(
     [
         Archive,
         ArrowRight,
+        Bot,
         Cloud,
+        Copy,
         GitBranch,
         GitGraph,
         GitPullRequestArrow,
-        ListTree
+        ListTree,
+        Square,
+        Terminal
     ]
 );
 

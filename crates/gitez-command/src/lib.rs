@@ -79,6 +79,12 @@ impl Git {
             .map(drop)
     }
 
+    /// Checks out the local branch `branch`, like `git switch`. Fails, with
+    /// git's explanation, when uncommitted changes would be overwritten.
+    pub fn switch(&self, branch: &str) -> Result<()> {
+        self.run(["switch", "--quiet", branch], None).map(drop)
+    }
+
     /// Replaces the last commit with one that has `message` and also the
     /// staged changes, like `git commit --amend`.
     pub fn amend(&self, message: &str) -> Result<()> {

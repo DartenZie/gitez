@@ -170,3 +170,26 @@ fn applies_a_patch_to_the_index_and_takes_it_back() {
         .expect_err("the hunk is not staged any more");
     assert!(matches!(error, Error::Failed { .. }), "{error:?}");
 }
+
+#[test]
+fn switches_to_a_branch_unless_changes_would_be_lost() {
+    let dir = repository();
+    let root = dir.path();
+    std::fs::write(root.join("a.txt"), "main\n").expect("write");
+    git(root, &["add", "a.txt"]);
+    git(root, &["commit", "--quiet", "-m", "main"]);
+    git(root, &["switch", "--quiet", "-c", "feature"]);
+    std::fs::write(root.join("a.txt"), "feature\n").expect("write");
+    git(root, &["commit", "--quiet", "-am", "feature"]);
+    git(root, &["switch", "--quiet", "main"]);
+
+    let repo = Git::new(root);
+    repo.switch("feature").expect("switch");
+    assert_eq!(git(root, &["branch", "--show-current"]), "feature");
+
+    // An edit that the other branch's version would overwrite.
+    std::fs::write(root.join("a.txt"), "edited\n").expect("write");
+    let error = repo.switch("main").expect_err("changes would be lost");
+    assert!(matches!(error, Error::Failed { .. }), "{error}");
+    assert_eq!(git(root, &["branch", "--show-current"]), "feature");
+}

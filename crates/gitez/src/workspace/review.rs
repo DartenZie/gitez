@@ -20,10 +20,12 @@ use gpui_kit::component::button::*;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::kbd::Kbd;
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+mod prompt;
 mod threads;
 
 use super::labels;
@@ -57,6 +59,8 @@ pub enum ReviewEvent {
     Committed { everything: bool },
     /// The local pull request was saved.
     PullRequestSaved,
+    /// Another branch was checked out.
+    CheckedOut,
 }
 
 /// Height of one diff line.
@@ -320,6 +324,9 @@ struct CommitSubject {
 pub struct Tips {
     pub head: Option<Oid>,
     pub base: Option<Oid>,
+    /// Whether the head branch is checked out, so an agent's commits land
+    /// on it.
+    pub checked_out: bool,
 }
 
 struct PullRequestSubject {
@@ -334,6 +341,9 @@ struct PullRequestSubject {
     /// Why the last save failed.
     save_error: Option<SharedString>,
     comments: threads::Comments,
+    panel: prompt::PromptPanel,
+    /// Checking out the head branch.
+    checking_out: Option<Task<()>>,
 }
 
 pub struct Review {
@@ -449,9 +459,11 @@ impl Review {
         pull_request: PullRequest,
         tips: Tips,
         user_name: Option<String>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let load = Self::load_pull_request(repository, &store, pull_request.number, tips, cx);
+        let panel = prompt::PromptPanel::new(&pull_request.prompt, window, cx);
         let subject = Subject::PullRequest(Box::new(PullRequestSubject {
             store,
             pull_request,
@@ -463,8 +475,12 @@ impl Review {
                 user_name,
                 ..Default::default()
             },
+            panel,
+            checking_out: None,
         }));
-        Self::with_subject(repository, subject, load, cx)
+        let mut review = Self::with_subject(repository, subject, load, cx);
+        review.find_run(cx);
+        review
     }
 
     /// Reads pull request `number` and its diff in the background.
@@ -531,6 +547,43 @@ impl Review {
         let number = subject.pull_request.number;
         let store = subject.store.clone();
         self._load = Self::load_pull_request(&self.repository, &store, number, tips, cx);
+    }
+
+    /// Checks out the pull request's head branch, so an agent works on it.
+    fn checkout_head(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dir) = self.repository.work_dir() else {
+            return;
+        };
+        let Subject::PullRequest(subject) = &mut self.subject else {
+            return;
+        };
+        if subject.checking_out.is_some() {
+            return;
+        }
+        let git = Git::new(dir);
+        let branch = subject.pull_request.head.branch.clone();
+        subject.checking_out = Some(cx.spawn_in(window, async move |this, cx| {
+            let switched = cx
+                .background_executor()
+                .spawn(async move { git.switch(&branch) })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                if let Subject::PullRequest(subject) = &mut this.subject {
+                    subject.checking_out = None;
+                }
+                match switched {
+                    Ok(()) => cx.emit(ReviewEvent::CheckedOut),
+                    Err(error) => window.push_notification(
+                        Notification::error(format!("{:#}", anyhow::Error::from(error)))
+                            .title("Could not check out the branch"),
+                        cx,
+                    ),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 
     /// The number of the local pull request reviewed, if one is.
@@ -1849,7 +1902,7 @@ impl Review {
         subject: &PullRequestSubject,
         totals: Option<(usize, usize, usize)>,
         mono: SharedString,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let pull_request = &subject.pull_request;
         let branch = |name: &str| {
@@ -1909,8 +1962,20 @@ impl Review {
                     .child(
                         Button::new("pull-request-checkout")
                             .h(px(30.))
-                            .label("Checkout branch")
-                            .disabled(true),
+                            .label(if subject.tips.checked_out {
+                                "Checked out"
+                            } else {
+                                "Checkout branch"
+                            })
+                            .loading(subject.checking_out.is_some())
+                            .disabled(
+                                subject.tips.checked_out
+                                    || subject.tips.head.is_none()
+                                    || self.repository.work_dir().is_none(),
+                            )
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.checkout_head(window, cx)),
+                            ),
                     )
                     .child(
                         Button::new("pull-request-merge")
@@ -2198,7 +2263,8 @@ impl Render for Review {
                                 .flex_1()
                                 .min_w_0()
                                 .h_full(),
-                            ),
+                            )
+                            .children(self.render_prompt_panel(cx)),
                     )
                     .into_any_element()
             }

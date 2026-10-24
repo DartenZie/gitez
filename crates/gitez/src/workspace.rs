@@ -468,6 +468,11 @@ impl Workspace {
                     this.refresh_status(window, cx);
                     return;
                 }
+                ReviewEvent::CheckedOut => {
+                    this.reload(window, cx);
+                    this.refresh_status(window, cx);
+                    return;
+                }
                 ReviewEvent::Committed { everything } => {
                     // The watcher would notice too, but later.
                     this.reload(window, cx);
@@ -511,8 +516,17 @@ impl Workspace {
         let (repository, store) = (snapshot.repository.clone(), snapshot.reviews.clone());
         let pull_request = pull_request.clone();
         let user_name = snapshot.user_name.clone();
-        let review = cx
-            .new(|cx| Review::pull_request(&repository, store, pull_request, tips, user_name, cx));
+        let review = cx.new(|cx| {
+            Review::pull_request(
+                &repository,
+                store,
+                pull_request,
+                tips,
+                user_name,
+                window,
+                cx,
+            )
+        });
         self.show_review(review, None, window, cx);
     }
 
@@ -837,6 +851,11 @@ fn tips_of(snapshot: &Snapshot, number: u32) -> Option<Tips> {
     Some(Tips {
         head: snapshot.branch_tip(&pull_request.head.branch),
         base: snapshot.branch_tip(&pull_request.base.branch),
+        checked_out: snapshot
+            .refs
+            .branches
+            .iter()
+            .any(|branch| branch.is_head && branch.name == pull_request.head.branch),
     })
 }
 

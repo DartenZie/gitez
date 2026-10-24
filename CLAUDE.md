@@ -71,7 +71,10 @@ Decided 2026-10-23; change only with the owner's agreement.
   Claude Code" spawns the `claude` CLI in print mode (`claude -p`, streaming
   JSON output) in the repository's working directory and shows the streamed
   output in a panel. "Copy" puts the same prompt on the clipboard. Keep the
-  agent behind a trait so other agents can be added later.
+  agent behind a trait so other agents can be added later. It runs with
+  `--permission-mode bypassPermissions` (decided 2026-10-24), since a
+  headless run cannot ask for permission; it starts only when the pull
+  request's head branch is checked out.
 - **Review storage** (decided 2026-10-24). Local pull requests live in
   `<git common dir>/gitez/reviews/`, so linked worktrees share them and
   nothing reaches the working tree, a commit or a push. The `gitez-review`

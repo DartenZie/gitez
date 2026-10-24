@@ -44,6 +44,10 @@ pub mod color {
     pub const BRANCH_VIOLET: u32 = 0xc0_8c_f0;
     pub const BRANCH_TEAL: u32 = 0x4f_c6_b0;
 
+    /// The agent prompt panel: a comment in it, and the prompt text.
+    pub const PROMPT_COMMENT: u32 = 0x18_18_1b;
+    pub const PROMPT: u32 = 0x0f_0f_11;
+
     /// A review thread under the lines it comments on.
     pub const THREAD: u32 = 0x1a1916;
     pub const THREAD_BORDER: u32 = 0x33_30_2a;
