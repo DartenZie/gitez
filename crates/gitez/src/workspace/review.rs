@@ -3,6 +3,8 @@
 //! `Commit.dc.html` artboard. The uncommitted changes can be staged and
 //! committed from here.
 
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::sync::Arc;
 
 use gitez_command::Git;
@@ -173,6 +175,9 @@ pub struct Review {
     list: ListState,
     /// The file at the top of the list.
     current_file: usize,
+    /// The files marked viewed, by path, with the [`fingerprint`] of their
+    /// diff then: a file that changes since counts as not viewed again.
+    viewed: HashMap<String, u64>,
     _load: Task<()>,
 }
 
@@ -269,6 +274,7 @@ impl Review {
             file_rows: Vec::new(),
             list,
             current_file: 0,
+            viewed: HashMap::new(),
             _load: load,
         }
     }
@@ -326,28 +332,8 @@ impl Review {
                     return;
                 }
                 let anchor = self.scroll_anchor();
-                (self.rows, self.file_rows) = rows(&files);
-                self.list.reset(self.rows.len());
-                if let Some((path, row, offset_in_item)) = anchor
-                    && let Some(file) = files.iter().position(|file| file.path == path)
-                {
-                    // The same row of the same file, or the file's last row
-                    // if it got shorter.
-                    let end = self
-                        .file_rows
-                        .get(file + 1)
-                        .copied()
-                        .unwrap_or(self.rows.len());
-                    let item_ix = (self.file_rows[file] + row).min(end.saturating_sub(1));
-                    self.list.scroll_to(ListOffset {
-                        item_ix,
-                        offset_in_item,
-                    });
-                    self.current_file = file;
-                } else {
-                    self.current_file = 0;
-                }
                 self.files = Some(Ok(Arc::new(files)));
+                self.rebuild_rows(anchor);
             }
             Err(error) => {
                 self.files = Some(Err(format!(
@@ -357,6 +343,68 @@ impl Review {
                 .into()));
             }
         }
+        cx.notify();
+    }
+
+    /// Lays out the rows of the files again, then scrolls back to `anchor`,
+    /// from [`Self::scroll_anchor`] before the change.
+    fn rebuild_rows(&mut self, anchor: Option<(String, usize, Pixels)>) {
+        let Some(Ok(files)) = &self.files else {
+            return;
+        };
+        let files = files.clone();
+        (self.rows, self.file_rows) = rows(&files, |file| self.is_viewed(file));
+        self.list.reset(self.rows.len());
+        if let Some((path, row, offset_in_item)) = anchor
+            && let Some(file) = files.iter().position(|file| file.path == path)
+        {
+            // The same row of the same file, or the file's last row if it
+            // got shorter.
+            let end = self
+                .file_rows
+                .get(file + 1)
+                .copied()
+                .unwrap_or(self.rows.len());
+            let item_ix = (self.file_rows[file] + row).min(end.saturating_sub(1));
+            self.list.scroll_to(ListOffset {
+                item_ix,
+                offset_in_item,
+            });
+            self.current_file = file;
+        } else {
+            self.current_file = 0;
+        }
+    }
+
+    /// Whether `file` is marked viewed and has not changed since.
+    fn is_viewed(&self, file: &FileDiff) -> bool {
+        self.viewed.get(&file.path) == Some(&fingerprint(file))
+    }
+
+    /// Marks the file at `index` viewed, which collapses it, or not viewed.
+    fn set_viewed(&mut self, index: usize, viewed: bool, cx: &mut Context<Self>) {
+        let Some(Ok(files)) = &self.files else {
+            return;
+        };
+        let Some(file) = files.get(index) else {
+            return;
+        };
+        let (file_path, file_print) = (file.path.clone(), fingerprint(file));
+        let mut anchor = self.scroll_anchor();
+        if viewed {
+            self.viewed.insert(file_path.clone(), file_print);
+        } else {
+            self.viewed.remove(&file_path);
+        }
+        if let Some((path, row, offset)) = &mut anchor
+            && *path == file_path
+        {
+            // Scrolled into the file being collapsed: keep its header in
+            // view, with the next file below it.
+            *row = 0;
+            *offset = px(0.);
+        }
+        self.rebuild_rows(anchor);
         cx.notify();
     }
 
@@ -593,7 +641,6 @@ impl Review {
         div()
             .h_flex()
             .flex_none()
-            .ml_auto()
             .gap(px(4.))
             .when(status.staged.is_some(), |this| {
                 this.child(
@@ -850,10 +897,26 @@ impl Review {
             Some(Row::File(index)) => {
                 let file = &files[index];
                 let status = self.file_status(&file.path);
-                file_header(file, status, mono)
-                    .when_some(status, |this, status| {
-                        this.child(self.staging_buttons(index, status, cx))
-                    })
+                let viewed = self.is_viewed(file);
+                file_header(file, status, viewed, mono)
+                    .child(
+                        div()
+                            .h_flex()
+                            .flex_none()
+                            .ml_auto()
+                            .gap(px(10.))
+                            .when_some(status, |this, status| {
+                                this.child(self.staging_buttons(index, status, cx))
+                            })
+                            .child(
+                                Checkbox::new(("viewed", index))
+                                    .label("Viewed")
+                                    .checked(viewed)
+                                    .on_click(cx.listener(move |this, checked: &bool, _, cx| {
+                                        this.set_viewed(index, *checked, cx)
+                                    })),
+                            ),
+                    )
                     .into_any_element()
             }
             Some(Row::Hunk(file, hunk)) => {
@@ -891,6 +954,9 @@ impl Review {
                 .text_color(rgb(color::TEXT_MUTED))
                 .child(notice(&files[file]))
                 .into_any_element(),
+            Some(Row::FileEnd(file)) if self.is_viewed(&files[file]) => {
+                div().h(CARD_GAP).into_any_element()
+            }
             Some(Row::FileEnd(_)) => div()
                 .v_flex()
                 .w_full()
@@ -1111,6 +1177,44 @@ impl Review {
         }
     }
 
+    /// The strip above the diff: how many files are marked viewed.
+    fn render_toolbar(&self, files: &[FileDiff]) -> impl IntoElement {
+        let viewed = files.iter().filter(|file| self.is_viewed(file)).count();
+        let total = files.len();
+        div()
+            .h_flex()
+            .flex_none()
+            .gap(px(10.))
+            .px(px(24.))
+            .py(px(10.))
+            .bg(rgb(color::DIFF_CARD))
+            .border_b_1()
+            .border_color(rgb(color::BORDER))
+            .text_size(px(12.5))
+            .child(
+                div()
+                    .h_flex()
+                    .ml_auto()
+                    .gap(px(10.))
+                    .child(muted("Viewed"))
+                    .child(
+                        div()
+                            .w(px(120.))
+                            .h(px(6.))
+                            .rounded(px(3.))
+                            .bg(rgb(color::BORDER))
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(relative(viewed as f32 / total.max(1) as f32))
+                                    .bg(rgb(color::DIFF_ADDED)),
+                            ),
+                    )
+                    .child(format!("{viewed} of {total}")),
+            )
+    }
+
     /// The changed files by directory; clicking one scrolls to it.
     fn render_files(&self, files: &[FileDiff], cx: &mut Context<Self>) -> impl IntoElement {
         let mut items: Vec<AnyElement> = Vec::new();
@@ -1137,6 +1241,7 @@ impl Review {
             }
             let (letter, letter_color) = labels::change_letter(&file.kind);
             let active = index == self.current_file;
+            let viewed = self.is_viewed(file);
             items.push(
                 div()
                     .id(("review-file", index))
@@ -1151,6 +1256,10 @@ impl Review {
                         if active {
                             this.bg(rgb(color::FILE_ACTIVE))
                                 .text_color(rgb(color::TEXT))
+                        } else if viewed {
+                            this.text_color(rgb(color::TEXT_FAINT)).hover(|style| {
+                                style.bg(rgb(color::NAV_HOVER)).text_color(rgb(color::TEXT))
+                            })
                         } else {
                             this.text_color(rgb(color::TEXT_SECONDARY)).hover(|style| {
                                 style.bg(rgb(color::NAV_HOVER)).text_color(rgb(color::TEXT))
@@ -1172,8 +1281,16 @@ impl Review {
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_ellipsis()
+                            .when(viewed, |this| this.line_through())
                             .child(name.to_owned()),
                     )
+                    .when(viewed, |this| {
+                        this.child(
+                            Icon::new(IconName::Check)
+                                .size(px(13.))
+                                .text_color(rgb(color::DIFF_ADDED)),
+                        )
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| this.scroll_to_file(index, cx)))
                     .into_any_element(),
             );
@@ -1230,22 +1347,31 @@ impl Render for Review {
             Some(Ok(files)) => {
                 let files = files.clone();
                 div()
-                    .h_flex()
-                    .items_start()
+                    .v_flex()
                     .flex_1()
                     .min_h_0()
-                    .gap(px(20.))
-                    .pt(px(20.))
-                    .px(px(24.))
-                    .child(self.render_files(&files, cx))
+                    .child(self.render_toolbar(&files))
                     .child(
-                        list(
-                            self.list.clone(),
-                            cx.processor(|this, index, _window, cx| this.render_row(index, cx)),
-                        )
-                        .flex_1()
-                        .min_w_0()
-                        .h_full(),
+                        div()
+                            .h_flex()
+                            .items_start()
+                            .flex_1()
+                            .min_h_0()
+                            .gap(px(20.))
+                            .pt(px(20.))
+                            .px(px(24.))
+                            .child(self.render_files(&files, cx))
+                            .child(
+                                list(
+                                    self.list.clone(),
+                                    cx.processor(|this, index, _window, cx| {
+                                        this.render_row(index, cx)
+                                    }),
+                                )
+                                .flex_1()
+                                .min_w_0()
+                                .h_full(),
+                            ),
                     )
                     .into_any_element()
             }
@@ -1267,13 +1393,15 @@ impl Render for Review {
 }
 
 /// The rows of the diff list for `files`, and the row of each file's header.
-fn rows(files: &[FileDiff]) -> (Vec<Row>, Vec<usize>) {
+/// A file that is `viewed` shows only its header.
+fn rows(files: &[FileDiff], viewed: impl Fn(&FileDiff) -> bool) -> (Vec<Row>, Vec<usize>) {
     let mut rows = Vec::new();
     let mut file_rows = Vec::with_capacity(files.len());
     for (file, diff) in files.iter().enumerate() {
         file_rows.push(rows.len());
         rows.push(Row::File(file));
         match &diff.content {
+            _ if viewed(diff) => {}
             DiffContent::Text(hunks) => {
                 for (hunk_index, hunk) in hunks.iter().enumerate() {
                     rows.push(Row::Hunk(file, hunk_index));
@@ -1290,6 +1418,31 @@ fn rows(files: &[FileDiff]) -> (Vec<Row>, Vec<usize>) {
     }
     rows.push(Row::End);
     (rows, file_rows)
+}
+
+/// What a file's diff looks like, to tell whether it changed since it was
+/// marked viewed. Where the lines are and whether they are staged is left
+/// out, so staging a hunk does not count as a change.
+fn fingerprint(file: &FileDiff) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    match &file.content {
+        DiffContent::Text(hunks) => {
+            // Hunks hashed apart and summed, as staging reorders them.
+            let sum = hunks.iter().fold(0_u64, |sum, hunk| {
+                let mut hunk_hasher = DefaultHasher::new();
+                for line in &hunk.lines {
+                    (line.kind as u8, &line.text, line.crlf, line.no_newline)
+                        .hash(&mut hunk_hasher);
+                }
+                sum.wrapping_add(hunk_hasher.finish())
+            });
+            (0_u8, sum).hash(&mut hasher);
+        }
+        DiffContent::TooLarge(counts) => (1_u8, counts.added, counts.removed).hash(&mut hasher),
+        DiffContent::Binary => 2_u8.hash(&mut hasher),
+        DiffContent::Unchanged => 3_u8.hash(&mut hasher),
+    }
+    hasher.finish()
 }
 
 /// Files, lines added and lines removed.
@@ -1316,8 +1469,14 @@ fn card_row() -> Div {
 }
 
 /// The top of a file's card: path, what happened to it, how much of it is
-/// staged (for uncommitted changes) and line counts.
-fn file_header(file: &FileDiff, status: Option<&FileStatus>, mono: SharedString) -> Div {
+/// staged (for uncommitted changes) and line counts. A file marked `viewed`
+/// is collapsed to this header.
+fn file_header(
+    file: &FileDiff,
+    status: Option<&FileStatus>,
+    viewed: bool,
+    mono: SharedString,
+) -> Div {
     let (directory, name) = split_path(&file.path);
     let untracked = status.is_some_and(|status| status.unstaged == Some(WorktreeChange::Untracked));
     let kind = match &file.kind {
@@ -1346,8 +1505,16 @@ fn file_header(file: &FileDiff, status: Option<&FileStatus>, mono: SharedString)
         .bg(rgb(color::DIFF_FILE_HEADER))
         .border_1()
         .border_color(rgb(color::DIFF_CARD_BORDER))
-        .rounded_t(px(8.))
         .text_size(px(12.5))
+        .map(|this| {
+            if viewed {
+                this.rounded(px(8.))
+                    .text_color(rgb(color::TEXT_MUTED))
+                    .child(Icon::new(IconName::ChevronRight).size(px(12.)))
+            } else {
+                this.rounded_t(px(8.))
+            }
+        })
         .child(
             div()
                 .h_flex()
@@ -1398,6 +1565,17 @@ fn file_header(file: &FileDiff, status: Option<&FileStatus>, mono: SharedString)
                                 .child(format!("−{}", counts.removed)),
                         )
                     }),
+            )
+        })
+        .when(viewed, |this| {
+            this.child(
+                div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_size(px(12.))
+                    .child("Collapsed because you marked it viewed"),
             )
         })
 }
@@ -1547,4 +1725,108 @@ fn message(text: impl Into<SharedString>) -> impl IntoElement {
         .p(px(24.))
         .text_color(rgb(color::TEXT_MUTED))
         .child(text.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use gitez_git::{ChangeKind, DiffContent, DiffLine, FileDiff, Hunk, LineKind, Staging};
+
+    use super::{fingerprint, rows};
+
+    fn line(kind: LineKind, text: &str) -> DiffLine {
+        DiffLine {
+            kind,
+            old: None,
+            new: None,
+            text: text.to_owned(),
+            crlf: false,
+            no_newline: false,
+        }
+    }
+
+    fn hunk(start: u32, staging: Staging, lines: Vec<DiffLine>) -> Hunk {
+        Hunk {
+            old_start: start,
+            old_len: 1,
+            new_start: start,
+            new_len: 1,
+            lines,
+            staging: Some(staging),
+            patchable: true,
+        }
+    }
+
+    fn file(path: &str, hunks: Vec<Hunk>) -> FileDiff {
+        FileDiff {
+            path: path.to_owned(),
+            kind: ChangeKind::Modified,
+            content: DiffContent::Text(hunks),
+        }
+    }
+
+    #[test]
+    fn staging_a_hunk_keeps_a_file_viewed_but_editing_it_does_not() {
+        let first = || vec![line(LineKind::Removed, "a"), line(LineKind::Added, "b")];
+        let second = || vec![line(LineKind::Added, "z")];
+        let unstaged = file(
+            "f",
+            vec![
+                hunk(1, Staging::Unstaged, first()),
+                hunk(9, Staging::Unstaged, second()),
+            ],
+        );
+        // The second hunk staged: it moves first, as a staged hunk.
+        let partly_staged = file(
+            "f",
+            vec![
+                hunk(8, Staging::Staged, second()),
+                hunk(1, Staging::Unstaged, first()),
+            ],
+        );
+        assert_eq!(fingerprint(&unstaged), fingerprint(&partly_staged));
+
+        let edited = file(
+            "f",
+            vec![
+                hunk(1, Staging::Unstaged, first()),
+                hunk(9, Staging::Unstaged, vec![line(LineKind::Added, "y")]),
+            ],
+        );
+        assert_ne!(fingerprint(&unstaged), fingerprint(&edited));
+
+        let mut crlf = unstaged.clone();
+        if let DiffContent::Text(hunks) = &mut crlf.content {
+            hunks[1].lines[0].crlf = true;
+        }
+        assert_ne!(fingerprint(&unstaged), fingerprint(&crlf));
+    }
+
+    #[test]
+    fn a_viewed_file_shows_only_its_header() {
+        let files = [
+            file(
+                "a",
+                vec![hunk(1, Staging::Unstaged, vec![line(LineKind::Added, "x")])],
+            ),
+            file(
+                "b",
+                vec![hunk(1, Staging::Unstaged, vec![line(LineKind::Added, "y")])],
+            ),
+        ];
+        let (rows, file_rows) = rows(&files, |file| file.path == "a");
+        let rows: Vec<String> = rows.iter().map(|row| format!("{row:?}")).collect();
+        assert_eq!(
+            rows,
+            [
+                "File(0)",
+                "FileEnd(0)",
+                "File(1)",
+                "Hunk(1, 0)",
+                "Line(1, 0, 0)",
+                "FileEnd(1)",
+                "End"
+            ]
+        );
+        assert_eq!(file_rows, [0, 2]);
+    }
 }
