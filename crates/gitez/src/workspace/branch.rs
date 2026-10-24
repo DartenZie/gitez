@@ -317,7 +317,7 @@ impl Workspace {
             return;
         };
         let name = branch.clone();
-        self.run_branch_command(
+        self.run_git(
             move |git| git.delete_branch(&name, force),
             move |this, result, window, cx| match result {
                 Ok(()) => {
@@ -328,7 +328,7 @@ impl Workspace {
                         "Undo",
                         move |this, window, cx| {
                             let restore = restore.clone();
-                            this.run_branch_command(
+                            this.run_git(
                                 {
                                     let restore = restore.clone();
                                     move |git| git.create_branch(&restore, &tip.to_string(), false)
@@ -478,7 +478,7 @@ impl Workspace {
                 checkout,
             } => {
                 let branch = name.clone();
-                self.run_branch_command(
+                self.run_git(
                     move |git| git.create_branch(&branch, &start.to_string(), checkout),
                     move |_, result, window, cx| {
                         let notification = match result {
@@ -498,7 +498,7 @@ impl Workspace {
             }
             BranchRequest::Rename { from, to } => {
                 let (old, new) = (from.clone(), to.clone());
-                self.run_branch_command(
+                self.run_git(
                     move |git| git.rename_branch(&old, &new),
                     move |_, result, window, cx| {
                         let notification = match result {
@@ -518,7 +518,7 @@ impl Workspace {
 
     /// Runs `command` off the UI thread, then reads the repository again;
     /// `done` tells about the outcome.
-    pub(super) fn run_branch_command<T: Send + 'static>(
+    pub(super) fn run_git<T: Send + 'static>(
         &mut self,
         command: impl FnOnce(Git) -> gitez_command::Result<T> + Send + 'static,
         done: impl FnOnce(&mut Self, gitez_command::Result<T>, &mut Window, &mut Context<Self>)
@@ -532,10 +532,10 @@ impl Workspace {
         let run = cx
             .background_executor()
             .spawn(async move { command(Git::new(dir)) });
-        self.branch_command = Some(cx.spawn_in(window, async move |this, cx| {
+        self.git_command = Some(cx.spawn_in(window, async move |this, cx| {
             let result = run.await;
             this.update_in(cx, |this, window, cx| {
-                this.branch_command = None;
+                this.git_command = None;
                 done(this, result, window, cx);
                 this.reload(window, cx);
                 this.refresh_status(window, cx);

@@ -8,7 +8,9 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::remote::{RemoteActions, RemoteOp};
-use super::{Fetch, NewBranch, NewPullRequest, OpenPalette, OpenRepository, Pull, Push};
+use super::{
+    Fetch, NewBranch, NewPullRequest, OpenPalette, OpenRepository, Pull, Push, StashChanges,
+};
 use crate::theme::{self, color};
 
 /// Height of toolbar buttons in the design.
@@ -17,7 +19,7 @@ const BUTTON_HEIGHT: Pixels = px(30.);
 /// Repository switcher, undo and redo, remote operations, branch and stash,
 /// the command palette entry and "New local PR".
 ///
-/// Undo, redo and stash are disabled until their write paths exist.
+/// Undo and redo are disabled until their write paths exist.
 #[derive(IntoElement)]
 pub struct Toolbar {
     /// Name of the open repository.
@@ -30,6 +32,8 @@ pub struct Toolbar {
     pub running: Option<RemoteOp>,
     /// Whether there is a commit to start a branch from.
     pub can_branch: bool,
+    /// Whether there are uncommitted changes to stash.
+    pub can_stash: bool,
 }
 
 impl RenderOnce for Toolbar {
@@ -86,7 +90,21 @@ impl RenderOnce for Toolbar {
                                 window.dispatch_action(Box::new(NewBranch), cx)
                             }),
                     )
-                    .child(button("stash", IconName::Archive, "Stash")),
+                    .child(
+                        Button::new("stash")
+                            .h(BUTTON_HEIGHT)
+                            .icon(IconName::Archive)
+                            .label("Stash")
+                            .tooltip(if self.can_stash {
+                                "Put the uncommitted changes aside"
+                            } else {
+                                "There are no changes to stash"
+                            })
+                            .disabled(!self.can_stash)
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(StashChanges), cx)
+                            }),
+                    ),
             )
             .child(palette_entry())
             .child(
@@ -193,14 +211,6 @@ fn logo() -> impl IntoElement {
 
 fn separator() -> impl IntoElement {
     div().w(px(1.)).h(px(20.)).bg(rgb(color::SEPARATOR))
-}
-
-fn button(id: &'static str, icon: IconName, label: &'static str) -> Button {
-    Button::new(id)
-        .h(BUTTON_HEIGHT)
-        .icon(icon)
-        .label(label)
-        .disabled(true)
 }
 
 fn icon_button(id: &'static str, icon: IconName, label: &'static str) -> Button {

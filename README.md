@@ -121,7 +121,11 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 > branch from it, rename it or delete it. A branch whose commits are on
 > no other branch is deleted only after you confirm, and **Undo** brings
 > a deleted branch back. Branches of an open local pull request cannot be
-> renamed or deleted.
+> renamed or deleted. **Stash** puts your uncommitted changes aside, new
+> files too unless you untick that, with an optional message; right-click
+> a stash in the sidebar to pop it, apply it and keep it, or drop it
+> (**Undo** brings it back). A stash that conflicts with your files is
+> kept, with the conflicts marked in them.
 
 ## Technology
 

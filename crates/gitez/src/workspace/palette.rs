@@ -62,6 +62,8 @@ pub enum PaletteCommand {
     CherryPick,
     NewBranch,
     RenameBranch,
+    StashChanges,
+    PopStash,
     Fetch,
     Pull,
     Push,
@@ -94,6 +96,8 @@ pub struct PaletteContext {
     pub branches: Vec<String>,
     /// What fetch, pull and push would do.
     pub remote: Option<RemoteActions>,
+    /// Entries in the stash.
+    pub stashes: usize,
 }
 
 /// The kinds of item, one tab each.
@@ -215,6 +219,18 @@ fn actions() -> Vec<Action> {
             icon: IconName::Pencil,
             keywords: &["branch", "rename", "move"],
             command: PaletteCommand::RenameBranch,
+        },
+        Action {
+            title: "Stash changes…",
+            icon: IconName::Archive,
+            keywords: &["stash", "push", "save", "wip"],
+            command: PaletteCommand::StashChanges,
+        },
+        Action {
+            title: "Pop latest stash",
+            icon: IconName::Archive,
+            keywords: &["stash", "pop", "apply", "unstash"],
+            command: PaletteCommand::PopStash,
         },
         Action {
             title: "Fetch",
@@ -386,6 +402,8 @@ impl Palette {
                 Some("no branch checked out")
             }
             PaletteCommand::NewBranch if context.head.is_none() => Some("no commits yet"),
+            PaletteCommand::StashChanges if context.changed.is_empty() => Some("nothing to stash"),
+            PaletteCommand::PopStash if context.stashes == 0 => Some("no stashes"),
             PaletteCommand::ContinueRebase | PaletteCommand::AbortRebase if !context.rebasing => {
                 Some("no rebase in progress")
             }

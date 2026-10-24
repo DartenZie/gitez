@@ -359,6 +359,8 @@ fn reads_stashes_newest_first() {
         ]
     );
     assert_eq!(stashes[0].id, fx.rev("stash@{0}"));
+    assert_eq!(stashes[0].recorded, format!("WIP on main: {first} first"));
+    assert_eq!(stashes[1].recorded, "On main: Older change");
 }
 
 #[test]

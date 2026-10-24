@@ -42,6 +42,12 @@ pub enum SidebarEvent {
     NewBranchFrom(Oid),
     RenameBranch(String),
     DeleteBranch(String),
+    /// Bring stash `index` back, dropping it if `pop`.
+    Unstash {
+        index: usize,
+        pop: bool,
+    },
+    DropStash(usize),
 }
 
 pub struct Sidebar {
@@ -196,6 +202,11 @@ impl Render for Sidebar {
                     .iter()
                     .map(|pull_request| pull_request_row(pull_request, cx).into_any_element())
                     .collect::<Vec<_>>();
+                let stash_rows = refs
+                    .stashes
+                    .iter()
+                    .map(|stash| stash_row(stash, now, cx).into_any_element())
+                    .collect::<Vec<_>>();
                 let branch_rows = refs
                     .branches
                     .iter()
@@ -251,12 +262,7 @@ impl Render for Sidebar {
                     "Stashes",
                     refs.stashes.len(),
                     "No stashes",
-                    || {
-                        refs.stashes
-                            .iter()
-                            .map(|stash| stash_row(stash, now).into_any_element())
-                            .collect()
-                    },
+                    || stash_rows,
                     cx,
                 ))
             })
@@ -490,7 +496,8 @@ fn remote_row(remote: &str, branches: usize) -> impl IntoElement {
         .child(trailing(count))
 }
 
-fn stash_row(stash: &Stash, now: i64) -> impl IntoElement {
+/// A stash entry; right-click to pop, apply or drop it.
+fn stash_row(stash: &Stash, now: i64, cx: &mut Context<Sidebar>) -> impl IntoElement {
     let when = time::relative(stash.time, now);
     let detail = match &stash.branch {
         Some(branch) => format!("on {branch} · {when}"),
@@ -511,4 +518,27 @@ fn stash_row(stash: &Stash, now: i64) -> impl IntoElement {
                 .text_color(rgb(color::TEXT_FAINT))
                 .child(detail),
         )
+        .id(("stash", stash.index))
+        .context_menu({
+            let sidebar = cx.entity().downgrade();
+            let index = stash.index;
+            move |menu, _, _| {
+                let item = |label: &'static str, event: SidebarEvent| {
+                    let sidebar = sidebar.clone();
+                    let event = std::cell::RefCell::new(Some(event));
+                    PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                        if let Some(event) = event.borrow_mut().take() {
+                            sidebar.update(cx, |_, cx| cx.emit(event)).ok();
+                        }
+                    })
+                };
+                menu.item(item("Pop", SidebarEvent::Unstash { index, pop: true }))
+                    .item(item(
+                        "Apply and keep",
+                        SidebarEvent::Unstash { index, pop: false },
+                    ))
+                    .separator()
+                    .item(item("Drop", SidebarEvent::DropStash(index)))
+            }
+        })
 }

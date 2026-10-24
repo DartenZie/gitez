@@ -1,7 +1,9 @@
 use std::path::Path;
 use std::process::Command;
 
-use gitez_command::{Error, Git, PullMethod, PullOutcome, PushRejection, not_merged};
+use gitez_command::{
+    Error, Git, PullMethod, PullOutcome, PushRejection, UnstashOutcome, not_merged,
+};
 
 /// `git <args>` in `dir`, returning its trimmed output.
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -777,4 +779,57 @@ fn creates_renames_and_deletes_branches() {
     git_.create_branch("done", "chores", false).expect("create");
     git_.delete_branch("done", false).expect("merged");
     assert!(git_.delete_branch("chores", true).is_err(), "checked out");
+}
+
+#[test]
+fn stashes_applies_pops_drops_and_restores() {
+    let dir = repository();
+    let root = dir.path();
+    let git_ = Git::new(root);
+    std::fs::write(root.join("a.txt"), "a\n").expect("write");
+    git(root, &["add", "a.txt"]);
+    git(root, &["commit", "--quiet", "-m", "a"]);
+    assert!(!git_.stash(None, true).expect("nothing to stash"));
+
+    std::fs::write(root.join("a.txt"), "a\nb\n").expect("write");
+    std::fs::write(root.join("new.txt"), "new\n").expect("write");
+    assert!(git_.stash(Some("Half-done parser"), false).expect("stash"));
+    // Untracked files stay without `untracked`.
+    assert_eq!(status(root), "?? new.txt");
+    assert!(git_.stash(None, true).expect("stash untracked"));
+    assert_eq!(status(root), "");
+    let list = git(root, &["stash", "list", "--format=%gs"]);
+    assert!(list.ends_with("On main: Half-done parser"), "{list}");
+
+    // stash@{1} is the parser change; apply keeps it, pop drops it.
+    assert_eq!(
+        git_.unstash(1, false).expect("apply"),
+        UnstashOutcome::Applied
+    );
+    assert_eq!(status(root), "M a.txt");
+    assert_eq!(git(root, &["stash", "list"]).lines().count(), 2);
+    git(root, &["checkout", "--", "a.txt"]);
+    assert_eq!(git_.unstash(1, true).expect("pop"), UnstashOutcome::Applied);
+    assert_eq!(git(root, &["stash", "list"]).lines().count(), 1);
+
+    // A change to the same line conflicts; the stash stays.
+    git(root, &["commit", "--quiet", "-am", "b"]);
+    git(root, &["stash", "pop", "--quiet"]);
+    std::fs::write(root.join("a.txt"), "a\nours\n").expect("write");
+    assert!(git_.stash(None, false).expect("stash ours"));
+    std::fs::write(root.join("a.txt"), "a\ntheirs\n").expect("write");
+    git(root, &["commit", "--quiet", "-am", "theirs"]);
+    assert_eq!(
+        git_.unstash(0, true).expect("pop"),
+        UnstashOutcome::Conflicts
+    );
+    assert_eq!(git(root, &["stash", "list"]).lines().count(), 1);
+    git(root, &["reset", "--quiet", "--hard"]);
+
+    let id = git(root, &["rev-parse", "stash@{0}"]);
+    git_.drop_stash(0).expect("drop");
+    assert!(git(root, &["stash", "list"]).is_empty());
+    git_.restore_stash(&id, "Brought back").expect("restore");
+    assert_eq!(git(root, &["rev-parse", "stash@{0}"]), id);
+    assert!(git_.drop_stash(5).is_err());
 }

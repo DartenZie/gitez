@@ -75,6 +75,8 @@ pub struct Stash {
     pub branch: Option<String>,
     /// The stash message without git's `On <branch>:` prefix.
     pub message: String,
+    /// The whole message, as git recorded it and `git stash list` shows.
+    pub recorded: String,
     pub time: Timestamp,
 }
 
@@ -274,6 +276,7 @@ fn read_stashes(repo: &gix::Repository) -> Result<Vec<Stash>> {
             id: line.new_oid,
             branch,
             message,
+            recorded: line.message.to_str_lossy().into_owned(),
             time: line.signature.time.into(),
         });
     }

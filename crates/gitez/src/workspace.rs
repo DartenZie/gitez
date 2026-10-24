@@ -14,6 +14,7 @@ mod remote;
 mod review;
 mod rewrite;
 mod sidebar;
+mod stash;
 mod status_bar;
 mod toolbar;
 
@@ -55,6 +56,7 @@ use review::{
 };
 use rewrite::{Rewrite, RewriteEvent};
 use sidebar::{Sidebar, SidebarEvent};
+use stash::StashForm;
 
 actions!(
     workspace,
@@ -66,7 +68,8 @@ actions!(
         Fetch,
         Pull,
         Push,
-        NewBranch
+        NewBranch,
+        StashChanges
     ]
 );
 
@@ -124,8 +127,10 @@ pub struct Workspace {
     rewrite_command: Option<Task<()>>,
     /// The form creating or renaming a branch, while its dialog is open.
     branch_form: Option<(Entity<BranchForm>, Subscription)>,
-    /// Creating, renaming or deleting a branch.
-    branch_command: Option<Task<()>>,
+    /// The "Stash changes" form, while its dialog is open.
+    stash_form: Option<(Entity<StashForm>, Subscription)>,
+    /// Changing a branch or a stash.
+    git_command: Option<Task<()>>,
     /// The fetch, pull or push running, if one is.
     remote_op: Option<(RemoteOp, Task<()>)>,
     /// The command palette of the open repository, kept while hidden so a
@@ -169,6 +174,8 @@ impl Workspace {
                 SidebarEvent::DeleteBranch(branch) => {
                     this.delete_branch(branch.clone(), false, window, cx)
                 }
+                SidebarEvent::Unstash { index, pop } => this.unstash(*index, *pop, window, cx),
+                SidebarEvent::DropStash(index) => this.drop_stash(*index, window, cx),
             }),
             // The detail pane shows the selected commit.
             cx.subscribe(&history, |this, _, _: &SelectionChanged, cx| {
@@ -232,7 +239,8 @@ impl Workspace {
             rewrite_command: None,
             remote_op: None,
             branch_form: None,
-            branch_command: None,
+            stash_form: None,
+            git_command: None,
             palette: None,
             palette_open: false,
             _switch: None,
@@ -1108,6 +1116,7 @@ impl Workspace {
                 .map(|branch| branch.name.clone())
                 .collect(),
             remote: Some(RemoteActions::of(snapshot)),
+            stashes: snapshot.refs.stashes.len(),
         };
         let palette = palette.clone();
         palette.update(cx, |palette, cx| palette.open(context, window, cx));
@@ -1173,6 +1182,8 @@ impl Workspace {
                     self.rename_branch(name, window, cx);
                 }
             }
+            PaletteCommand::StashChanges => self.stash_changes(&StashChanges, window, cx),
+            PaletteCommand::PopStash => self.unstash(0, true, window, cx),
             PaletteCommand::Fetch => self.fetch(&Fetch, window, cx),
             PaletteCommand::Pull => self.pull(&Pull, window, cx),
             PaletteCommand::Push => self.push(&Push, window, cx),
@@ -1392,6 +1403,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::pull))
             .on_action(cx.listener(Self::push))
             .on_action(cx.listener(Self::new_branch))
+            .on_action(cx.listener(Self::stash_changes))
             .relative()
             .v_flex()
             .size_full()
@@ -1408,6 +1420,7 @@ impl Render for Workspace {
                     .and_then(|snapshot| snapshot.refs.head.as_ref())
                     .and_then(Head::target)
                     .is_some(),
+                can_stash: self.status.as_ref().is_some_and(|status| !status.is_clean()),
             })
             .when_some(
                 snapshot

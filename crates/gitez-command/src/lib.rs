@@ -164,6 +164,14 @@ pub fn not_merged(error: &Error) -> bool {
     matches!(error, Error::Failed { output, .. } if output.contains("not fully merged"))
 }
 
+/// How [`Git::unstash`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnstashOutcome {
+    Applied,
+    /// The changes conflict with the working tree; the stash is kept.
+    Conflicts,
+}
+
 /// Runs `git` in one working tree.
 #[derive(Debug, Clone)]
 pub struct Git {
@@ -442,6 +450,38 @@ impl Git {
         self.run(args, None).map(drop)
     }
 
+    /// Brings the changes of stash `index` (`stash@{index}`) back into the
+    /// working tree, like `git stash apply`, and with `pop` drops it once
+    /// they apply cleanly. On a conflict the stash is kept and the
+    /// conflicts stay in the working tree.
+    pub fn unstash(&self, index: usize, pop: bool) -> Result<UnstashOutcome> {
+        let stash = format!("stash@{{{index}}}");
+        let command = if pop { "pop" } else { "apply" };
+        match self.run(["stash", command, "--quiet", &stash], None) {
+            Ok(_) => Ok(UnstashOutcome::Applied),
+            Err(_) if self.conflicted().is_ok_and(|paths| !paths.is_empty()) => {
+                Ok(UnstashOutcome::Conflicts)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Removes stash `index`, like `git stash drop`.
+    pub fn drop_stash(&self, index: usize) -> Result<()> {
+        self.run(
+            ["stash", "drop", "--quiet", &format!("stash@{{{index}}}")],
+            None,
+        )
+        .map(drop)
+    }
+
+    /// Puts the stash commit `id` (a full id), dropped earlier, back on
+    /// top of the stashes with `message`, like `git stash store`.
+    pub fn restore_stash(&self, id: &str, message: &str) -> Result<()> {
+        self.run(["stash", "store", "--quiet", "-m", message, id], None)
+            .map(drop)
+    }
+
     /// Runs `git <args>` as the user typed it, calling `output` with each
     /// line it writes, to standard output or standard error, as it comes.
     /// Nothing can ask for input: no prompt, no editor (messages stay as git
@@ -668,20 +708,26 @@ impl Git {
     /// `git stash push --include-untracked`; returns whether there was
     /// anything to stash.
     fn stash_push(&self, message: &str) -> Result<bool> {
+        self.stash(Some(message), true)
+    }
+
+    /// Stashes the uncommitted changes, like `git stash push`, with
+    /// `message` or git's own "WIP on …"; untracked files too if
+    /// `untracked`. Returns whether there was anything to stash.
+    pub fn stash(&self, message: Option<&str>, untracked: bool) -> Result<bool> {
         let before = self
             .run(["rev-parse", "--quiet", "--verify", "refs/stash"], None)
             .ok();
-        self.run(
-            [
-                "stash",
-                "push",
-                "--quiet",
-                "--include-untracked",
-                "-m",
-                message,
-            ],
-            None,
-        )?;
+        let mut args = vec!["stash", "push", "--quiet"];
+        if untracked {
+            args.push("--include-untracked");
+        }
+        if let Some(message) = message {
+            args.extend(["-m", message]);
+        }
+        // Literal pathspecs stop `git stash` from cleaning the untracked
+        // files it stashed, which it does with the pathspec `:/`.
+        self.run_with_env(args, None, &[("GIT_LITERAL_PATHSPECS", "0")])?;
         let after = self
             .run(["rev-parse", "--quiet", "--verify", "refs/stash"], None)
             .ok();
