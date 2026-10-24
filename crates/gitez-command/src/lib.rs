@@ -320,6 +320,63 @@ impl Git {
         picked
     }
 
+    /// Runs `git <args>` as the user typed it, calling `output` with each
+    /// line it writes, to standard output or standard error, as it comes.
+    /// Nothing can ask for input: no prompt, no editor (messages stay as git
+    /// proposes them) and no pager. Returns whether git succeeded.
+    pub fn run_as_typed(&self, args: &[String], mut output: impl FnMut(String)) -> Result<bool> {
+        use std::io::BufRead as _;
+
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(&self.work_dir)
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_EDITOR", "true")
+            .env("GIT_SEQUENCE_EDITOR", "true")
+            .env("GIT_PAGER", "cat")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(Error::Spawn)?;
+        let (sender, lines) = std::sync::mpsc::channel();
+        let readers: Vec<_> = [
+            child
+                .stdout
+                .take()
+                .map(|out| Box::new(out) as Box<dyn std::io::Read + Send>),
+            child
+                .stderr
+                .take()
+                .map(|err| Box::new(err) as Box<dyn std::io::Read + Send>),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|stream| {
+            let sender = sender.clone();
+            std::thread::spawn(move || {
+                for line in std::io::BufReader::new(stream).lines() {
+                    let Ok(line) = line else { break };
+                    if sender.send(line).is_err() {
+                        break;
+                    }
+                }
+            })
+        })
+        .collect();
+        // Ends once both readers are done.
+        drop(sender);
+        for line in lines {
+            output(line);
+        }
+        for reader in readers {
+            let _ = reader.join();
+        }
+        let status = child.wait().map_err(Error::Spawn)?;
+        Ok(status.success())
+    }
+
     /// Rewrites the commits after `base` (all of them, from the root, when
     /// `None`) on the branch checked out, `branch`, as `steps` say, oldest
     /// first, like `git rebase -i --autostash base` with that todo list.

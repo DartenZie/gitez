@@ -178,7 +178,8 @@ impl EventEmitter<RewriteEvent> for Rewrite {}
 
 impl Rewrite {
     /// Rewrites the commits of `branch`, checked out on `tip`, from `from`
-    /// up; commit `reword`, if given, starts out reworded.
+    /// up; commit `reword`, if given, starts out reworded, and with
+    /// `autosquash` the fixups start out folded in.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         snapshot: Arc<Snapshot>,
@@ -186,6 +187,7 @@ impl Rewrite {
         tip: Oid,
         from: Oid,
         reword: Option<Oid>,
+        autosquash: bool,
         uncommitted: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -212,7 +214,7 @@ impl Rewrite {
         let load = cx.spawn_in(window, async move |this, cx| {
             let result = read.await;
             this.update_in(cx, |this, window, cx| {
-                this.finish_load(result, reword, window, cx)
+                this.finish_load(result, reword, autosquash, window, cx)
             })
             .ok();
         });
@@ -239,6 +241,7 @@ impl Rewrite {
         &mut self,
         result: gitez_git::Result<Rewritable>,
         reword: Option<Oid>,
+        autosquash: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -257,6 +260,9 @@ impl Rewrite {
                 self.load = Load::Ready;
                 if let Some(index) = reword.and_then(|id| self.index_of(id)) {
                     self.set_action(index, Action::Reword, window, cx);
+                }
+                if autosquash {
+                    self.autosquash(cx);
                 }
             }
             Ok(Rewritable::Elsewhere) => {

@@ -107,6 +107,40 @@ impl Repository {
         Ok(Rewritable::Elsewhere)
     }
 
+    /// The commit `rev` names, as `git rev-parse rev^{commit}` would find
+    /// it; `None` when it names none.
+    pub fn resolve_commit(&self, rev: &str) -> Result<Option<Oid>> {
+        let repo = self.local();
+        let Ok(id) = repo.rev_parse_single(rev) else {
+            return Ok(None);
+        };
+        Ok(id.object()?.peel_to_commit().ok().map(|commit| commit.id))
+    }
+
+    /// The first commit after `base` on the line of first parents that
+    /// leads to `tip`: where rewriting the commits since `base` starts.
+    /// `None` when `base` is not on that line, or is `tip` itself.
+    pub fn first_after(&self, tip: Oid, base: Oid) -> Result<Option<Oid>> {
+        if tip == base || !self.contains(tip, base)? {
+            return Ok(None);
+        }
+        let repo = self.local();
+        let mut current = tip;
+        loop {
+            let parent = repo
+                .find_commit(current)?
+                .parent_ids()
+                .next()
+                .map(|parent| parent.detach());
+            match parent {
+                Some(parent) if parent == base => return Ok(Some(current)),
+                Some(parent) => current = parent,
+                // `base` is only on a side line.
+                None => return Ok(None),
+            }
+        }
+    }
+
     /// Whether commit `id` is in the history of commit `tip`.
     fn contains(&self, tip: Oid, id: Oid) -> Result<bool> {
         Ok(self.local().merge_base(id, tip)?.map(|base| base.detach()) == Some(id))

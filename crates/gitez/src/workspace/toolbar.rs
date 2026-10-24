@@ -6,7 +6,7 @@ use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::*;
 use gpui_kit::*;
 
-use super::{NewPullRequest, OpenRepository};
+use super::{NewPullRequest, OpenPalette, OpenRepository};
 use crate::theme::{self, color};
 
 /// Height of toolbar buttons in the design.
@@ -129,13 +129,13 @@ fn icon_button(id: &'static str, icon: IconName, label: &'static str) -> Button 
         .disabled(true)
 }
 
-/// The search field that opens the command palette (`⌘K`). The palette is
-/// not built yet, so this is only its resting appearance.
+/// The search field that opens the command palette (`⌘K`).
 fn palette_entry() -> impl IntoElement {
     let shortcut =
         Keystroke::parse("secondary-k").expect("the palette shortcut is a valid keystroke");
 
     div()
+        .id("palette-entry")
         .h_flex()
         .flex_1()
         .max_w(px(460.))
@@ -150,6 +150,9 @@ fn palette_entry() -> impl IntoElement {
         .bg(rgb(color::BACKGROUND))
         .text_color(rgb(color::TEXT_MUTED))
         .text_size(px(12.5))
+        .cursor_text()
+        .hover(|style| style.border_color(rgb(color::PICK_BORDER)))
+        .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenPalette), cx))
         .child(Icon::new(IconName::Search).size(px(14.)))
         .child(
             div()

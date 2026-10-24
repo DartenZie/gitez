@@ -1514,6 +1514,10 @@ fn finds_the_commits_to_rewrite_and_a_stopped_rebase() {
             summary: "a".to_owned()
         })
     );
+    assert_eq!(repo.resolve_commit("main~2").expect("resolve"), Some(a));
+    assert_eq!(repo.resolve_commit("no-such-ref").expect("resolve"), None);
+    assert_eq!(repo.first_after(c, a).expect("walk"), Some(b));
+    assert_eq!(repo.first_after(c, c).expect("walk"), None);
     let Rewritable::Commits { base, .. } = repo.rewritable(c, a, None).expect("read") else {
         panic!("a is on main");
     };

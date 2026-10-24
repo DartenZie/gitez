@@ -1,8 +1,8 @@
-//! Small pieces shared by the history list and the commit detail: ref labels,
+//! Small pieces shared by the views: ref labels, keycaps,
 //! author avatars and the summary of uncommitted changes.
 
 use gitez_git::{ChangeKind, RefKind, RefLabel, WorkingTreeStatus};
-use gpui_kit::component::StyledExt as _;
+use gpui_kit::component::{ActiveTheme as _, StyledExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -138,6 +138,29 @@ pub fn working_tree_summary(status: &WorkingTreeStatus) -> String {
         }
     }
     summary
+}
+
+/// The secondary modifier, as keycaps show it: ⌘ on macOS, Ctrl elsewhere.
+pub const SECONDARY_KEY: &str = if cfg!(target_os = "macos") {
+    "⌘"
+} else {
+    "Ctrl"
+};
+
+/// A keycap with `key` on it. Unlike `Kbd`, it can show a modifier alone
+/// or a key's name.
+pub fn key_cap(key: &'static str, cx: &App) -> Div {
+    div()
+        .flex_none()
+        .px(px(5.))
+        .rounded(px(4.))
+        .border_1()
+        .border_b_2()
+        .border_color(rgb(color::REMOTE_LABEL_BORDER))
+        .font_family(cx.theme().mono_font_family.clone())
+        .text_size(px(10.5))
+        .text_color(rgb(color::REMOTE_LABEL_TEXT))
+        .child(key)
 }
 
 #[cfg(test)]

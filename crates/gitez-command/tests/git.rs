@@ -589,3 +589,30 @@ fn a_rewrite_stops_at_an_edit_and_gives_up_on_a_conflict() {
     assert_eq!(git(root, &["branch", "--show-current"]), "main");
     assert_eq!(status(root), "");
 }
+
+#[test]
+fn runs_a_command_as_typed_and_streams_its_output() {
+    let (dir, _) = five_commits();
+    let root = dir.path();
+    let mut lines = Vec::new();
+    let ok = Git::new(root)
+        .run_as_typed(&["log".to_owned(), "--format=%s".to_owned()], |line| {
+            lines.push(line)
+        })
+        .expect("run");
+    assert!(ok);
+    assert_eq!(lines, ["e", "d", "c", "b", "a"]);
+
+    // Standard error comes too, and a failure is reported.
+    let mut lines = Vec::new();
+    let ok = Git::new(root)
+        .run_as_typed(&["switch".to_owned(), "nowhere".to_owned()], |line| {
+            lines.push(line)
+        })
+        .expect("run");
+    assert!(!ok);
+    assert!(
+        lines.iter().any(|line| line.contains("nowhere")),
+        "{lines:?}"
+    );
+}

@@ -8,6 +8,7 @@ mod graph;
 mod history;
 mod labels;
 mod new_pull_request;
+mod palette;
 mod review;
 mod rewrite;
 mod sidebar;
@@ -43,6 +44,7 @@ use history::{
     BranchDropped, CherryPickRequested, History, PickedChanged, Selection, SelectionChanged,
 };
 use new_pull_request::{FormEvent, NewPullRequestForm};
+use palette::{Palette, PaletteCommand, PaletteContext, PaletteEvent};
 use review::{
     CommitDraft, LastCommit, MergeDialog, MergeEvent, MergedPullRequest, Merging, Review,
     ReviewEvent, Tips,
@@ -50,12 +52,17 @@ use review::{
 use rewrite::{Rewrite, RewriteEvent};
 use sidebar::{Sidebar, SidebarEvent};
 
-actions!(workspace, [OpenRepository, ReviewSelected, NewPullRequest]);
+actions!(
+    workspace,
+    [OpenRepository, ReviewSelected, NewPullRequest, OpenPalette]
+);
 
 /// Key bindings of the views inside the workspace.
 pub fn key_bindings() -> Vec<KeyBinding> {
     let mut bindings = history::key_bindings();
     bindings.extend(review::key_bindings());
+    bindings.extend(palette::key_bindings());
+    bindings.push(KeyBinding::new("secondary-k", OpenPalette, None));
     bindings
 }
 
@@ -102,6 +109,13 @@ pub struct Workspace {
     rewrite: Option<(Entity<Rewrite>, Subscription)>,
     /// Continuing, aborting or undoing a rewrite.
     rewrite_command: Option<Task<()>>,
+    /// The command palette of the open repository, kept while hidden so a
+    /// command run from it can finish.
+    palette: Option<(Entity<Palette>, Subscription)>,
+    /// Whether the palette is shown.
+    palette_open: bool,
+    /// Checking out a branch chosen in the palette.
+    _switch: Option<Task<()>>,
     /// The cherry-pick panel, shown in place of the commit detail.
     cherry_pick: Option<(Entity<CherryPick>, Subscription)>,
     /// The dialog offering to merge a branch dropped on another, while
@@ -160,7 +174,7 @@ impl Workspace {
                         .update(cx, |history, cx| history.pick_only(*id, cx));
                     this.open_cherry_pick(window, cx);
                 }
-                DetailEvent::Reword(id) => this.open_rewrite(*id, window, cx),
+                DetailEvent::Reword(id) => this.open_rewrite(*id, Some(*id), false, window, cx),
             }),
             // Files change outside GitEZ; read the status again on return.
             cx.observe_window_activation(window, |this, window, cx| {
@@ -188,6 +202,9 @@ impl Workspace {
             merge_dialog: None,
             rewrite: None,
             rewrite_command: None,
+            palette: None,
+            palette_open: false,
+            _switch: None,
             cherry_pick: None,
             open_after_reload: None,
             sidebar,
@@ -267,6 +284,7 @@ impl Workspace {
         self.review = None;
         self.rewrite = None;
         self.commit_draft = None;
+        self.open_palette_for(&snapshot, window, cx);
         self.watch(&snapshot, window, cx);
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.set_snapshot(snapshot.clone(), cx));
@@ -841,8 +859,16 @@ impl Workspace {
     }
 
     /// Shows the history of the branch checked out from commit `from` up, to
-    /// rewrite it, with `from` to be reworded.
-    fn open_rewrite(&mut self, from: Oid, window: &mut Window, cx: &mut Context<Self>) {
+    /// rewrite it, with `reword` to be reworded and, with `autosquash`, the
+    /// fixups folded in.
+    fn open_rewrite(
+        &mut self,
+        from: Oid,
+        reword: Option<Oid>,
+        autosquash: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(snapshot) = self.snapshot.clone() else {
             return;
         };
@@ -871,7 +897,8 @@ impl Workspace {
                 name,
                 target,
                 from,
-                Some(from),
+                reword,
+                autosquash,
                 uncommitted,
                 window,
                 cx,
@@ -1004,6 +1031,240 @@ impl Workspace {
         );
     }
 
+    /// Makes the command palette for the repository of `snapshot`.
+    fn open_palette_for(
+        &mut self,
+        snapshot: &Snapshot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (repository, history) = (snapshot.repository.clone(), self.history.clone());
+        let palette = cx.new(|cx| Palette::new(repository, history, window, cx));
+        let subscription =
+            cx.subscribe_in(&palette, window, |this, _, event, window, cx| match event {
+                PaletteEvent::Dismiss => this.close_palette(window, cx),
+                PaletteEvent::Command(command) => {
+                    this.close_palette(window, cx);
+                    this.run_palette_command(command.clone(), window, cx);
+                }
+                PaletteEvent::Finished { command, ok } => {
+                    if !this.palette_open {
+                        window.push_notification(
+                            if *ok {
+                                Notification::success(format!("{command} finished"))
+                            } else {
+                                Notification::error(format!(
+                                    "{command} failed; ⌘K shows what it wrote"
+                                ))
+                            },
+                            cx,
+                        );
+                    }
+                    this.reload(window, cx);
+                    this.refresh_status(window, cx);
+                }
+            });
+        self.palette = Some((palette, subscription));
+        self.palette_open = false;
+    }
+
+    /// Shows the command palette.
+    fn open_palette(&mut self, _: &OpenPalette, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(snapshot), Some((palette, _))) = (&self.snapshot, &self.palette) else {
+            return;
+        };
+        let branch = match &snapshot.refs.head {
+            Some(Head::Branch { name, .. }) => Some(name.clone()),
+            _ => None,
+        };
+        let context = PaletteContext {
+            branch,
+            head: snapshot.refs.head.as_ref().and_then(Head::target),
+            merging: snapshot.merge.is_some(),
+            rebasing: snapshot.rebase.is_some(),
+            picked: self.history.read(cx).picked().len(),
+            changed: self.status.as_ref().map_or_else(Vec::new, |status| {
+                status.files.iter().map(|file| file.path.clone()).collect()
+            }),
+            branches: snapshot
+                .refs
+                .branches
+                .iter()
+                .map(|branch| branch.name.clone())
+                .collect(),
+        };
+        let palette = palette.clone();
+        palette.update(cx, |palette, cx| palette.open(context, window, cx));
+        window.focus(&palette.read(cx).input_focus(cx), cx);
+        self.palette_open = true;
+        cx.notify();
+    }
+
+    fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.palette_open {
+            return;
+        }
+        self.palette_open = false;
+        let focus = if let Some((rewrite, _)) = &self.rewrite {
+            rewrite.focus_handle(cx)
+        } else if let Some((review, _)) = &self.review {
+            review.focus_handle(cx)
+        } else {
+            self.history.focus_handle(cx)
+        };
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// Does what was chosen in the palette.
+    fn run_palette_command(
+        &mut self,
+        command: PaletteCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match command {
+            PaletteCommand::OpenRepository => {
+                self.prompt_for_repository(&OpenRepository, window, cx)
+            }
+            PaletteCommand::NewPullRequest => self.new_pull_request(&NewPullRequest, window, cx),
+            PaletteCommand::CommitChanges => self.open_working_tree(None, window, cx),
+            PaletteCommand::OpenFile(path) => self.open_working_tree(Some(path), window, cx),
+            PaletteCommand::RewordLast => {
+                let head = self
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.refs.head.as_ref())
+                    .and_then(Head::target);
+                if let Some(head) = head {
+                    self.open_rewrite(head, Some(head), false, window, cx);
+                }
+            }
+            PaletteCommand::RewriteSince { base, autosquash } => {
+                self.open_rewrite_since(base, autosquash, window, cx)
+            }
+            PaletteCommand::ContinueRebase => self.continue_rebase(window, cx),
+            PaletteCommand::AbortRebase => self.abort_rebase(window, cx),
+            PaletteCommand::ResolveConflicts => self.open_conflicts(window, cx),
+            PaletteCommand::CherryPick => self.open_cherry_pick(window, cx),
+            PaletteCommand::SelectCommit(id) => {
+                self.review = None;
+                self.rewrite = None;
+                let found = self
+                    .history
+                    .update(cx, |history, cx| history.select_commit(id, cx));
+                if !found {
+                    window.push_notification(
+                        Notification::info("That commit is not in the history shown."),
+                        cx,
+                    );
+                }
+                window.focus(&self.history.focus_handle(cx), cx);
+                cx.notify();
+            }
+            PaletteCommand::Switch(branch) => self.switch_branch(branch, window, cx),
+        }
+    }
+
+    /// Shows the uncommitted changes to review and commit, scrolled to the
+    /// file at `path` if given.
+    fn open_working_tree(
+        &mut self,
+        path: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let selected = self
+            .history
+            .update(cx, |history, cx| history.select_working_tree(cx));
+        if selected {
+            self.rewrite = None;
+            self.open_review(path, window, cx);
+        }
+    }
+
+    /// Rewrites the commits after revision `base`, as `git rebase -i base`
+    /// would.
+    fn open_rewrite_since(
+        &mut self,
+        base: String,
+        autosquash: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let Some(tip) = snapshot.refs.head.as_ref().and_then(Head::target) else {
+            return;
+        };
+        let repository = snapshot.repository.clone();
+        let find = cx.background_executor().spawn({
+            let base = base.clone();
+            async move {
+                let Some(base) = repository.resolve_commit(&base)? else {
+                    return Ok(None);
+                };
+                repository.first_after(tip, base)
+            }
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let found: gitez_git::Result<Option<Oid>> = find.await;
+            this.update_in(cx, |this, window, cx| match found {
+                Ok(Some(from)) => this.open_rewrite(from, None, autosquash, window, cx),
+                Ok(None) => window.push_notification(
+                    Notification::warning(format!(
+                        "{base} is not a commit before the tip of the branch checked out."
+                    )),
+                    cx,
+                ),
+                Err(error) => window.push_notification(
+                    Notification::error(format!(
+                        "Could not find {base}: {:#}",
+                        anyhow::Error::from(error)
+                    )),
+                    cx,
+                ),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Checks out local branch `branch`.
+    fn switch_branch(&mut self, branch: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dir) = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.repository.work_dir().map(PathBuf::from))
+        else {
+            return;
+        };
+        let switch = cx.background_executor().spawn({
+            let branch = branch.clone();
+            async move { Git::new(dir).switch(&branch) }
+        });
+        self._switch = Some(cx.spawn_in(window, async move |this, cx| {
+            let switched = switch.await;
+            this.update_in(cx, |this, window, cx| {
+                this._switch = None;
+                match switched {
+                    Ok(()) => window.push_notification(
+                        Notification::success(format!("Checked out {branch}")),
+                        cx,
+                    ),
+                    Err(error) => window.push_notification(
+                        Notification::error(format!("Could not check out {branch}: {error}")),
+                        cx,
+                    ),
+                }
+                this.reload(window, cx);
+                this.refresh_status(window, cx);
+            })
+            .ok();
+        }));
+    }
+
     /// Shows the conflicts of the merge in progress.
     fn open_conflicts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(snapshot) = &self.snapshot else {
@@ -1097,6 +1358,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::prompt_for_repository))
             .on_action(cx.listener(Self::review_selected))
             .on_action(cx.listener(Self::new_pull_request))
+            .on_action(cx.listener(Self::open_palette))
+            .relative()
             .v_flex()
             .size_full()
             .bg(rgb(color::BACKGROUND))
@@ -1168,6 +1431,31 @@ impl Render for Workspace {
                 snapshot,
                 status: self.status.clone(),
             })
+            .when_some(
+                self.palette
+                    .as_ref()
+                    .filter(|_| self.palette_open)
+                    .map(|(palette, _)| palette.clone()),
+                |this, palette| {
+                    this.child(
+                        div()
+                            .id("palette-backdrop")
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full()
+                            .flex()
+                            .justify_center()
+                            .items_start()
+                            .pt(px(56.))
+                            .bg(rgba(color::BACKDROP))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.close_palette(window, cx)
+                            }))
+                            .child(palette),
+                    )
+                },
+            )
     }
 }
 

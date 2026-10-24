@@ -423,6 +423,39 @@ impl History {
         }
     }
 
+    /// The commits read so far, newest first.
+    pub fn commits(&self) -> &[Commit] {
+        &self.commits
+    }
+
+    /// The refs pointing at commit `id`.
+    pub fn labels_of(&self, id: Oid) -> &[RefLabel] {
+        self.labels.get(&id).map_or(&[][..], Vec::as_slice)
+    }
+
+    /// Selects commit `id`, if the history has read it; returns whether it
+    /// did.
+    pub fn select_commit(&mut self, id: Oid, cx: &mut Context<Self>) -> bool {
+        let Some(index) = self.commits.iter().position(|commit| commit.id == id) else {
+            return false;
+        };
+        let Some(row) = self.index_of(Entry::Commit(index)) else {
+            return false;
+        };
+        self.select(row, cx);
+        true
+    }
+
+    /// Selects the uncommitted changes, if there are any; returns whether
+    /// it did.
+    pub fn select_working_tree(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(row) = self.index_of(Entry::WorkingTree) else {
+            return false;
+        };
+        self.select(row, cx);
+        true
+    }
+
     /// The commits right before and after the selected one in the history:
     /// newer, then older.
     pub fn neighbors(&self) -> (Option<&Commit>, Option<&Commit>) {
@@ -1359,24 +1392,8 @@ fn moving(branch: &SharedString) -> impl IntoElement {
 
 /// How to pick commits, shown while some are picked.
 fn pick_hint(cx: &App) -> impl IntoElement {
-    // A modifier alone is not a keystroke `Kbd` can show.
-    let key = |key: &'static str| {
-        div()
-            .px(px(5.))
-            .rounded(px(4.))
-            .border_1()
-            .border_b_2()
-            .border_color(rgb(color::REMOTE_LABEL_BORDER))
-            .font_family(cx.theme().mono_font_family.clone())
-            .text_size(px(10.5))
-            .text_color(rgb(color::REMOTE_LABEL_TEXT))
-            .child(key)
-    };
-    let secondary = if cfg!(target_os = "macos") {
-        "⌘"
-    } else {
-        "Ctrl"
-    };
+    let key = |key: &'static str| labels::key_cap(key, cx);
+    let secondary = labels::SECONDARY_KEY;
     div()
         .h_flex()
         .ml_auto()

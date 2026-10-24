@@ -96,7 +96,16 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 > `refs/gitez/backup/<branch>` and **Undo** puts the branch back on it. A
 > rewrite that conflicts is given up; one stopped at an edit, or any
 > rebase stopped in a terminal, shows a banner to **Continue** or
-> **Abort** it. Nothing else can be changed from GitEZ yet.
+> **Abort** it. **⌘K** (Ctrl+K on Linux), or the search field in the
+> toolbar, opens the command palette: type to find an action, a commit (by
+> message, id, tag or branch), a branch to check out or a changed file,
+> with tabs to show only one kind. A query starting with `git` is a git
+> command. GitEZ offers its own screen for the ones it knows
+> (`git rebase -i <commit>` opens the history editor, `--autosquash`
+> folding the fixups in; `git switch <branch>` checks it out), and **⌘↵**
+> runs any of them exactly as typed with your own `git`, the output
+> streaming into the palette. Tab fills in the selected branch, commit or
+> file as the next argument. Nothing can prompt or open an editor there.
 
 ## Technology
 
