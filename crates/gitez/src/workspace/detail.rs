@@ -34,6 +34,8 @@ pub enum DetailEvent {
     CherryPick(Oid),
     /// Rewrite the history from this commit up, rewording it.
     Reword(Oid),
+    /// Ask for a new branch starting at this commit.
+    NewBranch(Oid),
 }
 
 /// The selected commit: SHA, parents, message, author, refs and changed files.
@@ -269,6 +271,11 @@ fn actions(id: Oid, cx: &mut Context<DetailPane>) -> impl IntoElement {
             action("commit-reword", IconName::Pencil, "Reword")
                 .tooltip("Rewrite the history of the branch checked out from this commit up")
                 .on_click(cx.listener(move |_, _, _, cx| cx.emit(DetailEvent::Reword(id)))),
+        )
+        .child(
+            action("commit-branch", IconName::GitBranch, "Branch…")
+                .tooltip("New branch starting at this commit")
+                .on_click(cx.listener(move |_, _, _, cx| cx.emit(DetailEvent::NewBranch(id)))),
         )
 }
 

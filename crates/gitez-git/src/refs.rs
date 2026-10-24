@@ -319,6 +319,30 @@ fn lossy(bytes: &BStr) -> String {
     bytes.to_str_lossy().into_owned()
 }
 
+/// Why `name` cannot name a branch, as `git check-ref-format --branch`
+/// would refuse it; `None` when it can.
+pub fn branch_name_problem(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("Name the branch.");
+    }
+    if name.chars().any(char::is_whitespace) {
+        return Some("A branch name cannot contain spaces.");
+    }
+    if name.starts_with('-') {
+        return Some("A branch name cannot start with “-”.");
+    }
+    if name == "HEAD" {
+        return Some("“HEAD” cannot name a branch.");
+    }
+    if gix::refs::FullName::try_from(format!("refs/heads/{name}")).is_err() {
+        return Some(
+            "A branch name cannot contain “..”, “~”, “^”, “:”, “?”, “*”, “[”, “\\” or “@{”, \
+             or start or end with “/” or “.”, or end with “.lock”.",
+        );
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -4,9 +4,10 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use gitez_git::{Branch, Stash};
+use gitez_git::{Branch, Oid, Stash};
 use gitez_review::{PullRequest, State};
 use gpui_kit::assets::IconName;
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -35,6 +36,12 @@ enum Section {
 pub enum SidebarEvent {
     /// Show the local pull request with this number.
     OpenPullRequest(u32),
+    /// Check out the branch with this name.
+    CheckOut(String),
+    /// Ask for a new branch starting where this one is.
+    NewBranchFrom(Oid),
+    RenameBranch(String),
+    DeleteBranch(String),
 }
 
 pub struct Sidebar {
@@ -189,6 +196,14 @@ impl Render for Sidebar {
                     .iter()
                     .map(|pull_request| pull_request_row(pull_request, cx).into_any_element())
                     .collect::<Vec<_>>();
+                let branch_rows = refs
+                    .branches
+                    .iter()
+                    .map(|branch| {
+                        branch_row(branch, snapshot.tracking.get(&branch.name), cx)
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>();
                 this.child(self.section(
                     Section::LocalPullRequests,
                     "Local pull requests",
@@ -202,15 +217,7 @@ impl Render for Sidebar {
                     "Branches",
                     refs.branches.len(),
                     "No branches",
-                    || {
-                        refs.branches
-                            .iter()
-                            .map(|branch| {
-                                branch_row(branch, snapshot.tracking.get(&branch.name))
-                                    .into_any_element()
-                            })
-                            .collect()
-                    },
+                    || branch_rows,
                     cx,
                 ))
                 .child(self.section(
@@ -325,7 +332,13 @@ fn trailing(text: impl Into<SharedString>) -> Div {
         .child(text.into())
 }
 
-fn branch_row(branch: &Branch, tracking: Option<&Tracking>) -> impl IntoElement {
+/// A local branch: double-click checks it out, right-click shows what else
+/// can be done with it.
+fn branch_row(
+    branch: &Branch,
+    tracking: Option<&Tracking>,
+    cx: &mut Context<Sidebar>,
+) -> impl IntoElement {
     let branch_color = rgb(theme::branch_color(&branch.name));
     let dot = div().size(px(8.)).rounded_full().bg(branch_color);
     let marker = div()
@@ -363,6 +376,46 @@ fn branch_row(branch: &Branch, tracking: Option<&Tracking>) -> impl IntoElement 
         .child(label(branch.name.clone()))
         .when_some(ahead_behind, |this, text| {
             this.child(trailing(text).font_weight(FontWeight::NORMAL))
+        })
+        .id(SharedString::from(format!("branch-{}", branch.name)))
+        .on_click({
+            let (name, is_head) = (branch.name.clone(), branch.is_head);
+            cx.listener(move |_, event: &ClickEvent, _, cx| {
+                if event.click_count() == 2 && !is_head {
+                    cx.emit(SidebarEvent::CheckOut(name.clone()));
+                }
+            })
+        })
+        .context_menu({
+            let sidebar = cx.entity().downgrade();
+            let (name, tip, is_head) = (branch.name.clone(), branch.target, branch.is_head);
+            move |menu, _, _| {
+                let item = |label: &'static str, event: fn(&str, Oid) -> SidebarEvent| {
+                    let (sidebar, name) = (sidebar.clone(), name.clone());
+                    PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                        sidebar.update(cx, |_, cx| cx.emit(event(&name, tip))).ok();
+                    })
+                };
+                menu.item(
+                    item("Check out", |name, _| {
+                        SidebarEvent::CheckOut(name.to_owned())
+                    })
+                    .disabled(is_head),
+                )
+                .item(item("New branch from here…", |_, tip| {
+                    SidebarEvent::NewBranchFrom(tip)
+                }))
+                .item(item("Rename…", |name, _| {
+                    SidebarEvent::RenameBranch(name.to_owned())
+                }))
+                .separator()
+                .item(
+                    item("Delete", |name, _| {
+                        SidebarEvent::DeleteBranch(name.to_owned())
+                    })
+                    .disabled(is_head),
+                )
+            }
         })
 }
 

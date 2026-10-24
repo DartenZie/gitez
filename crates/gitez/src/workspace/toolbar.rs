@@ -8,7 +8,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::remote::{RemoteActions, RemoteOp};
-use super::{Fetch, NewPullRequest, OpenPalette, OpenRepository, Pull, Push};
+use super::{Fetch, NewBranch, NewPullRequest, OpenPalette, OpenRepository, Pull, Push};
 use crate::theme::{self, color};
 
 /// Height of toolbar buttons in the design.
@@ -17,8 +17,7 @@ const BUTTON_HEIGHT: Pixels = px(30.);
 /// Repository switcher, undo and redo, remote operations, branch and stash,
 /// the command palette entry and "New local PR".
 ///
-/// Undo, redo, branch and stash are disabled until their write paths
-/// exist.
+/// Undo, redo and stash are disabled until their write paths exist.
 #[derive(IntoElement)]
 pub struct Toolbar {
     /// Name of the open repository.
@@ -29,6 +28,8 @@ pub struct Toolbar {
     pub remote: Option<RemoteActions>,
     /// The remote operation running, if one is.
     pub running: Option<RemoteOp>,
+    /// Whether there is a commit to start a branch from.
+    pub can_branch: bool,
 }
 
 impl RenderOnce for Toolbar {
@@ -74,7 +75,17 @@ impl RenderOnce for Toolbar {
                 div()
                     .h_flex()
                     .gap(px(6.))
-                    .child(button("branch", IconName::GitBranch, "Branch"))
+                    .child(
+                        Button::new("branch")
+                            .h(BUTTON_HEIGHT)
+                            .icon(IconName::GitBranch)
+                            .label("Branch")
+                            .tooltip("New branch from the selected commit")
+                            .disabled(!self.can_branch)
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(NewBranch), cx)
+                            }),
+                    )
                     .child(button("stash", IconName::Archive, "Stash")),
             )
             .child(palette_entry())

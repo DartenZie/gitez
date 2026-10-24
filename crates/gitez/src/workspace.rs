@@ -1,6 +1,7 @@
 //! The main window: toolbar, repository sidebar, history, commit detail and
 //! status bar, laid out as in the `Main.dc.html` artboard.
 
+mod branch;
 mod cherry_pick;
 mod conflicts;
 mod detail;
@@ -38,6 +39,7 @@ use gitez_review::{NewPullRequest as NewPullRequestFields, State, Timestamp, Tip
 
 use crate::repository::Snapshot;
 use crate::theme::{self, color};
+use branch::BranchForm;
 use cherry_pick::{CherryPick, CherryPickEvent};
 use conflicts::{Conflicts, ConflictsEvent};
 use detail::{DetailEvent, DetailPane};
@@ -63,7 +65,8 @@ actions!(
         OpenPalette,
         Fetch,
         Pull,
-        Push
+        Push,
+        NewBranch
     ]
 );
 
@@ -119,6 +122,10 @@ pub struct Workspace {
     rewrite: Option<(Entity<Rewrite>, Subscription)>,
     /// Continuing, aborting or undoing a rewrite.
     rewrite_command: Option<Task<()>>,
+    /// The form creating or renaming a branch, while its dialog is open.
+    branch_form: Option<(Entity<BranchForm>, Subscription)>,
+    /// Creating, renaming or deleting a branch.
+    branch_command: Option<Task<()>>,
     /// The fetch, pull or push running, if one is.
     remote_op: Option<(RemoteOp, Task<()>)>,
     /// The command palette of the open repository, kept while hidden so a
@@ -154,6 +161,14 @@ impl Workspace {
                 SidebarEvent::OpenPullRequest(number) => {
                     this.open_pull_request(*number, window, cx)
                 }
+                SidebarEvent::CheckOut(branch) => this.switch_branch(branch.clone(), window, cx),
+                SidebarEvent::NewBranchFrom(tip) => this.new_branch_at(*tip, window, cx),
+                SidebarEvent::RenameBranch(branch) => {
+                    this.rename_branch(branch.clone(), window, cx)
+                }
+                SidebarEvent::DeleteBranch(branch) => {
+                    this.delete_branch(branch.clone(), false, window, cx)
+                }
             }),
             // The detail pane shows the selected commit.
             cx.subscribe(&history, |this, _, _: &SelectionChanged, cx| {
@@ -187,6 +202,7 @@ impl Workspace {
                     this.open_cherry_pick(window, cx);
                 }
                 DetailEvent::Reword(id) => this.open_rewrite(*id, Some(*id), false, window, cx),
+                DetailEvent::NewBranch(id) => this.new_branch_at(*id, window, cx),
             }),
             // Files change outside GitEZ; read the status again on return.
             cx.observe_window_activation(window, |this, window, cx| {
@@ -215,6 +231,8 @@ impl Workspace {
             rewrite: None,
             rewrite_command: None,
             remote_op: None,
+            branch_form: None,
+            branch_command: None,
             palette: None,
             palette_open: false,
             _switch: None,
@@ -1145,6 +1163,16 @@ impl Workspace {
             PaletteCommand::AbortRebase => self.abort_rebase(window, cx),
             PaletteCommand::ResolveConflicts => self.open_conflicts(window, cx),
             PaletteCommand::CherryPick => self.open_cherry_pick(window, cx),
+            PaletteCommand::NewBranch => self.new_branch(&NewBranch, window, cx),
+            PaletteCommand::RenameBranch => {
+                if let Some(Head::Branch { name, .. }) = self
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.refs.head.clone())
+                {
+                    self.rename_branch(name, window, cx);
+                }
+            }
             PaletteCommand::Fetch => self.fetch(&Fetch, window, cx),
             PaletteCommand::Pull => self.pull(&Pull, window, cx),
             PaletteCommand::Push => self.push(&Push, window, cx),
@@ -1363,6 +1391,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::fetch))
             .on_action(cx.listener(Self::pull))
             .on_action(cx.listener(Self::push))
+            .on_action(cx.listener(Self::new_branch))
             .relative()
             .v_flex()
             .size_full()
@@ -1374,6 +1403,11 @@ impl Render for Workspace {
                 loading: self.loading.is_some(),
                 remote: snapshot.as_deref().map(RemoteActions::of),
                 running: self.remote_op.as_ref().map(|(op, _)| *op),
+                can_branch: snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.refs.head.as_ref())
+                    .and_then(Head::target)
+                    .is_some(),
             })
             .when_some(
                 snapshot

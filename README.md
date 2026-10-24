@@ -114,6 +114,14 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 > says when the repository last fetched. A push the remote rejects offers
 > to pull first or to force push with `--force-with-lease`; a pull of
 > diverged branches with no `pull.rebase` set offers to merge them.
+> **Branch** in the toolbar, **Branch…** on a commit, or the palette
+> creates a branch at the selected commit (or `HEAD`) and checks it out
+> unless you untick that; the name is checked as you type. Double-click a
+> branch in the sidebar to check it out, or right-click it to start a
+> branch from it, rename it or delete it. A branch whose commits are on
+> no other branch is deleted only after you confirm, and **Undo** brings
+> a deleted branch back. Branches of an open local pull request cannot be
+> renamed or deleted.
 
 ## Technology
 

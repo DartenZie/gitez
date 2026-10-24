@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use gitez_command::{Error, Git, PullMethod, PullOutcome, PushRejection};
+use gitez_command::{Error, Git, PullMethod, PullOutcome, PushRejection, not_merged};
 
 /// `git <args>` in `dir`, returning its trimmed output.
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -745,4 +745,36 @@ fn a_conflicting_pull_stops_to_resolve() {
         PullOutcome::Conflicts
     );
     assert_eq!(b.conflicted().expect("conflicts"), ["a.txt"]);
+}
+
+#[test]
+fn creates_renames_and_deletes_branches() {
+    let dir = diverged("main");
+    let root = dir.path();
+    let git_ = Git::new(root);
+    let feature = git(root, &["rev-parse", "feature"]);
+
+    git_.create_branch("topic", &feature, false)
+        .expect("create");
+    assert_eq!(git(root, &["rev-parse", "topic"]), feature);
+    assert_eq!(git(root, &["branch", "--show-current"]), "main");
+    assert!(git_.create_branch("topic", "main", false).is_err());
+
+    git_.create_branch("work", "main", true)
+        .expect("create and check out");
+    assert_eq!(git(root, &["branch", "--show-current"]), "work");
+
+    git_.rename_branch("work", "chores")
+        .expect("rename the current branch");
+    assert_eq!(git(root, &["branch", "--show-current"]), "chores");
+
+    // "topic" has b, which "chores" lacks.
+    let error = git_.delete_branch("topic", false).expect_err("not merged");
+    assert!(not_merged(&error), "{error}");
+    git_.delete_branch("topic", true).expect("force");
+    assert!(git(root, &["branch", "--list", "topic"]).is_empty());
+
+    git_.create_branch("done", "chores", false).expect("create");
+    git_.delete_branch("done", false).expect("merged");
+    assert!(git_.delete_branch("chores", true).is_err(), "checked out");
 }

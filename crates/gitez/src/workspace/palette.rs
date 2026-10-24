@@ -60,6 +60,8 @@ pub enum PaletteCommand {
     AbortRebase,
     ResolveConflicts,
     CherryPick,
+    NewBranch,
+    RenameBranch,
     Fetch,
     Pull,
     Push,
@@ -201,6 +203,18 @@ fn actions() -> Vec<Action> {
             icon: IconName::Cherry,
             keywords: &["cherry-pick", "pick"],
             command: PaletteCommand::CherryPick,
+        },
+        Action {
+            title: "New branch…",
+            icon: IconName::GitBranch,
+            keywords: &["branch", "switch", "checkout", "create"],
+            command: PaletteCommand::NewBranch,
+        },
+        Action {
+            title: "Rename branch…",
+            icon: IconName::Pencil,
+            keywords: &["branch", "rename", "move"],
+            command: PaletteCommand::RenameBranch,
         },
         Action {
             title: "Fetch",
@@ -366,7 +380,12 @@ impl Palette {
             PaletteCommand::CommitChanges if context.changed.is_empty() => {
                 Some("nothing to commit")
             }
-            PaletteCommand::RewordLast if context.branch.is_none() => Some("no branch checked out"),
+            PaletteCommand::RewordLast | PaletteCommand::RenameBranch
+                if context.branch.is_none() =>
+            {
+                Some("no branch checked out")
+            }
+            PaletteCommand::NewBranch if context.head.is_none() => Some("no commits yet"),
             PaletteCommand::ContinueRebase | PaletteCommand::AbortRebase if !context.rebasing => {
                 Some("no rebase in progress")
             }
@@ -397,6 +416,7 @@ impl Palette {
                 })
             }),
             PaletteCommand::RewordLast => self.context.head.map(short),
+            PaletteCommand::RenameBranch => self.context.branch.clone(),
             PaletteCommand::CommitChanges if !self.context.changed.is_empty() => Some(count(
                 self.context.changed.len(),
                 "changed file",

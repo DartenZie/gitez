@@ -34,7 +34,9 @@ pub use error::{Error, Result};
 pub use follow::{ChangedLines, Followed};
 pub use merge::{MergeInProgress, MergePreview};
 pub use pick::PickTrial;
-pub use refs::{Branch, Head, RefKind, RefLabel, Refs, RemoteBranch, Stash, Tag};
+pub use refs::{
+    Branch, Head, RefKind, RefLabel, Refs, RemoteBranch, Stash, Tag, branch_name_problem,
+};
 pub use repository::Repository;
 pub use rewrite::{RebaseInProgress, Rewritable, RewriteBase, RewriteCommit};
 pub use status::{FileStatus, WorkingTreeStatus, WorktreeChange};

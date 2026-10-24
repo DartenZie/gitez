@@ -1565,3 +1565,34 @@ fn finds_the_commits_to_rewrite_and_a_stopped_rebase() {
         })
     );
 }
+
+#[test]
+fn branch_names_follow_git_rules() {
+    use gitez_git::branch_name_problem;
+    for good in ["main", "feature/graph-cache", "fix-1.2", "ünïcode"] {
+        assert_eq!(branch_name_problem(good), None, "{good}");
+    }
+    for bad in [
+        "",
+        "two words",
+        "-x",
+        "HEAD",
+        "a..b",
+        "a~1",
+        "a^",
+        "a:b",
+        "a?",
+        "a*",
+        "a[",
+        "a\\b",
+        "a@{1}",
+        "/a",
+        "a/",
+        "a.",
+        ".a",
+        "a.lock",
+        "a//b",
+    ] {
+        assert!(branch_name_problem(bad).is_some(), "{bad:?}");
+    }
+}

@@ -158,6 +158,12 @@ pub fn needs_pull_method(error: &Error) -> bool {
     matches!(error, Error::Failed { output, .. } if output.contains("divergent branches"))
 }
 
+/// Whether `error`, from [`Git::delete_branch`], says the branch has
+/// commits that would be lost.
+pub fn not_merged(error: &Error) -> bool {
+    matches!(error, Error::Failed { output, .. } if output.contains("not fully merged"))
+}
+
 /// Runs `git` in one working tree.
 #[derive(Debug, Clone)]
 pub struct Git {
@@ -216,6 +222,32 @@ impl Git {
     /// git's explanation, when uncommitted changes would be overwritten.
     pub fn switch(&self, branch: &str) -> Result<()> {
         self.run(["switch", "--quiet", branch], None).map(drop)
+    }
+
+    /// Creates branch `name` at commit `start` (a full id or a ref), like
+    /// `git branch name start`, and checks it out if `checkout`, like
+    /// `git switch -c name start`.
+    pub fn create_branch(&self, name: &str, start: &str, checkout: bool) -> Result<()> {
+        let args = if checkout {
+            ["switch", "--quiet", "--create", name, start]
+        } else {
+            ["branch", "--quiet", "--no-track", name, start]
+        };
+        self.run(args, None).map(drop)
+    }
+
+    /// Renames branch `from` to `to`, like `git branch -m`; its upstream
+    /// and reflog go with it.
+    pub fn rename_branch(&self, from: &str, to: &str) -> Result<()> {
+        self.run(["branch", "--move", from, to], None).map(drop)
+    }
+
+    /// Deletes branch `name`, like `git branch -d`, which refuses while
+    /// its commits are on neither its upstream nor the branch checked out
+    /// (see [`not_merged`]); `force` deletes it anyway (`-D`).
+    pub fn delete_branch(&self, name: &str, force: bool) -> Result<()> {
+        let flag = if force { "-D" } else { "-d" };
+        self.run(["branch", flag, name], None).map(drop)
     }
 
     /// Brings the commits of branch `head` into branch `base` the way `how`
