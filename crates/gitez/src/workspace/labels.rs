@@ -1,7 +1,7 @@
-//! Small pieces shared by the history list and the commit detail: ref labels
-//! and author avatars.
+//! Small pieces shared by the history list and the commit detail: ref labels,
+//! author avatars and the summary of uncommitted changes.
 
-use gitez_git::{RefKind, RefLabel};
+use gitez_git::{RefKind, RefLabel, WorkingTreeStatus};
 use gpui_kit::component::StyledExt as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -102,9 +102,50 @@ fn initials(name: &str) -> String {
         .collect()
 }
 
+/// "3 files, 1 staged, 1 conflicted", leaving out the parts that are zero.
+pub fn working_tree_summary(status: &WorkingTreeStatus) -> String {
+    let mut summary = match status.files.len() {
+        1 => "1 file".to_owned(),
+        count => format!("{count} files"),
+    };
+    for (count, what) in [
+        (status.staged(), "staged"),
+        (status.conflicted(), "conflicted"),
+    ] {
+        if count > 0 {
+            summary.push_str(&format!(", {count} {what}"));
+        }
+    }
+    summary
+}
+
 #[cfg(test)]
 mod tests {
-    use super::initials;
+    use gitez_git::{ChangeKind, FileStatus, WorkingTreeStatus, WorktreeChange};
+
+    use super::{initials, working_tree_summary};
+
+    #[test]
+    fn working_tree_summary_leaves_out_zero_counts() {
+        let file = |staged: Option<ChangeKind>, unstaged: Option<WorktreeChange>| FileStatus {
+            path: "a".to_owned(),
+            staged,
+            unstaged,
+        };
+        let status = |files| WorkingTreeStatus { files };
+        assert_eq!(
+            working_tree_summary(&status(vec![file(None, Some(WorktreeChange::Untracked))])),
+            "1 file"
+        );
+        assert_eq!(
+            working_tree_summary(&status(vec![
+                file(Some(ChangeKind::Added), None),
+                file(None, Some(WorktreeChange::Modified)),
+                file(None, Some(WorktreeChange::Conflicted)),
+            ])),
+            "3 files, 1 staged, 1 conflicted"
+        );
+    }
 
     #[test]
     fn initials_take_first_and_last_words() {

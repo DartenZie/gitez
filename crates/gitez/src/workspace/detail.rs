@@ -1,9 +1,13 @@
-//! Details of the selected commit, in the right-hand pane.
+//! Details of the selected commit, or of the uncommitted changes, in the
+//! right-hand pane.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use gitez_git::{ChangeKind, Commit, CommitDetails, FileChange, Oid, RefLabel, Repository};
+use gitez_git::{
+    ChangeKind, Commit, CommitDetails, FileChange, FileStatus, LineCounts, Oid, RefLabel,
+    Repository, WorkingTreeStatus, WorktreeChange,
+};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::*;
 use gpui_kit::component::*;
@@ -22,7 +26,9 @@ const DEBOUNCE: Duration = Duration::from_millis(40);
 const MAX_FILES_SHOWN: usize = 500;
 
 /// The selected commit: SHA, parents, message, author, refs and changed files.
+/// Or, with the uncommitted-changes row selected, the files they touch.
 pub struct DetailPane {
+    working_tree: Option<Arc<WorkingTreeStatus>>,
     commit: Option<Commit>,
     labels: Vec<RefLabel>,
     /// `None` while the details are being read.
@@ -34,6 +40,7 @@ pub struct DetailPane {
 impl DetailPane {
     pub fn new() -> Self {
         Self {
+            working_tree: None,
             commit: None,
             labels: Vec::new(),
             details: None,
@@ -79,6 +86,15 @@ impl DetailPane {
         cx.notify();
     }
 
+    /// Shows the uncommitted changes in `status`.
+    pub fn show_working_tree(&mut self, status: Arc<WorkingTreeStatus>, cx: &mut Context<Self>) {
+        *self = Self {
+            working_tree: Some(status),
+            ..Self::new()
+        };
+        cx.notify();
+    }
+
     fn finish(
         &mut self,
         id: Oid,
@@ -103,6 +119,17 @@ impl DetailPane {
 impl Render for DetailPane {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pane = div().v_flex().size_full().bg(rgb(color::PANEL));
+        let mono = cx.theme().mono_font_family.clone();
+        if let Some(status) = &self.working_tree {
+            return pane.child(
+                div()
+                    .id("working-tree-detail")
+                    .v_flex()
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .child(working_tree(status, mono)),
+            );
+        }
         let Some(commit) = &self.commit else {
             return pane.child(
                 div()
@@ -124,7 +151,6 @@ impl Render for DetailPane {
                     ),
             );
         };
-        let mono = cx.theme().mono_font_family.clone();
         let details = match &self.details {
             Some(Ok(details)) => Some(details.clone()),
             _ => None,
@@ -337,35 +363,160 @@ fn files(details: &CommitDetails, mono: SharedString) -> impl IntoElement {
                 .files
                 .iter()
                 .take(MAX_FILES_SHOWN)
-                .map(|file| file_row(file, mono.clone())),
+                .map(|file| commit_file_row(file, mono.clone())),
         )
-        .when(hidden > 0, |this| {
-            this.child(
-                div()
-                    .px(px(16.))
-                    .py(px(6.))
-                    .text_size(px(12.))
-                    .text_color(rgb(color::TEXT_MUTED))
-                    .child(format!("and {hidden} more files")),
-            )
+        .when(hidden > 0, |this| this.child(more_files(hidden)))
+}
+
+/// "Uncommitted changes", then the staged files and the other changes.
+fn working_tree(status: &WorkingTreeStatus, mono: SharedString) -> impl IntoElement {
+    let staged: Vec<&FileStatus> = status
+        .files
+        .iter()
+        .filter(|file| file.staged.is_some())
+        .collect();
+    let unstaged: Vec<&FileStatus> = status
+        .files
+        .iter()
+        .filter(|file| file.unstaged.is_some())
+        .collect();
+    let group =
+        |title: &'static str, files: &[&FileStatus], row: &dyn Fn(&FileStatus) -> AnyElement| {
+            let hidden = files.len().saturating_sub(MAX_FILES_SHOWN);
+            div()
+                .v_flex()
+                .pb(px(8.))
+                .child(
+                    div()
+                        .h_flex()
+                        .gap(px(8.))
+                        .pt(px(12.))
+                        .px(px(16.))
+                        .pb(px(6.))
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(rgb(color::TEXT_MUTED))
+                                .child(files.len().to_string()),
+                        ),
+                )
+                .children(files.iter().take(MAX_FILES_SHOWN).map(|file| row(file)))
+                .when(hidden > 0, |this| this.child(more_files(hidden)))
+        };
+
+    div()
+        .v_flex()
+        .child(
+            div()
+                .v_flex()
+                .gap(px(4.))
+                .pt(px(16.))
+                .px(px(18.))
+                .pb(px(14.))
+                .border_b_1()
+                .border_color(rgb(color::BORDER))
+                .child(
+                    div()
+                        .text_size(px(17.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Uncommitted changes"),
+                )
+                .child(
+                    div()
+                        .text_size(theme::SMALL_TEXT_SIZE)
+                        .text_color(rgb(color::TEXT_MUTED))
+                        .child(labels::working_tree_summary(status)),
+                ),
+        )
+        .when(!staged.is_empty(), |this| {
+            this.child(group("Staged", &staged, &|file| {
+                let kind = file.staged.as_ref().unwrap_or(&ChangeKind::Modified);
+                let (letter, letter_color) = change_letter(kind);
+                file_row(
+                    letter,
+                    letter_color,
+                    &file.path,
+                    rename_source(kind),
+                    None,
+                    mono.clone(),
+                )
+                .into_any_element()
+            }))
+        })
+        .when(!unstaged.is_empty(), |this| {
+            this.child(group("Changes", &unstaged, &|file| {
+                let (letter, letter_color) =
+                    worktree_letter(file.unstaged.unwrap_or(WorktreeChange::Modified));
+                file_row(letter, letter_color, &file.path, None, None, mono.clone())
+                    .into_any_element()
+            }))
         })
 }
 
-fn file_row(file: &FileChange, mono: SharedString) -> impl IntoElement {
-    let (letter, letter_color) = match file.kind {
+fn more_files(hidden: usize) -> impl IntoElement {
+    div()
+        .px(px(16.))
+        .py(px(6.))
+        .text_size(px(12.))
+        .text_color(rgb(color::TEXT_MUTED))
+        .child(format!("and {hidden} more files"))
+}
+
+/// The status letter of a committed or staged change, as `git status --short`
+/// writes it.
+fn change_letter(kind: &ChangeKind) -> (&'static str, u32) {
+    match kind {
         ChangeKind::Added => ("A", color::DIFF_ADDED),
         ChangeKind::Modified => ("M", color::ACCENT),
         ChangeKind::Deleted => ("D", color::DIFF_REMOVED),
         ChangeKind::Renamed { .. } => ("R", color::BRANCH_BLUE),
         ChangeKind::Copied { .. } => ("C", color::BRANCH_BLUE),
-    };
-    let (directory, name) = match file.path.rfind('/') {
-        Some(slash) => file.path.split_at(slash + 1),
-        None => ("", file.path.as_str()),
-    };
-    let from = match &file.kind {
+    }
+}
+
+/// The status letter of an unstaged change: `?` untracked, `U` unmerged.
+fn worktree_letter(change: WorktreeChange) -> (&'static str, u32) {
+    match change {
+        WorktreeChange::Modified => ("M", color::ACCENT),
+        WorktreeChange::Deleted => ("D", color::DIFF_REMOVED),
+        WorktreeChange::Untracked => ("?", color::DIFF_ADDED),
+        WorktreeChange::Conflicted => ("U", color::DIFF_REMOVED),
+    }
+}
+
+fn rename_source(kind: &ChangeKind) -> Option<String> {
+    match kind {
         ChangeKind::Renamed { from } | ChangeKind::Copied { from } => Some(from.clone()),
         _ => None,
+    }
+}
+
+fn commit_file_row(file: &FileChange, mono: SharedString) -> impl IntoElement {
+    let (letter, letter_color) = change_letter(&file.kind);
+    file_row(
+        letter,
+        letter_color,
+        &file.path,
+        rename_source(&file.kind),
+        file.lines,
+        mono,
+    )
+}
+
+/// One changed file: its status letter, the old path of a rename, the path
+/// with the directory muted, and lines added and removed if known.
+fn file_row(
+    letter: &'static str,
+    letter_color: u32,
+    path: &str,
+    from: Option<String>,
+    lines: Option<LineCounts>,
+    mono: SharedString,
+) -> impl IntoElement {
+    let (directory, name) = match path.rfind('/') {
+        Some(slash) => path.split_at(slash + 1),
+        None => ("", path),
     };
     let count = |prefix: &str, value: usize, hex: u32| {
         (value > 0).then(|| div().text_color(rgb(hex)).child(format!("{prefix}{value}")))
@@ -409,7 +560,7 @@ fn file_row(file: &FileChange, mono: SharedString) -> impl IntoElement {
                 )
                 .child(div().min_w_0().text_ellipsis().child(name.to_owned())),
         )
-        .when_some(file.lines, |this, lines| {
+        .when_some(lines, |this, lines| {
             this.child(
                 div()
                     .h_flex()

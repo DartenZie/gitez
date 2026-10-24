@@ -22,7 +22,7 @@ anyhow = "1"
 thiserror = "2"
 
 # Read-only git access (writes go through the git CLI, see CLAUDE.md).
-gix = { version = "0.90", default-features = false, features = ["max-performance", "revision", "blob-diff", "sha1"] }
+gix = { version = "0.90", default-features = false, features = ["max-performance", "revision", "blob-diff", "status", "sha1"] }
 
 tempfile = "3"
 

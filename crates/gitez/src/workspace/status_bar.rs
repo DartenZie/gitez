@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use gitez_git::Head;
+use gitez_git::{Head, WorkingTreeStatus};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -11,11 +11,12 @@ use gpui_kit::*;
 use crate::repository::Snapshot;
 use crate::theme::{self, color};
 
-/// Where `HEAD` is, how the current branch compares to its upstream, and the
-/// repository's location.
+/// Where `HEAD` is, how the current branch compares to its upstream, the
+/// uncommitted changes, and the repository's location.
 #[derive(IntoElement)]
 pub struct StatusBar {
     pub snapshot: Option<Arc<Snapshot>>,
+    pub status: Option<Arc<WorkingTreeStatus>>,
 }
 
 impl RenderOnce for StatusBar {
@@ -93,6 +94,9 @@ impl RenderOnce for StatusBar {
             .when_some(tracking, |this, tracking| {
                 this.child(truncated(tracking).flex_shrink_0().max_w(px(320.)))
             })
+            .when_some(self.status.as_deref().and_then(changes), |this, changes| {
+                this.child(truncated(changes).flex_shrink_0())
+            })
             .child(
                 truncated(display_path(&snapshot.path))
                     .ml_auto()
@@ -100,6 +104,23 @@ impl RenderOnce for StatusBar {
                     .max_w(relative(0.5)),
             )
     }
+}
+
+/// "3 changed · 1 staged · 1 conflicted", or `None` when clean.
+fn changes(status: &WorkingTreeStatus) -> Option<String> {
+    if status.is_clean() {
+        return None;
+    }
+    let mut text = format!("{} changed", status.files.len());
+    for (count, what) in [
+        (status.staged(), "staged"),
+        (status.conflicted(), "conflicted"),
+    ] {
+        if count > 0 {
+            text.push_str(&format!(" · {count} {what}"));
+        }
+    }
+    Some(text)
 }
 
 /// One line of text, cut short with an ellipsis when it does not fit.

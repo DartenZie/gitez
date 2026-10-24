@@ -65,5 +65,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             start.elapsed()
         );
     }
+
+    for run in ["first", "second"] {
+        let start = Instant::now();
+        let status = repo.status()?;
+        println!(
+            "status ({run} read): {} files, {} staged in {:?}",
+            status.files.len(),
+            status.staged(),
+            start.elapsed()
+        );
+    }
     Ok(())
 }

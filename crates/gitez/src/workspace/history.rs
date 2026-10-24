@@ -1,11 +1,13 @@
 //! The commit history: every commit reachable from a ref, newest first, with
-//! its graph, labels, author and date, in a virtual list.
+//! its graph, labels, author and date, in a virtual list. Uncommitted changes
+//! get a row of their own right above the commit `HEAD` points at.
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 use gitez_git::graph::{GraphLayout, Row};
-use gitez_git::{Commit, Oid, Order, RefLabel};
+use gitez_git::{Commit, Oid, Order, RefLabel, WorkingTreeStatus};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -55,8 +57,23 @@ mod columns {
     pub const END_PADDING: Pixels = px(14.);
 }
 
-/// Emitted when the selected commit changes.
+/// Emitted when the selected row changes, or the uncommitted changes while
+/// their row is selected.
 pub struct SelectionChanged;
+
+/// What the selected row shows.
+pub enum Selection<'a> {
+    WorkingTree(&'a Arc<WorkingTreeStatus>),
+    Commit(&'a Commit, &'a [RefLabel]),
+}
+
+/// A row of the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Entry {
+    WorkingTree,
+    /// The commit at this index of `commits`.
+    Commit(usize),
+}
 
 pub struct History {
     focus_handle: FocusHandle,
@@ -71,7 +88,11 @@ pub struct History {
     graph_scroll: Pixels,
     labels: HashMap<Oid, Vec<RefLabel>>,
     head: Option<Oid>,
-    selected: Option<usize>,
+    /// Index of the `HEAD` commit in `commits`, once read.
+    head_index: Option<usize>,
+    /// Uncommitted changes; the list shows their row while not clean.
+    working_tree: Option<Arc<WorkingTreeStatus>>,
+    selected: Option<Entry>,
     /// Whether the whole history has been read.
     complete: bool,
     error: Option<SharedString>,
@@ -94,6 +115,8 @@ impl History {
             graph_scroll: px(0.),
             labels: HashMap::new(),
             head: None,
+            head_index: None,
+            working_tree: None,
             selected: None,
             complete: false,
             error: None,
@@ -179,6 +202,16 @@ impl History {
             .iter()
             .map(|row| row.width)
             .fold(self.lanes, usize::max);
+        if self.head_index.is_none()
+            && let Some(head) = self.head
+            && let Some(offset) = commits.iter().position(|commit| commit.id == head)
+        {
+            self.head_index = Some(self.commits.len() + offset);
+            // The uncommitted-changes row moves from the top to above `HEAD`.
+            if self.working_tree_index().is_some() {
+                self.scroll_to_selection();
+            }
+        }
         self.commits.extend(commits);
         self.rows.extend(rows);
         cx.notify();
@@ -197,41 +230,115 @@ impl History {
         cx.notify();
     }
 
-    /// The selected commit and the refs pointing at it.
-    pub fn selected(&self) -> Option<(&Commit, &[RefLabel])> {
-        let commit = self.commits.get(self.selected?)?;
-        let labels = self.labels.get(&commit.id).map_or(&[][..], Vec::as_slice);
-        Some((commit, labels))
+    /// Shows `status` as the uncommitted-changes row, or removes the row
+    /// when `status` is clean or `None`.
+    pub fn set_working_tree(
+        &mut self,
+        status: Option<Arc<WorkingTreeStatus>>,
+        cx: &mut Context<Self>,
+    ) {
+        let status = status.filter(|status| !status.is_clean());
+        if status == self.working_tree {
+            return;
+        }
+        self.working_tree = status;
+        if self.selected == Some(Entry::WorkingTree) {
+            if self.working_tree.is_none() {
+                self.selected = None;
+            }
+            cx.emit(SelectionChanged);
+        }
+        cx.notify();
     }
 
-    pub fn is_head(&self, id: Oid) -> bool {
-        self.head == Some(id)
+    /// What the selected row shows.
+    pub fn selected(&self) -> Option<Selection<'_>> {
+        match self.selected? {
+            Entry::WorkingTree => self.working_tree.as_ref().map(Selection::WorkingTree),
+            Entry::Commit(index) => {
+                let commit = self.commits.get(index)?;
+                let labels = self.labels.get(&commit.id).map_or(&[][..], Vec::as_slice);
+                Some(Selection::Commit(commit, labels))
+            }
+        }
+    }
+
+    /// Where the uncommitted-changes row is, if shown: right above the `HEAD`
+    /// commit, or at the top until that commit has been read.
+    fn working_tree_index(&self) -> Option<usize> {
+        self.working_tree.as_ref()?;
+        Some(self.head_index.unwrap_or(0))
+    }
+
+    /// Number of rows in the list.
+    fn len(&self) -> usize {
+        self.commits.len() + usize::from(self.working_tree_index().is_some())
+    }
+
+    fn entry(&self, index: usize) -> Entry {
+        match self.working_tree_index() {
+            Some(wip) if index == wip => Entry::WorkingTree,
+            Some(wip) if index > wip => Entry::Commit(index - 1),
+            _ => Entry::Commit(index),
+        }
+    }
+
+    fn index_of(&self, entry: Entry) -> Option<usize> {
+        match (entry, self.working_tree_index()) {
+            (Entry::WorkingTree, wip) => wip,
+            (Entry::Commit(index), Some(wip)) if index >= wip => Some(index + 1),
+            (Entry::Commit(index), _) => Some(index),
+        }
+    }
+
+    /// The graph row of an entry; the uncommitted changes take `HEAD`'s.
+    fn graph_row(&self, entry: Entry) -> Option<&Row> {
+        match entry {
+            Entry::WorkingTree => self.rows.get(self.head_index?),
+            Entry::Commit(index) => self.rows.get(index),
+        }
     }
 
     fn select(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(last) = self.commits.len().checked_sub(1) else {
+        let Some(last) = self.len().checked_sub(1) else {
             return;
         };
-        let index = index.min(last);
-        if self.selected != Some(index) {
-            self.selected = Some(index);
-            self.scroll.scroll_to_item(index, ScrollStrategy::Nearest);
-            if let Some(row) = self.rows.get(index) {
-                let scroll = graph::scroll_to_lane(row.lane, self.graph_scroll, self.graph_width());
-                self.set_graph_scroll(scroll);
-            }
+        let entry = self.entry(index.min(last));
+        if self.selected != Some(entry) {
+            self.selected = Some(entry);
+            self.scroll_to_selection();
             cx.emit(SelectionChanged);
             cx.notify();
         }
     }
 
+    /// Scrolls the list, and the graph sideways, to show the selected row.
+    fn scroll_to_selection(&mut self) {
+        let Some(entry) = self.selected else {
+            return;
+        };
+        if let Some(index) = self.index_of(entry) {
+            self.scroll.scroll_to_item(index, ScrollStrategy::Nearest);
+        }
+        if let Some(lane) = self.graph_row(entry).map(|row| row.lane) {
+            let scroll = graph::scroll_to_lane(lane, self.graph_scroll, self.graph_width());
+            self.set_graph_scroll(scroll);
+        }
+    }
+
+    fn selected_index(&self) -> Option<usize> {
+        self.index_of(self.selected?)
+    }
+
     fn select_previous(&mut self, _: &SelectPrevious, _: &mut Window, cx: &mut Context<Self>) {
-        let index = self.selected.map_or(0, |index| index.saturating_sub(1));
+        let index = self
+            .selected_index()
+            .map_or(0, |index| index.saturating_sub(1));
         self.select(index, cx);
     }
 
     fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
-        let index = self.selected.map_or(0, |index| index + 1);
+        let index = self.selected_index().map_or(0, |index| index + 1);
         self.select(index, cx);
     }
 
@@ -282,100 +389,165 @@ impl History {
     }
 
     fn render_rows(&self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let graph_width = self.graph_width();
         range
             .filter_map(|index| {
-                let commit = self.commits.get(index)?;
-                let row = self.rows.get(index)?;
-                let selected = self.selected == Some(index);
-                let labels = self.labels.get(&commit.id);
-
-                Some(
-                    div()
-                        .id(index)
-                        .h_flex()
-                        // Rows are laid out on their own and would otherwise
-                        // be as wide as their content, misaligning the columns.
-                        .w_full()
-                        .h(ROW_HEIGHT)
-                        .pr(columns::END_PADDING)
-                        .gap(columns::GAP)
-                        .border_b_1()
-                        .border_color(rgb(color::ROW_BORDER))
-                        .map(|this| {
-                            if selected {
-                                this.bg(rgb(color::SELECTED))
-                            } else {
-                                this.hover(|style| style.bg(rgb(color::ROW_HOVER)))
-                            }
-                        })
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            window.focus(&this.focus_handle, cx);
-                            this.select(index, cx);
-                        }))
-                        .child(
-                            div()
-                                .h_full()
-                                .flex_none()
-                                .on_scroll_wheel(cx.listener(Self::scroll_graph))
-                                .child(graph::cell(
-                                    row.clone(),
-                                    self.is_head(commit.id),
-                                    graph_width,
-                                    self.graph_scroll,
-                                )),
-                        )
-                        .child(
-                            div()
-                                .h_flex()
-                                .flex_1()
-                                .min_w_0()
-                                .gap(px(6.))
-                                .overflow_hidden()
-                                .when_some(labels, |this, labels| {
-                                    this.children(labels.iter().map(labels::ref_label))
-                                })
-                                .child(
-                                    div()
-                                        // Labels shrink before the summary
-                                        // goes below this.
-                                        .min_w(SUMMARY_MIN_WIDTH)
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .text_ellipsis()
-                                        .child(commit.summary.clone()),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .h_flex()
-                                .w(columns::AUTHOR)
-                                .flex_none()
-                                .gap(px(7.))
-                                .text_color(rgb(color::AUTHOR_TEXT))
-                                .child(labels::avatar(&commit.author.name, px(20.)))
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .text_ellipsis()
-                                        .child(commit.author.name.clone()),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .w(columns::DATE)
-                                .flex_none()
-                                .text_size(px(12.))
-                                .text_color(rgb(color::TEXT_MUTED))
-                                .whitespace_nowrap()
-                                .child(time::relative(commit.author.time, self.now)),
-                        )
-                        .into_any_element(),
-                )
+                let entry = self.entry(index);
+                let row = self.row_shell(index, self.selected == Some(entry), cx);
+                match entry {
+                    Entry::WorkingTree => self.render_working_tree(row, cx),
+                    Entry::Commit(commit) => self.render_commit(row, commit, cx),
+                }
             })
             .collect()
+    }
+
+    /// An empty row at list position `index`, selected on click.
+    fn row_shell(&self, index: usize, selected: bool, cx: &mut Context<Self>) -> Stateful<Div> {
+        div()
+            .id(index)
+            .h_flex()
+            // Rows are laid out on their own and would otherwise be as wide
+            // as their content, misaligning the columns.
+            .w_full()
+            .h(ROW_HEIGHT)
+            .pr(columns::END_PADDING)
+            .gap(columns::GAP)
+            .border_b_1()
+            .border_color(rgb(color::ROW_BORDER))
+            .map(|this| {
+                if selected {
+                    this.bg(rgb(color::SELECTED))
+                } else {
+                    this.hover(|style| style.bg(rgb(color::ROW_HOVER)))
+                }
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                window.focus(&this.focus_handle, cx);
+                this.select(index, cx);
+            }))
+    }
+
+    /// The graph column of a row: scrolls the graph sideways.
+    fn graph_column(&self, cell: impl IntoElement, cx: &mut Context<Self>) -> Div {
+        div()
+            .h_full()
+            .flex_none()
+            .on_scroll_wheel(cx.listener(Self::scroll_graph))
+            .child(cell)
+    }
+
+    fn render_working_tree(
+        &self,
+        row: Stateful<Div>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let status = self.working_tree.as_ref()?;
+        let head_row = self.head_index.and_then(|index| self.rows.get(index));
+        let cell =
+            graph::working_tree_cell(head_row.cloned(), self.graph_width(), self.graph_scroll);
+        Some(
+            row.child(self.graph_column(cell, cx))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .italic()
+                        .text_color(rgb(color::WORKING_TREE_TEXT))
+                        .child(format!(
+                            "Uncommitted changes — {}",
+                            labels::working_tree_summary(status)
+                        )),
+                )
+                .child(div().w(columns::AUTHOR).flex_none())
+                .child(
+                    div()
+                        .w(columns::DATE)
+                        .flex_none()
+                        .text_size(px(12.))
+                        .text_color(rgb(color::TEXT_MUTED))
+                        .child("now"),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_commit(
+        &self,
+        row: Stateful<Div>,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let commit = self.commits.get(index)?;
+        let graph_row = self.rows.get(index)?;
+        let labels = self.labels.get(&commit.id);
+        let head = if self.head != Some(commit.id) {
+            graph::Head::No
+        } else if self.working_tree.is_some() && self.head_index == Some(index) {
+            graph::Head::BelowWorkingTree
+        } else {
+            graph::Head::Yes
+        };
+        let cell = graph::cell(
+            graph_row.clone(),
+            head,
+            self.graph_width(),
+            self.graph_scroll,
+        );
+
+        Some(
+            row.child(self.graph_column(cell, cx))
+                .child(
+                    div()
+                        .h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap(px(6.))
+                        .overflow_hidden()
+                        .when_some(labels, |this, labels| {
+                            this.children(labels.iter().map(labels::ref_label))
+                        })
+                        .child(
+                            div()
+                                // Labels shrink before the summary goes below
+                                // this.
+                                .min_w(SUMMARY_MIN_WIDTH)
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(commit.summary.clone()),
+                        ),
+                )
+                .child(
+                    div()
+                        .h_flex()
+                        .w(columns::AUTHOR)
+                        .flex_none()
+                        .gap(px(7.))
+                        .text_color(rgb(color::AUTHOR_TEXT))
+                        .child(labels::avatar(&commit.author.name, px(20.)))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(commit.author.name.clone()),
+                        ),
+                )
+                .child(
+                    div()
+                        .w(columns::DATE)
+                        .flex_none()
+                        .text_size(px(12.))
+                        .text_color(rgb(color::TEXT_MUTED))
+                        .whitespace_nowrap()
+                        .child(time::relative(commit.author.time, self.now)),
+                )
+                .into_any_element(),
+        )
     }
 }
 
@@ -425,7 +597,7 @@ impl Render for History {
             (false, _) => format!("· {count} commits so far…"),
         };
 
-        let body = if self.commits.is_empty() && (self.complete || self.error.is_some()) {
+        let body = if self.len() == 0 && (self.complete || self.error.is_some()) {
             let message = self
                 .error
                 .clone()
@@ -439,7 +611,7 @@ impl Render for History {
         } else {
             uniform_list(
                 "history",
-                self.commits.len(),
+                self.len(),
                 cx.processor(|this, range, _window, cx| this.render_rows(range, cx)),
             )
             .flex_1()

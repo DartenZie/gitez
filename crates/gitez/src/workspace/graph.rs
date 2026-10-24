@@ -22,6 +22,11 @@ const NODE_RADIUS: Pixels = px(6.);
 /// The ring drawn around the commit `HEAD` points at.
 const HEAD_RING_RADIUS: Pixels = px(10.);
 const HEAD_RING_WIDTH: Pixels = px(2.);
+/// The hollow, dashed node of the uncommitted-changes row and the dashed
+/// line joining it to the `HEAD` commit.
+const WORKING_TREE_RADIUS: Pixels = px(5.5);
+const WORKING_TREE_BORDER: Pixels = px(1.6);
+const DASHES: [Pixels; 2] = [px(3.), px(4.)];
 
 /// Width needed to show a graph `lanes` lanes wide in full.
 pub fn content_width(lanes: usize) -> Pixels {
@@ -47,15 +52,25 @@ pub fn scroll_to_lane(lane: usize, scroll: Pixels, width: Pixels) -> Pixels {
     }
 }
 
+/// How a commit row relates to `HEAD`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Head {
+    No,
+    /// `HEAD` points at this commit.
+    Yes,
+    /// `HEAD` points at this commit and the uncommitted-changes row sits
+    /// right above it, joined to it by a dashed line.
+    BelowWorkingTree,
+}
+
 /// An element that paints `row` across its bounds, with the graph moved
-/// `scroll` to the left. `is_head` adds the ring that marks the commit `HEAD`
-/// points at.
-pub fn cell(row: Row, is_head: bool, width: Pixels, scroll: Pixels) -> impl IntoElement {
+/// `scroll` to the left.
+pub fn cell(row: Row, head: Head, width: Pixels, scroll: Pixels) -> impl IntoElement {
     canvas(
         |_, _, _| {},
         move |bounds, _, window, _| {
             window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                paint_row(&row, is_head, bounds, scroll, window);
+                paint_row(&row, head, bounds, scroll, window);
             });
         },
     )
@@ -64,17 +79,68 @@ pub fn cell(row: Row, is_head: bool, width: Pixels, scroll: Pixels) -> impl Into
     .flex_none()
 }
 
-fn paint_row(
-    row: &Row,
-    is_head: bool,
+/// An element that paints the uncommitted-changes row, which sits right
+/// above `head_row`, the row of the commit `HEAD` points at. Lines entering
+/// `head_row` from above pass through; with no `head_row` (an unborn branch,
+/// or `HEAD` not read yet) only the node is drawn, in the first lane.
+pub fn working_tree_cell(head_row: Option<Row>, width: Pixels, scroll: Pixels) -> impl IntoElement {
+    canvas(
+        |_, _, _| {},
+        move |bounds, _, window, _| {
+            window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                paint_working_tree(head_row.as_ref(), bounds, scroll, window);
+            });
+        },
+    )
+    .w(width)
+    .h_full()
+    .flex_none()
+}
+
+/// The x coordinate of `lane`'s centre in a row at `bounds`.
+fn lane_x(bounds: Bounds<Pixels>, scroll: Pixels, lane: usize) -> Pixels {
+    bounds.left() - scroll + FIRST_LANE + LANE_WIDTH * lane as f32
+}
+
+fn paint_working_tree(
+    head_row: Option<&Row>,
     bounds: Bounds<Pixels>,
     scroll: Pixels,
     window: &mut Window,
 ) {
+    let (lane, color) = head_row.map_or((0, 0), |row| (row.lane, row.color));
+    let node = point(lane_x(bounds, scroll, lane), bounds.center().y);
+    if let Some(row) = head_row {
+        // Every line at the top of the `HEAD` row crosses this row whole.
+        for segment in &row.segments {
+            if let Segment::Through { lane, color } | Segment::In { lane, color } = *segment {
+                let x = lane_x(bounds, scroll, lane);
+                let path = line(point(x, bounds.top()), point(x, bounds.bottom()));
+                if let Some(path) = path {
+                    window.paint_path(path, lane_color(color));
+                }
+            }
+        }
+        let path = dashed_line(node, point(node.x, bounds.bottom()));
+        if let Some(path) = path {
+            window.paint_path(path, lane_color(color));
+        }
+    }
+    window.paint_quad(quad(
+        circle_bounds(node, WORKING_TREE_RADIUS),
+        WORKING_TREE_RADIUS,
+        rgb(theme::color::BACKGROUND),
+        WORKING_TREE_BORDER,
+        lane_color(color),
+        BorderStyle::Dashed,
+    ));
+}
+
+fn paint_row(row: &Row, head: Head, bounds: Bounds<Pixels>, scroll: Pixels, window: &mut Window) {
     let top = bounds.top();
     let bottom = bounds.bottom();
     let middle = bounds.center().y;
-    let x = |lane: usize| bounds.left() - scroll + FIRST_LANE + LANE_WIDTH * lane as f32;
+    let x = |lane: usize| lane_x(bounds, scroll, lane);
     let node = point(x(row.lane), middle);
 
     for segment in &row.segments {
@@ -91,7 +157,12 @@ fn paint_row(
     }
 
     let color = lane_color(row.color);
-    if is_head {
+    if head == Head::BelowWorkingTree
+        && let Some(path) = dashed_line(point(node.x, top), node)
+    {
+        window.paint_path(path, color);
+    }
+    if head != Head::No {
         window.paint_quad(quad(
             circle_bounds(node, HEAD_RING_RADIUS),
             HEAD_RING_RADIUS,
@@ -114,6 +185,13 @@ fn circle_bounds(center: Point<Pixels>, radius: Pixels) -> Bounds<Pixels> {
 
 fn line(from: Point<Pixels>, to: Point<Pixels>) -> Option<Path<Pixels>> {
     let mut builder = PathBuilder::stroke(LINE_WIDTH);
+    builder.move_to(from);
+    builder.line_to(to);
+    builder.build().ok()
+}
+
+fn dashed_line(from: Point<Pixels>, to: Point<Pixels>) -> Option<Path<Pixels>> {
+    let mut builder = PathBuilder::stroke(LINE_WIDTH).dash_array(&DASHES);
     builder.move_to(from);
     builder.line_to(to);
     builder.build().ok()

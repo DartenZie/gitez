@@ -32,6 +32,8 @@ enum Section {
 
 pub struct Sidebar {
     snapshot: Option<Arc<Snapshot>>,
+    /// Files with uncommitted changes, once read.
+    changed_files: Option<usize>,
     collapsed: HashSet<Section>,
 }
 
@@ -39,7 +41,16 @@ impl Sidebar {
     pub fn new() -> Self {
         Self {
             snapshot: None,
+            changed_files: None,
             collapsed: HashSet::new(),
+        }
+    }
+
+    /// Shows `count` beside "Working tree"; nothing for `None` or zero.
+    pub fn set_changed_files(&mut self, count: Option<usize>, cx: &mut Context<Self>) {
+        if self.changed_files != count {
+            self.changed_files = count;
+            cx.notify();
         }
     }
 
@@ -138,11 +149,18 @@ impl Render for Sidebar {
                     .pt(px(10.))
                     .px(px(8.))
                     .pb(px(4.))
-                    .child(nav_item("nav-history", IconName::GitGraph, "History", true))
+                    .child(nav_item(
+                        "nav-history",
+                        IconName::GitGraph,
+                        "History",
+                        None,
+                        true,
+                    ))
                     .child(nav_item(
                         "nav-working-tree",
                         IconName::ListTree,
                         "Working tree",
+                        self.changed_files.filter(|&count| count > 0),
                         false,
                     )),
             )
@@ -229,6 +247,7 @@ fn nav_item(
     id: &'static str,
     icon: IconName,
     label: &'static str,
+    count: Option<usize>,
     active: bool,
 ) -> impl IntoElement {
     div()
@@ -249,6 +268,15 @@ fn nav_item(
         })
         .child(Icon::new(icon).size(px(15.)))
         .child(label)
+        .when_some(count, |this, count| {
+            this.child(
+                div()
+                    .ml_auto()
+                    .text_size(theme::SMALL_TEXT_SIZE)
+                    .text_color(rgb(color::TEXT_MUTED))
+                    .child(count.to_string()),
+            )
+        })
 }
 
 /// A single-line sidebar row.

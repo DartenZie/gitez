@@ -6,7 +6,8 @@ use std::process::Command;
 
 use gitez_git::graph::GraphLayout;
 use gitez_git::{
-    ChangeKind, Commit, FileChange, Head, LineCounts, Oid, Order, RefKind, Repository,
+    ChangeKind, Commit, FileChange, FileStatus, Head, LineCounts, Oid, Order, RefKind, Repository,
+    WorktreeChange,
 };
 use tempfile::TempDir;
 
@@ -392,6 +393,7 @@ fn types_can_move_to_background_threads() {
     assert_send_sync::<Repository>();
     assert_send::<gitez_git::CommitWalk>();
     assert_send_sync::<gitez_git::CommitDetails>();
+    assert_send_sync::<gitez_git::WorkingTreeStatus>();
     assert_send_sync::<gitez_git::Refs>();
     assert_send_sync::<GraphLayout>();
 }
@@ -509,4 +511,117 @@ fn details_of_a_shallow_boundary_compare_with_nothing() {
             .all(|file| file.kind == ChangeKind::Added)
     );
     assert!(!details.files.is_empty());
+}
+
+fn file_status(
+    path: &str,
+    staged: Option<ChangeKind>,
+    unstaged: Option<WorktreeChange>,
+) -> FileStatus {
+    FileStatus {
+        path: path.to_owned(),
+        staged,
+        unstaged,
+    }
+}
+
+#[test]
+fn status_of_a_clean_working_tree_is_empty() {
+    let fixture = Fixture::new();
+    fixture.commit("a.txt", "one");
+    let status = fixture.open().status().expect("read status");
+    assert!(status.is_clean());
+}
+
+#[test]
+fn status_separates_staged_unstaged_and_untracked() {
+    let fixture = Fixture::new();
+    fixture.commit("edited.txt", "one");
+    fixture.commit("both.txt", "one");
+    fixture.commit("removed.txt", "one");
+    fixture.commit("old-name.txt", "a line long enough for rename detection\n");
+    std::fs::write(fixture.root.join(".gitignore"), "*.log\n").expect("write");
+    fixture.git(&["add", ".gitignore"]);
+    fixture.git(&["commit", "--quiet", "-m", "Ignore logs"]);
+
+    std::fs::write(fixture.root.join("edited.txt"), "two\n").expect("write");
+    std::fs::write(fixture.root.join("both.txt"), "two\n").expect("write");
+    fixture.git(&["add", "both.txt"]);
+    std::fs::write(fixture.root.join("both.txt"), "three\n").expect("write");
+    std::fs::remove_file(fixture.root.join("removed.txt")).expect("remove");
+    fixture.git(&["mv", "old-name.txt", "new-name.txt"]);
+    std::fs::write(fixture.root.join("staged-new.txt"), "new\n").expect("write");
+    fixture.git(&["add", "staged-new.txt"]);
+    std::fs::create_dir(fixture.root.join("dir")).expect("mkdir");
+    std::fs::write(fixture.root.join("dir/untracked.txt"), "?\n").expect("write");
+    std::fs::write(fixture.root.join("debug.log"), "ignored\n").expect("write");
+
+    let status = fixture.open().status().expect("read status");
+    assert_eq!(
+        status.files,
+        vec![
+            file_status(
+                "both.txt",
+                Some(ChangeKind::Modified),
+                Some(WorktreeChange::Modified)
+            ),
+            file_status("dir/untracked.txt", None, Some(WorktreeChange::Untracked)),
+            file_status("edited.txt", None, Some(WorktreeChange::Modified)),
+            file_status(
+                "new-name.txt",
+                Some(ChangeKind::Renamed {
+                    from: "old-name.txt".to_owned()
+                }),
+                None
+            ),
+            file_status("removed.txt", None, Some(WorktreeChange::Deleted)),
+            file_status("staged-new.txt", Some(ChangeKind::Added), None),
+        ]
+    );
+    assert_eq!(status.staged(), 3);
+    assert_eq!(status.conflicted(), 0);
+}
+
+#[test]
+fn status_reports_merge_conflicts() {
+    let fixture = Fixture::new();
+    fixture.commit("shared.txt", "base");
+    fixture.git(&["checkout", "--quiet", "-b", "other"]);
+    fixture.commit("shared.txt", "theirs");
+    fixture.git(&["checkout", "--quiet", "main"]);
+    fixture.commit("shared.txt", "ours");
+    let merge = Command::new("git")
+        .args(["merge", "--quiet", "other"])
+        .current_dir(&fixture.root)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("run git");
+    assert!(!merge.status.success(), "the merge should conflict");
+
+    let status = fixture.open().status().expect("read status");
+    assert_eq!(
+        status.files,
+        vec![file_status(
+            "shared.txt",
+            None,
+            Some(WorktreeChange::Conflicted)
+        )]
+    );
+    assert_eq!(status.conflicted(), 1);
+}
+
+#[test]
+fn status_of_an_empty_repository_lists_untracked_files() {
+    let fixture = Fixture::new();
+    std::fs::write(fixture.root.join("first.txt"), "hello\n").expect("write");
+    let status = fixture.open().status().expect("read status");
+    assert_eq!(
+        status.files,
+        vec![file_status(
+            "first.txt",
+            None,
+            Some(WorktreeChange::Untracked)
+        )]
+    );
 }

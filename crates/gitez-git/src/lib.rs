@@ -14,12 +14,14 @@ mod error;
 pub mod graph;
 mod refs;
 mod repository;
+mod status;
 
 pub use commits::{Commit, CommitWalk, Order, Signature, Timestamp};
 pub use details::{ChangeKind, CommitDetails, FileChange, LineCounts};
 pub use error::{Error, Result};
 pub use refs::{Branch, Head, RefKind, RefLabel, Refs, RemoteBranch, Stash, Tag};
 pub use repository::Repository;
+pub use status::{FileStatus, WorkingTreeStatus, WorktreeChange};
 
 /// A git object id (a commit hash, for the purposes of this crate).
 pub use gix::ObjectId as Oid;

@@ -59,6 +59,8 @@ pub mod color {
     pub const REMOTE_LABEL_BORDER: u32 = 0x3a_3a_40;
     pub const REMOTE_LABEL_TEXT: u32 = 0xa8_a6_9e;
     pub const TAG_LABEL_BORDER: u32 = 0x5a_57_4f;
+    /// The uncommitted-changes row of the history.
+    pub const WORKING_TREE_TEXT: u32 = REMOTE_LABEL_TEXT;
     /// Text on the small HEAD badge, which takes the branch colour.
     pub const HEAD_BADGE_TEXT: u32 = 0x0e_1a_28;
 }

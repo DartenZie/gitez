@@ -18,10 +18,12 @@ use gpui_kit::component::{StyledExt as _, WindowExt as _, h_resizable, resizable
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use gitez_git::WorkingTreeStatus;
+
 use crate::repository::Snapshot;
 use crate::theme::{self, color};
 use detail::DetailPane;
-use history::History;
+use history::{History, Selection};
 use sidebar::Sidebar;
 
 pub use history::key_bindings as history_key_bindings;
@@ -38,6 +40,13 @@ pub struct Workspace {
     /// Why the last attempt to open a repository failed, shown while no
     /// repository is open.
     error: Option<SharedString>,
+    /// Uncommitted changes of the open repository, once read.
+    status: Option<Arc<WorkingTreeStatus>>,
+    /// The status read in flight. Dropping it ignores its result.
+    status_load: Option<Task<()>>,
+    /// The last status read error shown, so it is not repeated on every
+    /// refresh.
+    status_error: Option<String>,
     sidebar: Entity<Sidebar>,
     history: Entity<History>,
     detail: Entity<DetailPane>,
@@ -50,13 +59,24 @@ impl Workspace {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
         let history = cx.new(History::new);
-        // The detail pane shows the selected commit.
-        let subscriptions = vec![cx.subscribe(&history, |this, _, _, cx| this.show_selection(cx))];
+        let subscriptions = vec![
+            // The detail pane shows the selected commit.
+            cx.subscribe(&history, |this, _, _, cx| this.show_selection(cx)),
+            // Files change outside GitEZ; read the status again on return.
+            cx.observe_window_activation(window, |this, window, cx| {
+                if window.is_window_active() {
+                    this.refresh_status(window, cx);
+                }
+            }),
+        ];
         let mut workspace = Self {
             focus_handle,
             snapshot: None,
             loading: None,
             error: None,
+            status: None,
+            status_load: None,
+            status_error: None,
             sidebar: cx.new(|_| Sidebar::new()),
             history,
             detail: cx.new(|_| DetailPane::new()),
@@ -138,6 +158,65 @@ impl Workspace {
         window.focus(&self.history.focus_handle(cx), cx);
         self.snapshot = Some(snapshot);
         self.error = None;
+        self.set_status(None, cx);
+        self.status_error = None;
+        self.refresh_status(window, cx);
+        cx.notify();
+    }
+
+    /// Reads the working tree's status on a background thread.
+    fn refresh_status(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let repository = snapshot.repository.clone();
+        let path = snapshot.path.clone();
+        let read = cx
+            .background_executor()
+            .spawn(async move { repository.status() });
+        self.status_load = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = read.await;
+            this.update_in(cx, |this, window, cx| {
+                // The repository changed while reading.
+                if this
+                    .snapshot
+                    .as_ref()
+                    .is_none_or(|snapshot| snapshot.path != path)
+                {
+                    return;
+                }
+                this.status_load = None;
+                match result {
+                    Ok(status) => {
+                        this.status_error = None;
+                        this.set_status(Some(Arc::new(status)), cx);
+                    }
+                    Err(error) => {
+                        let message = format!(
+                            "Could not read the working tree: {:#}",
+                            anyhow::Error::from(error)
+                        );
+                        if this.status_error.as_ref() != Some(&message) {
+                            window.push_notification(Notification::error(message.clone()), cx);
+                            this.status_error = Some(message);
+                        }
+                    }
+                }
+            })
+            .ok();
+        }));
+    }
+
+    fn set_status(&mut self, status: Option<Arc<WorkingTreeStatus>>, cx: &mut Context<Self>) {
+        if status == self.status {
+            return;
+        }
+        self.status = status.clone();
+        let changed = status.as_ref().map(|status| status.files.len());
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.set_changed_files(changed, cx));
+        self.history
+            .update(cx, |history, cx| history.set_working_tree(status, cx));
         cx.notify();
     }
 
@@ -146,11 +225,16 @@ impl Workspace {
         let Some(snapshot) = &self.snapshot else {
             return;
         };
-        let selection = self
-            .history
-            .read(cx)
-            .selected()
-            .map(|(commit, labels)| (commit.clone(), labels.to_vec()));
+        let selection = match self.history.read(cx).selected() {
+            Some(Selection::WorkingTree(status)) => {
+                let status = status.clone();
+                self.detail
+                    .update(cx, |detail, cx| detail.show_working_tree(status, cx));
+                return;
+            }
+            Some(Selection::Commit(commit, labels)) => Some((commit.clone(), labels.to_vec())),
+            None => None,
+        };
         self.detail.update(cx, |detail, cx| {
             detail.show(&snapshot.repository, selection, cx)
         });
@@ -224,7 +308,10 @@ impl Render for Workspace {
                         ),
                 ),
             )
-            .child(status_bar::StatusBar { snapshot })
+            .child(status_bar::StatusBar {
+                snapshot,
+                status: self.status.clone(),
+            })
     }
 }
 
