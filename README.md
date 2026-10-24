@@ -31,9 +31,11 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 > and `]` step to the newer and older commit, Esc goes back. Uncommitted
 > changes appear as a row above the current commit; open it the same way to
 > review them, with each file marked staged, partly staged or untracked.
-> Changes made in an editor, a terminal or another git client show up as
-> they happen, in the open review too.
-> Nothing can be changed from GitEZ yet.
+> Stage or unstage files there and commit them with a message (⌘↵); the
+> commit runs your own `git`, so hooks and signing work as in the terminal,
+> and a hook that rejects the commit shows its output. Changes made in an
+> editor, a terminal or another git client show up as they happen, in the
+> open review too. Nothing else can be changed from GitEZ yet.
 
 ## Technology
 
@@ -126,6 +128,8 @@ crates/gitez/       the application binary
 crates/gitez-git/   read-only repository access on gitoxide: refs, history, graph layout,
                     commit messages, changed files and diffs, working-tree status,
                     watching for changes
+crates/gitez-command/ changes made by running the user's git binary: staging,
+                    unstaging, committing
 rust-toolchain.toml pinned Rust toolchain
 CLAUDE.md           instructions for Claude Code when working in this repository
 ```

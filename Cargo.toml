@@ -32,6 +32,7 @@ futures = "0.3"
 tempfile = "3"
 
 gitez-git = { path = "crates/gitez-git" }
+gitez-command = { path = "crates/gitez-command" }
 
 [workspace.lints.rust]
 unsafe_code = "warn"

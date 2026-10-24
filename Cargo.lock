@@ -2045,9 +2045,18 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures",
+ "gitez-command",
  "gitez-git",
  "gpui-kit",
  "tempfile",
+]
+
+[[package]]
+name = "gitez-command"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

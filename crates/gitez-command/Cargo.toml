@@ -1,0 +1,19 @@
+[package]
+name = "gitez-command"
+description = "Changes to git repositories for GitEZ, made by running the user's git binary."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
