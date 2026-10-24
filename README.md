@@ -106,6 +106,14 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 > runs any of them exactly as typed with your own `git`, the output
 > streaming into the palette. Tab fills in the selected branch, commit or
 > file as the next argument. Nothing can prompt or open an editor there.
+> **Fetch** fetches every remote, **Pull** brings the upstream's commits
+> into the branch checked out as your git configuration says, and
+> **Push** sends it to its upstream, publishing a new branch to `origin`
+> first. They run your own `git`, so credential helpers and hooks apply;
+> the buttons count the commits to pull and to push, and the status bar
+> says when the repository last fetched. A push the remote rejects offers
+> to pull first or to force push with `--force-with-lease`; a pull of
+> diverged branches with no `pull.rebase` set offers to merge them.
 
 ## Technology
 

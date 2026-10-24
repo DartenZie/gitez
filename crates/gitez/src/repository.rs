@@ -34,6 +34,10 @@ pub struct Snapshot {
     pub merge: Option<gitez_git::MergeInProgress>,
     /// The rebase git stopped in the middle of, if one is in progress.
     pub rebase: Option<gitez_git::RebaseInProgress>,
+    /// The configured remotes, sorted.
+    pub remotes: Vec<String>,
+    /// When this working tree last fetched, in seconds since the epoch.
+    pub fetched: Option<i64>,
 }
 
 /// How a local branch compares to its upstream.
@@ -91,6 +95,9 @@ impl Snapshot {
             .rebase_in_progress()
             .context("could not read the rebase in progress")?;
 
+        let remotes = repository.remote_names();
+        let fetched = repository.last_fetch();
+
         Ok(Self {
             name: repository.name().into(),
             path: repository
@@ -106,6 +113,8 @@ impl Snapshot {
             user_name,
             merge,
             rebase,
+            remotes,
+            fetched,
         })
     }
 

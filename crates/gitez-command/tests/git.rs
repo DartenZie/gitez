@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use gitez_command::{Error, Git};
+use gitez_command::{Error, Git, PullMethod, PullOutcome, PushRejection};
 
 /// `git <args>` in `dir`, returning its trimmed output.
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -615,4 +615,134 @@ fn runs_a_command_as_typed_and_streams_its_output() {
         lines.iter().any(|line| line.contains("nowhere")),
         "{lines:?}"
     );
+}
+
+/// A bare repository with one commit on `main`, and two clones of it.
+fn remote_and_clones() -> (tempfile::TempDir, Git, Git) {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let root = dir.path();
+    let seed = root.join("seed");
+    std::fs::create_dir(&seed).expect("create seed");
+    git(&seed, &["init", "--quiet", "--initial-branch=main"]);
+    std::fs::write(seed.join("a.txt"), "a\n").expect("write");
+    git(&seed, &["add", "a.txt"]);
+    git(
+        &seed,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "a",
+        ],
+    );
+    git(root, &["clone", "--quiet", "--bare", "seed", "origin.git"]);
+    let clone = |name: &str| {
+        git(root, &["clone", "--quiet", "origin.git", name]);
+        let path = root.join(name);
+        for (key, value) in [
+            ("user.name", "Test"),
+            ("user.email", "test@example.com"),
+            ("commit.gpgsign", "false"),
+            ("core.hooksPath", ".git/hooks"),
+            ("push.default", "simple"),
+        ] {
+            git(&path, &["config", key, value]);
+        }
+        Git::new(path)
+    };
+    let (a, b) = (clone("a"), clone("b"));
+    (dir, a, b)
+}
+
+fn commit_file(git_: &Git, file: &str, text: &str) {
+    let root = git_.work_dir();
+    std::fs::write(root.join(file), text).expect("write");
+    git(root, &["add", file]);
+    git(root, &["commit", "--quiet", "-m", text.trim()]);
+}
+
+#[test]
+fn publishes_fetches_and_pulls_a_branch() {
+    let (_dir, a, b) = remote_and_clones();
+    git(a.work_dir(), &["switch", "--quiet", "-c", "feature"]);
+    commit_file(&a, "f.txt", "f\n");
+    a.push("feature", Some("origin"), false).expect("publish");
+    assert_eq!(
+        git(a.work_dir(), &["rev-parse", "--abbrev-ref", "feature@{u}"]),
+        "origin/feature"
+    );
+
+    b.fetch().expect("fetch");
+    assert_eq!(
+        git(b.work_dir(), &["rev-parse", "origin/feature"]),
+        git(a.work_dir(), &["rev-parse", "feature"])
+    );
+
+    git(a.work_dir(), &["switch", "--quiet", "main"]);
+    commit_file(&a, "a.txt", "a2\n");
+    a.push("main", None, false).expect("push");
+    assert_eq!(
+        b.pull(PullMethod::Configured).expect("pull"),
+        PullOutcome::Pulled
+    );
+    assert_eq!(
+        git(b.work_dir(), &["rev-parse", "main"]),
+        git(a.work_dir(), &["rev-parse", "main"])
+    );
+}
+
+#[test]
+fn a_rejected_push_says_why_and_can_be_forced() {
+    let (_dir, a, b) = remote_and_clones();
+    commit_file(&a, "a.txt", "from a\n");
+    a.push("main", None, false).expect("push");
+
+    commit_file(&b, "b.txt", "from b\n");
+    let error = b.push("main", None, false).expect_err("not fetched");
+    assert_eq!(PushRejection::of(&error), Some(PushRejection::NotFetched));
+    // The lease is the last fetch, which does not have a's commit.
+    assert!(b.push("main", None, true).is_err());
+
+    b.fetch().expect("fetch");
+    let error = b.push("main", None, false).expect_err("diverged");
+    assert_eq!(PushRejection::of(&error), Some(PushRejection::Diverged));
+
+    // Merged, it goes through.
+    assert_eq!(
+        b.pull(PullMethod::Merge).expect("pull"),
+        PullOutcome::Pulled
+    );
+    b.push("main", None, false).expect("push the merge");
+
+    // Rewritten, it needs force.
+    git(
+        b.work_dir(),
+        &["commit", "--quiet", "--amend", "-m", "rewritten"],
+    );
+    let error = b.push("main", None, false).expect_err("rewritten");
+    assert_eq!(PushRejection::of(&error), Some(PushRejection::Diverged));
+    b.push("main", None, true).expect("force with lease");
+    assert_eq!(
+        PushRejection::of(&Error::Spawn(std::io::ErrorKind::Other.into())),
+        None
+    );
+}
+
+#[test]
+fn a_conflicting_pull_stops_to_resolve() {
+    let (_dir, a, b) = remote_and_clones();
+    commit_file(&a, "a.txt", "from a\n");
+    a.push("main", None, false).expect("push");
+    commit_file(&b, "a.txt", "from b\n");
+    assert_eq!(
+        b.pull(PullMethod::Merge).expect("pull"),
+        PullOutcome::Conflicts
+    );
+    assert_eq!(b.conflicted().expect("conflicts"), ["a.txt"]);
 }

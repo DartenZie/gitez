@@ -3,16 +3,17 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use gitez_git::{Head, WorkingTreeStatus};
+use gitez_git::{Head, Timestamp, WorkingTreeStatus};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::repository::Snapshot;
 use crate::theme::{self, color};
+use crate::time;
 
 /// Where `HEAD` is, how the current branch compares to its upstream, the
-/// uncommitted changes, and the repository's location.
+/// uncommitted changes, when the repository last fetched, and its location.
 #[derive(IntoElement)]
 pub struct StatusBar {
     pub snapshot: Option<Arc<Snapshot>>,
@@ -88,6 +89,11 @@ impl RenderOnce for StatusBar {
             }
         });
 
+        let fetched = snapshot.fetched.map(|seconds| {
+            let when = Timestamp { seconds, offset: 0 };
+            format!("Fetched {}", time::relative(when, time::now()))
+        });
+
         // The branch and its tracking give way to the path when space runs
         // out; the path itself is cut short only beyond half the bar.
         bar.child(head)
@@ -98,8 +104,12 @@ impl RenderOnce for StatusBar {
                 this.child(truncated(changes).flex_shrink_0())
             })
             .child(
-                truncated(display_path(&snapshot.path))
+                truncated(fetched.unwrap_or_default())
                     .ml_auto()
+                    .flex_shrink_0(),
+            )
+            .child(
+                truncated(display_path(&snapshot.path))
                     .flex_shrink_0()
                     .max_w(relative(0.5)),
             )

@@ -301,6 +301,12 @@ fn reads_remotes_upstreams_and_ahead_behind() {
         .map(|b| b.short_name())
         .collect();
     assert_eq!(remotes, ["origin/feature", "origin/main"]);
+    assert_eq!(repo.remote_names(), ["origin"]);
+    assert_eq!(upstream.open().remote_names(), Vec::<String>::new());
+    // A clone has not fetched; fetching writes `FETCH_HEAD`.
+    assert_eq!(repo.last_fetch(), None);
+    fx.git(&["fetch", "--quiet"]);
+    assert!(fx.open().last_fetch().is_some());
 
     let main = refs
         .branches

@@ -9,6 +9,7 @@ mod history;
 mod labels;
 mod new_pull_request;
 mod palette;
+mod remote;
 mod review;
 mod rewrite;
 mod sidebar;
@@ -45,6 +46,7 @@ use history::{
 };
 use new_pull_request::{FormEvent, NewPullRequestForm};
 use palette::{Palette, PaletteCommand, PaletteContext, PaletteEvent};
+use remote::{RemoteActions, RemoteOp};
 use review::{
     CommitDraft, LastCommit, MergeDialog, MergeEvent, MergedPullRequest, Merging, Review,
     ReviewEvent, Tips,
@@ -54,7 +56,15 @@ use sidebar::{Sidebar, SidebarEvent};
 
 actions!(
     workspace,
-    [OpenRepository, ReviewSelected, NewPullRequest, OpenPalette]
+    [
+        OpenRepository,
+        ReviewSelected,
+        NewPullRequest,
+        OpenPalette,
+        Fetch,
+        Pull,
+        Push
+    ]
 );
 
 /// Key bindings of the views inside the workspace.
@@ -109,6 +119,8 @@ pub struct Workspace {
     rewrite: Option<(Entity<Rewrite>, Subscription)>,
     /// Continuing, aborting or undoing a rewrite.
     rewrite_command: Option<Task<()>>,
+    /// The fetch, pull or push running, if one is.
+    remote_op: Option<(RemoteOp, Task<()>)>,
     /// The command palette of the open repository, kept while hidden so a
     /// command run from it can finish.
     palette: Option<(Entity<Palette>, Subscription)>,
@@ -202,6 +214,7 @@ impl Workspace {
             merge_dialog: None,
             rewrite: None,
             rewrite_command: None,
+            remote_op: None,
             palette: None,
             palette_open: false,
             _switch: None,
@@ -912,28 +925,12 @@ impl Workspace {
                     backup,
                     message,
                 } => {
-                    let workspace = cx.entity().downgrade();
                     let (branch, backup) = (branch.clone(), backup.clone());
-                    window.push_notification(
-                        Notification::success(message.clone()).action(move |_, _, cx| {
-                            let notification = cx.entity().downgrade();
-                            let (workspace, branch, backup) =
-                                (workspace.clone(), branch.clone(), backup.clone());
-                            Button::new("undo-rewrite").small().label("Undo").on_click(
-                                move |_, window, cx| {
-                                    workspace
-                                        .update(cx, |this, cx| {
-                                            this.undo_rewrite(&branch, &backup, window, cx)
-                                        })
-                                        .ok();
-                                    notification
-                                        .update(cx, |notification, cx| {
-                                            notification.dismiss(window, cx)
-                                        })
-                                        .ok();
-                                },
-                            )
-                        }),
+                    this.notify_with_action(
+                        Notification::success(message.clone()),
+                        "Undo",
+                        move |this, window, cx| this.undo_rewrite(&branch, &backup, window, cx),
+                        window,
                         cx,
                     );
                 }
@@ -1092,6 +1089,7 @@ impl Workspace {
                 .iter()
                 .map(|branch| branch.name.clone())
                 .collect(),
+            remote: Some(RemoteActions::of(snapshot)),
         };
         let palette = palette.clone();
         palette.update(cx, |palette, cx| palette.open(context, window, cx));
@@ -1147,6 +1145,9 @@ impl Workspace {
             PaletteCommand::AbortRebase => self.abort_rebase(window, cx),
             PaletteCommand::ResolveConflicts => self.open_conflicts(window, cx),
             PaletteCommand::CherryPick => self.open_cherry_pick(window, cx),
+            PaletteCommand::Fetch => self.fetch(&Fetch, window, cx),
+            PaletteCommand::Pull => self.pull(&Pull, window, cx),
+            PaletteCommand::Push => self.push(&Push, window, cx),
             PaletteCommand::SelectCommit(id) => {
                 self.review = None;
                 self.rewrite = None;
@@ -1359,6 +1360,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::review_selected))
             .on_action(cx.listener(Self::new_pull_request))
             .on_action(cx.listener(Self::open_palette))
+            .on_action(cx.listener(Self::fetch))
+            .on_action(cx.listener(Self::pull))
+            .on_action(cx.listener(Self::push))
             .relative()
             .v_flex()
             .size_full()
@@ -1368,6 +1372,8 @@ impl Render for Workspace {
             .child(toolbar::Toolbar {
                 repository_name: snapshot.as_ref().map(|snapshot| snapshot.name.clone()),
                 loading: self.loading.is_some(),
+                remote: snapshot.as_deref().map(RemoteActions::of),
+                running: self.remote_op.as_ref().map(|(op, _)| *op),
             })
             .when_some(
                 snapshot

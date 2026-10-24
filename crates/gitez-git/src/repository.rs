@@ -70,6 +70,26 @@ impl Repository {
         (!value.is_empty()).then_some(value)
     }
 
+    /// The names of the configured remotes, sorted.
+    pub fn remote_names(&self) -> Vec<String> {
+        self.local()
+            .remote_names()
+            .into_iter()
+            .map(|name| name.to_str_lossy().into_owned())
+            .collect()
+    }
+
+    /// When this working tree last fetched, as seconds since the Unix
+    /// epoch: the time `FETCH_HEAD` was written. `None` before the first
+    /// fetch.
+    pub fn last_fetch(&self) -> Option<i64> {
+        let modified = std::fs::metadata(self.git_dir().join("FETCH_HEAD"))
+            .and_then(|metadata| metadata.modified())
+            .ok()?;
+        let elapsed = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+        i64::try_from(elapsed.as_secs()).ok()
+    }
+
     /// A handle for use on the current thread.
     pub(crate) fn local(&self) -> gix::Repository {
         let mut repo = self.inner.to_thread_local();

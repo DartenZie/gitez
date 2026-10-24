@@ -13,6 +13,7 @@ use gpui_kit::*;
 
 use super::history::History;
 use super::labels::{self, SECONDARY_KEY};
+use super::remote::RemoteActions;
 use crate::theme::{self, color};
 
 actions!(palette, [SelectPrevious, SelectNext, FillArgument, Dismiss]);
@@ -59,6 +60,9 @@ pub enum PaletteCommand {
     AbortRebase,
     ResolveConflicts,
     CherryPick,
+    Fetch,
+    Pull,
+    Push,
     /// Rewrite the commits after `base`, a revision as typed, folding in
     /// fixups if `autosquash`.
     RewriteSince {
@@ -86,6 +90,8 @@ pub struct PaletteContext {
     pub changed: Vec<String>,
     /// Local branches.
     pub branches: Vec<String>,
+    /// What fetch, pull and push would do.
+    pub remote: Option<RemoteActions>,
 }
 
 /// The kinds of item, one tab each.
@@ -195,6 +201,24 @@ fn actions() -> Vec<Action> {
             icon: IconName::Cherry,
             keywords: &["cherry-pick", "pick"],
             command: PaletteCommand::CherryPick,
+        },
+        Action {
+            title: "Fetch",
+            icon: IconName::RefreshCw,
+            keywords: &["fetch", "remote", "update"],
+            command: PaletteCommand::Fetch,
+        },
+        Action {
+            title: "Pull",
+            icon: IconName::ArrowDown,
+            keywords: &["pull", "fetch", "merge", "update"],
+            command: PaletteCommand::Pull,
+        },
+        Action {
+            title: "Push",
+            icon: IconName::ArrowUp,
+            keywords: &["push", "publish", "remote"],
+            command: PaletteCommand::Push,
         },
         Action {
             title: "New local pull request",
@@ -326,9 +350,19 @@ impl Palette {
     }
 
     /// Why action `command` cannot run now, if it cannot.
-    fn unavailable(&self, command: &PaletteCommand) -> Option<&'static str> {
+    fn unavailable(&self, command: &PaletteCommand) -> Option<SharedString> {
         let context = &self.context;
-        match command {
+        let remote = context.remote.as_ref();
+        let reason = match command {
+            PaletteCommand::Fetch => remote.and_then(|remote| remote.fetch.clone().err()),
+            PaletteCommand::Pull => remote.and_then(|remote| remote.pull.clone().err()),
+            PaletteCommand::Push => remote.and_then(|remote| remote.push.clone().err()),
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            return Some(lowercase_first(&reason).into());
+        }
+        let reason = match command {
             PaletteCommand::CommitChanges if context.changed.is_empty() => {
                 Some("nothing to commit")
             }
@@ -341,12 +375,27 @@ impl Palette {
                 Some("⌘-click commits in the history first")
             }
             _ => None,
-        }
+        };
+        reason.map(Into::into)
     }
 
     fn action_item(&self, action: Action, section: &str) -> Item {
         let disabled = self.unavailable(&action.command);
+        let remote = self.context.remote.as_ref();
         let detail = match &action.command {
+            PaletteCommand::Fetch => remote.and_then(|remote| remote.fetch.clone().ok()),
+            PaletteCommand::Pull => remote.and_then(|remote| {
+                remote.pull.as_ref().ok().map(|pull| match remote.behind {
+                    0 => pull.clone(),
+                    behind => format!("↓{behind} · {pull}"),
+                })
+            }),
+            PaletteCommand::Push => remote.and_then(|remote| {
+                remote.push.as_ref().ok().map(|plan| match remote.ahead {
+                    0 => plan.describe(),
+                    ahead => format!("↑{ahead} · {}", plan.describe()),
+                })
+            }),
             PaletteCommand::RewordLast => self.context.head.map(short),
             PaletteCommand::CommitChanges if !self.context.changed.is_empty() => Some(count(
                 self.context.changed.len(),
@@ -369,7 +418,7 @@ impl Palette {
             sha: None,
             subtitle: None,
             detail: detail.map(Into::into),
-            disabled: disabled.map(Into::into),
+            disabled,
             keys: &[],
             run: Run::Command(action.command),
             fill: None,
@@ -460,8 +509,7 @@ impl Palette {
             detail: None,
             disabled: self
                 .unavailable(&PaletteCommand::RewordLast)
-                .filter(|_| matches!(command, PaletteCommand::RewriteSince { .. }))
-                .map(Into::into),
+                .filter(|_| matches!(command, PaletteCommand::RewriteSince { .. })),
             keys: &[],
             run: Run::Command(command),
             fill: None,
@@ -1252,6 +1300,15 @@ fn count(n: usize, one: &str, many: &str) -> String {
         format!("1 {one}")
     } else {
         format!("{n} {many}")
+    }
+}
+
+/// `text` with its first letter in lower case, to follow other words.
+fn lowercase_first(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_lowercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 

@@ -107,6 +107,57 @@ pub enum RewriteOutcome {
     Stopped,
 }
 
+/// How [`Git::pull`] brings in the upstream's commits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullMethod {
+    /// As the user's configuration says (`pull.rebase`, `pull.ff`).
+    Configured,
+    /// A merge commit when the branches have diverged (`--no-rebase`).
+    Merge,
+}
+
+/// How [`Git::pull`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullOutcome {
+    Pulled,
+    /// The merge or rebase stopped with conflicts to resolve.
+    Conflicts,
+}
+
+/// Why `git push` refused to replace a remote branch, read from what it
+/// wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushRejection {
+    /// The remote has commits not fetched yet ("fetch first").
+    NotFetched,
+    /// The branch and the remote one have diverged, as after rewriting
+    /// pushed commits.
+    Diverged,
+}
+
+impl PushRejection {
+    /// Why `error`, from [`Git::push`], is a rejection, if it is one.
+    pub fn of(error: &Error) -> Option<Self> {
+        let Error::Failed { output, .. } = error else {
+            return None;
+        };
+        if !output.contains("[rejected]") {
+            return None;
+        }
+        if output.contains("(fetch first)") {
+            Some(Self::NotFetched)
+        } else {
+            Some(Self::Diverged)
+        }
+    }
+}
+
+/// Whether `error`, from [`Git::pull`], says the branches have diverged
+/// and the configuration does not say how to bring them together.
+pub fn needs_pull_method(error: &Error) -> bool {
+    matches!(error, Error::Failed { output, .. } if output.contains("divergent branches"))
+}
+
 /// Runs `git` in one working tree.
 #[derive(Debug, Clone)]
 pub struct Git {
@@ -318,6 +369,45 @@ impl Git {
             picked = picked.and(Err(Error::Failed { command, output }));
         }
         picked
+    }
+
+    /// Fetches from every remote, like `git fetch --all`.
+    pub fn fetch(&self) -> Result<()> {
+        self.run(["fetch", "--all", "--quiet"], None).map(drop)
+    }
+
+    /// Brings the upstream's new commits into the branch checked out, like
+    /// `git pull`. A merge or rebase that conflicts stops with the conflicts
+    /// in the working tree, to be resolved as after any merge or rebase.
+    pub fn pull(&self, method: PullMethod) -> Result<PullOutcome> {
+        let mut args = vec!["pull", "--quiet"];
+        if method == PullMethod::Merge {
+            args.push("--no-rebase");
+        }
+        // No editor can open for a merge message.
+        match self.run_with_env(args, None, &[("GIT_MERGE_AUTOEDIT", "no")]) {
+            Ok(_) => Ok(PullOutcome::Pulled),
+            Err(_) if self.conflicted().is_ok_and(|paths| !paths.is_empty()) => {
+                Ok(PullOutcome::Conflicts)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Sends branch `branch`, checked out, to its upstream, like `git push`.
+    /// When `publish_to` names a remote, the branch has no upstream yet: it
+    /// goes there under its own name and that becomes its upstream
+    /// (`--set-upstream`). With `force`, the remote branch is replaced, but
+    /// only if it is still where it was last fetched (`--force-with-lease`).
+    pub fn push(&self, branch: &str, publish_to: Option<&str>, force: bool) -> Result<()> {
+        let mut args = vec!["push", "--quiet"];
+        if force {
+            args.push("--force-with-lease");
+        }
+        if let Some(remote) = publish_to {
+            args.extend(["--set-upstream", remote, branch]);
+        }
+        self.run(args, None).map(drop)
     }
 
     /// Runs `git <args>` as the user typed it, calling `output` with each

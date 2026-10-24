@@ -103,6 +103,9 @@ pub mod color {
     pub const WARNING_BORDER: u32 = 0x4d_3f_22;
     pub const WARNING_TEXT: u32 = 0xe9_d3_a6;
 
+    /// Commits to push or pull, beside those toolbar buttons.
+    pub const REMOTE_COUNT: u32 = FIXUP_TEXT;
+
     /// The command palette: its box, a hovered item and the icon box of
     /// an item that cannot run, and the dimmed window behind it.
     pub const PALETTE: u32 = 0x1b_1b_1e;
