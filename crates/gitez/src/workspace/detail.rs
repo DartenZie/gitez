@@ -10,6 +10,7 @@ use gitez_git::{
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::*;
+use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -188,7 +189,42 @@ impl Render for DetailPane {
                 })
                 .when_some(details, |this, details| this.child(files(&details, mono))),
         )
+        .child(review_footer())
     }
+}
+
+/// "Review all changes", which opens the selected commit's diff.
+fn review_footer() -> impl IntoElement {
+    let enter = Keystroke::parse("enter").expect("enter is a valid keystroke");
+    div()
+        .v_flex()
+        .flex_none()
+        .gap(px(8.))
+        .px(px(16.))
+        .py(px(14.))
+        .border_t_1()
+        .border_color(rgb(color::BORDER))
+        .child(
+            Button::new("review-all-changes")
+                .primary()
+                .h(px(36.))
+                .w_full()
+                .label("Review all changes")
+                .icon(Icon::new(IconName::ArrowRight).size(px(14.)))
+                .on_click(|_, window, cx| {
+                    window.dispatch_action(Box::new(super::ReviewSelected), cx)
+                }),
+        )
+        .child(
+            div()
+                .h_flex()
+                .justify_center()
+                .gap(px(4.))
+                .text_size(theme::SMALL_TEXT_SIZE)
+                .text_color(rgb(color::TEXT_MUTED))
+                .child("Double-click any row or press")
+                .child(Kbd::new(enter)),
+        )
 }
 
 /// SHA and parents, summary and body, author, and refs.
@@ -437,7 +473,7 @@ fn working_tree(status: &WorkingTreeStatus, mono: SharedString) -> impl IntoElem
         .when(!staged.is_empty(), |this| {
             this.child(group("Staged", &staged, &|file| {
                 let kind = file.staged.as_ref().unwrap_or(&ChangeKind::Modified);
-                let (letter, letter_color) = change_letter(kind);
+                let (letter, letter_color) = labels::change_letter(kind);
                 file_row(
                     letter,
                     letter_color,
@@ -468,18 +504,6 @@ fn more_files(hidden: usize) -> impl IntoElement {
         .child(format!("and {hidden} more files"))
 }
 
-/// The status letter of a committed or staged change, as `git status --short`
-/// writes it.
-fn change_letter(kind: &ChangeKind) -> (&'static str, u32) {
-    match kind {
-        ChangeKind::Added => ("A", color::DIFF_ADDED),
-        ChangeKind::Modified => ("M", color::ACCENT),
-        ChangeKind::Deleted => ("D", color::DIFF_REMOVED),
-        ChangeKind::Renamed { .. } => ("R", color::BRANCH_BLUE),
-        ChangeKind::Copied { .. } => ("C", color::BRANCH_BLUE),
-    }
-}
-
 /// The status letter of an unstaged change: `?` untracked, `U` unmerged.
 fn worktree_letter(change: WorktreeChange) -> (&'static str, u32) {
     match change {
@@ -498,7 +522,7 @@ fn rename_source(kind: &ChangeKind) -> Option<String> {
 }
 
 fn commit_file_row(file: &FileChange, mono: SharedString) -> impl IntoElement {
-    let (letter, letter_color) = change_letter(&file.kind);
+    let (letter, letter_color) = labels::change_letter(&file.kind);
     file_row(
         letter,
         letter_color,

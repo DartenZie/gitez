@@ -1,5 +1,6 @@
 //! Times reading refs, walking the whole history, laying out the graph and
-//! reading the details (message and changed files) of the newest commits.
+//! reading the details (message and changed files) and diffs of the newest
+//! commits, and the working-tree status.
 //!
 //! ```sh
 //! cargo run --release -p gitez-git --example history -- <repository>
@@ -61,6 +62,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let (elapsed, Some(id)) = slowest {
         println!(
             "details: {} commits, {files} changed files in {:?}, slowest {id} in {elapsed:?}",
+            newest.len(),
+            start.elapsed()
+        );
+    }
+
+    let mut slowest = (Default::default(), newest.first().copied());
+    let mut lines = 0;
+    let start = Instant::now();
+    for &id in &newest {
+        let started = Instant::now();
+        for file in repo.commit_diff(id)? {
+            if let gitez_git::DiffContent::Text(hunks) = file.content {
+                lines += hunks.iter().map(|hunk| hunk.lines.len()).sum::<usize>();
+            }
+        }
+        let elapsed = started.elapsed();
+        if elapsed > slowest.0 {
+            slowest = (elapsed, Some(id));
+        }
+    }
+    if let (elapsed, Some(id)) = slowest {
+        println!(
+            "diffs: {} commits, {lines} diff lines in {:?}, slowest {id} in {elapsed:?}",
             newest.len(),
             start.elapsed()
         );

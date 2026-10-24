@@ -59,6 +59,19 @@ pub mod color {
     pub const REMOTE_LABEL_BORDER: u32 = 0x3a_3a_40;
     pub const REMOTE_LABEL_TEXT: u32 = 0xa8_a6_9e;
     pub const TAG_LABEL_BORDER: u32 = 0x5a_57_4f;
+    /// Diffs: each file is a card with a header, hunk headers and lines.
+    pub const DIFF_CARD: u32 = 0x141416;
+    pub const DIFF_CARD_BORDER: u32 = 0x29_29_2e;
+    pub const DIFF_FILE_HEADER: u32 = 0x19_19_1c;
+    pub const DIFF_HUNK: u32 = 0x19_1c_22;
+    pub const DIFF_HUNK_TEXT: u32 = 0x93_a9_c6;
+    pub const DIFF_TEXT: u32 = 0xd8_d5_cc;
+    pub const DIFF_LINE_NUMBER: u32 = 0x85_83_7b;
+    /// The "new file" label on a diff card.
+    pub const DIFF_ADDED_TEXT: u32 = 0x8f_d6_a7;
+    /// The selected file in a review's file list.
+    pub const FILE_ACTIVE: u32 = BUTTON;
+
     /// The uncommitted-changes row of the history.
     pub const WORKING_TREE_TEXT: u32 = REMOTE_LABEL_TEXT;
     /// Text on the small HEAD badge, which takes the branch colour.

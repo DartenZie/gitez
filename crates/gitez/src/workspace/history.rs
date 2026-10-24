@@ -32,6 +32,7 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("j", SelectNext, CONTEXT),
         KeyBinding::new("home", SelectFirst, CONTEXT),
         KeyBinding::new("end", SelectLast, CONTEXT),
+        KeyBinding::new("enter", super::ReviewSelected, CONTEXT),
     ]
 }
 
@@ -329,6 +330,37 @@ impl History {
         }
     }
 
+    /// The commits right before and after the selected one in the history:
+    /// newer, then older.
+    pub fn neighbors(&self) -> (Option<&Commit>, Option<&Commit>) {
+        let Some(Entry::Commit(index)) = self.selected else {
+            return (None, None);
+        };
+        let newer = index
+            .checked_sub(1)
+            .and_then(|index| self.commits.get(index));
+        (newer, self.commits.get(index + 1))
+    }
+
+    /// Selects the commit `delta` places from the selected one, newer for a
+    /// negative `delta`. Returns whether the selection moved.
+    pub fn select_adjacent_commit(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
+        let Some(Entry::Commit(index)) = self.selected else {
+            return false;
+        };
+        let Some(index) = index.checked_add_signed(delta) else {
+            return false;
+        };
+        if index >= self.commits.len() {
+            return false;
+        }
+        self.selected = Some(Entry::Commit(index));
+        self.scroll_to_selection();
+        cx.emit(SelectionChanged);
+        cx.notify();
+        true
+    }
+
     /// Where the uncommitted-changes row is, if shown: right above the `HEAD`
     /// commit, or at the top until that commit has been read.
     fn working_tree_index(&self) -> Option<usize> {
@@ -487,9 +519,12 @@ impl History {
                     this.hover(|style| style.bg(rgb(color::ROW_HOVER)))
                 }
             })
-            .on_click(cx.listener(move |this, _, window, cx| {
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 window.focus(&this.focus_handle, cx);
                 this.select(index, cx);
+                if event.click_count() == 2 {
+                    window.dispatch_action(Box::new(super::ReviewSelected), cx);
+                }
             }))
     }
 

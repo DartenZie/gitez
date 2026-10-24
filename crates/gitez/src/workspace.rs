@@ -5,6 +5,7 @@ mod detail;
 mod graph;
 mod history;
 mod labels;
+mod review;
 mod sidebar;
 mod status_bar;
 mod toolbar;
@@ -27,11 +28,17 @@ use crate::repository::Snapshot;
 use crate::theme::{self, color};
 use detail::DetailPane;
 use history::{History, Selection};
+use review::{Review, ReviewEvent};
 use sidebar::Sidebar;
 
-pub use history::key_bindings as history_key_bindings;
+actions!(workspace, [OpenRepository, ReviewSelected]);
 
-actions!(workspace, [OpenRepository]);
+/// Key bindings of the views inside the workspace.
+pub fn key_bindings() -> Vec<KeyBinding> {
+    let mut bindings = history::key_bindings();
+    bindings.extend(review::key_bindings());
+    bindings
+}
 
 /// How long to keep collecting file system events after the first one, so a
 /// burst (a checkout, a build) is handled once.
@@ -60,6 +67,8 @@ pub struct Workspace {
     _watch: Option<Task<()>>,
     /// Re-reading the refs and history after they changed.
     _reload: Option<Task<()>>,
+    /// The commit being reviewed, shown instead of the history.
+    review: Option<(Entity<Review>, Subscription)>,
     sidebar: Entity<Sidebar>,
     history: Entity<History>,
     detail: Entity<DetailPane>,
@@ -93,6 +102,7 @@ impl Workspace {
             _watcher: None,
             _watch: None,
             _reload: None,
+            review: None,
             sidebar: cx.new(|_| Sidebar::new()),
             history,
             detail: cx.new(|_| DetailPane::new()),
@@ -167,6 +177,7 @@ impl Workspace {
 
     fn show(&mut self, snapshot: Arc<Snapshot>, window: &mut Window, cx: &mut Context<Self>) {
         window.set_window_title(&format!("{} — GitEZ", snapshot.name));
+        self.review = None;
         self.watch(&snapshot, window, cx);
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.set_snapshot(snapshot.clone(), cx));
@@ -342,6 +353,47 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Reviews the commit selected in the history.
+    fn review_selected(&mut self, _: &ReviewSelected, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let history = self.history.read(cx);
+        let Some(Selection::Commit(commit, labels)) = history.selected() else {
+            return;
+        };
+        let (newer, older) = history.neighbors();
+        let (commit, labels) = (commit.clone(), labels.to_vec());
+        let neighbors = (newer.cloned(), older.cloned());
+        let repository = snapshot.repository.clone();
+        let review = cx.new(|cx| Review::new(&repository, commit, labels, neighbors, cx));
+        let subscription = cx.subscribe_in(&review, window, |this, _, event, window, cx| {
+            let delta = match event {
+                ReviewEvent::Close => {
+                    this.close_review(window, cx);
+                    return;
+                }
+                ReviewEvent::Newer => -1,
+                ReviewEvent::Older => 1,
+            };
+            let moved = this
+                .history
+                .update(cx, |history, cx| history.select_adjacent_commit(delta, cx));
+            if moved {
+                this.review_selected(&ReviewSelected, window, cx);
+            }
+        });
+        window.focus(&review.focus_handle(cx), cx);
+        self.review = Some((review, subscription));
+        cx.notify();
+    }
+
+    fn close_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.review = None;
+        window.focus(&self.history.focus_handle(cx), cx);
+        cx.notify();
+    }
+
     /// Shows the commit selected in the history in the detail pane.
     fn show_selection(&mut self, cx: &mut Context<Self>) {
         let Some(snapshot) = &self.snapshot else {
@@ -387,6 +439,7 @@ impl Render for Workspace {
             .key_context("Workspace")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::prompt_for_repository))
+            .on_action(cx.listener(Self::review_selected))
             .v_flex()
             .size_full()
             .bg(rgb(color::BACKGROUND))
@@ -396,8 +449,11 @@ impl Render for Workspace {
                 repository_name: snapshot.as_ref().map(|snapshot| snapshot.name.clone()),
                 loading: self.loading.is_some(),
             })
-            .child(
-                div().flex_1().min_h_0().child(
+            .child(div().flex_1().min_h_0().map(|this| {
+                if let Some((review, _)) = &self.review {
+                    return this.child(review.clone());
+                }
+                this.child(
                     h_resizable("workspace-panes")
                         .child(
                             resizable_panel()
@@ -428,8 +484,8 @@ impl Render for Workspace {
                                     }
                                 }),
                         ),
-                ),
-            )
+                )
+            }))
             .child(status_bar::StatusBar {
                 snapshot,
                 status: self.status.clone(),

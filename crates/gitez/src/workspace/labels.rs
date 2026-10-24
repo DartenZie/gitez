@@ -1,7 +1,7 @@
 //! Small pieces shared by the history list and the commit detail: ref labels,
 //! author avatars and the summary of uncommitted changes.
 
-use gitez_git::{RefKind, RefLabel, WorkingTreeStatus};
+use gitez_git::{ChangeKind, RefKind, RefLabel, WorkingTreeStatus};
 use gpui_kit::component::StyledExt as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -109,6 +109,18 @@ fn initials(name: &str) -> String {
         .chain(last)
         .flat_map(char::to_uppercase)
         .collect()
+}
+
+/// The status letter of a committed or staged change and its colour, as
+/// `git status --short` writes it.
+pub fn change_letter(kind: &ChangeKind) -> (&'static str, u32) {
+    match kind {
+        ChangeKind::Added => ("A", color::DIFF_ADDED),
+        ChangeKind::Modified => ("M", color::ACCENT),
+        ChangeKind::Deleted => ("D", color::DIFF_REMOVED),
+        ChangeKind::Renamed { .. } => ("R", color::BRANCH_BLUE),
+        ChangeKind::Copied { .. } => ("C", color::BRANCH_BLUE),
+    }
 }
 
 /// "3 files, 1 staged, 1 conflicted", leaving out the parts that are zero.

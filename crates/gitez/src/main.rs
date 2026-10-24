@@ -34,7 +34,7 @@ fn main() {
                 KeyBinding::new("secondary-o", OpenRepository, None),
                 KeyBinding::new("secondary-q", Quit, None),
             ]);
-            cx.bind_keys(workspace::history_key_bindings());
+            cx.bind_keys(workspace::key_bindings());
             cx.set_menus([
                 Menu {
                     name: "GitEZ".into(),

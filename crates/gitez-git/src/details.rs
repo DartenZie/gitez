@@ -88,19 +88,9 @@ impl Repository {
             time: committer.time().unwrap_or_default().into(),
         };
         let signed = decoded.extra_headers().pgp_signature().is_some();
-        let first_parent = decoded.parents().next();
         drop(decoded);
 
-        // The boundary of a shallow clone has no parent to compare with.
-        let is_shallow_boundary = repo
-            .shallow_commits()?
-            .is_some_and(|shallow| shallow.contains(&id));
-        let new_tree = commit.tree()?;
-        let old_tree = match first_parent {
-            Some(parent) if !is_shallow_boundary => repo.find_commit(parent)?.tree()?,
-            _ => repo.empty_tree(),
-        };
-
+        let (old_tree, new_tree) = trees(&repo, &commit)?;
         let mut line_cache = repo.diff_resource_cache_for_tree_diff()?;
         let mut files = Vec::new();
         let mut error = None;
@@ -146,7 +136,25 @@ impl Repository {
     }
 }
 
-fn kind(change: &Change<'_, '_, '_>) -> ChangeKind {
+/// The trees commit `commit` compares: its first parent's and its own. A root
+/// commit, or the boundary of a shallow clone, compares with the empty tree.
+pub(crate) fn trees<'repo>(
+    repo: &'repo gix::Repository,
+    commit: &gix::Commit<'repo>,
+) -> Result<(gix::Tree<'repo>, gix::Tree<'repo>)> {
+    let first_parent = commit.parent_ids().next().map(|id| id.detach());
+    // The boundary of a shallow clone has no parent to compare with.
+    let is_shallow_boundary = repo
+        .shallow_commits()?
+        .is_some_and(|shallow| shallow.contains(&commit.id));
+    let old_tree = match first_parent {
+        Some(parent) if !is_shallow_boundary => repo.find_commit(parent)?.tree()?,
+        _ => repo.empty_tree(),
+    };
+    Ok((old_tree, commit.tree()?))
+}
+
+pub(crate) fn kind(change: &Change<'_, '_, '_>) -> ChangeKind {
     match change {
         Change::Addition { .. } => ChangeKind::Added,
         Change::Deletion { .. } => ChangeKind::Deleted,

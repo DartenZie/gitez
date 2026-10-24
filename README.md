@@ -26,8 +26,10 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 
 > **Status:** early development. The current build opens a repository and
 > shows its history as a commit graph, with branches, remotes, tags and
-> stashes in the sidebar and the selected commit's details beside it.
-> Uncommitted changes appear as a row above the current commit. Changes made
+> stashes in the sidebar and the selected commit's details beside it. Press
+> Enter or double-click a commit to review its full diff, file by file; `[`
+> and `]` step to the newer and older commit, Esc goes back. Uncommitted
+> changes appear as a row above the current commit. Changes made
 > in an editor, a terminal or another git client show up as they happen.
 > Nothing can be changed from GitEZ yet.
 
@@ -120,8 +122,8 @@ cargo test               # run tests
 Cargo.toml          workspace: dependency versions, lints, build profiles
 crates/gitez/       the application binary
 crates/gitez-git/   read-only repository access on gitoxide: refs, history, graph layout,
-                    commit messages and changed files, working-tree status, watching
-                    for changes
+                    commit messages, changed files and diffs, working-tree status,
+                    watching for changes
 rust-toolchain.toml pinned Rust toolchain
 CLAUDE.md           instructions for Claude Code when working in this repository
 ```

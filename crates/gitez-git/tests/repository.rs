@@ -6,8 +6,8 @@ use std::process::Command;
 
 use gitez_git::graph::GraphLayout;
 use gitez_git::{
-    Affected, ChangeKind, Commit, FileChange, FileStatus, Head, LineCounts, Oid, Order, RefKind,
-    Repository, WorktreeChange,
+    Affected, ChangeKind, Commit, DiffContent, DiffLine, FileChange, FileStatus, Head, Hunk,
+    LineCounts, LineKind, Oid, Order, RefKind, Repository, WorktreeChange,
 };
 use tempfile::TempDir;
 
@@ -703,4 +703,126 @@ fn watch_reports_changes_made_by_git() {
         affected.refs |= part.refs;
         affected.working_tree |= part.working_tree;
     }
+}
+
+#[test]
+fn diff_numbers_lines_and_keeps_three_lines_of_context() {
+    let fixture = Fixture::new();
+    let lines: Vec<String> = (1..=20).map(|n| format!("line {n}")).collect();
+    std::fs::write(fixture.root.join("text.txt"), lines.join("\n") + "\n").expect("write");
+    std::fs::write(fixture.root.join("image.bin"), [0u8, 1, 2, 3]).expect("write");
+    std::fs::write(
+        fixture.root.join("moved.txt"),
+        "same content in both places\n",
+    )
+    .expect("write");
+    fixture.git(&["add", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "Add files"]);
+
+    let mut changed = lines.clone();
+    changed[9] = "line 10, edited".to_owned();
+    changed.remove(16);
+    std::fs::write(fixture.root.join("text.txt"), changed.join("\n") + "\n").expect("write");
+    std::fs::write(fixture.root.join("image.bin"), [0u8, 1, 2, 4]).expect("write");
+    fixture.git(&["mv", "moved.txt", "renamed.txt"]);
+    std::fs::write(fixture.root.join("new.txt"), "hello\r\nworld\n").expect("write");
+    fixture.git(&["add", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "Change files"]);
+
+    let diffs = fixture
+        .open()
+        .commit_diff(fixture.rev("HEAD"))
+        .expect("diff");
+    let paths: Vec<&str> = diffs.iter().map(|diff| diff.path.as_str()).collect();
+    assert_eq!(paths, ["image.bin", "new.txt", "renamed.txt", "text.txt"]);
+    assert_eq!(diffs[0].content, DiffContent::Binary);
+    assert_eq!(diffs[2].content, DiffContent::Unchanged);
+    assert_eq!(
+        diffs[2].kind,
+        ChangeKind::Renamed {
+            from: "moved.txt".to_owned()
+        }
+    );
+
+    let line = |kind, old: Option<u32>, new: Option<u32>, text: &str| DiffLine {
+        kind,
+        old,
+        new,
+        text: text.to_owned(),
+        no_newline: false,
+    };
+    assert_eq!(
+        diffs[1].content,
+        DiffContent::Text(vec![Hunk {
+            old_start: 0,
+            old_len: 0,
+            new_start: 1,
+            new_len: 2,
+            lines: vec![
+                // The carriage return of a CRLF line ending is not shown.
+                line(LineKind::Added, None, Some(1), "hello"),
+                line(LineKind::Added, None, Some(2), "world"),
+            ],
+        }])
+    );
+
+    let context = |n: u32| line(LineKind::Context, Some(n), Some(n), &format!("line {n}"));
+    let DiffContent::Text(hunks) = &diffs[3].content else {
+        panic!("text.txt has a text diff: {:?}", diffs[3].content);
+    };
+    // The two changes are 7 lines apart, closer than twice the context, so
+    // they share one hunk.
+    assert_eq!(hunks.len(), 1);
+    let hunk = &hunks[0];
+    assert_eq!(
+        (hunk.old_start, hunk.old_len, hunk.new_start, hunk.new_len),
+        (7, 14, 7, 13)
+    );
+    let mut expected: Vec<DiffLine> = (7..=9).map(context).collect();
+    expected.push(line(LineKind::Removed, Some(10), None, "line 10"));
+    expected.push(line(LineKind::Added, None, Some(10), "line 10, edited"));
+    expected.extend((11..=16).map(context));
+    expected.push(line(LineKind::Removed, Some(17), None, "line 17"));
+    expected.extend((18..=20).map(|n| {
+        line(
+            LineKind::Context,
+            Some(n),
+            Some(n - 1),
+            &format!("line {n}"),
+        )
+    }));
+    assert_eq!(hunk.lines, expected);
+    let counts = diffs[3].line_counts().expect("text has line counts");
+    assert_eq!((counts.added, counts.removed), (1, 2));
+}
+
+#[test]
+fn diff_shows_a_missing_newline_at_end_of_file() {
+    let fixture = Fixture::new();
+    std::fs::write(fixture.root.join("a.txt"), "one\ntwo").expect("write");
+    fixture.git(&["add", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "No newline"]);
+    std::fs::write(fixture.root.join("a.txt"), "one\ntwo\n").expect("write");
+    fixture.git(&["commit", "--quiet", "-am", "Add newline"]);
+
+    let diffs = fixture
+        .open()
+        .commit_diff(fixture.rev("HEAD"))
+        .expect("diff");
+    let DiffContent::Text(hunks) = &diffs[0].content else {
+        panic!("a text diff: {:?}", diffs[0].content);
+    };
+    let lines: Vec<(LineKind, &str, bool)> = hunks[0]
+        .lines
+        .iter()
+        .map(|line| (line.kind, line.text.as_str(), line.no_newline))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            (LineKind::Context, "one", false),
+            (LineKind::Removed, "two", true),
+            (LineKind::Added, "two", false),
+        ]
+    );
 }

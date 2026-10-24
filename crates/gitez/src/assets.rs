@@ -13,6 +13,7 @@ icon_assets!(
     ExtraIcons,
     [
         Archive,
+        ArrowRight,
         Cloud,
         GitBranch,
         GitGraph,
