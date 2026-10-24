@@ -32,6 +32,12 @@ impl Repository {
         self.inner.git_dir()
     }
 
+    /// The git directory shared by all worktrees of the repository: the
+    /// main `.git` directory, also when opened from a linked worktree.
+    pub fn common_dir(&self) -> PathBuf {
+        self.local().common_dir().to_owned()
+    }
+
     /// The working tree, or `None` for a bare repository.
     pub fn work_dir(&self) -> Option<&Path> {
         self.inner.work_dir()

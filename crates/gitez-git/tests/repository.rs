@@ -653,7 +653,7 @@ fn classify_tells_refs_from_working_tree_changes() {
     assert_eq!(classify(&[git.join("refs/heads/main")]), everything);
     assert_eq!(classify(&[git.join("HEAD")]), everything);
     // Losing events reports the git directory itself.
-    assert_eq!(classify(&[git.clone()]), everything);
+    assert_eq!(classify(std::slice::from_ref(&git)), everything);
 
     for nothing in [
         fixture.root.join("target/debug/build/output"),
@@ -664,9 +664,13 @@ fn classify_tells_refs_from_working_tree_changes() {
         git.join("refs/heads/main.lock"),
         git.join("logs/HEAD"),
         git.join("FETCH_HEAD"),
+        git.join("gitez/reviews/1/review.json"),
         fixture._dir.path().join("elsewhere.txt"),
     ] {
-        assert!(classify(&[nothing.clone()]).is_empty(), "{nothing:?}");
+        assert!(
+            classify(std::slice::from_ref(&nothing)).is_empty(),
+            "{nothing:?}"
+        );
     }
     assert_eq!(
         classify(&[
@@ -924,7 +928,8 @@ fn working_tree_diff_compares_head_with_the_files_on_disk() {
         .open()
         .working_tree_diff(DiffOptions::default())
         .expect("diff");
-    let summary: Vec<(&str, &ChangeKind, Option<(usize, usize)>)> = diffs
+    type Summary<'a> = (&'a str, &'a ChangeKind, Option<(usize, usize)>);
+    let summary: Vec<Summary> = diffs
         .iter()
         .map(|diff| {
             (
@@ -1170,5 +1175,37 @@ fn whitespace_can_be_ignored() {
             .open()
             .commit_diff(fixture.rev("HEAD"), ignore)
             .expect("diff"),
+    );
+}
+
+#[test]
+fn worktrees_share_the_common_git_directory() {
+    let fixture = Fixture::new();
+    fixture.commit("a.txt", "first");
+    let linked = fixture._dir.path().join("linked");
+    fixture.git(&[
+        "worktree",
+        "add",
+        "--quiet",
+        "-b",
+        "side",
+        linked.to_str().expect("a UTF-8 path"),
+    ]);
+    let canonical = |path: std::path::PathBuf| path.canonicalize().expect("canonical");
+
+    let main = fixture.open();
+    let worktree = Repository::open(&linked).expect("open the worktree");
+    assert_eq!(
+        canonical(main.common_dir()),
+        canonical(fixture.root.join(".git"))
+    );
+    assert_eq!(
+        canonical(worktree.common_dir()),
+        canonical(main.common_dir())
+    );
+    // Its own git directory is not the common one.
+    assert_ne!(
+        canonical(worktree.git_dir().to_owned()),
+        canonical(main.common_dir())
     );
 }

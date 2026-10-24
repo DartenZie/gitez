@@ -123,7 +123,7 @@ Other useful commands:
 ```sh
 cargo build --release    # optimised build in target/release/gitez
 cargo fmt                # format
-cargo clippy --all-targets   # lint
+cargo clippy --all-targets --workspace   # lint every crate
 cargo test               # run tests
 ```
 
@@ -137,11 +137,13 @@ crates/gitez-git/   read-only repository access on gitoxide: refs, history, grap
                     watching for changes
 crates/gitez-command/ changes made by running the user's git binary: staging,
                     unstaging files or hunks, committing, amending
+crates/gitez-review/ local pull requests, their comment threads and agent run
+                    transcripts, stored in .git/gitez/reviews (not in the app yet)
 rust-toolchain.toml pinned Rust toolchain
 CLAUDE.md           instructions for Claude Code when working in this repository
 ```
 
-More crates (review storage, agent integration, UI components) will be added
+More crates (agent integration, UI components) will be added
 under `crates/` as the application grows.
 
 To time reading refs, history, commit details and the working-tree status on a

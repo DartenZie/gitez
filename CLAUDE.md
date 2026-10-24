@@ -10,7 +10,8 @@ requests**: a branch can be reviewed like a PR without leaving the machine. The
 reviewer comments on lines of the diff, and GitEZ turns the comments into a
 prompt for a coding agent (Claude Code in v1) that can be copied or sent
 directly. Review data is stored under the repository's `.git` directory
-(planned: `.git/gitez/reviews`), never in the working tree.
+(`.git/gitez/reviews`, see "Review storage" below), never in the working
+tree.
 
 The reference design is a Design canvas at
 <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>. Read it with the Artifact
@@ -71,6 +72,29 @@ Decided 2026-10-23; change only with the owner's agreement.
   JSON output) in the repository's working directory and shows the streamed
   output in a panel. "Copy" puts the same prompt on the clipboard. Keep the
   agent behind a trait so other agents can be added later.
+- **Review storage** (decided 2026-10-24). Local pull requests live in
+  `<git common dir>/gitez/reviews/`, so linked worktrees share them and
+  nothing reaches the working tree, a commit or a push. The `gitez-review`
+  crate owns the format; nothing else reads or writes these files.
+  - One folder per pull request, named by its number (the highest existing
+    number plus one): `reviews/<n>/review.json` holds everything about it,
+    `reviews/<n>/runs/<UTC time>.jsonl` holds one transcript per agent run.
+  - `review.json` is one JSON document with a `version` field: number,
+    title, description, state (`open`, `merged`, `closed`), base and head as
+    branch plus the last commit seen, created and updated times (RFC 3339,
+    UTC), viewed files (path to blob id), prompt options, and threads.
+  - A thread has an id, an anchor (commit, path, `old` or `new` side, first
+    and last line, and a copy of those lines), whether it is in the agent
+    prompt, its resolution (`null`, or by `auto` or `you` with commit and
+    time) and its comments (id, body, time). When the head moves, a thread
+    whose lines changed resolves itself; the others are re-anchored to the
+    new commit.
+  - A transcript starts with a GitEZ header line (time, agent, prompt), then
+    the agent's stream-JSON events verbatim, one per line.
+  - Writes go to `review.json.lock`, created exclusively, then renamed over
+    `review.json`, as git does with its own files. A newer `version` than
+    GitEZ knows is refused, never overwritten.
+  - Plain file I/O, not the git CLI: git has no command for this data.
 - **Milestone 1: open a repository and show its history.** Repository picker,
   sidebar (branches, remotes, tags, stashes) and a virtualised commit graph.
   Local PR review and the working-tree commit flow follow.
@@ -92,8 +116,9 @@ Decided 2026-10-23; change only with the owner's agreement.
   crates under `crates/` when it has a clear boundary (git backend, review
   storage, agent integration, UI components); keep the binary crate thin.
 - Lints are set in the workspace `Cargo.toml` (`clippy::all`, `unsafe_code`
-  warns). Code must be `cargo fmt` clean and `cargo clippy --all-targets` clean
-  before it is considered done.
+  warns). Code must be `cargo fmt` clean and `cargo clippy --all-targets
+  --workspace` clean before it is considered done; without `--workspace`
+  clippy checks only the default member, the `gitez` binary.
 - Performance is a primary goal. Never block the UI thread on git or disk I/O;
   use GPUI's background executor and stream results. Virtualise long lists
   (commit graph, diffs). Prefer measuring to guessing.
@@ -108,7 +133,7 @@ Decided 2026-10-23; change only with the owner's agreement.
 cargo run                      # build and launch (first GPUI build takes minutes)
 cargo build --release
 cargo fmt --all
-cargo clippy --all-targets
+cargo clippy --all-targets --workspace
 cargo test --workspace
 ```
 
