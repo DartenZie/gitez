@@ -469,7 +469,7 @@ impl Review {
         cx: &mut Context<Self>,
     ) -> Self {
         let load = Self::load_pull_request(repository, &store, pull_request.number, tips, cx);
-        let panel = prompt::PromptPanel::new(&pull_request.prompt, window, cx);
+        let panel = prompt::PromptPanel::new(repository, &pull_request.prompt, window, cx);
         let subject = Subject::PullRequest(Box::new(PullRequestSubject {
             store,
             pull_request,

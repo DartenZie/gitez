@@ -1037,7 +1037,16 @@ fn branch_diff_shows_the_changes_since_the_branch_left_its_base() {
 fn user_name_is_read_from_the_repository_config() {
     let fixture = Fixture::new();
     fixture.git(&["config", "user.name", "Ada Lovelace"]);
-    assert_eq!(fixture.open().user_name().as_deref(), Some("Ada Lovelace"));
+    fixture.git(&["config", "gitez.testCommand", "  cargo test  "]);
+    fixture.git(&["config", "gitez.empty", ""]);
+    let repo = fixture.open();
+    assert_eq!(repo.user_name().as_deref(), Some("Ada Lovelace"));
+    assert_eq!(
+        repo.config_string("gitez.testCommand").as_deref(),
+        Some("cargo test")
+    );
+    assert_eq!(repo.config_string("gitez.empty"), None);
+    assert_eq!(repo.config_string("gitez.missing"), None);
 }
 
 /// `git apply --cached` of `patch`, reversed if `reverse`.

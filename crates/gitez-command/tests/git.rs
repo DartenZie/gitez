@@ -304,3 +304,26 @@ fn a_conflicting_merge_is_undone() {
         assert_eq!(git(root, &["rev-parse", "feature"]), feature, "{how:?}");
     }
 }
+
+#[test]
+fn sets_and_removes_a_config_value() {
+    let dir = repository();
+    let root = dir.path();
+    let repo = Git::new(root);
+    // Removing what is not set is fine.
+    repo.set_config("gitez.testCommand", None).expect("unset");
+    repo.set_config("gitez.testCommand", Some("cargo test --workspace"))
+        .expect("set");
+    assert_eq!(
+        git(root, &["config", "--local", "gitez.testCommand"]),
+        "cargo test --workspace"
+    );
+    repo.set_config("gitez.testCommand", None).expect("unset");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["config", "--local", "gitez.testCommand"])
+        .output()
+        .expect("git runs");
+    assert!(!output.status.success());
+}

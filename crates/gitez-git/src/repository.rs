@@ -56,11 +56,18 @@ impl Repository {
 
     /// The name commits are made under (`user.name`), if configured.
     pub fn user_name(&self) -> Option<String> {
+        self.config_string("user.name")
+    }
+
+    /// The value of `key` in the repository's git configuration, such as
+    /// `gitez.testCommand`, if set and not empty. Read when the repository
+    /// was opened.
+    pub fn config_string(&self, key: &str) -> Option<String> {
         let repo = self.local();
         let config = repo.config_snapshot();
-        let name = config.string("user.name")?;
-        let name = name.to_str_lossy().trim().to_owned();
-        (!name.is_empty()).then_some(name)
+        let value = config.string(key)?;
+        let value = value.to_str_lossy().trim().to_owned();
+        (!value.is_empty()).then_some(value)
     }
 
     /// A handle for use on the current thread.

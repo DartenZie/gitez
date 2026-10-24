@@ -153,6 +153,25 @@ impl Git {
         merged
     }
 
+    /// Sets `key` in the repository's own configuration to `value`, like
+    /// `git config --local`, or removes it when `value` is `None`.
+    pub fn set_config(&self, key: &str, value: Option<&str>) -> Result<()> {
+        match value {
+            Some(value) => self.run(["config", "--local", key, value], None).map(drop),
+            None => match self.run(["config", "--local", "--unset-all", key], None) {
+                // Exit code 5: it was not set.
+                Err(Error::Failed { .. }) if self.config_unset(key) => Ok(()),
+                result => result.map(drop),
+            },
+        }
+    }
+
+    /// Whether `key` is not set in the repository's own configuration.
+    fn config_unset(&self, key: &str) -> bool {
+        self.run(["config", "--local", "--get-all", key], None)
+            .is_err()
+    }
+
     /// Replaces the last commit with one that has `message` and also the
     /// staged changes, like `git commit --amend`.
     pub fn amend(&self, message: &str) -> Result<()> {

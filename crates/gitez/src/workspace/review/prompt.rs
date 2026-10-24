@@ -10,10 +10,13 @@ use std::time::Duration;
 
 use futures::StreamExt as _;
 use gitez_agent::{Agent, AgentEvent, ClaudeCode, Outcome, Stopper};
+use gitez_command::Git;
+use gitez_git::Repository;
 use gitez_review::{PromptContext, RunHeader, Side, Store, Template, Timestamp};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::*;
 use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -27,6 +30,10 @@ use crate::time;
 pub(super) const PANEL_WIDTH: Pixels = px(380.);
 /// How long "Copied" shows after copying.
 const COPIED_FOR: Duration = Duration::from_secs(2);
+/// Wait this long after the last keystroke before saving the test command.
+const SAVE_TEST_COMMAND_AFTER: Duration = Duration::from_millis(600);
+/// Where the test command is kept: the repository's own git config.
+const TEST_COMMAND_KEY: &str = "gitez.testCommand";
 /// The prompt options' agent id for copying only.
 const NO_AGENT: &str = "none";
 
@@ -52,17 +59,58 @@ pub(super) struct PromptPanel {
     copied: Option<Task<()>>,
     /// The run shown: running now, or the last one.
     run: Option<(Entity<AgentRun>, Subscription)>,
+    /// The command that runs the tests, as set for the repository.
+    test_command: Entity<InputState>,
+    /// The command guessed from the project's files, used when none is set.
+    detected_test_command: Option<String>,
+    /// Saving the test command, after a pause in typing.
+    saving_test_command: Task<()>,
+    test_command_error: Option<SharedString>,
     _load_run: Task<()>,
+    _detect: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl PromptPanel {
     /// The panel for pull request `number` with `options`.
     pub(super) fn new(
+        repository: &Repository,
         options: &gitez_review::PromptOptions,
         window: &mut Window,
         cx: &mut Context<Review>,
     ) -> Self {
+        let configured = repository.config_string(TEST_COMMAND_KEY);
+        let test_command = cx.new(|cx| {
+            let mut input = InputState::new(window, cx).placeholder("Such as cargo test");
+            if let Some(command) = configured {
+                input.set_value(command, window, cx);
+            }
+            input
+        });
+        let detect = match repository.work_dir() {
+            Some(dir) => {
+                let dir = dir.to_owned();
+                cx.spawn_in(window, async move |this, cx| {
+                    let detected = cx
+                        .background_executor()
+                        .spawn(async move { gitez_agent::detect_test_command(&dir) })
+                        .await;
+                    this.update_in(cx, |this, window, cx| {
+                        if let Subject::PullRequest(subject) = &mut this.subject {
+                            if let Some(command) = &detected {
+                                subject.panel.test_command.update(cx, |input, cx| {
+                                    input.set_placeholder(command.clone(), window, cx)
+                                });
+                            }
+                            subject.panel.detected_test_command = detected;
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                })
+            }
+            None => Task::ready(()),
+        };
         let agent_index = AGENTS
             .iter()
             .position(|(id, _)| *id == options.agent)
@@ -87,6 +135,11 @@ impl PromptPanel {
             cx,
         );
         let subscriptions = vec![
+            cx.subscribe(&test_command, |this, _, event: &InputEvent, cx| {
+                if let InputEvent::Change = event {
+                    this.save_test_command(cx);
+                }
+            }),
             cx.subscribe(&agent, |this, _, event: &SelectEvent<_>, cx| {
                 if let SelectEvent::Confirm(Some(name)) = event
                     && let Some((id, _)) = AGENTS.iter().find(|(_, label)| name == label)
@@ -109,7 +162,12 @@ impl PromptPanel {
             template,
             copied: None,
             run: None,
+            test_command,
+            detected_test_command: None,
+            saving_test_command: Task::ready(()),
+            test_command_error: None,
             _load_run: Task::ready(()),
+            _detect: detect,
             _subscriptions: subscriptions,
         }
     }
@@ -194,17 +252,62 @@ impl Review {
 
     /// The prompt as it would be sent now; `None` without included
     /// comments.
-    fn prompt_text(&self) -> Option<String> {
-        let (subject, _) = self.panel()?;
+    fn prompt_text(&self, cx: &App) -> Option<String> {
+        let (subject, panel) = self.panel()?;
+        let typed = panel.test_command.read(cx).value().trim().to_owned();
         subject.pull_request.prompt(&PromptContext {
             repository: self.repository.name(),
             commits_ahead: subject.ahead,
-            test_command: None,
+            test_command: if typed.is_empty() {
+                panel.detected_test_command.clone()
+            } else {
+                Some(typed)
+            },
         })
     }
 
+    /// Saves the test command in the repository's git config once typing
+    /// pauses; an empty one is removed, so the guess applies again.
+    fn save_test_command(&mut self, cx: &mut Context<Self>) {
+        let Some(dir) = self.repository.work_dir() else {
+            return;
+        };
+        let git = Git::new(dir);
+        let Subject::PullRequest(subject) = &mut self.subject else {
+            return;
+        };
+        let panel = &mut subject.panel;
+        let command = panel.test_command.read(cx).value().trim().to_owned();
+        panel.saving_test_command = cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(SAVE_TEST_COMMAND_AFTER)
+                .await;
+            let saved = cx
+                .background_executor()
+                .spawn(async move {
+                    git.set_config(TEST_COMMAND_KEY, (!command.is_empty()).then_some(&*command))
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if let Subject::PullRequest(subject) = &mut this.subject {
+                    subject.panel.test_command_error = saved.err().map(|error| {
+                        format!(
+                            "Could not save the test command: {:#}",
+                            anyhow::Error::from(error)
+                        )
+                        .into()
+                    });
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
+        // The prompt shows the command as typed.
+        cx.notify();
+    }
+
     fn copy_prompt(&mut self, cx: &mut Context<Self>) {
-        let Some(prompt) = self.prompt_text() else {
+        let Some(prompt) = self.prompt_text(cx) else {
             return;
         };
         cx.write_to_clipboard(ClipboardItem::new_string(prompt));
@@ -254,7 +357,7 @@ impl Review {
         if self.cannot_send(cx).is_some() {
             return;
         }
-        let (Some(prompt), Some(dir)) = (self.prompt_text(), self.repository.work_dir()) else {
+        let (Some(prompt), Some(dir)) = (self.prompt_text(cx), self.repository.work_dir()) else {
             return;
         };
         let Subject::PullRequest(subject) = &self.subject else {
@@ -300,7 +403,7 @@ impl Review {
             open
         };
         let included = open.iter().filter(|thread| thread.in_prompt).count();
-        let prompt = self.prompt_text();
+        let prompt = self.prompt_text(cx);
         let agent = gitez_agent::agent(&pull_request.prompt.agent);
         let cannot_send = self.cannot_send(cx);
         let options = &pull_request.prompt;
@@ -447,6 +550,32 @@ impl Review {
                                 this.change_prompt(cx, |options| options.run_tests = checked)
                             })),
                     ),
+            )
+            .when(
+                options.run_tests && options.template == Template::Fix,
+                |this| {
+                    this.child(
+                        section()
+                            .pb(px(12.))
+                            .gap(px(4.))
+                            .child(labelled(
+                                "Test command",
+                                Input::new(&panel.test_command).small(),
+                            ))
+                            .child(
+                                muted(match &panel.test_command_error {
+                                    Some(error) => error.clone(),
+                                    None => "Kept in this repository’s git config;                                              leave it empty to use the suggestion."
+                                        .into(),
+                                })
+                                .when(panel.test_command_error.is_some(), |this| {
+                                    this.text_color(rgb(color::DIFF_REMOVED))
+                                })
+                                .text_size(theme::SMALL_TEXT_SIZE)
+                                .line_height(relative(1.5)),
+                            ),
+                    )
+                },
             )
             .child(
                 div()

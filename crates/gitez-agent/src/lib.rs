@@ -7,11 +7,13 @@
 
 mod claude_code;
 mod session;
+mod test_command;
 
 use std::path::{Path, PathBuf};
 
 pub use claude_code::ClaudeCode;
 pub use session::{Outcome, Session, Stopper};
+pub use test_command::detect_test_command;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

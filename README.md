@@ -52,7 +52,10 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 > branch resolves itself. The agent prompt panel beside the diff shows
 > the prompt built from the included threads, with the agent, a template
 > (fix the comments, or explain without changing anything) and whether to
-> quote code and run tests. **Copy** puts it on the clipboard; **Send to
+> quote code and run tests. The test command is guessed from the project
+> (`cargo test`, `pnpm test`, `go test ./...` and so on) and can be set
+> per repository; it is kept as `gitez.testCommand` in the repository's
+> git config. **Copy** puts it on the clipboard; **Send to
 > Claude Code** runs `claude` headless in the working tree, with all
 > permissions, and streams what it does into the panel (it needs the
 > branch checked out, which **Checkout branch** does). Each run's
@@ -164,11 +167,12 @@ crates/gitez-git/   read-only repository access on gitoxide: refs, history, grap
                     merge previews, watching for changes
 crates/gitez-command/ changes made by running the user's git binary: staging,
                     unstaging files or hunks, committing, amending, switching branches,
-                    merging
+                    merging, setting config values
 crates/gitez-review/ local pull requests, their comment threads and agent run
                     transcripts, stored in .git/gitez/reviews
 crates/gitez-agent/ coding agents a review prompt is sent to: Claude Code run as
-                    `claude -p` with its streamed events parsed
+                    `claude -p` with its streamed events parsed; guessing a project's
+                    test command
 rust-toolchain.toml pinned Rust toolchain
 CLAUDE.md           instructions for Claude Code when working in this repository
 ```
