@@ -8,7 +8,7 @@ use std::sync::Arc;
 use gitez_command::Git;
 use gitez_git::{
     ChangeKind, Commit, CommitDetails, DiffContent, DiffLine, FileDiff, FileStatus, LineKind,
-    RefKind, RefLabel, Repository, WorkingTreeStatus, WorktreeChange,
+    RefKind, RefLabel, Repository, Staging, WorkingTreeStatus, WorktreeChange,
 };
 use gpui_kit::component::button::*;
 use gpui_kit::component::checkbox::Checkbox;
@@ -648,6 +648,82 @@ impl Review {
         ])
     }
 
+    /// Whether a hunk is staged, and the button that stages or unstages it
+    /// alone.
+    fn hunk_staging(
+        &self,
+        file: usize,
+        hunk: usize,
+        staging: Staging,
+        patchable: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let (label, id) = match staging {
+            Staging::Staged => ("Unstage hunk", "unstage-hunk"),
+            Staging::Unstaged => ("Stage hunk", "stage-hunk"),
+        };
+        div()
+            .h_flex()
+            .ml_auto()
+            .pr(px(8.))
+            .gap(px(8.))
+            .font_family(cx.theme().font_family.clone())
+            .when(staging == Staging::Staged, |this| {
+                this.child(
+                    div()
+                        .text_size(theme::SMALL_TEXT_SIZE)
+                        .text_color(rgb(color::ACCENT))
+                        .child("staged"),
+                )
+            })
+            .when(patchable, |this| {
+                this.child(
+                    Button::new((id, file * 100_000 + hunk))
+                        .ghost()
+                        .xsmall()
+                        .h(px(18.))
+                        .label(label)
+                        .disabled(self.is_running())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.apply_hunk(file, hunk, window, cx)
+                        })),
+                )
+            })
+    }
+
+    /// Stages an unstaged hunk alone, or unstages a staged one.
+    fn apply_hunk(
+        &mut self,
+        file: usize,
+        hunk: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(Ok(files)) = &self.files else {
+            return;
+        };
+        let Some(file) = files.get(file) else {
+            return;
+        };
+        let DiffContent::Text(hunks) = &file.content else {
+            return;
+        };
+        let Some(hunk) = hunks.get(hunk).filter(|hunk| hunk.patchable) else {
+            return;
+        };
+        let Some(staging) = hunk.staging else {
+            return;
+        };
+        let patch = hunk.patch(&file.path);
+        let reverse = staging == Staging::Staged;
+        self.run_git(
+            move |git| git.apply_to_index(&patch, reverse),
+            |_, _, cx| cx.emit(ReviewEvent::Staged),
+            window,
+            cx,
+        );
+    }
+
     /// Whether a `git` command is running.
     fn is_running(&self) -> bool {
         matches!(&self.subject, Subject::WorkingTree { form, .. } if form.running.is_some())
@@ -784,7 +860,8 @@ impl Review {
                 let DiffContent::Text(hunks) = &files[file].content else {
                     return div().into_any_element();
                 };
-                let hunk = &hunks[hunk];
+                let index = hunk;
+                let hunk = &hunks[index];
                 card_row()
                     .h(LINE_HEIGHT)
                     .bg(rgb(color::DIFF_HUNK))
@@ -796,6 +873,9 @@ impl Review {
                         "@@ -{},{} +{},{} @@",
                         hunk.old_start, hunk.old_len, hunk.new_start, hunk.new_len
                     ))
+                    .when_some(hunk.staging, |this, staging| {
+                        this.child(self.hunk_staging(file, index, staging, hunk.patchable, cx))
+                    })
                     .into_any_element()
             }
             Some(Row::Line(file, hunk, line)) => {
@@ -1365,7 +1445,9 @@ fn diff_line(line: &DiffLine, mono: SharedString) -> impl IntoElement {
                 .whitespace_nowrap()
                 .text_ellipsis()
                 .text_color(rgb(color::DIFF_TEXT))
-                .child(line.text.replace('\t', TAB)),
+                // A carriage return is shown only as part of the text when
+                // no newline follows it.
+                .child(line.text.trim_end_matches('\r').replace('\t', TAB)),
         )
         .when(line.no_newline, |this| {
             this.child(

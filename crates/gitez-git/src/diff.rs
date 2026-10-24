@@ -10,7 +10,7 @@ use gix::object::tree::EntryKind;
 use gix::object::tree::diff::Change;
 
 use crate::details::{kind, trees};
-use crate::{ChangeKind, Error, LineCounts, Oid, Repository, Result};
+use crate::{ChangeKind, Error, LineCounts, Oid, Repository, Result, WorktreeChange};
 
 /// Unchanged lines shown around each change, as `git diff` does.
 const CONTEXT_LINES: u32 = 3;
@@ -32,7 +32,14 @@ pub struct FileDiff {
 impl FileDiff {
     /// Lines added and removed, if the content is text.
     pub fn line_counts(&self) -> Option<LineCounts> {
-        match &self.content {
+        self.content.line_counts()
+    }
+}
+
+impl DiffContent {
+    /// Lines added and removed, if the content is text.
+    pub fn line_counts(&self) -> Option<LineCounts> {
+        match self {
             DiffContent::Text(hunks) => Some(hunks.iter().flat_map(|hunk| &hunk.lines).fold(
                 LineCounts::default(),
                 |mut counts, line| {
@@ -74,6 +81,87 @@ pub struct Hunk {
     pub new_start: u32,
     pub new_len: u32,
     pub lines: Vec<DiffLine>,
+    /// For uncommitted changes, whether the hunk is staged; `None` in a
+    /// commit.
+    pub staging: Option<Staging>,
+    /// Whether [`Hunk::patch`] stages or unstages exactly this hunk: the
+    /// file exists on both sides and its text is UTF-8.
+    pub patchable: bool,
+}
+
+/// Which part of the uncommitted changes a hunk belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Staging {
+    /// From `HEAD` to the index: part of the next commit.
+    Staged,
+    /// From the index to the working tree.
+    Unstaged,
+}
+
+impl Hunk {
+    /// A patch of this hunk alone to the file at `path`, for
+    /// `git apply --cached`: as is to stage an unstaged hunk, reversed to
+    /// unstage a staged one. Only meaningful when [`patchable`](Self::patchable).
+    pub fn patch(&self, path: &str) -> String {
+        // Without the hunks before it, the hunk starts where it does in the
+        // old file.
+        let new_start = match (self.old_len, self.new_len) {
+            (0, 0) => self.old_start,
+            (0, _) => self.old_start + 1,
+            (_, 0) => self.old_start.saturating_sub(1),
+            _ => self.old_start,
+        };
+        let (old, new) = (quote("a/", path), quote("b/", path));
+        let mut patch = format!(
+            "diff --git {old} {new}\n--- {old}\n+++ {new}\n@@ -{},{} +{new_start},{} @@\n",
+            self.old_start, self.old_len, self.new_len
+        );
+        for line in &self.lines {
+            patch.push(match line.kind {
+                LineKind::Context => ' ',
+                LineKind::Added => '+',
+                LineKind::Removed => '-',
+            });
+            patch.push_str(&line.text);
+            if line.crlf {
+                patch.push('\r');
+            }
+            patch.push('\n');
+            if line.no_newline {
+                patch.push_str("\\ No newline at end of file\n");
+            }
+        }
+        patch
+    }
+}
+
+/// `prefix` and `path` as a patch names a file, quoted like git does when
+/// the path has quotes, backslashes or control characters.
+fn quote(prefix: &str, path: &str) -> String {
+    if !path
+        .chars()
+        .any(|c| c == '"' || c == '\\' || c.is_control())
+    {
+        return format!("{prefix}{path}");
+    }
+    let mut quoted = format!("\"{prefix}");
+    for c in path.chars() {
+        match c {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\n' => quoted.push_str("\\n"),
+            '\t' => quoted.push_str("\\t"),
+            c if c.is_control() => {
+                let mut buffer = [0; 4];
+                for byte in c.encode_utf8(&mut buffer).bytes() {
+                    quoted.push_str(&format!("\\{byte:03o}"));
+                }
+            }
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +173,8 @@ pub struct DiffLine {
     pub new: Option<u32>,
     /// The line without its line ending.
     pub text: String,
+    /// The line ends with a carriage return before the newline.
+    pub crlf: bool,
     /// The line is the last of its file and has no line ending, which
     /// `git diff` marks with "\\ No newline at end of file".
     pub no_newline: bool,
@@ -122,7 +212,7 @@ impl Repository {
                     Ok(content) => files.push(FileDiff {
                         path: change.location().to_str_lossy().into_owned(),
                         kind: kind(&change),
-                        content,
+                        content: with_staging(content, None, false),
                     }),
                     Err(err) => {
                         error = Some(err);
@@ -140,10 +230,10 @@ impl Repository {
 }
 
 impl Repository {
-    /// The diff of every uncommitted change, from `HEAD` to the files in the
-    /// working tree, like `git diff HEAD` with untracked files shown as
-    /// added. Staged and unstaged changes to a file are shown together. In
-    /// path order; empty for a bare repository.
+    /// The diff of every uncommitted change, with untracked files shown as
+    /// added. Each file's staged hunks (`git diff --cached`) come before its
+    /// unstaged ones (`git diff`); see [`Hunk::staging`]. In path order;
+    /// empty for a bare repository.
     pub fn working_tree_diff(&self) -> Result<Vec<FileDiff>> {
         let status = self.status()?;
         let repo = self.local();
@@ -151,7 +241,13 @@ impl Repository {
             return Ok(Vec::new());
         };
         let head_tree = repo.find_tree(repo.head_tree_id_or_empty()?)?;
-        let mut cache = repo.diff_resource_cache(
+        let index = repo.index_or_empty()?;
+        let null = repo.object_hash().null();
+        // `HEAD` to the index: both sides are stored objects, and a null id
+        // is an empty side.
+        let mut staged_cache = repo.diff_resource_cache(Mode::ToGit, WorktreeRoots::default())?;
+        // To the working tree: a null id on the new side reads the file.
+        let mut worktree_cache = repo.diff_resource_cache(
             Mode::ToGit,
             WorktreeRoots {
                 old_root: None,
@@ -167,11 +263,14 @@ impl Repository {
                 _ => None,
             };
             let old_path = from.unwrap_or(&file.path);
-            let old = head_tree
+            let head = head_tree
                 .lookup_entry_by_path(old_path)?
                 .map(|entry| (entry.object_id(), entry.mode().kind()));
+            let indexed = index
+                .entry_by_path(file.path.as_str().into())
+                .and_then(|entry| Some((entry.id, entry.mode.to_tree_entry_mode()?.kind())));
             let metadata = std::fs::symlink_metadata(workdir.join(&file.path)).ok();
-            let kind = match (&file.staged, &old, &metadata) {
+            let kind = match (&file.staged, &head, &metadata) {
                 (Some(kind @ (ChangeKind::Renamed { .. } | ChangeKind::Copied { .. })), _, _) => {
                     kind.clone()
                 }
@@ -179,46 +278,74 @@ impl Repository {
                 (_, Some(_), None) => ChangeKind::Deleted,
                 (_, Some(_), Some(_)) => ChangeKind::Modified,
             };
-            if old.is_none() && metadata.is_none() {
+            if head.is_none() && metadata.is_none() {
                 // Staged and then deleted again: nothing left to compare.
                 continue;
             }
+            let worktree_kind = match &metadata {
+                Some(metadata) if metadata.is_symlink() => EntryKind::Link,
+                Some(metadata) if is_executable(metadata) => EntryKind::BlobExecutable,
+                _ => EntryKind::Blob,
+            };
+            let is_file = |kind: EntryKind| {
+                matches!(
+                    kind,
+                    EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link
+                )
+            };
+
             let content = if metadata.as_ref().is_some_and(std::fs::Metadata::is_dir)
-                || old.is_some_and(|(_, kind)| {
-                    !matches!(
-                        kind,
-                        EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link
-                    )
-                }) {
+                || [head, indexed]
+                    .into_iter()
+                    .flatten()
+                    .any(|(_, kind)| !is_file(kind))
+            {
                 // A submodule or nested repository.
                 DiffContent::Unchanged
+            } else if file.unstaged == Some(WorktreeChange::Conflicted) {
+                // The index holds the conflict's sides, not one version:
+                // compare `HEAD` with the file and its conflict markers.
+                let (id, old_kind) = head.unwrap_or((null, EntryKind::Blob));
+                set_sides(
+                    &repo,
+                    &mut worktree_cache,
+                    (id, old_kind, old_path),
+                    (null, worktree_kind, &file.path),
+                )?;
+                prepared_content(&mut worktree_cache, &mut budget)?
             } else {
-                let (old_id, old_kind) =
-                    old.unwrap_or((repo.object_hash().null(), EntryKind::Blob));
-                let new_kind = match &metadata {
-                    Some(metadata) if metadata.is_symlink() => EntryKind::Link,
-                    Some(metadata) if is_executable(metadata) => EntryKind::BlobExecutable,
-                    _ => EntryKind::Blob,
+                let staged = match &file.staged {
+                    Some(_) => {
+                        let (old_id, old_kind) = head.unwrap_or((null, EntryKind::Blob));
+                        let (new_id, new_kind) = indexed.unwrap_or((null, EntryKind::Blob));
+                        set_sides(
+                            &repo,
+                            &mut staged_cache,
+                            (old_id, old_kind, old_path),
+                            (new_id, new_kind, &file.path),
+                        )?;
+                        let content = prepared_content(&mut staged_cache, &mut budget)?;
+                        let patchable = head.is_some() && indexed.is_some();
+                        Some(with_staging(content, Some(Staging::Staged), patchable))
+                    }
+                    None => None,
                 };
-                cache
-                    .set_resource(
-                        old_id,
-                        old_kind,
-                        old_path.as_str().into(),
-                        ResourceKind::OldOrSource,
-                        &repo.objects,
-                    )
-                    .map_err(gix::Error::from)?;
-                cache
-                    .set_resource(
-                        repo.object_hash().null(),
-                        new_kind,
-                        file.path.as_str().into(),
-                        ResourceKind::NewOrDestination,
-                        &repo.objects,
-                    )
-                    .map_err(gix::Error::from)?;
-                prepared_content(&mut cache, &mut budget)?
+                let unstaged = match file.unstaged {
+                    Some(_) => {
+                        let (old_id, old_kind) = indexed.unwrap_or((null, EntryKind::Blob));
+                        set_sides(
+                            &repo,
+                            &mut worktree_cache,
+                            (old_id, old_kind, &file.path),
+                            (null, worktree_kind, &file.path),
+                        )?;
+                        let content = prepared_content(&mut worktree_cache, &mut budget)?;
+                        let patchable = indexed.is_some() && metadata.is_some();
+                        Some(with_staging(content, Some(Staging::Unstaged), patchable))
+                    }
+                    None => None,
+                };
+                combine(staged, unstaged)
             };
             files.push(FileDiff {
                 path: file.path.clone(),
@@ -227,6 +354,74 @@ impl Repository {
             });
         }
         Ok(files)
+    }
+}
+
+/// Sets the old and new side of the next diff in `cache`: object id, kind
+/// and path of each.
+fn set_sides(
+    repo: &gix::Repository,
+    cache: &mut gix::diff::blob::Platform,
+    (old_id, old_kind, old_path): (Oid, EntryKind, &str),
+    (new_id, new_kind, new_path): (Oid, EntryKind, &str),
+) -> Result<()> {
+    cache
+        .set_resource(
+            old_id,
+            old_kind,
+            old_path.into(),
+            ResourceKind::OldOrSource,
+            &repo.objects,
+        )
+        .map_err(gix::Error::from)?;
+    cache
+        .set_resource(
+            new_id,
+            new_kind,
+            new_path.into(),
+            ResourceKind::NewOrDestination,
+            &repo.objects,
+        )
+        .map_err(gix::Error::from)?;
+    Ok(())
+}
+
+/// `content` with its hunks marked as `staging`, and as patchable when
+/// `patchable` allows and their text does.
+fn with_staging(content: DiffContent, staging: Option<Staging>, patchable: bool) -> DiffContent {
+    match content {
+        DiffContent::Text(mut hunks) => {
+            for hunk in &mut hunks {
+                hunk.staging = staging;
+                hunk.patchable &= patchable;
+            }
+            DiffContent::Text(hunks)
+        }
+        other => other,
+    }
+}
+
+/// One file's staged and unstaged changes as one content: the staged
+/// hunks, then the unstaged ones.
+fn combine(staged: Option<DiffContent>, unstaged: Option<DiffContent>) -> DiffContent {
+    use DiffContent::{Binary, Text, TooLarge, Unchanged};
+    match (staged, unstaged) {
+        (Some(Text(mut staged)), Some(Text(unstaged))) => {
+            staged.extend(unstaged);
+            Text(staged)
+        }
+        (Some(Binary), _) | (_, Some(Binary)) => Binary,
+        (Some(TooLarge(a)), Some(other)) | (Some(other), Some(TooLarge(a))) => {
+            let b = other.line_counts().unwrap_or_default();
+            TooLarge(LineCounts {
+                added: a.added + b.added,
+                removed: a.removed + b.removed,
+            })
+        }
+        (Some(Unchanged) | None, Some(content)) | (Some(content), Some(Unchanged) | None) => {
+            content
+        }
+        (None, None) => Unchanged,
     }
 }
 
@@ -315,6 +510,7 @@ impl ConsumeHunk for Hunks {
     ) -> std::io::Result<()> {
         let mut old = header.before_hunk_start;
         let mut new = header.after_hunk_start;
+        let mut exact = true;
         let lines = lines
             .iter()
             .map(|&(line_kind, text)| {
@@ -333,15 +529,20 @@ impl ConsumeHunk for Hunks {
                         (LineKind::Added, None, Some(new - 1))
                     }
                 };
-                let (text, no_newline) = match text.strip_suffix(b"\n") {
-                    Some(text) => (text.strip_suffix(b"\r").unwrap_or(text), false),
-                    None => (text, true),
+                let (text, crlf, no_newline) = match text.strip_suffix(b"\n") {
+                    Some(text) => match text.strip_suffix(b"\r") {
+                        Some(text) => (text, true, false),
+                        None => (text, false, false),
+                    },
+                    None => (text, false, true),
                 };
+                exact &= text.to_str().is_ok();
                 DiffLine {
                     kind,
                     old: old_number,
                     new: new_number,
                     text: text.to_str_lossy().into_owned(),
+                    crlf,
                     no_newline,
                 }
             })
@@ -361,6 +562,9 @@ impl ConsumeHunk for Hunks {
             new_start: start(header.after_hunk_start, header.after_hunk_len),
             new_len: header.after_hunk_len,
             lines,
+            staging: None,
+            // Set for uncommitted changes, where it matters.
+            patchable: exact,
         });
         Ok(())
     }

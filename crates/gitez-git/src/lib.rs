@@ -20,7 +20,7 @@ mod watch;
 
 pub use commits::{Commit, CommitWalk, Order, Signature, Timestamp};
 pub use details::{ChangeKind, CommitDetails, FileChange, LineCounts};
-pub use diff::{DiffContent, DiffLine, FileDiff, Hunk, LineKind};
+pub use diff::{DiffContent, DiffLine, FileDiff, Hunk, LineKind, Staging};
 pub use error::{Error, Result};
 pub use refs::{Branch, Head, RefKind, RefLabel, Refs, RemoteBranch, Stash, Tag};
 pub use repository::Repository;

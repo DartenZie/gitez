@@ -7,7 +7,7 @@ use std::process::Command;
 use gitez_git::graph::GraphLayout;
 use gitez_git::{
     Affected, ChangeKind, Commit, DiffContent, DiffLine, FileChange, FileStatus, Head, Hunk,
-    LineCounts, LineKind, Oid, Order, RefKind, Repository, WorktreeChange,
+    LineCounts, LineKind, Oid, Order, RefKind, Repository, Staging, WorktreeChange,
 };
 use tempfile::TempDir;
 
@@ -749,6 +749,7 @@ fn diff_numbers_lines_and_keeps_three_lines_of_context() {
         old,
         new,
         text: text.to_owned(),
+        crlf: false,
         no_newline: false,
     };
     assert_eq!(
@@ -760,9 +761,14 @@ fn diff_numbers_lines_and_keeps_three_lines_of_context() {
             new_len: 2,
             lines: vec![
                 // The carriage return of a CRLF line ending is not shown.
-                line(LineKind::Added, None, Some(1), "hello"),
+                DiffLine {
+                    crlf: true,
+                    ..line(LineKind::Added, None, Some(1), "hello")
+                },
                 line(LineKind::Added, None, Some(2), "world"),
             ],
+            staging: None,
+            patchable: false,
         }])
     );
 
@@ -910,4 +916,118 @@ fn ahead_behind_counts_only_the_commits_one_side_lacks() {
     assert_eq!(repo.ahead_behind(ahead, base).expect("ahead"), (1, 0));
     assert_eq!(repo.ahead_behind(base, ahead).expect("behind"), (0, 1));
     assert_eq!(repo.ahead_behind(ahead, other).expect("diverged"), (1, 1));
+}
+
+/// `git apply --cached` of `patch`, reversed if `reverse`.
+fn apply_to_index(fixture: &Fixture, patch: &str, reverse: bool) {
+    let file = fixture.root.join("../hunk.patch");
+    std::fs::write(&file, patch).expect("write patch");
+    let file = file.to_str().expect("UTF-8 path");
+    let mut args = vec!["apply", "--cached", file];
+    if reverse {
+        args.insert(2, "--reverse");
+    }
+    fixture.git(&args);
+}
+
+/// The hunks of the uncommitted changes to `path`: staging, and the text of
+/// their changed lines.
+fn uncommitted_hunks(fixture: &Fixture, path: &str) -> Vec<(Option<Staging>, bool, Vec<String>)> {
+    let diffs = fixture.open().working_tree_diff().expect("diff");
+    let diff = diffs
+        .iter()
+        .find(|diff| diff.path == path)
+        .expect("the file has changes");
+    let DiffContent::Text(hunks) = &diff.content else {
+        panic!("a text diff: {:?}", diff.content);
+    };
+    hunks
+        .iter()
+        .map(|hunk| {
+            let changed = hunk
+                .lines
+                .iter()
+                .filter(|line| line.kind != LineKind::Context)
+                .map(|line| line.text.clone())
+                .collect();
+            (hunk.staging, hunk.patchable, changed)
+        })
+        .collect()
+}
+
+#[test]
+fn hunks_stage_and_unstage_one_at_a_time() {
+    let fixture = Fixture::new();
+    let path = "odd \"name\".txt";
+    let original: Vec<String> = (1..=30).map(|n| format!("line {n}\r")).collect();
+    // CRLF line endings and no newline at the end of the file.
+    std::fs::write(fixture.root.join(path), original.join("\n")).expect("write");
+    fixture.git(&["add", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "Add"]);
+
+    let mut edited = original.clone();
+    edited[1] = "line 2, edited\r".to_owned();
+    edited[29] = "line 30, edited\r".to_owned();
+    std::fs::write(fixture.root.join(path), edited.join("\n")).expect("write");
+    let removed_and_added = |n: u32, edited: &str| vec![format!("line {n}"), edited.to_owned()];
+    // Without a newline after it, the last line's carriage return is text.
+    let last = vec!["line 30\r".to_owned(), "line 30, edited\r".to_owned()];
+    assert_eq!(
+        uncommitted_hunks(&fixture, path),
+        [
+            (
+                Some(Staging::Unstaged),
+                true,
+                removed_and_added(2, "line 2, edited")
+            ),
+            (Some(Staging::Unstaged), true, last.clone()),
+        ]
+    );
+
+    // Stage the second hunk alone.
+    let diffs = fixture.open().working_tree_diff().expect("diff");
+    let DiffContent::Text(hunks) = &diffs[0].content else {
+        panic!("a text diff");
+    };
+    apply_to_index(&fixture, &hunks[1].patch(path), false);
+    assert_eq!(
+        uncommitted_hunks(&fixture, path),
+        [
+            (Some(Staging::Staged), true, last.clone()),
+            (
+                Some(Staging::Unstaged),
+                true,
+                removed_and_added(2, "line 2, edited")
+            ),
+        ]
+    );
+
+    // And unstage it again.
+    let diffs = fixture.open().working_tree_diff().expect("diff");
+    let DiffContent::Text(hunks) = &diffs[0].content else {
+        panic!("a text diff");
+    };
+    apply_to_index(&fixture, &hunks[0].patch(path), true);
+    assert_eq!(fixture.git(&["diff", "--cached"]), "");
+    assert_eq!(uncommitted_hunks(&fixture, path).len(), 2);
+}
+
+#[test]
+fn new_and_deleted_files_are_not_patchable_by_hunk() {
+    let fixture = Fixture::new();
+    fixture.commit("gone.txt", "gone");
+    std::fs::remove_file(fixture.root.join("gone.txt")).expect("remove");
+    std::fs::write(fixture.root.join("new.txt"), "new\n").expect("write");
+    std::fs::write(fixture.root.join("staged.txt"), "staged\n").expect("write");
+    fixture.git(&["add", "staged.txt"]);
+
+    for (path, staging) in [
+        ("gone.txt", Staging::Unstaged),
+        ("new.txt", Staging::Unstaged),
+        ("staged.txt", Staging::Staged),
+    ] {
+        let hunks = uncommitted_hunks(&fixture, path);
+        assert_eq!(hunks.len(), 1, "{path}");
+        assert_eq!((hunks[0].0, hunks[0].1), (Some(staging), false), "{path}");
+    }
 }

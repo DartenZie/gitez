@@ -89,6 +89,17 @@ impl Git {
         .map(drop)
     }
 
+    /// Applies `patch` to the index only, like `git apply --cached`; with
+    /// `reverse`, takes it back out. Stages or unstages part of a file.
+    pub fn apply_to_index(&self, patch: &str, reverse: bool) -> Result<()> {
+        let mut args = vec!["apply", "--cached", "--whitespace=nowarn"];
+        if reverse {
+            args.push("--reverse");
+        }
+        args.push("-");
+        self.run(args, Some(patch.as_bytes())).map(drop)
+    }
+
     /// Runs `git <args>` with `paths` passed on standard input, so any
     /// number of paths fits and none is read as an option or a pattern.
     fn run_with_paths<const N: usize>(&self, args: [&str; N], paths: &[String]) -> Result<()> {

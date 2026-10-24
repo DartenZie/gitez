@@ -148,3 +148,25 @@ fn amends_the_message_and_adds_the_staged_changes() {
     );
     assert_eq!(status(dir.path()), "");
 }
+
+#[test]
+fn applies_a_patch_to_the_index_and_takes_it_back() {
+    let dir = repository();
+    let git_ = Git::new(dir.path());
+    std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").expect("write");
+    git_.stage_all().expect("stage");
+    git_.commit("Add a").expect("commit");
+    std::fs::write(dir.path().join("a.txt"), "one\nTWO\n").expect("write");
+    let patch =
+        "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+TWO\n";
+
+    git_.apply_to_index(patch, false).expect("stage the hunk");
+    assert_eq!(status(dir.path()), "M  a.txt");
+    git_.apply_to_index(patch, true).expect("unstage the hunk");
+    assert_eq!(status(dir.path()), "M a.txt");
+
+    let error = git_
+        .apply_to_index(patch, true)
+        .expect_err("the hunk is not staged any more");
+    assert!(matches!(error, Error::Failed { .. }), "{error:?}");
+}
