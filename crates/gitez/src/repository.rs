@@ -28,6 +28,8 @@ pub struct Snapshot {
     pub pull_requests: Vec<PullRequest>,
     /// Why some local pull requests could not be read, if any could not.
     pub pull_requests_error: Option<String>,
+    /// The name commits are made under, shown on review comments.
+    pub user_name: Option<String>,
 }
 
 /// How a local branch compares to its upstream.
@@ -77,6 +79,7 @@ impl Snapshot {
 
         let reviews = Store::new(&repository.common_dir());
         let (pull_requests, pull_requests_error) = load_pull_requests(&reviews);
+        let user_name = repository.user_name();
 
         Ok(Self {
             name: repository.name().into(),
@@ -90,6 +93,7 @@ impl Snapshot {
             reviews,
             pull_requests,
             pull_requests_error,
+            user_name,
         })
     }
 

@@ -45,9 +45,12 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 > open review too. **New local PR** creates a local pull request for a
 > branch against its base (`main` by default); the sidebar lists them,
 > and opening one shows the branch's changes since it left the base,
-> with the files marked viewed kept between sessions. Comments on lines
-> and the agent prompt come next. Nothing else can be changed from GitEZ
-> yet.
+> with the files marked viewed kept between sessions. Hover a line and
+> click **+** (or drag from it across several lines) to comment; threads
+> show under their lines, with replies, Resolve and whether they go into
+> the agent prompt. A thread whose lines change in a new commit on the
+> branch resolves itself. The agent prompt panel comes next. Nothing else
+> can be changed from GitEZ yet.
 
 ## Technology
 

@@ -1033,6 +1033,13 @@ fn branch_diff_shows_the_changes_since_the_branch_left_its_base() {
     assert!(diff.files.is_empty());
 }
 
+#[test]
+fn user_name_is_read_from_the_repository_config() {
+    let fixture = Fixture::new();
+    fixture.git(&["config", "user.name", "Ada Lovelace"]);
+    assert_eq!(fixture.open().user_name().as_deref(), Some("Ada Lovelace"));
+}
+
 /// `git apply --cached` of `patch`, reversed if `reverse`.
 fn apply_to_index(fixture: &Fixture, patch: &str, reverse: bool) {
     let file = fixture.root.join("../hunk.patch");

@@ -24,6 +24,8 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+mod threads;
+
 use super::labels;
 use crate::theme::{self, color};
 
@@ -53,6 +55,8 @@ pub enum ReviewEvent {
     /// A commit was made. `everything` is set when no uncommitted changes
     /// were left out of it.
     Committed { everything: bool },
+    /// The local pull request was saved.
+    PullRequestSaved,
 }
 
 /// Height of one diff line.
@@ -71,6 +75,10 @@ enum Row {
     File(usize),
     /// A hunk header: file and hunk index.
     Hunk(usize, usize),
+    /// A review thread under its lines: file and thread id.
+    Thread(usize, u32),
+    /// The box a new comment is written in: file.
+    Composer(usize),
     /// A diff line: file, hunk and line index.
     Line(usize, usize, usize),
     /// In the split layout, a line's old side beside a line's new side:
@@ -99,6 +107,8 @@ impl Row {
             | Row::Gap(file, _)
             | Row::Context(file, _, _)
             | Row::Notice(file)
+            | Row::Thread(file, _)
+            | Row::Composer(file)
             | Row::FileEnd(file) => Some(file),
             Row::End => None,
         }
@@ -112,6 +122,8 @@ impl Row {
             Row::Line(_, hunk, line) => Row::Line(file, hunk, line),
             Row::Pair(_, hunk, old, new) => Row::Pair(file, hunk, old, new),
             Row::Notice(_) => Row::Notice(file),
+            Row::Thread(_, id) => Row::Thread(file, id),
+            Row::Composer(_) => Row::Composer(file),
             Row::FileEnd(_) => Row::FileEnd(file),
             Row::Gap(_, at) => Row::Gap(file, at),
             Row::Context(_, at, line) => Row::Context(file, at, line),
@@ -321,6 +333,7 @@ struct PullRequestSubject {
     saving: Task<()>,
     /// Why the last save failed.
     save_error: Option<SharedString>,
+    comments: threads::Comments,
 }
 
 pub struct Review {
@@ -435,6 +448,7 @@ impl Review {
         store: Store,
         pull_request: PullRequest,
         tips: Tips,
+        user_name: Option<String>,
         cx: &mut Context<Self>,
     ) -> Self {
         let load = Self::load_pull_request(repository, &store, pull_request.number, tips, cx);
@@ -445,6 +459,10 @@ impl Review {
             ahead: None,
             saving: Task::ready(()),
             save_error: None,
+            comments: threads::Comments {
+                user_name,
+                ..Default::default()
+            },
         }));
         Self::with_subject(repository, subject, load, cx)
     }
@@ -538,6 +556,9 @@ impl Review {
                 .spawn(async move { store.save(&pull_request) })
                 .await;
             this.update(cx, |this, cx| {
+                if saved.is_ok() {
+                    cx.emit(ReviewEvent::PullRequestSaved);
+                }
                 if let Subject::PullRequest(subject) = &mut this.subject {
                     subject.save_error = saved.err().map(|error| {
                         format!(
@@ -672,6 +693,15 @@ impl Review {
             |file, at| self.is_expanded(file, at),
             ReviewSettings::get(cx).layout,
         );
+        let placed = self.placed_comments(&files);
+        if !placed.is_empty() {
+            (self.rows, self.file_rows) = threads::with_comments(
+                &self.rows,
+                &placed,
+                |row| threads::row_numbers(&files, row),
+                |file| self.is_viewed(&files[file]),
+            );
+        }
         self.list.reset(self.rows.len());
         if let Some(Anchor {
             path,
@@ -983,10 +1013,17 @@ impl Review {
     }
 
     fn close(&mut self, _: &Close, _: &mut Window, cx: &mut Context<Self>) {
-        cx.emit(ReviewEvent::Close);
+        if !self.cancel_writing(cx) {
+            cx.emit(ReviewEvent::Close);
+        }
     }
 
-    fn newer(&mut self, _: &Newer, _: &mut Window, cx: &mut Context<Self>) {
+    fn newer(&mut self, _: &Newer, window: &mut Window, cx: &mut Context<Self>) {
+        // Typed into a text box.
+        if !self.focus_handle.is_focused(window) {
+            cx.propagate();
+            return;
+        }
         if let Subject::Commit(subject) = &self.subject
             && subject.newer.is_some()
         {
@@ -994,7 +1031,11 @@ impl Review {
         }
     }
 
-    fn older(&mut self, _: &Older, _: &mut Window, cx: &mut Context<Self>) {
+    fn older(&mut self, _: &Older, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.focus_handle.is_focused(window) {
+            cx.propagate();
+            return;
+        }
         if let Subject::Commit(subject) = &self.subject
             && subject.older.is_some()
         {
@@ -1425,6 +1466,18 @@ impl Review {
     }
 
     fn render_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let element = self.render_plain_row(index, cx);
+        match self.rows.get(index).copied() {
+            Some(row @ (Row::Line(..) | Row::Pair(..) | Row::Context(..)))
+                if matches!(self.subject, Subject::PullRequest(_)) =>
+            {
+                self.commentable(element, index, row, cx)
+            }
+            _ => element,
+        }
+    }
+
+    fn render_plain_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
         let Some(Ok(files)) = &self.files else {
             return div().into_any_element();
         };
@@ -1434,7 +1487,18 @@ impl Review {
                 let file = &files[index];
                 let status = self.file_status(&file.path);
                 let viewed = self.is_viewed(file);
+                let open = self
+                    .open_threads_by_path()
+                    .get(file.path.as_str())
+                    .copied()
+                    .unwrap_or(0);
                 file_header(file, status, viewed, mono)
+                    .when(open > 0, |this| {
+                        this.child(threads::chip(match open {
+                            1 => "1 comment".to_owned(),
+                            open => format!("{open} comments"),
+                        }))
+                    })
                     .child(
                         div()
                             .h_flex()
@@ -1585,6 +1649,8 @@ impl Review {
                 )
                 .child(div().h(CARD_GAP))
                 .into_any_element(),
+            Some(Row::Thread(_, id)) => self.render_thread(id, cx),
+            Some(Row::Composer(_)) => self.render_composer(cx),
             Some(Row::End) => self.render_end(cx).into_any_element(),
             None => div().into_any_element(),
         }
@@ -1975,6 +2041,7 @@ impl Review {
     fn render_files(&self, files: &[FileDiff], cx: &mut Context<Self>) -> impl IntoElement {
         let mut items: Vec<AnyElement> = Vec::new();
         let mut directory = None;
+        let open_threads = self.open_threads_by_path();
         for (index, file) in files.iter().enumerate() {
             let (dir, name) = split_path(&file.path);
             if directory != Some(dir) {
@@ -2040,6 +2107,9 @@ impl Review {
                             .when(viewed, |this| this.line_through())
                             .child(name.to_owned()),
                     )
+                    .when_some(open_threads.get(file.path.as_str()), |this, open| {
+                        this.child(threads::chip(open.to_string()))
+                    })
                     .when(viewed, |this| {
                         this.child(
                             Icon::new(IconName::Check)
@@ -2141,6 +2211,10 @@ impl Render for Review {
             .on_action(cx.listener(Self::newer))
             .on_action(cx.listener(Self::older))
             .on_action(cx.listener(Self::commit_staged))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| this.finish_selecting(window, cx)),
+            )
             .v_flex()
             .size_full()
             .bg(rgb(color::BACKGROUND))

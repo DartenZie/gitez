@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use gix::bstr::ByteSlice as _;
+
 use crate::{Error, Result};
 
 /// Object cache per thread-local handle. Commit walks look objects up more
@@ -50,6 +52,15 @@ impl Repository {
         dir.file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| dir.display().to_string())
+    }
+
+    /// The name commits are made under (`user.name`), if configured.
+    pub fn user_name(&self) -> Option<String> {
+        let repo = self.local();
+        let config = repo.config_snapshot();
+        let name = config.string("user.name")?;
+        let name = name.to_str_lossy().trim().to_owned();
+        (!name.is_empty()).then_some(name)
     }
 
     /// A handle for use on the current thread.

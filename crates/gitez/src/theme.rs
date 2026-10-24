@@ -44,6 +44,12 @@ pub mod color {
     pub const BRANCH_VIOLET: u32 = 0xc0_8c_f0;
     pub const BRANCH_TEAL: u32 = 0x4f_c6_b0;
 
+    /// A review thread under the lines it comments on.
+    pub const THREAD: u32 = 0x1a1916;
+    pub const THREAD_BORDER: u32 = 0x33_30_2a;
+    pub const THREAD_DIVIDER: u32 = 0x2c_2a_25;
+    /// Text of the amber chips: comment counts, a thread's number.
+    pub const CHIP_TEXT: u32 = 0xf0_c4_6e;
     /// An open pull request's number and state chip text.
     pub const PULL_REQUEST_OPEN_TEXT: u32 = 0x7f_d8_c6;
 

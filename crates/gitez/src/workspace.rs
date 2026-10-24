@@ -459,6 +459,11 @@ impl Workspace {
                 }
                 ReviewEvent::Newer => -1,
                 ReviewEvent::Older => 1,
+                ReviewEvent::PullRequestSaved => {
+                    // The sidebar shows its open comments.
+                    this.reload(window, cx);
+                    return;
+                }
                 ReviewEvent::Staged => {
                     this.refresh_status(window, cx);
                     return;
@@ -505,7 +510,9 @@ impl Workspace {
         };
         let (repository, store) = (snapshot.repository.clone(), snapshot.reviews.clone());
         let pull_request = pull_request.clone();
-        let review = cx.new(|cx| Review::pull_request(&repository, store, pull_request, tips, cx));
+        let user_name = snapshot.user_name.clone();
+        let review = cx
+            .new(|cx| Review::pull_request(&repository, store, pull_request, tips, user_name, cx));
         self.show_review(review, None, window, cx);
     }
 
