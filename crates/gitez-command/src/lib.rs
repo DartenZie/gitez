@@ -172,6 +172,30 @@ pub enum UnstashOutcome {
     Conflicts,
 }
 
+/// One change to a reference, made only if the reference is still where it
+/// was expected: see [`Git::update_refs`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefUpdate {
+    /// The full name, such as `refs/heads/main`.
+    pub name: String,
+    /// The commit it must be on now (a full id), or `None` if it must not
+    /// exist.
+    pub old: Option<String>,
+    /// The commit to move it to, or `None` to delete it.
+    pub new: Option<String>,
+}
+
+/// What [`Git::reset`] does to the index and the files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetMode {
+    /// Leaves both as they are, so the difference shows as staged changes
+    /// (`--soft`).
+    Soft,
+    /// Updates the files that differ between the commits and keeps local
+    /// changes, refusing if one would be lost (`--keep`).
+    Keep,
+}
+
 /// Runs `git` in one working tree.
 #[derive(Debug, Clone)]
 pub struct Git {
@@ -479,6 +503,42 @@ impl Git {
     /// top of the stashes with `message`, like `git stash store`.
     pub fn restore_stash(&self, id: &str, message: &str) -> Result<()> {
         self.run(["stash", "store", "--quiet", "-m", message, id], None)
+            .map(drop)
+    }
+
+    /// Makes `updates` together or not at all, like `git update-ref
+    /// --stdin` in one transaction. Fails, changing nothing, if any
+    /// reference is not where `old` says.
+    pub fn update_refs(&self, updates: &[RefUpdate]) -> Result<()> {
+        let mut input = String::from("start\n");
+        for update in updates {
+            let name = &update.name;
+            let line = match (&update.old, &update.new) {
+                (None, Some(new)) => format!("create {name} {new}\n"),
+                (Some(old), Some(new)) => format!("update {name} {new} {old}\n"),
+                (Some(old), None) => format!("delete {name} {old}\n"),
+                (None, None) => continue,
+            };
+            input.push_str(&line);
+        }
+        input.push_str("commit\n");
+        self.run(["update-ref", "--stdin"], Some(input.as_bytes()))
+            .map(drop)
+    }
+
+    /// Moves the branch checked out to `commit`, like `git reset`, the way
+    /// `mode` says.
+    pub fn reset(&self, commit: &str, mode: ResetMode) -> Result<()> {
+        let flag = match mode {
+            ResetMode::Soft => "--soft",
+            ResetMode::Keep => "--keep",
+        };
+        self.run(["reset", "--quiet", flag, commit], None).map(drop)
+    }
+
+    /// Checks out `commit` without a branch, like `git switch --detach`.
+    pub fn switch_detached(&self, commit: &str) -> Result<()> {
+        self.run(["switch", "--quiet", "--detach", commit], None)
             .map(drop)
     }
 

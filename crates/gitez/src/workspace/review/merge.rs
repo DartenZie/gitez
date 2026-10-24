@@ -3,31 +3,41 @@
 //! the ways to bring the branch in. It opens for a local pull request, or
 //! when a branch is dropped on another in the history.
 
-use gitez_command::{Git, MergeMethod, MergeOutcome};
+use gitez_command::{Git, MergeMethod, MergeOutcome, ResetMode};
 use gitez_git::{Head, MergePreview, Oid, RefKind, RefLabel, Repository};
 use gitez_review::{PullRequest, State, Store, Timestamp};
 use gpui_kit::assets::IconName;
-use gpui_kit::component::notification::Notification;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::{Review, ReviewEvent, Subject, follow_head, muted};
 use crate::theme::{self, color};
+use crate::undo::{self, Recorder, ReviewChange, ReviewTips};
 use crate::workspace::labels;
 
 /// What the dialog asks of its owner.
 pub(crate) enum MergeEvent {
     /// The branch was merged, and the pull request merged with it, if any,
-    /// saved as merged.
-    Merged(Option<Box<PullRequest>>),
-    /// The branch was rebased onto the other.
-    Rebased,
+    /// saved as merged. `step` is the undo step.
+    Merged {
+        pull_request: Option<Box<PullRequest>>,
+        step: Option<u64>,
+    },
+    /// The branch was rebased onto the other; `step` is the undo step.
+    Rebased { step: Option<u64> },
     /// The merge stopped with conflicts to resolve.
     Stopped,
     /// Review the branch as a local pull request: this open one, or a new
     /// one.
     Review(Option<u32>),
+}
+
+/// How a merge or rebase ended, before it is recorded for undo.
+enum Done {
+    Merged(Option<Box<PullRequest>>),
+    Rebased,
+    Stopped,
 }
 
 /// The branches as the dialog merges them.
@@ -140,6 +150,13 @@ impl MergeDialog {
         let (head, base) = (merging.head.clone(), merging.base.clone());
         let message = how.map(|how| message(merging, how, self.ahead()));
         let base_before = merging.base_tip;
+        let label = match how {
+            Some(_) => match number {
+                Some(number) => format!("Merge #{number} into {base}"),
+                None => format!("Merge {head} into {base}"),
+            },
+            None => format!("Rebase {head} onto {base}"),
+        };
         self.running = Some(choice);
         self.error = None;
         self._task = cx.spawn(async move |this, cx| {
@@ -150,28 +167,42 @@ impl MergeDialog {
                         Some(Head::Branch { name, .. }) => Some(name),
                         _ => None,
                     };
+                    let recorder = Recorder::start(git.work_dir());
                     let (Some(how), Some(message)) = (how, message) else {
                         git.rebase_branch(&head, &base, return_to.as_deref())?;
-                        return anyhow::Ok(MergeEvent::Rebased);
+                        return anyhow::Ok((Done::Rebased, recorder.finish(ResetMode::Keep)));
                     };
                     match git.merge_branch(&head, &base, how, &message, return_to.as_deref())? {
                         MergeOutcome::Merged => {
-                            let pull_request = number
+                            let merged = number
                                 .map(|number| {
                                     record_merge(&repository, &store, number, base_before)
                                 })
                                 .transpose()?;
-                            Ok(MergeEvent::Merged(pull_request.map(Box::new)))
+                            let mut recorded = recorder.finish(ResetMode::Keep);
+                            let pull_request = merged.map(|(pull_request, review)| {
+                                recorded =
+                                    recorded.take().map(|recorded| recorded.with_review(review));
+                                Box::new(pull_request)
+                            });
+                            Ok((Done::Merged(pull_request), recorded))
                         }
                         // Recorded once the merge is committed.
-                        MergeOutcome::Conflicts => Ok(MergeEvent::Stopped),
+                        MergeOutcome::Conflicts => Ok((Done::Stopped, None)),
                     }
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.running = None;
                 match done {
-                    Ok(event) => cx.emit(event),
+                    Ok((done, recorded)) => {
+                        let step = undo::record(cx, recorded, label);
+                        cx.emit(match done {
+                            Done::Merged(pull_request) => MergeEvent::Merged { pull_request, step },
+                            Done::Rebased => MergeEvent::Rebased { step },
+                            Done::Stopped => MergeEvent::Stopped,
+                        })
+                    }
                     Err(error) => this.error = Some(format!("{error:#}").into()),
                 }
                 cx.notify();
@@ -553,15 +584,20 @@ impl Review {
         let dialog = cx.new(|cx| MergeDialog::new(repository, store, merging, false, cx));
         let subscription =
             cx.subscribe_in(&dialog, window, |this, _, event, window, cx| match event {
-                MergeEvent::Merged(Some(pull_request)) => {
-                    this.merged(pull_request.as_ref().clone(), window, cx)
-                }
+                MergeEvent::Merged {
+                    pull_request: Some(pull_request),
+                    step,
+                } => this.merged(pull_request.as_ref().clone(), *step, window, cx),
                 MergeEvent::Stopped => {
                     window.close_dialog(cx);
                     cx.emit(ReviewEvent::MergeStopped);
                 }
                 // Not offered for a pull request.
-                MergeEvent::Merged(None) | MergeEvent::Rebased | MergeEvent::Review(_) => {}
+                MergeEvent::Merged {
+                    pull_request: None, ..
+                }
+                | MergeEvent::Rebased { .. }
+                | MergeEvent::Review(_) => {}
             });
         if let Subject::PullRequest(subject) = &mut self.subject {
             subject.merge_dialog = Some(subscription);
@@ -585,37 +621,44 @@ impl Review {
     }
 
     /// Shows `pull_request`, just merged.
-    fn merged(&mut self, pull_request: PullRequest, window: &mut Window, cx: &mut Context<Self>) {
+    fn merged(
+        &mut self,
+        pull_request: PullRequest,
+        step: Option<u64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Subject::PullRequest(subject) = &mut self.subject else {
             return;
         };
         window.close_dialog(cx);
-        window.push_notification(
-            Notification::success(format!(
+        cx.emit(ReviewEvent::Merged {
+            message: format!(
                 "Merged #{} into {}",
                 pull_request.number, pull_request.base.branch
-            )),
-            cx,
-        );
+            )
+            .into(),
+            step,
+        });
         let (number, tips, store) = (pull_request.number, subject.tips, subject.store.clone());
         subject.pull_request = pull_request;
         self._load = Self::load_pull_request(&self.repository, &store, number, tips, cx);
-        // The branches moved and another one is checked out.
-        cx.emit(ReviewEvent::CheckedOut);
         cx.notify();
     }
 }
 
 /// Pull request `number` saved as merged into its base, which was on
-/// `base_before` until then. Its threads follow the head if a rebase moved
-/// it. Blocks; run it on a background thread.
+/// `base_before` until then, with what undoing that puts back. Its threads
+/// follow the head if a rebase moved it. Blocks; run it on a background
+/// thread.
 pub(crate) fn record_merge(
     repository: &Repository,
     store: &Store,
     number: u32,
     base_before: Oid,
-) -> anyhow::Result<PullRequest> {
+) -> anyhow::Result<(PullRequest, ReviewChange)> {
     let mut pull_request = store.load(number)?;
+    let before = ReviewTips::of(&pull_request);
     let head = repository
         .refs()?
         .branches
@@ -632,7 +675,13 @@ pub(crate) fn record_merge(
     pull_request.state = State::Merged;
     pull_request.updated = now;
     store.save(&pull_request)?;
-    Ok(pull_request)
+    let review = ReviewChange {
+        store: store.clone(),
+        number,
+        before,
+        after: ReviewTips::of(&pull_request),
+    };
+    Ok((pull_request, review))
 }
 
 /// The commit message for merging `merging` the way `how` says, with

@@ -1,6 +1,6 @@
 //! Fetch, pull and push: when each can run, and what it does.
 
-use gitez_command::{Git, PullMethod, PullOutcome, PushRejection, needs_pull_method};
+use gitez_command::{Git, PullMethod, PullOutcome, PushRejection, ResetMode, needs_pull_method};
 use gitez_git::Head;
 use gpui_kit::component::button::*;
 use gpui_kit::component::notification::Notification;
@@ -9,6 +9,7 @@ use gpui_kit::*;
 
 use super::{Fetch, Pull, Push, Workspace};
 use crate::repository::Snapshot;
+use crate::undo::{self, Recorder};
 
 /// One of the toolbar's remote operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,8 +144,9 @@ impl Workspace {
         };
         self.run_remote(
             RemoteOp::Fetch,
+            None,
             |git| git.fetch(),
-            move |_, result, window, cx| {
+            move |_, result, _, window, cx| {
                 let notification = match result {
                     // "Fetch from origin" becomes "Fetched from origin".
                     Ok(()) => Notification::success(description.replacen("Fetch", "Fetched", 1)),
@@ -165,15 +167,17 @@ impl Workspace {
         let Some(snapshot) = &self.snapshot else {
             return;
         };
-        if RemoteActions::of(snapshot).pull.is_err() {
+        // "Pull origin/main into main"
+        let Ok(label) = RemoteActions::of(snapshot).pull else {
             return;
-        }
+        };
         self.run_remote(
             RemoteOp::Pull,
+            Some(label),
             move |git| git.pull(method),
-            |this, result, window, cx| match result {
+            |this, result, step, window, cx| match result {
                 Ok(PullOutcome::Pulled) => {
-                    window.push_notification(Notification::success("Pulled"), cx)
+                    this.notify_done(Notification::success("Pulled"), step, window, cx)
                 }
                 Ok(PullOutcome::Conflicts) => window.push_notification(
                     Notification::warning(
@@ -215,8 +219,9 @@ impl Workspace {
         let (branch, publish_to) = (plan.branch.clone(), plan.publish.then(|| plan.to.clone()));
         self.run_remote(
             RemoteOp::Push,
+            None,
             move |git| git.push(&branch, publish_to.as_deref(), force),
-            move |this, result, window, cx| match result {
+            move |this, result, _, window, cx| match result {
                 Ok(()) => {
                     let done = if plan.publish {
                         format!("Published {} to {}", plan.branch, plan.to)
@@ -264,9 +269,15 @@ impl Workspace {
     fn run_remote<T: Send + 'static>(
         &mut self,
         op: RemoteOp,
+        label: Option<String>,
         command: impl FnOnce(Git) -> gitez_command::Result<T> + Send + 'static,
-        done: impl FnOnce(&mut Self, gitez_command::Result<T>, &mut Window, &mut Context<Self>)
-        + 'static,
+        done: impl FnOnce(
+            &mut Self,
+            gitez_command::Result<T>,
+            Option<u64>,
+            &mut Window,
+            &mut Context<Self>,
+        ) + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -276,14 +287,22 @@ impl Workspace {
         let Some(dir) = self.snapshot.as_ref().map(|snapshot| snapshot.path.clone()) else {
             return;
         };
-        let run = cx
-            .background_executor()
-            .spawn(async move { command(Git::new(dir)) });
+        let record = label.is_some();
+        let run = cx.background_executor().spawn(async move {
+            let recorder = record.then(|| Recorder::start(&dir));
+            let result = command(Git::new(dir));
+            let recorded = match (&result, recorder) {
+                (Ok(_), Some(recorder)) => recorder.finish(ResetMode::Keep),
+                _ => None,
+            };
+            (result, recorded)
+        });
         let task = cx.spawn_in(window, async move |this, cx| {
-            let result = run.await;
+            let (result, recorded) = run.await;
             this.update_in(cx, |this, window, cx| {
                 this.remote_op = None;
-                done(this, result, window, cx);
+                let step = label.and_then(|label| undo::record(cx, recorded, label));
+                done(this, result, step, window, cx);
                 this.reload(window, cx);
                 this.refresh_status(window, cx);
                 cx.notify();

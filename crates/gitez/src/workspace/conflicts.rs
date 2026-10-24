@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use gitez_command::{Git, Side};
+use gitez_command::{Git, ResetMode, Side};
 use gitez_git::{Conflict, ConflictFile, MergeInProgress, Repository, Segment, WorktreeChange};
 use gitez_review::{PullRequest, State, Store};
 use gpui_kit::assets::IconName;
@@ -18,6 +18,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::theme::{self, color};
+use crate::undo::{self, Recorder};
 
 /// Lines of the file shown before and after a conflict.
 const CONTEXT: usize = 3;
@@ -31,7 +32,8 @@ pub enum ConflictsEvent {
     /// The index or the branch changed.
     Changed,
     /// The merge was committed, or given up when `committed` is false.
-    Finished { committed: bool },
+    /// `step` is the undo step.
+    Finished { committed: bool, step: Option<u64> },
 }
 
 /// How a conflict is resolved so far.
@@ -508,23 +510,38 @@ impl Conflicts {
                     && merge.theirs_branch.as_deref() == Some(pull_request.head.branch.as_str())
             })
             .map(|pull_request| pull_request.number);
+        let label = match (&pull_request, &merge.theirs_branch, &merge.branch) {
+            (Some(number), _, Some(into)) => format!("Merge #{number} into {into}"),
+            (_, Some(theirs), Some(into)) => format!("Merge {theirs} into {into}"),
+            _ => "Commit the merge".to_owned(),
+        };
         let (repository, store) = (self.repository.clone(), self.reviews.clone());
         self.error = None;
         self.running = Some(cx.spawn(async move |this, cx| {
             let committed = cx
                 .background_executor()
                 .spawn(async move {
+                    let recorder = Recorder::start(git.work_dir());
                     git.commit_merge()?;
+                    let mut recorded = recorder.finish(ResetMode::Keep);
                     if let Some(number) = pull_request {
-                        super::review::record_merge(&repository, &store, number, merge.ours)?;
+                        let (_, review) =
+                            super::review::record_merge(&repository, &store, number, merge.ours)?;
+                        recorded = recorded.map(|recorded| recorded.with_review(review));
                     }
-                    anyhow::Ok(())
+                    anyhow::Ok(recorded)
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.running = None;
                 match committed {
-                    Ok(()) => cx.emit(ConflictsEvent::Finished { committed: true }),
+                    Ok(recorded) => {
+                        let step = undo::record(cx, recorded, label);
+                        cx.emit(ConflictsEvent::Finished {
+                            committed: true,
+                            step,
+                        })
+                    }
                     Err(error) => this.error = Some(format!("{error:#}").into()),
                 }
                 cx.notify();
@@ -550,7 +567,10 @@ impl Conflicts {
             this.update(cx, |this, cx| {
                 this.running = None;
                 match aborted {
-                    Ok(()) => cx.emit(ConflictsEvent::Finished { committed: false }),
+                    Ok(()) => cx.emit(ConflictsEvent::Finished {
+                        committed: false,
+                        step: None,
+                    }),
                     Err(error) => {
                         this.error = Some(format!("{:#}", anyhow::Error::from(error)).into())
                     }

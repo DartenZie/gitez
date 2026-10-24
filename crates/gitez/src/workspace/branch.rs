@@ -1,6 +1,6 @@
 //! The forms that create a branch and rename one.
 
-use gitez_command::{Git, not_merged};
+use gitez_command::{Git, ResetMode, not_merged};
 use gitez_git::{Head, Oid, RefKind, branch_name_problem};
 use gitez_review::State;
 use gpui_kit::component::button::*;
@@ -13,6 +13,7 @@ use gpui_kit::*;
 
 use super::{NewBranch, Workspace};
 use crate::theme::color;
+use crate::undo::{self, Recorder};
 
 /// What the form makes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -318,38 +319,14 @@ impl Workspace {
         };
         let name = branch.clone();
         self.run_git(
+            Some(format!("Delete branch {branch}")),
             move |git| git.delete_branch(&name, force),
-            move |this, result, window, cx| match result {
+            move |this, result, step, window, cx| match result {
                 Ok(()) => {
                     let short = tip.to_hex_with_len(7).to_string();
-                    let restore = branch.clone();
-                    this.notify_with_action(
+                    this.notify_done(
                         Notification::success(format!("Deleted {branch} (was {short})")),
-                        "Undo",
-                        move |this, window, cx| {
-                            let restore = restore.clone();
-                            this.run_git(
-                                {
-                                    let restore = restore.clone();
-                                    move |git| git.create_branch(&restore, &tip.to_string(), false)
-                                },
-                                move |_, result, window, cx| {
-                                    window.push_notification(
-                                        match result {
-                                            Ok(()) => {
-                                                Notification::success(format!("{restore} is back"))
-                                            }
-                                            Err(error) => Notification::error(format!(
-                                                "Could not bring {restore} back: {error}"
-                                            )),
-                                        },
-                                        cx,
-                                    )
-                                },
-                                window,
-                                cx,
-                            );
-                        },
+                        step,
                         window,
                         cx,
                     );
@@ -479,8 +456,9 @@ impl Workspace {
             } => {
                 let branch = name.clone();
                 self.run_git(
+                    Some(format!("Create branch {name}")),
                     move |git| git.create_branch(&branch, &start.to_string(), checkout),
-                    move |_, result, window, cx| {
+                    move |this, result, step, window, cx| {
                         let notification = match result {
                             Ok(()) if checkout => {
                                 Notification::success(format!("Created and checked out {name}"))
@@ -490,7 +468,7 @@ impl Workspace {
                                 Notification::error(format!("Could not create {name}: {error}"))
                             }
                         };
-                        window.push_notification(notification, cx);
+                        this.notify_done(notification, step, window, cx);
                     },
                     window,
                     cx,
@@ -499,15 +477,16 @@ impl Workspace {
             BranchRequest::Rename { from, to } => {
                 let (old, new) = (from.clone(), to.clone());
                 self.run_git(
+                    Some(format!("Rename {from} to {to}")),
                     move |git| git.rename_branch(&old, &new),
-                    move |_, result, window, cx| {
+                    move |this, result, step, window, cx| {
                         let notification = match result {
                             Ok(()) => Notification::success(format!("Renamed {from} to {to}")),
                             Err(error) => {
                                 Notification::error(format!("Could not rename {from}: {error}"))
                             }
                         };
-                        window.push_notification(notification, cx);
+                        this.notify_done(notification, step, window, cx);
                     },
                     window,
                     cx,
@@ -517,26 +496,41 @@ impl Workspace {
     }
 
     /// Runs `command` off the UI thread, then reads the repository again;
-    /// `done` tells about the outcome.
+    /// `done` tells about the outcome. With a `label`, a command that
+    /// succeeds is an undo step, whose id `done` gets.
     pub(super) fn run_git<T: Send + 'static>(
         &mut self,
+        label: Option<String>,
         command: impl FnOnce(Git) -> gitez_command::Result<T> + Send + 'static,
-        done: impl FnOnce(&mut Self, gitez_command::Result<T>, &mut Window, &mut Context<Self>)
-        + 'static,
+        done: impl FnOnce(
+            &mut Self,
+            gitez_command::Result<T>,
+            Option<u64>,
+            &mut Window,
+            &mut Context<Self>,
+        ) + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(dir) = self.snapshot.as_ref().map(|snapshot| snapshot.path.clone()) else {
             return;
         };
-        let run = cx
-            .background_executor()
-            .spawn(async move { command(Git::new(dir)) });
+        let record = label.is_some();
+        let run = cx.background_executor().spawn(async move {
+            let recorder = record.then(|| Recorder::start(&dir));
+            let result = command(Git::new(dir));
+            let recorded = match (&result, recorder) {
+                (Ok(_), Some(recorder)) => recorder.finish(ResetMode::Keep),
+                _ => None,
+            };
+            (result, recorded)
+        });
         self.git_command = Some(cx.spawn_in(window, async move |this, cx| {
-            let result = run.await;
+            let (result, recorded) = run.await;
             this.update_in(cx, |this, window, cx| {
                 this.git_command = None;
-                done(this, result, window, cx);
+                let step = label.and_then(|label| undo::record(cx, recorded, label));
+                done(this, result, step, window, cx);
                 this.reload(window, cx);
                 this.refresh_status(window, cx);
             })

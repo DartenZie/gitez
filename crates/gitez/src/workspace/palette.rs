@@ -67,6 +67,8 @@ pub enum PaletteCommand {
     Fetch,
     Pull,
     Push,
+    Undo,
+    Redo,
     /// Rewrite the commits after `base`, a revision as typed, folding in
     /// fixups if `autosquash`.
     RewriteSince {
@@ -98,6 +100,9 @@ pub struct PaletteContext {
     pub remote: Option<RemoteActions>,
     /// Entries in the stash.
     pub stashes: usize,
+    /// What undo and redo would do.
+    pub undo: Option<String>,
+    pub redo: Option<String>,
 }
 
 /// The kinds of item, one tab each.
@@ -249,6 +254,18 @@ fn actions() -> Vec<Action> {
             icon: IconName::ArrowUp,
             keywords: &["push", "publish", "remote"],
             command: PaletteCommand::Push,
+        },
+        Action {
+            title: "Undo",
+            icon: IconName::Undo2,
+            keywords: &["undo", "revert", "back", "reset"],
+            command: PaletteCommand::Undo,
+        },
+        Action {
+            title: "Redo",
+            icon: IconName::Redo2,
+            keywords: &["redo", "again"],
+            command: PaletteCommand::Redo,
         },
         Action {
             title: "New local pull request",
@@ -404,6 +421,8 @@ impl Palette {
             PaletteCommand::NewBranch if context.head.is_none() => Some("no commits yet"),
             PaletteCommand::StashChanges if context.changed.is_empty() => Some("nothing to stash"),
             PaletteCommand::PopStash if context.stashes == 0 => Some("no stashes"),
+            PaletteCommand::Undo if context.undo.is_none() => Some("nothing to undo"),
+            PaletteCommand::Redo if context.redo.is_none() => Some("nothing to redo"),
             PaletteCommand::ContinueRebase | PaletteCommand::AbortRebase if !context.rebasing => {
                 Some("no rebase in progress")
             }
@@ -435,6 +454,8 @@ impl Palette {
             }),
             PaletteCommand::RewordLast => self.context.head.map(short),
             PaletteCommand::RenameBranch => self.context.branch.clone(),
+            PaletteCommand::Undo => self.context.undo.clone(),
+            PaletteCommand::Redo => self.context.redo.clone(),
             PaletteCommand::CommitChanges if !self.context.changed.is_empty() => Some(count(
                 self.context.changed.len(),
                 "changed file",
@@ -1342,7 +1363,7 @@ fn count(n: usize, one: &str, many: &str) -> String {
 }
 
 /// `text` with its first letter in lower case, to follow other words.
-fn lowercase_first(text: &str) -> String {
+pub(super) fn lowercase_first(text: &str) -> String {
     let mut chars = text.chars();
     match chars.next() {
         Some(first) => first.to_lowercase().chain(chars).collect(),

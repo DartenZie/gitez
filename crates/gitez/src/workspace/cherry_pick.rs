@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use gitez_command::{Git, PickOptions};
+use gitez_command::{Git, PickOptions, ResetMode};
 use gitez_git::{Commit, Head, Oid, PickTrial, Repository};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::*;
@@ -17,12 +17,17 @@ use gpui_kit::*;
 
 use crate::repository::Snapshot;
 use crate::theme::{self, color};
+use crate::undo::{self, Recorder};
 
 /// What the panel asks of the workspace.
 pub enum CherryPickEvent {
     Close,
-    /// The commits were applied; the text says how.
-    Done(SharedString),
+    /// The commits were applied; `message` says how, and `step` is the
+    /// undo step.
+    Done {
+        message: SharedString,
+        step: Option<u64>,
+    },
 }
 
 /// A branch the commits can go onto.
@@ -200,6 +205,10 @@ impl CherryPick {
             stash: self.stash && self.uncommitted > 0,
         };
         let return_to = self.checked_out.clone();
+        let label = match ids.len() {
+            1 => format!("Cherry-pick 1 commit onto {target}"),
+            n => format!("Cherry-pick {n} commits onto {target}"),
+        };
         let done = match (ids.len(), self.no_commit) {
             (1, false) => format!("Cherry-picked 1 commit onto {target}"),
             (n, false) => format!("Cherry-picked {n} commits onto {target}"),
@@ -210,12 +219,22 @@ impl CherryPick {
         self._run = Some(cx.spawn(async move |this, cx| {
             let picked = cx
                 .background_executor()
-                .spawn(async move { git.cherry_pick(&ids, &target, options, return_to.as_deref()) })
+                .spawn(async move {
+                    let recorder = Recorder::start(git.work_dir());
+                    git.cherry_pick(&ids, &target, options, return_to.as_deref())
+                        .map(|()| recorder.finish(ResetMode::Keep))
+                })
                 .await;
             this.update(cx, |this, cx| {
                 this.running = false;
                 match picked {
-                    Ok(()) => cx.emit(CherryPickEvent::Done(done.into())),
+                    Ok(recorded) => {
+                        let step = undo::record(cx, recorded, label);
+                        cx.emit(CherryPickEvent::Done {
+                            message: done.into(),
+                            step,
+                        });
+                    }
                     Err(error) => this.error = Some(error.to_string().into()),
                 }
                 cx.notify();

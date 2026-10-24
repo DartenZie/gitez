@@ -20,6 +20,7 @@ mod pick;
 mod refs;
 mod repository;
 mod rewrite;
+mod state;
 mod status;
 mod watch;
 
@@ -39,6 +40,7 @@ pub use refs::{
 };
 pub use repository::Repository;
 pub use rewrite::{RebaseInProgress, Rewritable, RewriteBase, RewriteCommit};
+pub use state::{HeadPlace, RefState, StashEntry};
 pub use status::{FileStatus, WorkingTreeStatus, WorktreeChange};
 pub use watch::{Affected, Watcher};
 

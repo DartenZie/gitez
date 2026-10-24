@@ -16,6 +16,7 @@ mod rewrite;
 mod sidebar;
 mod stash;
 mod status_bar;
+mod steps;
 mod toolbar;
 
 use std::path::PathBuf;
@@ -40,6 +41,7 @@ use gitez_review::{NewPullRequest as NewPullRequestFields, State, Timestamp, Tip
 
 use crate::repository::Snapshot;
 use crate::theme::{self, color};
+use crate::undo::{Direction, UndoLog};
 use branch::BranchForm;
 use cherry_pick::{CherryPick, CherryPickEvent};
 use conflicts::{Conflicts, ConflictsEvent};
@@ -69,7 +71,9 @@ actions!(
         Pull,
         Push,
         NewBranch,
-        StashChanges
+        StashChanges,
+        UndoStep,
+        RedoStep
     ]
 );
 
@@ -79,6 +83,13 @@ pub fn key_bindings() -> Vec<KeyBinding> {
     bindings.extend(review::key_bindings());
     bindings.extend(palette::key_bindings());
     bindings.push(KeyBinding::new("secondary-k", OpenPalette, None));
+    // Text fields bind these too, and theirs win while one has focus.
+    bindings.push(KeyBinding::new("secondary-z", UndoStep, Some("Workspace")));
+    bindings.push(KeyBinding::new(
+        "secondary-shift-z",
+        RedoStep,
+        Some("Workspace"),
+    ));
     bindings
 }
 
@@ -129,6 +140,8 @@ pub struct Workspace {
     branch_form: Option<(Entity<BranchForm>, Subscription)>,
     /// The "Stash changes" form, while its dialog is open.
     stash_form: Option<(Entity<StashForm>, Subscription)>,
+    /// Undoing or redoing a step.
+    stepping: Option<Task<()>>,
     /// Changing a branch or a stash.
     git_command: Option<Task<()>>,
     /// The fetch, pull or push running, if one is.
@@ -138,8 +151,6 @@ pub struct Workspace {
     palette: Option<(Entity<Palette>, Subscription)>,
     /// Whether the palette is shown.
     palette_open: bool,
-    /// Checking out a branch chosen in the palette.
-    _switch: Option<Task<()>>,
     /// The cherry-pick panel, shown in place of the commit detail.
     cherry_pick: Option<(Entity<CherryPick>, Subscription)>,
     /// The dialog offering to merge a branch dropped on another, while
@@ -212,6 +223,8 @@ impl Workspace {
                 DetailEvent::NewBranch(id) => this.new_branch_at(*id, window, cx),
             }),
             // Files change outside GitEZ; read the status again on return.
+            // The toolbar names the next undo and redo steps.
+            cx.observe_global::<UndoLog>(|_, cx| cx.notify()),
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
                     this.refresh_status(window, cx);
@@ -241,9 +254,9 @@ impl Workspace {
             branch_form: None,
             stash_form: None,
             git_command: None,
+            stepping: None,
             palette: None,
             palette_open: false,
-            _switch: None,
             cherry_pick: None,
             open_after_reload: None,
             sidebar,
@@ -594,6 +607,12 @@ impl Workspace {
                     this.open_conflicts(window, cx);
                     return;
                 }
+                ReviewEvent::Merged { message, step } => {
+                    this.notify_done(Notification::success(message.clone()), *step, window, cx);
+                    this.reload(window, cx);
+                    this.refresh_status(window, cx);
+                    return;
+                }
                 ReviewEvent::CheckedOut => {
                     this.reload(window, cx);
                     this.refresh_status(window, cx);
@@ -818,13 +837,22 @@ impl Workspace {
         let subscription = cx.subscribe_in(&dialog, window, move |this, _, event, window, cx| {
             window.close_dialog(cx);
             this.merge_dialog = None;
-            let done = match event {
-                MergeEvent::Merged(Some(pull_request)) => format!(
-                    "Merged #{} into {}",
-                    pull_request.number, pull_request.base.branch
+            let (done, step) = match event {
+                MergeEvent::Merged {
+                    pull_request: Some(pull_request),
+                    step,
+                } => (
+                    format!(
+                        "Merged #{} into {}",
+                        pull_request.number, pull_request.base.branch
+                    ),
+                    *step,
                 ),
-                MergeEvent::Merged(None) => format!("Merged {head} into {base}"),
-                MergeEvent::Rebased => format!("Rebased {head} onto {base}"),
+                MergeEvent::Merged {
+                    pull_request: None,
+                    step,
+                } => (format!("Merged {head} into {base}"), *step),
+                MergeEvent::Rebased { step } => (format!("Rebased {head} onto {base}"), *step),
                 MergeEvent::Stopped => {
                     this.reload(window, cx);
                     this.refresh_status(window, cx);
@@ -852,7 +880,7 @@ impl Workspace {
                     return;
                 }
             };
-            window.push_notification(Notification::success(done), cx);
+            this.notify_done(Notification::success(done), step, window, cx);
             this.reload(window, cx);
             this.refresh_status(window, cx);
         });
@@ -884,8 +912,8 @@ impl Workspace {
         let panel = cx.new(|cx| CherryPick::new(snapshot, commits, uncommitted, window, cx));
         let subscription = cx.subscribe_in(&panel, window, |this, _, event, window, cx| {
             this.cherry_pick = None;
-            if let CherryPickEvent::Done(done) = event {
-                window.push_notification(Notification::success(done.clone()), cx);
+            if let CherryPickEvent::Done { message, step } = event {
+                this.notify_done(Notification::success(message.clone()), *step, window, cx);
                 this.history
                     .update(cx, |history, cx| history.clear_picked(cx));
                 this.reload(window, cx);
@@ -946,19 +974,8 @@ impl Workspace {
         let subscription = cx.subscribe_in(&rewrite, window, |this, _, event, window, cx| {
             match event {
                 RewriteEvent::Close => {}
-                RewriteEvent::Done {
-                    branch,
-                    backup,
-                    message,
-                } => {
-                    let (branch, backup) = (branch.clone(), backup.clone());
-                    this.notify_with_action(
-                        Notification::success(message.clone()),
-                        "Undo",
-                        move |this, window, cx| this.undo_rewrite(&branch, &backup, window, cx),
-                        window,
-                        cx,
-                    );
+                RewriteEvent::Done { message, step } => {
+                    this.notify_done(Notification::success(message.clone()), *step, window, cx);
                 }
                 RewriteEvent::Stopped(message) => {
                     window.push_notification(Notification::info(message.clone()), cx);
@@ -1007,26 +1024,6 @@ impl Workspace {
     }
 
     /// Puts branch `branch` back on `backup`, where it was before a rewrite.
-    fn undo_rewrite(
-        &mut self,
-        branch: &str,
-        backup: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let (branch, backup) = (branch.to_owned(), backup.to_owned());
-        let name = branch.clone();
-        self.run_rewrite_command(
-            move |git| git.restore(&branch, &backup),
-            move |result| match result {
-                Ok(()) => Notification::success(format!("{name} is back as it was")),
-                Err(error) => Notification::error(format!("Could not undo the rewrite: {error}")),
-            },
-            window,
-            cx,
-        );
-    }
-
     fn continue_rebase(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.run_rewrite_command(
             |git| git.continue_rebase(),
@@ -1117,6 +1114,8 @@ impl Workspace {
                 .collect(),
             remote: Some(RemoteActions::of(snapshot)),
             stashes: snapshot.refs.stashes.len(),
+            undo: self.next_step(Direction::Undo, cx).map(|step| step.label),
+            redo: self.next_step(Direction::Redo, cx).map(|step| step.label),
         };
         let palette = palette.clone();
         palette.update(cx, |palette, cx| palette.open(context, window, cx));
@@ -1187,6 +1186,8 @@ impl Workspace {
             PaletteCommand::Fetch => self.fetch(&Fetch, window, cx),
             PaletteCommand::Pull => self.pull(&Pull, window, cx),
             PaletteCommand::Push => self.push(&Push, window, cx),
+            PaletteCommand::Undo => self.undo_step(&UndoStep, window, cx),
+            PaletteCommand::Redo => self.redo_step(&RedoStep, window, cx),
             PaletteCommand::SelectCommit(id) => {
                 self.review = None;
                 self.rewrite = None;
@@ -1273,36 +1274,21 @@ impl Workspace {
 
     /// Checks out local branch `branch`.
     fn switch_branch(&mut self, branch: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(dir) = self
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.repository.work_dir().map(PathBuf::from))
-        else {
-            return;
-        };
-        let switch = cx.background_executor().spawn({
-            let branch = branch.clone();
-            async move { Git::new(dir).switch(&branch) }
-        });
-        self._switch = Some(cx.spawn_in(window, async move |this, cx| {
-            let switched = switch.await;
-            this.update_in(cx, |this, window, cx| {
-                this._switch = None;
-                match switched {
-                    Ok(()) => window.push_notification(
-                        Notification::success(format!("Checked out {branch}")),
-                        cx,
-                    ),
-                    Err(error) => window.push_notification(
-                        Notification::error(format!("Could not check out {branch}: {error}")),
-                        cx,
-                    ),
-                }
-                this.reload(window, cx);
-                this.refresh_status(window, cx);
-            })
-            .ok();
-        }));
+        let name = branch.clone();
+        self.run_git(
+            Some(format!("Check out {branch}")),
+            move |git| git.switch(&name),
+            move |_, switched, _, window, cx| match switched {
+                Ok(()) => window
+                    .push_notification(Notification::success(format!("Checked out {branch}")), cx),
+                Err(error) => window.push_notification(
+                    Notification::error(format!("Could not check out {branch}: {error}")),
+                    cx,
+                ),
+            },
+            window,
+            cx,
+        );
     }
 
     /// Shows the conflicts of the merge in progress.
@@ -1317,15 +1303,13 @@ impl Workspace {
             match event {
                 ConflictsEvent::Close => this.close_conflicts(window, cx),
                 ConflictsEvent::Changed => this.refresh_status(window, cx),
-                ConflictsEvent::Finished { committed } => {
-                    window.push_notification(
-                        Notification::success(if *committed {
-                            "Merge committed"
-                        } else {
-                            "Merge aborted; everything is as it was before"
-                        }),
-                        cx,
-                    );
+                ConflictsEvent::Finished { committed, step } => {
+                    let message = if *committed {
+                        "Merge committed"
+                    } else {
+                        "Merge aborted; everything is as it was before"
+                    };
+                    this.notify_done(Notification::success(message), *step, window, cx);
                     this.close_conflicts(window, cx);
                     // A merged pull request shows as merged.
                     this.close_review(window, cx);
@@ -1404,6 +1388,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::push))
             .on_action(cx.listener(Self::new_branch))
             .on_action(cx.listener(Self::stash_changes))
+            .on_action(cx.listener(Self::undo_step))
+            .on_action(cx.listener(Self::redo_step))
             .relative()
             .v_flex()
             .size_full()
@@ -1421,6 +1407,14 @@ impl Render for Workspace {
                     .and_then(Head::target)
                     .is_some(),
                 can_stash: self.status.as_ref().is_some_and(|status| !status.is_clean()),
+                undo: self
+                    .next_step(Direction::Undo, cx)
+                    .filter(|_| self.stepping.is_none())
+                    .map(|step| step.label),
+                redo: self
+                    .next_step(Direction::Redo, cx)
+                    .filter(|_| self.stepping.is_none())
+                    .map(|step| step.label),
             })
             .when_some(
                 snapshot

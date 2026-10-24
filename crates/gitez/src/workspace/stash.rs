@@ -235,13 +235,12 @@ impl Workspace {
         let request = form.read(cx).submit(cx);
         window.close_dialog(cx);
         self.run_git(
+            Some("Stash changes".to_owned()),
             move |git| git.stash(request.message.as_deref(), request.untracked),
-            |this, result, window, cx| match result {
-                Ok(true) => this.notify_with_action(
+            |this, result, step, window, cx| match result {
+                Ok(true) => this.notify_done(
                     Notification::success("Stashed your changes"),
-                    "Pop",
-                    // The new stash is the top one.
-                    |this, window, cx| this.unstash(0, true, window, cx),
+                    step,
                     window,
                     cx,
                 ),
@@ -267,8 +266,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.run_git(
+            None,
             move |git| git.unstash(index, pop),
-            move |_, result, window, cx| {
+            move |_, result, _, window, cx| {
                 let notification = match result {
                     Ok(UnstashOutcome::Applied) if pop => {
                         Notification::success("Popped the stash into the working tree")
@@ -291,7 +291,7 @@ impl Workspace {
         );
     }
 
-    /// Drops stash `index`, offering to bring it back.
+    /// Drops stash `index`; it can be undone.
     pub(super) fn drop_stash(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(stash) = self.snapshot.as_ref().and_then(|snapshot| {
             snapshot
@@ -302,35 +302,14 @@ impl Workspace {
         }) else {
             return;
         };
-        let (id, message) = (stash.id.to_string(), stash.recorded.clone());
+        let label = format!("Drop stash “{}”", stash.message);
         self.run_git(
+            Some(label),
             move |git| git.drop_stash(index),
-            move |this, result, window, cx| match result {
-                Ok(()) => this.notify_with_action(
-                    Notification::success("Dropped the stash"),
-                    "Undo",
-                    move |this, window, cx| {
-                        let (id, message) = (id.clone(), message.clone());
-                        this.run_git(
-                            move |git| git.restore_stash(&id, &message),
-                            |_, result, window, cx| {
-                                window.push_notification(
-                                    match result {
-                                        Ok(()) => Notification::success("The stash is back"),
-                                        Err(error) => Notification::error(format!(
-                                            "Could not bring the stash back: {error}"
-                                        )),
-                                    },
-                                    cx,
-                                )
-                            },
-                            window,
-                            cx,
-                        );
-                    },
-                    window,
-                    cx,
-                ),
+            |this, result, step, window, cx| match result {
+                Ok(()) => {
+                    this.notify_done(Notification::success("Dropped the stash"), step, window, cx)
+                }
                 Err(error) => window.push_notification(
                     Notification::error(format!("Could not drop the stash: {error}")),
                     cx,

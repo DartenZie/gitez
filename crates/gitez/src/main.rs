@@ -7,6 +7,7 @@ mod assets;
 mod repository;
 mod theme;
 mod time;
+mod undo;
 mod workspace;
 
 use std::path::PathBuf;

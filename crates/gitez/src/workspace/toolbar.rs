@@ -7,9 +7,11 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::palette::lowercase_first;
 use super::remote::{RemoteActions, RemoteOp};
 use super::{
-    Fetch, NewBranch, NewPullRequest, OpenPalette, OpenRepository, Pull, Push, StashChanges,
+    Fetch, NewBranch, NewPullRequest, OpenPalette, OpenRepository, Pull, Push, RedoStep,
+    StashChanges, UndoStep,
 };
 use crate::theme::{self, color};
 
@@ -19,7 +21,6 @@ const BUTTON_HEIGHT: Pixels = px(30.);
 /// Repository switcher, undo and redo, remote operations, branch and stash,
 /// the command palette entry and "New local PR".
 ///
-/// Undo and redo are disabled until their write paths exist.
 #[derive(IntoElement)]
 pub struct Toolbar {
     /// Name of the open repository.
@@ -34,6 +35,9 @@ pub struct Toolbar {
     pub can_branch: bool,
     /// Whether there are uncommitted changes to stash.
     pub can_stash: bool,
+    /// What undo and redo would do next, such as "Commit “Fix the parser”".
+    pub undo: Option<String>,
+    pub redo: Option<String>,
 }
 
 impl RenderOnce for Toolbar {
@@ -69,8 +73,18 @@ impl RenderOnce for Toolbar {
                 div()
                     .h_flex()
                     .gap(px(2.))
-                    .child(icon_button("undo", IconName::Undo2, "Undo last git action"))
-                    .child(icon_button("redo", IconName::Redo2, "Redo")),
+                    .child(
+                        icon_button("undo", IconName::Undo2, "Undo", self.undo.as_deref())
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(UndoStep), cx)
+                            }),
+                    )
+                    .child(
+                        icon_button("redo", IconName::Redo2, "Redo", self.redo.as_deref())
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(RedoStep), cx)
+                            }),
+                    ),
             )
             .child(separator())
             .child(div().h_flex().gap(px(6.)).children(self.remote_buttons(cx)))
@@ -213,14 +227,19 @@ fn separator() -> impl IntoElement {
     div().w(px(1.)).h(px(20.)).bg(rgb(color::SEPARATOR))
 }
 
-fn icon_button(id: &'static str, icon: IconName, label: &'static str) -> Button {
+/// Undo or redo, `verb`, of `step`; disabled without one.
+fn icon_button(id: &'static str, icon: IconName, verb: &'static str, step: Option<&str>) -> Button {
+    let tooltip = match step {
+        Some(step) => format!("{verb} {}", lowercase_first(step)),
+        None => format!("Nothing to {}", verb.to_lowercase()),
+    };
     Button::new(id)
         .ghost()
         .size(BUTTON_HEIGHT)
         .icon(icon)
-        .accessibility_label(label)
-        .tooltip(label)
-        .disabled(true)
+        .accessibility_label(verb)
+        .tooltip(tooltip)
+        .disabled(step.is_none())
 }
 
 /// The search field that opens the command palette (`⌘K`).

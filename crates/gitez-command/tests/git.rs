@@ -2,7 +2,8 @@ use std::path::Path;
 use std::process::Command;
 
 use gitez_command::{
-    Error, Git, PullMethod, PullOutcome, PushRejection, UnstashOutcome, not_merged,
+    Error, Git, PullMethod, PullOutcome, PushRejection, RefUpdate, ResetMode, UnstashOutcome,
+    not_merged,
 };
 
 /// `git <args>` in `dir`, returning its trimmed output.
@@ -832,4 +833,74 @@ fn stashes_applies_pops_drops_and_restores() {
     git_.restore_stash(&id, "Brought back").expect("restore");
     assert_eq!(git(root, &["rev-parse", "stash@{0}"]), id);
     assert!(git_.drop_stash(5).is_err());
+}
+
+#[test]
+fn updates_refs_together_or_not_at_all() {
+    let dir = diverged("main");
+    let root = dir.path();
+    let git_ = Git::new(root);
+    let (main, feature) = (
+        git(root, &["rev-parse", "main"]),
+        git(root, &["rev-parse", "feature"]),
+    );
+    let update = |name: &str, old: Option<&str>, new: Option<&str>| RefUpdate {
+        name: format!("refs/heads/{name}"),
+        old: old.map(str::to_owned),
+        new: new.map(str::to_owned),
+    };
+
+    git_.update_refs(&[
+        update("copy", None, Some(&feature)),
+        update("feature", Some(&feature), Some(&main)),
+    ])
+    .expect("update");
+    assert_eq!(git(root, &["rev-parse", "copy"]), feature);
+    assert_eq!(git(root, &["rev-parse", "feature"]), main);
+
+    // "feature" is no longer where this expects, so "copy" stays too.
+    let error = git_
+        .update_refs(&[
+            update("copy", Some(&feature), None),
+            update("feature", Some(&feature), Some(&feature)),
+        ])
+        .expect_err("stale");
+    assert!(matches!(error, Error::Failed { .. }));
+    assert_eq!(git(root, &["rev-parse", "copy"]), feature);
+
+    git_.update_refs(&[update("copy", Some(&feature), None)])
+        .expect("delete");
+    assert!(git(root, &["branch", "--list", "copy"]).is_empty());
+}
+
+#[test]
+fn resets_softly_or_keeping_local_changes() {
+    let dir = repository();
+    let root = dir.path();
+    let git_ = Git::new(root);
+    std::fs::write(root.join("a.txt"), "a\n").expect("write");
+    git(root, &["add", "a.txt"]);
+    git(root, &["commit", "--quiet", "-m", "a"]);
+    let first = git(root, &["rev-parse", "HEAD"]);
+    std::fs::write(root.join("a.txt"), "a\nb\n").expect("write");
+    git(root, &["commit", "--quiet", "-am", "b"]);
+    let second = git(root, &["rev-parse", "HEAD"]);
+
+    // Soft: the commit's change comes back staged.
+    git_.reset(&first, ResetMode::Soft).expect("soft");
+    assert_eq!(status(root), "M  a.txt");
+    git_.reset(&second, ResetMode::Soft).expect("soft back");
+    assert_eq!(status(root), "");
+
+    // Keep: the files follow, local changes elsewhere stay.
+    std::fs::write(root.join("other.txt"), "local\n").expect("write");
+    git_.reset(&first, ResetMode::Keep).expect("keep");
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).expect("read"),
+        "a\n"
+    );
+    assert_eq!(status(root), "?? other.txt");
+
+    git_.switch_detached(&second).expect("detach");
+    assert_eq!(git(root, &["branch", "--show-current"]), "");
 }

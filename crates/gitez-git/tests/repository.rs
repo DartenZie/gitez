@@ -1598,3 +1598,41 @@ fn branch_names_follow_git_rules() {
         assert!(branch_name_problem(bad).is_some(), "{bad:?}");
     }
 }
+
+#[test]
+fn ref_state_reads_head_branches_and_stashes() {
+    use gitez_git::HeadPlace;
+    let fx = Fixture::new();
+    let first = fx.commit("a.txt", "first");
+    fx.git(&["branch", "feature"]);
+    std::fs::write(fx.root.join("a.txt"), "changed\n").expect("write");
+    fx.git(&["stash", "push", "--quiet", "-m", "tracked only"]);
+    std::fs::write(fx.root.join("new.txt"), "new\n").expect("write");
+    fx.git(&["stash", "push", "--quiet", "--include-untracked"]);
+
+    let state = fx.open().ref_state().expect("read state");
+    assert_eq!(state.head, Some(HeadPlace::Branch("main".into())));
+    assert_eq!(
+        state.branches.into_iter().collect::<Vec<_>>(),
+        [("feature".to_owned(), first), ("main".to_owned(), first)]
+    );
+    let stashes: Vec<(bool, &str)> = state
+        .stashes
+        .iter()
+        .map(|stash| (stash.untracked, stash.recorded.as_str()))
+        .collect();
+    let short = first.to_hex_with_len(7).to_string();
+    assert_eq!(
+        stashes,
+        [
+            (true, format!("WIP on main: {short} first").as_str()),
+            (false, "On main: tracked only")
+        ]
+    );
+
+    fx.git(&["switch", "--quiet", "--detach", "HEAD"]);
+    assert_eq!(
+        fx.open().ref_state().expect("read state").head,
+        Some(HeadPlace::Detached(first))
+    );
+}

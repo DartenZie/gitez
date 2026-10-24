@@ -8,7 +8,7 @@ use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use gitez_command::Git;
+use gitez_command::{Git, ResetMode};
 use gitez_git::{
     BranchDiff, ChangeKind, Commit, DiffContent, DiffLine, DiffOptions, FileDiff, FileStatus,
     Followed, Hunk, LineKind, LineSource, Oid, RefKind, RefLabel, Repository, Staging,
@@ -34,6 +34,7 @@ mod threads;
 
 use super::labels;
 use crate::theme::{self, color};
+use crate::undo::{self, Recorder};
 
 actions!(review, [Close, Newer, Older, CommitStaged]);
 
@@ -67,6 +68,12 @@ pub enum ReviewEvent {
     CheckedOut,
     /// A merge stopped with conflicts to resolve.
     MergeStopped,
+    /// The local pull request was merged, which moved the branches and
+    /// may have checked out another; `step` is the undo step.
+    Merged {
+        message: SharedString,
+        step: Option<u64>,
+    },
 }
 
 /// Height of one diff line.
@@ -575,16 +582,24 @@ impl Review {
         let git = Git::new(dir);
         let branch = subject.pull_request.head.branch.clone();
         subject.checking_out = Some(cx.spawn_in(window, async move |this, cx| {
+            let label = format!("Check out {branch}");
             let switched = cx
                 .background_executor()
-                .spawn(async move { git.switch(&branch) })
+                .spawn(async move {
+                    let recorder = Recorder::start(git.work_dir());
+                    git.switch(&branch)
+                        .map(|()| recorder.finish(ResetMode::Keep))
+                })
                 .await;
             this.update_in(cx, |this, window, cx| {
                 if let Subject::PullRequest(subject) = &mut this.subject {
                     subject.checking_out = None;
                 }
                 match switched {
-                    Ok(()) => cx.emit(ReviewEvent::CheckedOut),
+                    Ok(recorded) => {
+                        undo::record(cx, recorded, label);
+                        cx.emit(ReviewEvent::CheckedOut);
+                    }
                     Err(error) => window.push_notification(
                         Notification::error(format!("{:#}", anyhow::Error::from(error)))
                             .title("Could not check out the branch"),
@@ -1110,10 +1125,10 @@ impl Review {
 
     /// Runs `command` with `git` in the background unless another command is
     /// running, then `done` if it succeeded.
-    fn run_git(
+    fn run_git<T: Send + 'static>(
         &mut self,
-        command: impl FnOnce(&Git) -> gitez_command::Result<()> + Send + 'static,
-        done: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        command: impl FnOnce(&Git) -> gitez_command::Result<T> + Send + 'static,
+        done: impl FnOnce(&mut Self, T, &mut Window, &mut Context<Self>) + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1130,17 +1145,23 @@ impl Review {
                 .background_executor()
                 .spawn(async move { command(&git) })
                 .await;
-            let error: Option<SharedString> = result
-                .err()
-                .map(|error| format!("{:#}", anyhow::Error::from(error)).into());
             this.update_in(cx, |this, window, cx| {
-                let succeeded = error.is_none();
+                let (value, error) = match result {
+                    Ok(value) => (Some(value), None),
+                    Err(error) => (
+                        None,
+                        Some(SharedString::from(format!(
+                            "{:#}",
+                            anyhow::Error::from(error)
+                        ))),
+                    ),
+                };
                 if let Subject::WorkingTree { form, .. } = &mut this.subject {
                     form.running = None;
                     form.error = error;
                 }
-                if succeeded {
-                    done(this, window, cx);
+                if let Some(value) = value {
+                    done(this, value, window, cx);
                 }
                 cx.notify();
             })
@@ -1157,7 +1178,7 @@ impl Review {
                 Some(paths) => git.stage(paths),
                 None => git.stage_all(),
             },
-            |_, _, cx| cx.emit(ReviewEvent::Staged),
+            |_, (), _, cx| cx.emit(ReviewEvent::Staged),
             window,
             cx,
         );
@@ -1170,7 +1191,7 @@ impl Review {
                 Some(paths) => git.unstage(paths),
                 None => git.unstage_all(),
             },
-            |_, _, cx| cx.emit(ReviewEvent::Staged),
+            |_, (), _, cx| cx.emit(ReviewEvent::Staged),
             window,
             cx,
         );
@@ -1189,15 +1210,21 @@ impl Review {
             return;
         }
         let everything = status.files.iter().all(|file| file.unstaged.is_none());
+        let summary = message.lines().next().unwrap_or_default().to_owned();
         self.run_git(
             move |git| {
+                let recorder = Recorder::start(git.work_dir());
                 if amend {
-                    git.amend(&message)
+                    git.amend(&message)?;
                 } else {
-                    git.commit(&message)
+                    git.commit(&message)?;
                 }
+                // Undoing a commit brings its changes back staged.
+                Ok(recorder.finish(ResetMode::Soft))
             },
-            move |this, window, cx| {
+            move |this, recorded, window, cx| {
+                let verb = if amend { "Amend" } else { "Commit" };
+                undo::record(cx, recorded, format!("{verb} “{summary}”"));
                 if let Subject::WorkingTree { form, .. } = &this.subject {
                     form.draft.update(cx, |draft, _| draft.saved = None);
                     form.message
@@ -1407,7 +1434,7 @@ impl Review {
         let reverse = staging == Staging::Staged;
         self.run_git(
             move |git| git.apply_to_index(&patch, reverse),
-            |_, _, cx| cx.emit(ReviewEvent::Staged),
+            |_, (), _, cx| cx.emit(ReviewEvent::Staged),
             window,
             cx,
         );

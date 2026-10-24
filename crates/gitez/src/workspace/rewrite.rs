@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use gitez_command::{Git, RewriteAction, RewriteOutcome, RewriteStep};
+use gitez_command::{Git, ResetMode, RewriteAction, RewriteOutcome, RewriteStep};
 use gitez_git::{Oid, RefKind, RefLabel, Repository, Rewritable, RewriteBase, RewriteCommit};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::*;
@@ -18,6 +18,7 @@ use gpui_kit::*;
 use super::labels;
 use crate::repository::Snapshot;
 use crate::theme::{self, color};
+use crate::undo::{self, Recorder};
 
 /// Subjects up to this long read well in one-line logs.
 const SUBJECT_LENGTH: usize = 50;
@@ -25,11 +26,10 @@ const SUBJECT_LENGTH: usize = 50;
 /// What the screen asks of the workspace.
 pub enum RewriteEvent {
     Close,
-    /// The branch was rewritten; its old tip is kept at `backup`.
+    /// The branch was rewritten; `step` is the undo step.
     Done {
-        branch: String,
-        backup: String,
         message: SharedString,
+        step: Option<u64>,
     },
     /// The rewrite stopped at an edit; the text says where.
     Stopped(SharedString),
@@ -581,25 +581,29 @@ impl Rewrite {
                 .background_executor()
                 .spawn({
                     let (branch, backup) = (branch.clone(), backup.clone());
-                    async move { git.rewrite(&branch, base.as_deref(), &steps, &backup) }
+                    async move {
+                        let recorder = Recorder::start(git.work_dir());
+                        git.rewrite(&branch, base.as_deref(), &steps, &backup)
+                            .map(|outcome| (outcome, recorder.finish(ResetMode::Keep)))
+                    }
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.running = false;
                 match rewritten {
-                    Ok(RewriteOutcome::Done) => {
+                    Ok((RewriteOutcome::Done, recorded)) => {
                         let message = if before == after {
                             format!("Rewrote {branch}")
                         } else {
                             format!("Rewrote {branch}: {before} → {after} commits")
                         };
+                        let step = undo::record(cx, recorded, format!("Rewrite {branch}"));
                         cx.emit(RewriteEvent::Done {
-                            branch,
-                            backup,
                             message: message.into(),
+                            step,
                         });
                     }
-                    Ok(RewriteOutcome::Stopped) => cx.emit(RewriteEvent::Stopped(
+                    Ok((RewriteOutcome::Stopped, _)) => cx.emit(RewriteEvent::Stopped(
                         format!(
                             "Stopped at {} so you can change it. Amend the commit, then \
                              continue.",
