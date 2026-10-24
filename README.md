@@ -84,8 +84,19 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 > choose, optionally noting the source commit (`-x`), only staging the
 > changes (`-n`), or stashing your uncommitted changes around it. A
 > cherry-pick that conflicts is given up, leaving everything as it was.
-> Nothing else can be changed
-> from GitEZ yet.
+> The commit details also offer **Cherry-pick…** for one commit and
+> **Reword**, which rewrites the history of the branch checked out from
+> that commit up: each commit, newest first, can be picked, reworded
+> (subject and body), stopped at to edit, squashed or folded as a fixup
+> into the commit below, or dropped, and dragged into a new order.
+> **Autosquash fixups** folds `fixup!` and `squash!` commits into the
+> commits they name. A summary says what will happen and warns when
+> commits already pushed would change. The rewrite runs `git rebase -i`
+> with your uncommitted changes stashed around it; the old tip is kept as
+> `refs/gitez/backup/<branch>` and **Undo** puts the branch back on it. A
+> rewrite that conflicts is given up; one stopped at an edit, or any
+> rebase stopped in a terminal, shows a banner to **Continue** or
+> **Abort** it. Nothing else can be changed from GitEZ yet.
 
 ## Technology
 
@@ -183,10 +194,12 @@ crates/gitez/       the application binary
 crates/gitez-git/   read-only repository access on gitoxide: refs, history, graph layout,
                     commit messages, changed files and diffs, working-tree status,
                     merge previews, merges in progress and their conflict markers,
+                    cherry-pick trial runs, commits to rewrite and rebases in progress,
                     watching for changes
 crates/gitez-command/ changes made by running the user's git binary: staging,
                     unstaging files or hunks, committing, amending, switching branches,
-                    merging and resolving conflicts, setting config values
+                    merging and resolving conflicts, cherry-picking, rewriting history,
+                    setting config values
 crates/gitez-review/ local pull requests, their comment threads and agent run
                     transcripts, stored in .git/gitez/reviews
 crates/gitez-agent/ coding agents a review prompt is sent to: Claude Code run as

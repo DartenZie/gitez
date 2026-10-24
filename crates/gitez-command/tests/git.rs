@@ -440,3 +440,152 @@ fn cherry_picks_onto_a_branch_and_gives_up_on_a_conflict() {
     assert_eq!(git(root, &["branch", "--show-current"]), "feature");
     assert_eq!(status(root), "");
 }
+
+/// A repository whose main has commits a to e, each adding its own file
+/// with the commit's name in it.
+fn five_commits() -> (tempfile::TempDir, Vec<String>) {
+    let dir = repository();
+    let root = dir.path();
+    let ids = ["a", "b", "c", "d", "e"]
+        .into_iter()
+        .map(|name| {
+            std::fs::write(root.join(format!("{name}.txt")), format!("{name}\n")).expect("write");
+            git(root, &["add", "--all"]);
+            git(root, &["commit", "--quiet", "-m", name]);
+            git(root, &["rev-parse", "HEAD"])
+        })
+        .collect();
+    (dir, ids)
+}
+
+#[test]
+fn rewrites_reorders_folds_and_drops_commits() {
+    use gitez_command::{RewriteAction, RewriteOutcome, RewriteStep};
+
+    let (dir, ids) = five_commits();
+    let root = dir.path();
+    let tip = git(root, &["rev-parse", "HEAD"]);
+    std::fs::write(root.join("a.txt"), "uncommitted\n").expect("write");
+    let step = |index: usize, action| RewriteStep {
+        commit: ids[index].clone(),
+        action,
+    };
+    // After a: e, moved first and reworded, then b with c squashed into it
+    // and d folded in as a fixup.
+    let steps = [
+        step(
+            4,
+            RewriteAction::Reword("E, first\n\nWith a body.\n".to_owned()),
+        ),
+        step(1, RewriteAction::Pick),
+        step(2, RewriteAction::Squash),
+        step(3, RewriteAction::Fixup),
+    ];
+    let outcome = Git::new(root)
+        .rewrite("main", Some(&ids[0]), &steps, "refs/gitez/backup/main")
+        .expect("rewrite");
+    assert_eq!(outcome, RewriteOutcome::Done);
+    assert_eq!(git(root, &["log", "--format=%s", "main"]), "b\nE, first\na");
+    assert_eq!(
+        git(root, &["log", "-1", "--format=%b", "main~1"]),
+        "With a body."
+    );
+    // The squash keeps both messages; the fixup's is left out.
+    assert_eq!(git(root, &["log", "-1", "--format=%B", "main"]), "b\n\nc");
+    assert_eq!(
+        git(root, &["ls-tree", "--name-only", "main"]),
+        "a.txt\nb.txt\nc.txt\nd.txt\ne.txt"
+    );
+    assert_eq!(git(root, &["rev-parse", "refs/gitez/backup/main"]), tip);
+    assert_eq!(status(root), "M a.txt");
+    assert!(!root.join(".git/gitez/rewrite").exists());
+
+    // Undo puts the old commits back, keeping the uncommitted change.
+    Git::new(root)
+        .restore("main", "refs/gitez/backup/main")
+        .expect("restore");
+    assert_eq!(git(root, &["rev-parse", "main"]), tip);
+    assert_eq!(status(root), "M a.txt");
+
+    // Dropping d and e, from the root.
+    let steps = [
+        step(0, RewriteAction::Pick),
+        step(1, RewriteAction::Pick),
+        step(2, RewriteAction::Pick),
+        step(3, RewriteAction::Drop),
+        step(4, RewriteAction::Drop),
+    ];
+    Git::new(root)
+        .rewrite("main", None, &steps, "refs/gitez/backup/main")
+        .expect("rewrite from the root");
+    assert_eq!(git(root, &["log", "--format=%s", "main"]), "c\nb\na");
+}
+
+#[test]
+fn a_rewrite_stops_at_an_edit_and_gives_up_on_a_conflict() {
+    use gitez_command::{RewriteAction, RewriteOutcome, RewriteStep};
+
+    let (dir, ids) = five_commits();
+    let root = dir.path();
+    let step = |index: usize, action| RewriteStep {
+        commit: ids[index].clone(),
+        action,
+    };
+    let steps = [
+        step(1, RewriteAction::Edit),
+        step(2, RewriteAction::Pick),
+        step(3, RewriteAction::Reword("D again".to_owned())),
+        step(4, RewriteAction::Pick),
+    ];
+    let git_ = Git::new(root);
+    let outcome = git_
+        .rewrite("main", Some(&ids[0]), &steps, "refs/gitez/backup/main")
+        .expect("rewrite");
+    assert_eq!(outcome, RewriteOutcome::Stopped);
+    assert_eq!(git(root, &["log", "-1", "--format=%s", "HEAD"]), "b");
+    std::fs::write(root.join("b.txt"), "b, edited\n").expect("write");
+    git(
+        root,
+        &["commit", "--quiet", "--all", "--amend", "-m", "b, edited"],
+    );
+    // The reword after the stop still gets its message.
+    assert_eq!(
+        git_.continue_rebase().expect("continue"),
+        RewriteOutcome::Done
+    );
+    assert_eq!(
+        git(root, &["log", "--format=%s", "main"]),
+        "e\nD again\nc\nb, edited\na"
+    );
+
+    // A commit that changes e.txt, moved before the commit adding it,
+    // conflicts.
+    let tip = git(root, &["rev-parse", "HEAD"]);
+    std::fs::write(root.join("e.txt"), "e, changed\n").expect("write");
+    git(root, &["commit", "--quiet", "--all", "-m", "f changes e"]);
+    let f = git(root, &["rev-parse", "HEAD"]);
+    let e = git(root, &["rev-parse", "HEAD~1"]);
+    let before = git(root, &["rev-parse", "HEAD"]);
+    let steps = [
+        RewriteStep {
+            commit: f,
+            action: RewriteAction::Pick,
+        },
+        RewriteStep {
+            commit: e,
+            action: RewriteAction::Pick,
+        },
+    ];
+    let error = git_
+        .rewrite(
+            "main",
+            Some(&format!("{tip}~1")),
+            &steps,
+            "refs/gitez/backup/main",
+        )
+        .expect_err("conflict");
+    assert!(matches!(error, Error::Failed { .. }), "{error}");
+    assert_eq!(git(root, &["rev-parse", "HEAD"]), before);
+    assert_eq!(git(root, &["branch", "--show-current"]), "main");
+    assert_eq!(status(root), "");
+}

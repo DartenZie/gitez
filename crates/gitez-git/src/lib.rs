@@ -19,6 +19,7 @@ mod merge;
 mod pick;
 mod refs;
 mod repository;
+mod rewrite;
 mod status;
 mod watch;
 
@@ -35,6 +36,7 @@ pub use merge::{MergeInProgress, MergePreview};
 pub use pick::PickTrial;
 pub use refs::{Branch, Head, RefKind, RefLabel, Refs, RemoteBranch, Stash, Tag};
 pub use repository::Repository;
+pub use rewrite::{RebaseInProgress, Rewritable, RewriteBase, RewriteCommit};
 pub use status::{FileStatus, WorkingTreeStatus, WorktreeChange};
 pub use watch::{Affected, Watcher};
 

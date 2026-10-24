@@ -32,6 +32,8 @@ pub struct Snapshot {
     pub user_name: Option<String>,
     /// The merge git stopped to have conflicts resolved, if one did.
     pub merge: Option<gitez_git::MergeInProgress>,
+    /// The rebase git stopped in the middle of, if one is in progress.
+    pub rebase: Option<gitez_git::RebaseInProgress>,
 }
 
 /// How a local branch compares to its upstream.
@@ -85,6 +87,9 @@ impl Snapshot {
         let merge = repository
             .merge_in_progress()
             .context("could not read the merge in progress")?;
+        let rebase = repository
+            .rebase_in_progress()
+            .context("could not read the rebase in progress")?;
 
         Ok(Self {
             name: repository.name().into(),
@@ -100,6 +105,7 @@ impl Snapshot {
             pull_requests_error,
             user_name,
             merge,
+            rebase,
         })
     }
 

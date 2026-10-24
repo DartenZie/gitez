@@ -9,6 +9,7 @@ mod history;
 mod labels;
 mod new_pull_request;
 mod review;
+mod rewrite;
 mod sidebar;
 mod status_bar;
 mod toolbar;
@@ -23,12 +24,14 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::*;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{
-    Icon, Sizable as _, StyledExt as _, WindowExt as _, h_resizable, resizable_panel,
+    Disableable as _, Icon, Sizable as _, StyledExt as _, WindowExt as _, h_resizable,
+    resizable_panel,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use gitez_git::{Affected, Head, RefKind, RefLabel, Watcher, WorkingTreeStatus};
+use gitez_command::{Git, RewriteOutcome};
+use gitez_git::{Affected, Head, Oid, RefKind, RefLabel, Watcher, WorkingTreeStatus};
 use gitez_review::{NewPullRequest as NewPullRequestFields, State, Timestamp, Tip};
 
 use crate::repository::Snapshot;
@@ -44,6 +47,7 @@ use review::{
     CommitDraft, LastCommit, MergeDialog, MergeEvent, MergedPullRequest, Merging, Review,
     ReviewEvent, Tips,
 };
+use rewrite::{Rewrite, RewriteEvent};
 use sidebar::{Sidebar, SidebarEvent};
 
 actions!(workspace, [OpenRepository, ReviewSelected, NewPullRequest]);
@@ -93,6 +97,11 @@ pub struct Workspace {
     new_pull_request: Option<(Entity<NewPullRequestForm>, Subscription)>,
     /// Creating a local pull request.
     _create: Option<Task<()>>,
+    /// Rewriting the branch's history, shown instead of the history or a
+    /// review.
+    rewrite: Option<(Entity<Rewrite>, Subscription)>,
+    /// Continuing, aborting or undoing a rewrite.
+    rewrite_command: Option<Task<()>>,
     /// The cherry-pick panel, shown in place of the commit detail.
     cherry_pick: Option<(Entity<CherryPick>, Subscription)>,
     /// The dialog offering to merge a branch dropped on another, while
@@ -146,6 +155,12 @@ impl Workspace {
             }),
             cx.subscribe_in(&detail, window, |this, _, event, window, cx| match event {
                 DetailEvent::OpenFile(path) => this.open_review(Some(path.clone()), window, cx),
+                DetailEvent::CherryPick(id) => {
+                    this.history
+                        .update(cx, |history, cx| history.pick_only(*id, cx));
+                    this.open_cherry_pick(window, cx);
+                }
+                DetailEvent::Reword(id) => this.open_rewrite(*id, window, cx),
             }),
             // Files change outside GitEZ; read the status again on return.
             cx.observe_window_activation(window, |this, window, cx| {
@@ -171,6 +186,8 @@ impl Workspace {
             new_pull_request: None,
             _create: None,
             merge_dialog: None,
+            rewrite: None,
+            rewrite_command: None,
             cherry_pick: None,
             open_after_reload: None,
             sidebar,
@@ -248,6 +265,7 @@ impl Workspace {
     fn show(&mut self, snapshot: Arc<Snapshot>, window: &mut Window, cx: &mut Context<Self>) {
         window.set_window_title(&format!("{} — GitEZ", snapshot.name));
         self.review = None;
+        self.rewrite = None;
         self.commit_draft = None;
         self.watch(&snapshot, window, cx);
         self.sidebar
@@ -822,6 +840,170 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Shows the history of the branch checked out from commit `from` up, to
+    /// rewrite it, with `from` to be reworded.
+    fn open_rewrite(&mut self, from: Oid, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(snapshot) = self.snapshot.clone() else {
+            return;
+        };
+        let refusal = if snapshot.merge.is_some() {
+            Some("Finish or abort the merge in progress before rewriting history.")
+        } else if snapshot.rebase.is_some() {
+            Some("Continue or abort the rebase in progress before rewriting history again.")
+        } else {
+            None
+        };
+        if let Some(refusal) = refusal {
+            window.push_notification(Notification::warning(refusal), cx);
+            return;
+        }
+        let Some(Head::Branch { name, target }) = snapshot.refs.head.clone() else {
+            window.push_notification(
+                Notification::warning("Check out a branch to rewrite its history."),
+                cx,
+            );
+            return;
+        };
+        let uncommitted = self.status.as_ref().map_or(0, |status| status.files.len());
+        let rewrite = cx.new(|cx| {
+            Rewrite::new(
+                snapshot,
+                name,
+                target,
+                from,
+                Some(from),
+                uncommitted,
+                window,
+                cx,
+            )
+        });
+        let subscription = cx.subscribe_in(&rewrite, window, |this, _, event, window, cx| {
+            match event {
+                RewriteEvent::Close => {}
+                RewriteEvent::Done {
+                    branch,
+                    backup,
+                    message,
+                } => {
+                    let workspace = cx.entity().downgrade();
+                    let (branch, backup) = (branch.clone(), backup.clone());
+                    window.push_notification(
+                        Notification::success(message.clone()).action(move |_, _, cx| {
+                            let notification = cx.entity().downgrade();
+                            let (workspace, branch, backup) =
+                                (workspace.clone(), branch.clone(), backup.clone());
+                            Button::new("undo-rewrite").small().label("Undo").on_click(
+                                move |_, window, cx| {
+                                    workspace
+                                        .update(cx, |this, cx| {
+                                            this.undo_rewrite(&branch, &backup, window, cx)
+                                        })
+                                        .ok();
+                                    notification
+                                        .update(cx, |notification, cx| {
+                                            notification.dismiss(window, cx)
+                                        })
+                                        .ok();
+                                },
+                            )
+                        }),
+                        cx,
+                    );
+                }
+                RewriteEvent::Stopped(message) => {
+                    window.push_notification(Notification::info(message.clone()), cx);
+                }
+            }
+            this.rewrite = None;
+            window.focus(&this.history.focus_handle(cx), cx);
+            this.reload(window, cx);
+            this.refresh_status(window, cx);
+        });
+        window.focus(&rewrite.focus_handle(cx), cx);
+        self.rewrite = Some((rewrite, subscription));
+        cx.notify();
+    }
+
+    /// Runs `command` in the working tree off the UI thread, then reads the
+    /// repository again; `done` says what to tell about its outcome.
+    fn run_rewrite_command<T: Send + 'static>(
+        &mut self,
+        command: impl FnOnce(Git) -> gitez_command::Result<T> + Send + 'static,
+        done: impl FnOnce(gitez_command::Result<T>) -> Notification + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(dir) = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.repository.work_dir().map(PathBuf::from))
+        else {
+            return;
+        };
+        let run = cx
+            .background_executor()
+            .spawn(async move { command(Git::new(dir)) });
+        self.rewrite_command = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = run.await;
+            this.update_in(cx, |this, window, cx| {
+                this.rewrite_command = None;
+                window.push_notification(done(result), cx);
+                this.reload(window, cx);
+                this.refresh_status(window, cx);
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Puts branch `branch` back on `backup`, where it was before a rewrite.
+    fn undo_rewrite(
+        &mut self,
+        branch: &str,
+        backup: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (branch, backup) = (branch.to_owned(), backup.to_owned());
+        let name = branch.clone();
+        self.run_rewrite_command(
+            move |git| git.restore(&branch, &backup),
+            move |result| match result {
+                Ok(()) => Notification::success(format!("{name} is back as it was")),
+                Err(error) => Notification::error(format!("Could not undo the rewrite: {error}")),
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn continue_rebase(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_rewrite_command(
+            |git| git.continue_rebase(),
+            |result| match result {
+                Ok(RewriteOutcome::Done) => Notification::success("Rewrite finished"),
+                Ok(RewriteOutcome::Stopped) => {
+                    Notification::info("Stopped at the next commit to change")
+                }
+                Err(error) => Notification::error(format!("Could not continue: {error}")),
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn abort_rebase(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_rewrite_command(
+            |git| git.abort_rebase(),
+            |result| match result {
+                Ok(()) => Notification::success("Rewrite aborted; everything is as it was before"),
+                Err(error) => Notification::error(format!("Could not abort: {error}")),
+            },
+            window,
+            cx,
+        );
+    }
+
     /// Shows the conflicts of the merge in progress.
     fn open_conflicts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(snapshot) = &self.snapshot else {
@@ -931,9 +1113,18 @@ impl Render for Workspace {
                     .filter(|_| self.conflicts.is_none()),
                 |this, merge| this.child(merge_banner(merge, cx)),
             )
+            .when_some(
+                snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.rebase.as_ref()),
+                |this, rebase| this.child(rebase_banner(rebase, self.rewrite_command.is_some(), cx)),
+            )
             .child(div().flex_1().min_h_0().map(|this| {
                 if let Some((conflicts, _)) = &self.conflicts {
                     return this.child(conflicts.clone());
+                }
+                if let Some((rewrite, _)) = &self.rewrite {
+                    return this.child(rewrite.clone());
                 }
                 if let Some((review, _)) = &self.review {
                     return this.child(review.clone());
@@ -1128,5 +1319,55 @@ fn merge_banner(merge: &gitez_git::MergeInProgress, cx: &mut Context<Workspace>)
                 .primary()
                 .label("Resolve conflicts")
                 .on_click(cx.listener(|this, _, window, cx| this.open_conflicts(window, cx))),
+        )
+}
+
+/// The strip saying a rebase stopped, with the buttons to go on or give
+/// it up.
+fn rebase_banner(
+    rebase: &gitez_git::RebaseInProgress,
+    running: bool,
+    cx: &mut Context<Workspace>,
+) -> Div {
+    let branch = rebase.branch.clone().unwrap_or_else(|| "HEAD".into());
+    let at = match (&rebase.stopped_at, &rebase.summary) {
+        (Some(id), Some(summary)) => format!(" at {} “{summary}”", id.to_hex_with_len(7)),
+        (Some(id), None) => format!(" at {}", id.to_hex_with_len(7)),
+        _ => String::new(),
+    };
+    div()
+        .h_flex()
+        .flex_none()
+        .gap(px(10.))
+        .px(px(16.))
+        .py(px(8.))
+        .border_b_1()
+        .border_color(rgb(color::BORDER))
+        .bg(rgb(color::SELECTED))
+        .text_size(px(12.5))
+        .child(
+            Icon::new(IconName::Pencil)
+                .size(px(15.))
+                .text_color(rgb(color::ACCENT)),
+        )
+        .child(div().flex_1().min_w_0().child(format!(
+            "Rewriting {branch} stopped{at}. Change what you need and amend the commit, \
+                 then continue."
+        )))
+        .child(
+            Button::new("abort-rebase")
+                .small()
+                .ghost()
+                .label("Abort")
+                .disabled(running)
+                .on_click(cx.listener(|this, _, window, cx| this.abort_rebase(window, cx))),
+        )
+        .child(
+            Button::new("continue-rebase")
+                .small()
+                .primary()
+                .label("Continue")
+                .loading(running)
+                .on_click(cx.listener(|this, _, window, cx| this.continue_rebase(window, cx))),
         )
 }

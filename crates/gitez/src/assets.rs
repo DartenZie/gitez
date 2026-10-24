@@ -18,6 +18,7 @@ icon_assets!(
         ArrowRightToLine,
         Bot,
         Check,
+        Cherry,
         ChevronDown,
         ChevronUp,
         CircleAlert,
@@ -25,16 +26,20 @@ icon_assets!(
         Combine,
         Copy,
         GitBranch,
+        GitCommitVertical,
         GitFork,
         GitGraph,
         GitMerge,
         GitPullRequestArrow,
+        GripVertical,
         ListTree,
         LoaderCircle,
         Move,
         Pencil,
+        ShieldCheck,
         Square,
-        Terminal
+        Terminal,
+        TriangleAlert
     ]
 );
 

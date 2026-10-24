@@ -89,6 +89,20 @@ pub mod color {
     pub const TRIAL_CLEAN_TEXT: u32 = 0xb9_dc_c5;
     pub const TRIAL_CONFLICT: u32 = 0x22_1d_14;
 
+    /// Rewriting history: a reworded commit's card, a commit's chosen
+    /// action (reword, fixup and drop have their own colours), the chip
+    /// on a commit the upstream has, and the warning about pushed commits.
+    pub const REWORD_CARD: u32 = 0x1a_18_14;
+    pub const ACTION_ON: u32 = 0x2a_2a_30;
+    pub const REWORD_ON: u32 = 0x3a_2f_18;
+    pub const FIXUP_ON: u32 = 0x1e_2c_3d;
+    pub const FIXUP_TEXT: u32 = 0x8f_c2_f8;
+    pub const DROP_ON: u32 = 0x3a_1f_1c;
+    pub const DROP_TEXT: u32 = 0xf5_a5_9b;
+    pub const PUSHED_CHIP: u32 = 0x2c_24_20;
+    pub const WARNING_BORDER: u32 = 0x4d_3f_22;
+    pub const WARNING_TEXT: u32 = 0xe9_d3_a6;
+
     /// The agent prompt panel: a comment in it, and the prompt text.
     pub const PROMPT_COMMENT: u32 = 0x18_18_1b;
     pub const PROMPT: u32 = 0x0f_0f_11;

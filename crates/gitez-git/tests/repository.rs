@@ -1479,3 +1479,79 @@ fn cherry_pick_trial_applies_skips_and_finds_conflicts() {
     // Nothing was written.
     assert_eq!(fixture.git(&["status", "--porcelain"]), "");
 }
+
+#[test]
+fn finds_the_commits_to_rewrite_and_a_stopped_rebase() {
+    use gitez_git::{RebaseInProgress, Rewritable, RewriteBase};
+
+    let fixture = Fixture::new();
+    let a = fixture.commit("a.txt", "a");
+    let b = fixture.commit("b.txt", "b");
+    fixture.git(&["commit", "--quiet", "--allow-empty", "-m", "c\n\nThe body."]);
+    let c = fixture.rev("HEAD");
+    let repo = fixture.open();
+
+    let Rewritable::Commits { commits, base } = repo.rewritable(c, b, Some(b)).expect("read")
+    else {
+        panic!("b is on main");
+    };
+    let ids: Vec<Oid> = commits.iter().map(|commit| commit.id).collect();
+    assert_eq!(ids, [c, b]);
+    assert_eq!(commits[0].message, "c\n\nThe body.");
+    assert_eq!(commits[0].summary, "c");
+    // The upstream is on b.
+    assert_eq!(
+        commits
+            .iter()
+            .map(|commit| commit.pushed)
+            .collect::<Vec<_>>(),
+        [false, true]
+    );
+    assert_eq!(
+        base,
+        Some(RewriteBase {
+            id: a,
+            summary: "a".to_owned()
+        })
+    );
+    let Rewritable::Commits { base, .. } = repo.rewritable(c, a, None).expect("read") else {
+        panic!("a is on main");
+    };
+    assert_eq!(base, None);
+
+    // A commit on another branch, and a merge in the way.
+    fixture.git(&["checkout", "--quiet", "-b", "side", "HEAD~1"]);
+    let side = fixture.commit("side.txt", "side");
+    fixture.git(&["checkout", "--quiet", "main"]);
+    let merge = fixture.merge("side", "Merge side");
+    let repo = fixture.open();
+    assert_eq!(
+        repo.rewritable(c, side, None).expect("read"),
+        Rewritable::Elsewhere
+    );
+    assert_eq!(
+        repo.rewritable(merge, b, None).expect("read"),
+        Rewritable::Merge {
+            id: merge,
+            summary: "Merge side".to_owned()
+        }
+    );
+
+    // Stopped at an edit of b.
+    assert_eq!(repo.rebase_in_progress().expect("read"), None);
+    let output = Command::new("git")
+        .args(["rebase", "--quiet", "--interactive", a.to_string().as_str()])
+        .current_dir(&fixture.root)
+        .env("GIT_SEQUENCE_EDITOR", "sed -i.bak '1s/^pick/edit/'")
+        .output()
+        .expect("git runs");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        repo.rebase_in_progress().expect("read"),
+        Some(RebaseInProgress {
+            branch: Some("main".to_owned()),
+            stopped_at: Some(b),
+            summary: Some("b".to_owned()),
+        })
+    );
+}

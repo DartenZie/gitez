@@ -770,6 +770,14 @@ impl History {
         cx.notify();
     }
 
+    /// Picks commit `id` alone.
+    pub fn pick_only(&mut self, id: Oid, cx: &mut Context<Self>) {
+        self.pick_anchor = None;
+        self.picked = vec![id];
+        cx.emit(PickedChanged);
+        cx.notify();
+    }
+
     /// The picked commits, oldest first, as far as the history has been
     /// read.
     pub fn picked(&self) -> Vec<Commit> {

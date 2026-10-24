@@ -17,6 +17,12 @@ use std::process::{Command, Stdio};
 pub enum Error {
     #[error("could not run git")]
     Spawn(#[source] std::io::Error),
+    #[error("could not write {path}")]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     /// `git` ran and failed. `output` is what it wrote, often the output of a
     /// hook that rejected the change.
     #[error("{output}")]
@@ -67,6 +73,38 @@ pub struct PickOptions {
     pub no_commit: bool,
     /// Stashes uncommitted changes first and brings them back afterwards.
     pub stash: bool,
+}
+
+/// What [`Git::rewrite`] does with one commit, as in `git rebase -i`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RewriteAction {
+    /// Keeps it as it is.
+    Pick,
+    /// Keeps it with this message.
+    Reword(String),
+    /// Stops after it, so it can be changed.
+    Edit,
+    /// Folds it into the commit before, joining their messages.
+    Squash,
+    /// Folds it into the commit before, keeping that commit's message.
+    Fixup,
+    /// Leaves it out.
+    Drop,
+}
+
+/// One line of a rewrite: a commit (its full id) and what to do with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RewriteStep {
+    pub commit: String,
+    pub action: RewriteAction,
+}
+
+/// How [`Git::rewrite`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewriteOutcome {
+    Done,
+    /// Stopped at an `edit`; [`Git::continue_rebase`] goes on.
+    Stopped,
 }
 
 /// Runs `git` in one working tree.
@@ -282,6 +320,171 @@ impl Git {
         picked
     }
 
+    /// Rewrites the commits after `base` (all of them, from the root, when
+    /// `None`) on the branch checked out, `branch`, as `steps` say, oldest
+    /// first, like `git rebase -i --autostash base` with that todo list.
+    /// The tip is saved as `backup` (a full ref name) first. Uncommitted
+    /// changes are stashed and come back afterwards. When git cannot finish,
+    /// because of a conflict or a hook, the rewrite is given up and nothing
+    /// changes; at an `edit` it stops, to go on with
+    /// [`Git::continue_rebase`].
+    pub fn rewrite(
+        &self,
+        branch: &str,
+        base: Option<&str>,
+        steps: &[RewriteStep],
+        backup: &str,
+    ) -> Result<RewriteOutcome> {
+        self.run(
+            [
+                "update-ref",
+                "-m",
+                &format!("GitEZ: before rewriting {branch}"),
+                backup,
+                "HEAD",
+            ],
+            None,
+        )?;
+        let dir = self.rewrite_dir()?;
+        // Left over from an earlier rewrite.
+        let _ = std::fs::remove_dir_all(&dir);
+        let messages = dir.join("messages");
+        std::fs::create_dir_all(&messages).map_err(|source| Error::Write {
+            path: messages.clone(),
+            source,
+        })?;
+        let mut todo = String::new();
+        for step in steps {
+            let command = match &step.action {
+                RewriteAction::Pick => "pick",
+                RewriteAction::Reword(message) => {
+                    write(&messages.join(&step.commit), message)?;
+                    "reword"
+                }
+                RewriteAction::Edit => "edit",
+                RewriteAction::Squash => "squash",
+                RewriteAction::Fixup => "fixup",
+                RewriteAction::Drop => "drop",
+            };
+            todo.push_str(&format!("{command} {}\n", step.commit));
+        }
+        let todo_path = dir.join("todo");
+        write(&todo_path, &todo)?;
+        let git_dir = self.git_dir()?;
+        let editor = dir.join("editor.sh");
+        write(&editor, &editor_script(&git_dir, &messages))?;
+
+        let mut args = vec![
+            "-c",
+            // Dropped commits are listed with `drop`, never left out.
+            "rebase.missingCommitsCheck=ignore",
+            "rebase",
+            "--interactive",
+            "--autostash",
+            "--no-autosquash",
+        ];
+        args.extend(base.map_or(["--root"], |base| [base]));
+        let sequence_editor = format!("cp {}", shell_quote(&todo_path));
+        let rebased = self.run_with_env(
+            args,
+            None,
+            &[
+                ("GIT_SEQUENCE_EDITOR", sequence_editor.as_str()),
+                ("GIT_EDITOR", &format!("sh {}", shell_quote(&editor))),
+            ],
+        );
+        self.finish_rebase(rebased)
+    }
+
+    /// Goes on with the rebase in progress, like `git rebase --continue`,
+    /// using the messages GitEZ's rewrite chose. When it stops again on a
+    /// conflict, the rebase stays stopped.
+    pub fn continue_rebase(&self) -> Result<RewriteOutcome> {
+        let editor = self.rewrite_dir()?.join("editor.sh");
+        let editor = if editor.exists() {
+            format!("sh {}", shell_quote(&editor))
+        } else {
+            // Keeps the message git proposes.
+            "true".to_owned()
+        };
+        self.run_with_env(
+            ["rebase", "--continue"],
+            None,
+            &[("GIT_EDITOR", editor.as_str())],
+        )?;
+        Ok(if self.rebasing()? {
+            RewriteOutcome::Stopped
+        } else {
+            self.clean_rewrite_dir();
+            RewriteOutcome::Done
+        })
+    }
+
+    /// Gives up the rebase in progress, like `git rebase --abort`: the
+    /// branch and the working tree return to how they were before it.
+    pub fn abort_rebase(&self) -> Result<()> {
+        self.run(["rebase", "--abort"], None)?;
+        self.clean_rewrite_dir();
+        Ok(())
+    }
+
+    /// Moves branch `branch`, which must be checked out, back to `backup`,
+    /// keeping uncommitted changes, like `git reset --keep backup`.
+    pub fn restore(&self, branch: &str, backup: &str) -> Result<()> {
+        let head = self.run(["symbolic-ref", "--quiet", "--short", "HEAD"], None)?;
+        if String::from_utf8_lossy(&head).trim() != branch {
+            return Err(Error::Failed {
+                command: format!("git reset --keep {backup}"),
+                output: format!("{branch} is no longer checked out."),
+            });
+        }
+        self.run(["reset", "--quiet", "--keep", backup], None)
+            .map(drop)
+    }
+
+    /// Ends `rebased`, the result of starting a rebase: done, stopped at an
+    /// `edit`, or given up when git could not finish.
+    fn finish_rebase(&self, rebased: Result<Vec<u8>>) -> Result<RewriteOutcome> {
+        match rebased {
+            Ok(_) if self.rebasing()? => Ok(RewriteOutcome::Stopped),
+            Ok(_) => {
+                self.clean_rewrite_dir();
+                Ok(RewriteOutcome::Done)
+            }
+            Err(error) => {
+                if self.rebasing().unwrap_or(true) {
+                    // Brings back stashed changes too.
+                    self.run(["rebase", "--abort"], None).ok();
+                }
+                self.clean_rewrite_dir();
+                Err(error)
+            }
+        }
+    }
+
+    /// Whether a rebase is in progress.
+    fn rebasing(&self) -> Result<bool> {
+        let git_dir = self.git_dir()?;
+        Ok(git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists())
+    }
+
+    /// The working tree's git directory, as an absolute path.
+    fn git_dir(&self) -> Result<PathBuf> {
+        let output = self.run(["rev-parse", "--absolute-git-dir"], None)?;
+        Ok(PathBuf::from(String::from_utf8_lossy(&output).trim()))
+    }
+
+    /// Where a rewrite keeps its todo list and messages while it runs.
+    fn rewrite_dir(&self) -> Result<PathBuf> {
+        Ok(self.git_dir()?.join("gitez").join("rewrite"))
+    }
+
+    fn clean_rewrite_dir(&self) {
+        if let Ok(dir) = self.rewrite_dir() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
     /// Stashes every uncommitted change, untracked files too, like
     /// `git stash push --include-untracked`; returns whether there was
     /// anything to stash.
@@ -410,6 +613,20 @@ impl Git {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        self.run_with_env(args, input, &[])
+    }
+
+    /// [`Git::run`] with the environment variables `env` set as well.
+    fn run_with_env<I, S>(
+        &self,
+        args: I,
+        input: Option<&[u8]>,
+        env: &[(&str, &str)],
+    ) -> Result<Vec<u8>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let args: Vec<_> = args
             .into_iter()
             .map(|arg| arg.as_ref().to_owned())
@@ -422,6 +639,7 @@ impl Git {
             .env("GIT_LITERAL_PATHSPECS", "1")
             // Nothing can answer a prompt.
             .env("GIT_TERMINAL_PROMPT", "0")
+            .envs(env.iter().copied())
             .stdin(if input.is_some() {
                 Stdio::piped()
             } else {
@@ -462,4 +680,31 @@ impl Git {
             output: text,
         })
     }
+}
+
+/// The editor git runs for each commit a rewrite rewords: it puts the
+/// message chosen for the commit, kept in `messages` under its id, in the
+/// file git asks to edit. Commits without one keep what git proposes.
+fn editor_script(git_dir: &Path, messages: &Path) -> String {
+    format!(
+        "#!/bin/sh\n\
+         # Written by GitEZ for one rewrite.\n\
+         id=$(tail -n 1 {done} | cut -d ' ' -f 2)\n\
+         message={messages}/\"$id\"\n\
+         if [ -n \"$id\" ] && [ -f \"$message\" ]; then cat \"$message\" > \"$1\"; fi\n",
+        done = shell_quote(&git_dir.join("rebase-merge").join("done")),
+        messages = shell_quote(messages),
+    )
+}
+
+fn write(path: &Path, contents: &str) -> Result<()> {
+    std::fs::write(path, contents).map_err(|source| Error::Write {
+        path: path.to_owned(),
+        source,
+    })
+}
+
+/// `path` quoted for `sh`.
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
 }

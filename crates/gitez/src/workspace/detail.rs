@@ -30,6 +30,10 @@ const MAX_FILES_SHOWN: usize = 500;
 pub enum DetailEvent {
     /// Show the diff of the selection, scrolled to the file at this path.
     OpenFile(String),
+    /// Cherry-pick this commit onto a branch.
+    CherryPick(Oid),
+    /// Rewrite the history from this commit up, rewording it.
+    Reword(Oid),
 }
 
 /// The selected commit: SHA, parents, message, author, refs and changed files.
@@ -189,6 +193,7 @@ impl Render for DetailPane {
                     details.as_deref(),
                     mono.clone(),
                 ))
+                .child(actions(commit.id, cx))
                 .when_some(error, |this, error| {
                     this.child(
                         div()
@@ -237,6 +242,33 @@ fn commit_footer() -> impl IntoElement {
                 .text_color(rgb(color::TEXT_MUTED))
                 .child("Double-click any row or press")
                 .child(Kbd::new(enter)),
+        )
+}
+
+/// What can be done with the commit.
+fn actions(id: Oid, cx: &mut Context<DetailPane>) -> impl IntoElement {
+    let action = |name: &'static str, icon: IconName, label: &'static str| {
+        Button::new(name)
+            .flex_1()
+            .h(px(30.))
+            .icon(Icon::new(icon).size(px(14.)))
+            .label(label)
+    };
+    div()
+        .h_flex()
+        .gap(px(6.))
+        .px(px(18.))
+        .py(px(12.))
+        .border_b_1()
+        .border_color(rgb(color::BORDER))
+        .child(
+            action("commit-cherry-pick", IconName::Cherry, "Cherry-pick…")
+                .on_click(cx.listener(move |_, _, _, cx| cx.emit(DetailEvent::CherryPick(id)))),
+        )
+        .child(
+            action("commit-reword", IconName::Pencil, "Reword")
+                .tooltip("Rewrite the history of the branch checked out from this commit up")
+                .on_click(cx.listener(move |_, _, _, cx| cx.emit(DetailEvent::Reword(id)))),
         )
 }
 
