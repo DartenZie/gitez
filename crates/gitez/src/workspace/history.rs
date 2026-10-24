@@ -39,6 +39,8 @@ const FIRST_BATCH: usize = 200;
 const BATCH: usize = 5_000;
 
 pub const ROW_HEIGHT: Pixels = px(36.);
+/// Room kept for a commit's summary beside its ref labels.
+const SUMMARY_MIN_WIDTH: Pixels = px(160.);
 
 /// Column widths, shared by the header and the rows.
 mod columns {
@@ -335,7 +337,9 @@ impl History {
                                 })
                                 .child(
                                     div()
-                                        .min_w_0()
+                                        // Labels shrink before the summary
+                                        // goes below this.
+                                        .min_w(SUMMARY_MIN_WIDTH)
                                         .overflow_hidden()
                                         .whitespace_nowrap()
                                         .text_ellipsis()

@@ -8,11 +8,25 @@ use gpui_kit::*;
 
 use crate::theme::{self, color};
 
+/// Labels longer than this are cut short with an ellipsis, so a long branch
+/// name leaves room for the commit summary beside it.
+const MAX_LABEL_WIDTH: Pixels = px(200.);
+/// Labels shrink to this when several share a row with little space.
+const MIN_LABEL_WIDTH: Pixels = px(96.);
+
 /// A label for a branch, remote-tracking branch, tag or detached `HEAD`.
 pub fn ref_label(label: &RefLabel) -> impl IntoElement {
+    let name = || {
+        div()
+            .min_w_0()
+            .overflow_hidden()
+            .text_ellipsis()
+            .child(label.name.clone())
+    };
     let chip = div()
         .h_flex()
-        .flex_none()
+        .min_w(MIN_LABEL_WIDTH)
+        .max_w(MAX_LABEL_WIDTH)
         .h(px(20.))
         .px(px(7.))
         .gap(px(4.))
@@ -26,19 +40,19 @@ pub fn ref_label(label: &RefLabel) -> impl IntoElement {
             chip.bg(theme::with_alpha(branch_color, 0.16))
                 .text_color(rgb(branch_color))
                 .when(label.is_head, |this| this.child(head_badge(branch_color)))
-                .child(label.name.clone())
+                .child(name())
         }
         RefKind::RemoteBranch => chip
             .border_1()
             .border_color(rgb(color::REMOTE_LABEL_BORDER))
             .text_color(rgb(color::REMOTE_LABEL_TEXT))
-            .child(label.name.clone()),
+            .child(name()),
         RefKind::Tag => chip
             .border_1()
             .border_dashed()
             .border_color(rgb(color::TAG_LABEL_BORDER))
             .text_color(rgb(color::TEXT_SECONDARY))
-            .child(label.name.clone()),
+            .child(name()),
         RefKind::Head => chip
             .bg(theme::with_alpha(color::BRANCH_BLUE, 0.16))
             .child(head_badge(color::BRANCH_BLUE))
@@ -50,6 +64,7 @@ pub fn ref_label(label: &RefLabel) -> impl IntoElement {
 /// The small "HEAD" badge at the start of the current branch's label.
 fn head_badge(background: u32) -> impl IntoElement {
     div()
+        .flex_none()
         .px(px(4.))
         .rounded(px(3.))
         .bg(rgb(background))

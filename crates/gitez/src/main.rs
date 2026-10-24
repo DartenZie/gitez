@@ -3,6 +3,7 @@
 //!
 //! `gitez [path]` opens the repository containing `path` straight away.
 
+mod assets;
 mod repository;
 mod theme;
 mod time;
@@ -22,7 +23,7 @@ fn main() {
         .map(|arg| std::path::absolute(PathBuf::from(&arg)).unwrap_or_else(|_| arg.into()));
 
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(assets::Assets)
         .run(move |cx: &mut App| {
             // Must run before any gpui-kit component is used.
             gpui_kit::init(cx);
