@@ -62,7 +62,12 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 > transcript is kept, and the last one shows when you come back.
 > **Merge into …** merges the branch into its base with a merge commit,
 > a squash, a rebase or a fast-forward, and warns beforehand about files
-> that would conflict; if git stops, nothing is changed. The pull request
+> that would conflict. A merge commit that conflicts opens the **conflict
+> editor**: for each conflict, our and their lines side by side (and the
+> base, if you want it), lines ticked into the result or the result typed
+> by hand, then **Commit merge** or **Abort merge**. A merge that stopped
+> in a terminal shows a banner that opens the same editor. The other ways
+> of merging undo themselves if git stops. The pull request
 > is then marked merged and keeps showing the changes it had. **Edit**
 > changes a pull request's title and description; **Close** sets it aside
 > without merging, keeping its changes and comments, and **Reopen** brings
@@ -164,10 +169,11 @@ Cargo.toml          workspace: dependency versions, lints, build profiles
 crates/gitez/       the application binary
 crates/gitez-git/   read-only repository access on gitoxide: refs, history, graph layout,
                     commit messages, changed files and diffs, working-tree status,
-                    merge previews, watching for changes
+                    merge previews, merges in progress and their conflict markers,
+                    watching for changes
 crates/gitez-command/ changes made by running the user's git binary: staging,
                     unstaging files or hunks, committing, amending, switching branches,
-                    merging, setting config values
+                    merging and resolving conflicts, setting config values
 crates/gitez-review/ local pull requests, their comment threads and agent run
                     transcripts, stored in .git/gitez/reviews
 crates/gitez-agent/ coding agents a review prompt is sent to: Claude Code run as

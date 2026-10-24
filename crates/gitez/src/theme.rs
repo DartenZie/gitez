@@ -51,6 +51,23 @@ pub mod color {
     pub const MERGE_ICON_PRIMARY: u32 = 0x3a_2f_18;
     pub const MERGE_DIVIDER: u32 = 0x2a_2a_2f;
 
+    /// The conflict editor, with alpha: a conflict's lines from our side
+    /// and from theirs, faint and when picked for the result, and lines of
+    /// a resolved conflict.
+    pub const CONFLICT_OURS: u32 = 0xe8_b0_4b_17;
+    pub const CONFLICT_OURS_PICKED: u32 = 0xe8_b0_4b_33;
+    pub const CONFLICT_THEIRS: u32 = 0x4f_c6_b0_17;
+    pub const CONFLICT_THEIRS_PICKED: u32 = 0x4f_c6_b0_33;
+    pub const CONFLICT_RESOLVED: u32 = 0x6c_c5_8a_14;
+    /// The tags saying where a result line comes from: ours, theirs, both.
+    pub const SOURCE_OURS: u32 = 0x3a_2f_18;
+    pub const SOURCE_THEIRS: u32 = 0x17_34_30;
+    pub const SOURCE_BOTH: u32 = 0x2a_2a_30;
+    /// The box ticking a line, unticked.
+    pub const PICK_BORDER: u32 = 0x55_55_5b;
+    /// The strip under the result.
+    pub const RESULT_FOOTER: u32 = 0x17_17_1a;
+
     /// The agent prompt panel: a comment in it, and the prompt text.
     pub const PROMPT_COMMENT: u32 = 0x18_18_1b;
     pub const PROMPT: u32 = 0x0f_0f_11;

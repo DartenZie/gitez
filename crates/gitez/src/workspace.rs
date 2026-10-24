@@ -1,6 +1,7 @@
 //! The main window: toolbar, repository sidebar, history, commit detail and
 //! status bar, laid out as in the `Main.dc.html` artboard.
 
+mod conflicts;
 mod detail;
 mod graph;
 mod history;
@@ -17,9 +18,12 @@ use std::time::Duration;
 
 use futures::StreamExt as _;
 
+use gpui_kit::assets::IconName;
 use gpui_kit::component::button::*;
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::{StyledExt as _, WindowExt as _, h_resizable, resizable_panel};
+use gpui_kit::component::{
+    Icon, Sizable as _, StyledExt as _, WindowExt as _, h_resizable, resizable_panel,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -28,6 +32,7 @@ use gitez_review::Timestamp;
 
 use crate::repository::Snapshot;
 use crate::theme::{self, color};
+use conflicts::{Conflicts, ConflictsEvent};
 use detail::{DetailEvent, DetailPane};
 use history::{History, Selection};
 use new_pull_request::{FormEvent, NewPullRequestForm};
@@ -72,6 +77,9 @@ pub struct Workspace {
     _reload: Option<Task<()>>,
     /// The commit being reviewed, shown instead of the history.
     review: Option<(Entity<Review>, Subscription)>,
+    /// The conflicts of a merge being resolved, shown instead of the
+    /// history or a review.
+    conflicts: Option<(Entity<Conflicts>, Subscription)>,
     /// The message of the next commit, kept while the review is closed.
     commit_draft: Option<Entity<CommitDraft>>,
     /// The "New local PR" form while its dialog is open.
@@ -124,6 +132,7 @@ impl Workspace {
             _watch: None,
             _reload: None,
             review: None,
+            conflicts: None,
             commit_draft: None,
             new_pull_request: None,
             _create: None,
@@ -468,6 +477,12 @@ impl Workspace {
                     this.refresh_status(window, cx);
                     return;
                 }
+                ReviewEvent::MergeStopped => {
+                    this.reload(window, cx);
+                    this.refresh_status(window, cx);
+                    this.open_conflicts(window, cx);
+                    return;
+                }
                 ReviewEvent::CheckedOut => {
                     this.reload(window, cx);
                     this.refresh_status(window, cx);
@@ -645,6 +660,46 @@ impl Workspace {
         }));
     }
 
+    /// Shows the conflicts of the merge in progress.
+    fn open_conflicts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let pull_requests = Arc::new(snapshot.pull_requests.clone());
+        let (repository, reviews) = (snapshot.repository.clone(), snapshot.reviews.clone());
+        let conflicts = cx.new(|cx| Conflicts::new(repository, reviews, pull_requests, cx));
+        let subscription = cx.subscribe_in(&conflicts, window, |this, _, event, window, cx| {
+            match event {
+                ConflictsEvent::Close => this.close_conflicts(window, cx),
+                ConflictsEvent::Changed => this.refresh_status(window, cx),
+                ConflictsEvent::Finished { committed } => {
+                    window.push_notification(
+                        Notification::success(if *committed {
+                            "Merge committed"
+                        } else {
+                            "Merge aborted; everything is as it was before"
+                        }),
+                        cx,
+                    );
+                    this.close_conflicts(window, cx);
+                    // A merged pull request shows as merged.
+                    this.close_review(window, cx);
+                    this.reload(window, cx);
+                    this.refresh_status(window, cx);
+                }
+            }
+        });
+        window.focus(&conflicts.focus_handle(cx), cx);
+        self.conflicts = Some((conflicts, subscription));
+        cx.notify();
+    }
+
+    fn close_conflicts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.conflicts = None;
+        window.focus(&self.history.focus_handle(cx), cx);
+        cx.notify();
+    }
+
     fn close_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.review = None;
         window.focus(&self.history.focus_handle(cx), cx);
@@ -707,7 +762,17 @@ impl Render for Workspace {
                 repository_name: snapshot.as_ref().map(|snapshot| snapshot.name.clone()),
                 loading: self.loading.is_some(),
             })
+            .when_some(
+                snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.merge.as_ref())
+                    .filter(|_| self.conflicts.is_none()),
+                |this, merge| this.child(merge_banner(merge, cx)),
+            )
             .child(div().flex_1().min_h_0().map(|this| {
+                if let Some((conflicts, _)) = &self.conflicts {
+                    return this.child(conflicts.clone());
+                }
                 if let Some((review, _)) = &self.review {
                     return this.child(review.clone());
                 }
@@ -865,4 +930,39 @@ fn branch_label(name: &str) -> RefLabel {
         name: name.to_owned(),
         is_head: true,
     }
+}
+
+/// The strip saying a merge is waiting for its conflicts to be resolved.
+fn merge_banner(merge: &gitez_git::MergeInProgress, cx: &mut Context<Workspace>) -> Div {
+    let theirs = merge
+        .theirs_branch
+        .clone()
+        .unwrap_or_else(|| merge.theirs.to_hex_with_len(7).to_string());
+    let into = merge.branch.clone().unwrap_or_else(|| "HEAD".into());
+    div()
+        .h_flex()
+        .flex_none()
+        .gap(px(10.))
+        .px(px(16.))
+        .py(px(8.))
+        .border_b_1()
+        .border_color(rgb(color::BORDER))
+        .bg(rgb(color::SELECTED))
+        .text_size(px(12.5))
+        .child(
+            Icon::new(IconName::GitMerge)
+                .size(px(15.))
+                .text_color(rgb(color::ACCENT)),
+        )
+        .child(format!(
+            "Merging {theirs} into {into} stopped with conflicts to resolve."
+        ))
+        .child(
+            Button::new("resolve-conflicts")
+                .ml_auto()
+                .small()
+                .primary()
+                .label("Resolve conflicts")
+                .on_click(cx.listener(|this, _, window, cx| this.open_conflicts(window, cx))),
+        )
 }

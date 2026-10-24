@@ -2,7 +2,7 @@
 //! `Merge.dc.html` artboard: how the branches compare, whether they would
 //! conflict, and the ways to bring the branch in.
 
-use gitez_command::{Git, MergeMethod};
+use gitez_command::{Git, MergeMethod, MergeOutcome};
 use gitez_git::{Head, MergePreview, Oid, RefKind, RefLabel, Repository};
 use gitez_review::{PullRequest, State, Store, Timestamp};
 use gpui_kit::assets::IconName;
@@ -19,6 +19,8 @@ use crate::workspace::labels;
 pub(super) enum MergeEvent {
     /// The branch was merged and the pull request saved as merged.
     Merged(Box<PullRequest>),
+    /// The merge stopped with conflicts to resolve.
+    Stopped,
 }
 
 /// The pull request as the dialog merges it.
@@ -112,14 +114,20 @@ impl MergeDialog {
                         Some(Head::Branch { name, .. }) => Some(name),
                         _ => None,
                     };
-                    git.merge_branch(&head, &base, how, &message, return_to.as_deref())?;
-                    record_merge(&repository, &store, number, base_before)
+                    match git.merge_branch(&head, &base, how, &message, return_to.as_deref())? {
+                        MergeOutcome::Merged => {
+                            record_merge(&repository, &store, number, base_before).map(Some)
+                        }
+                        // Recorded once the merge is committed.
+                        MergeOutcome::Conflicts => Ok(None),
+                    }
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.running = None;
                 match merged {
-                    Ok(pull_request) => cx.emit(MergeEvent::Merged(Box::new(pull_request))),
+                    Ok(Some(pull_request)) => cx.emit(MergeEvent::Merged(Box::new(pull_request))),
+                    Ok(None) => cx.emit(MergeEvent::Stopped),
                     Err(error) => this.error = Some(format!("{error:#}").into()),
                 }
                 cx.notify();
@@ -127,6 +135,10 @@ impl MergeDialog {
             .ok();
         });
         cx.notify();
+    }
+
+    fn conflicts(&self) -> bool {
+        matches!(&self.preview, Some(Ok(preview)) if !preview.conflicts.is_empty())
     }
 
     fn ahead(&self) -> usize {
@@ -155,8 +167,10 @@ impl MergeDialog {
                 Some("Not possible — the branches have diverged".into())
             }
             MergeMethod::FastForward => None,
+            // The conflict editor opens to resolve them.
+            MergeMethod::Merge => None,
             _ if !preview.conflicts.is_empty() => Some(format!(
-                "Would conflict — merge {base} into the branch and resolve {} first",
+                "Would conflict — merge into {base} instead and resolve {} there",
                 if preview.conflicts.len() == 1 {
                     "it"
                 } else {
@@ -366,7 +380,11 @@ impl Render for MergeDialog {
                         MergeMethod::Merge,
                         IconName::GitMerge,
                         format!("Merge into {base}"),
-                        "Creates a merge commit.".into(),
+                        if self.conflicts() {
+                            "Creates a merge commit. The conflict editor opens next.".into()
+                        } else {
+                            "Creates a merge commit.".into()
+                        },
                         cx,
                     ))
                     .child(self.render_option(
@@ -448,10 +466,16 @@ impl Review {
         };
         let (repository, store) = (self.repository.clone(), subject.store.clone());
         let dialog = cx.new(|cx| MergeDialog::new(repository, store, merging, cx));
-        let subscription = cx.subscribe_in(&dialog, window, |this, _, event, window, cx| {
-            let MergeEvent::Merged(pull_request) = event;
-            this.merged(pull_request.as_ref().clone(), window, cx);
-        });
+        let subscription =
+            cx.subscribe_in(&dialog, window, |this, _, event, window, cx| match event {
+                MergeEvent::Merged(pull_request) => {
+                    this.merged(pull_request.as_ref().clone(), window, cx)
+                }
+                MergeEvent::Stopped => {
+                    window.close_dialog(cx);
+                    cx.emit(ReviewEvent::MergeStopped);
+                }
+            });
         if let Subject::PullRequest(subject) = &mut self.subject {
             subject.merge_dialog = Some(subscription);
         }
@@ -498,7 +522,7 @@ impl Review {
 /// Pull request `number` saved as merged into its base, which was on
 /// `base_before` until then. Its threads follow the head if a rebase moved
 /// it. Blocks; run it on a background thread.
-fn record_merge(
+pub(crate) fn record_merge(
     repository: &Repository,
     store: &Store,
     number: u32,

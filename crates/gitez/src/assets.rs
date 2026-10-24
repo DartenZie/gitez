@@ -13,9 +13,13 @@ icon_assets!(
     ExtraIcons,
     [
         Archive,
+        ArrowLeft,
         ArrowRight,
         ArrowRightToLine,
         Bot,
+        Check,
+        ChevronDown,
+        ChevronUp,
         CircleAlert,
         Cloud,
         Combine,

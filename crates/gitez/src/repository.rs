@@ -30,6 +30,8 @@ pub struct Snapshot {
     pub pull_requests_error: Option<String>,
     /// The name commits are made under, shown on review comments.
     pub user_name: Option<String>,
+    /// The merge git stopped to have conflicts resolved, if one did.
+    pub merge: Option<gitez_git::MergeInProgress>,
 }
 
 /// How a local branch compares to its upstream.
@@ -80,6 +82,9 @@ impl Snapshot {
         let reviews = Store::new(&repository.common_dir());
         let (pull_requests, pull_requests_error) = load_pull_requests(&reviews);
         let user_name = repository.user_name();
+        let merge = repository
+            .merge_in_progress()
+            .context("could not read the merge in progress")?;
 
         Ok(Self {
             name: repository.name().into(),
@@ -94,6 +99,7 @@ impl Snapshot {
             pull_requests,
             pull_requests_error,
             user_name,
+            merge,
         })
     }
 

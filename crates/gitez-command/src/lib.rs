@@ -25,6 +25,23 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// How [`Git::merge_branch`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeOutcome {
+    Merged,
+    /// The merge stopped with conflicts to resolve.
+    Conflicts,
+}
+
+/// One side of a merge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    /// The branch checked out.
+    Ours,
+    /// The branch merged in.
+    Theirs,
+}
+
 /// How [`Git::merge_branch`] brings a branch's commits into another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeMethod {
@@ -102,9 +119,12 @@ impl Git {
     }
 
     /// Brings the commits of branch `head` into branch `base` the way `how`
-    /// says, and leaves `base` checked out. When git cannot finish, because
-    /// of a conflict or a hook, everything it did is undone and
-    /// `return_to`, the branch checked out before, is checked out again.
+    /// says, and leaves `base` checked out. A merge commit that conflicts
+    /// stops with the conflicts in the working tree, to be resolved and
+    /// committed with [`Git::commit_merge`] or given up with
+    /// [`Git::abort_merge`]. Otherwise, when git cannot finish, because of a
+    /// conflict or a hook, everything it did is undone and `return_to`, the
+    /// branch checked out before, is checked out again.
     pub fn merge_branch(
         &self,
         head: &str,
@@ -112,7 +132,7 @@ impl Git {
         how: MergeMethod,
         message: &str,
         return_to: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<MergeOutcome> {
         let merged = self.merge_steps(head, base, how, message);
         if merged.is_err()
             && let Some(branch) = return_to
@@ -124,7 +144,13 @@ impl Git {
         merged
     }
 
-    fn merge_steps(&self, head: &str, base: &str, how: MergeMethod, message: &str) -> Result<()> {
+    fn merge_steps(
+        &self,
+        head: &str,
+        base: &str,
+        how: MergeMethod,
+        message: &str,
+    ) -> Result<MergeOutcome> {
         if how == MergeMethod::Rebase {
             // Checks out `head` and replays its commits on top of `base`.
             if let Err(error) = self.run(["rebase", "--quiet", base, head], None) {
@@ -134,9 +160,26 @@ impl Git {
         }
         self.switch(base)?;
         let merged = match how {
-            MergeMethod::Merge => self
-                .run(["merge", "--quiet", "--no-ff", "-m", message, head], None)
-                .map(drop),
+            MergeMethod::Merge => {
+                // With the base's lines in each conflict, to show them.
+                let merged = self.run(
+                    [
+                        "-c",
+                        "merge.conflictStyle=diff3",
+                        "merge",
+                        "--quiet",
+                        "--no-ff",
+                        "-m",
+                        message,
+                        head,
+                    ],
+                    None,
+                );
+                if merged.is_err() && !self.conflicted()?.is_empty() {
+                    return Ok(MergeOutcome::Conflicts);
+                }
+                merged.map(drop)
+            }
             MergeMethod::Squash => self
                 .run(["merge", "--quiet", "--squash", head], None)
                 .and_then(|_| self.commit(message)),
@@ -150,7 +193,50 @@ impl Git {
             // uncommitted changes were in the way, so none are lost.
             self.run(["reset", "--quiet", "--merge"], None).ok();
         }
-        merged
+        merged.map(|()| MergeOutcome::Merged)
+    }
+
+    /// The paths with unresolved conflicts, like `git diff --diff-filter=U`.
+    pub fn conflicted(&self) -> Result<Vec<String>> {
+        let output = self.run(["diff", "--name-only", "-z", "--diff-filter=U"], None)?;
+        Ok(output
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| String::from_utf8_lossy(path).into_owned())
+            .collect())
+    }
+
+    /// Resolves the conflicts in `paths` by taking one side's whole file,
+    /// like `git checkout --ours` (or `--theirs`) and `git add`. When that
+    /// side deleted the file, it is removed.
+    pub fn take_side(&self, paths: &[String], side: Side) -> Result<()> {
+        let flag = match side {
+            Side::Ours => "--ours",
+            Side::Theirs => "--theirs",
+        };
+        for path in paths {
+            let path = std::slice::from_ref(path);
+            match self.run_with_paths(["checkout", flag], path) {
+                Ok(()) => self.stage(path)?,
+                // That side has no version of it: it deleted the file.
+                Err(error) => self
+                    .run_with_paths(["rm", "--quiet"], path)
+                    .map_err(|_| error)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Commits the merge in progress with the message git prepared, once
+    /// every conflict is resolved and staged.
+    pub fn commit_merge(&self) -> Result<()> {
+        self.run(["commit", "--quiet", "--no-edit"], None).map(drop)
+    }
+
+    /// Gives up the merge in progress, like `git merge --abort`: the
+    /// working tree and index return to how they were before it.
+    pub fn abort_merge(&self) -> Result<()> {
+        self.run(["merge", "--abort"], None).map(drop)
     }
 
     /// Sets `key` in the repository's own configuration to `value`, like

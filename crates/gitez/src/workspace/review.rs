@@ -27,6 +27,8 @@ use gpui_kit::*;
 
 mod edit;
 mod merge;
+
+pub(crate) use merge::record_merge;
 mod prompt;
 mod threads;
 
@@ -63,6 +65,8 @@ pub enum ReviewEvent {
     PullRequestSaved,
     /// Another branch was checked out.
     CheckedOut,
+    /// A merge stopped with conflicts to resolve.
+    MergeStopped,
 }
 
 /// Height of one diff line.

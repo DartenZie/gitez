@@ -1367,3 +1367,56 @@ fn merge_preview_finds_the_files_that_would_conflict() {
     // Nothing was written: the merge leaves no trace.
     assert_eq!(fixture.git(&["status", "--porcelain"]), "");
 }
+
+#[test]
+fn a_merge_stopped_by_conflicts_is_read() {
+    let fixture = Fixture::new();
+    fixture.commit("shared.txt", "shared");
+    fixture.git(&["checkout", "--quiet", "-b", "feature"]);
+    std::fs::write(fixture.root.join("shared.txt"), "feature\n").expect("write");
+    fixture.git(&["commit", "--quiet", "-am", "feature edits shared"]);
+    let theirs = fixture.rev("HEAD");
+    fixture.git(&["checkout", "--quiet", "main"]);
+    std::fs::write(fixture.root.join("shared.txt"), "main\n").expect("write");
+    fixture.git(&["commit", "--quiet", "-am", "main edits shared"]);
+    let ours = fixture.rev("HEAD");
+    let repo = fixture.open();
+    assert_eq!(repo.merge_in_progress().expect("read"), None);
+
+    let merge = Command::new("git")
+        .arg("-C")
+        .arg(&fixture.root)
+        .args([
+            "-c",
+            "merge.conflictStyle=diff3",
+            "merge",
+            "--quiet",
+            "feature",
+        ])
+        .output()
+        .expect("git runs");
+    assert!(!merge.status.success(), "the merge conflicts");
+
+    let merge = repo
+        .merge_in_progress()
+        .expect("read")
+        .expect("in progress");
+    assert_eq!((merge.ours, merge.theirs), (ours, theirs));
+    assert_eq!(merge.branch.as_deref(), Some("main"));
+    assert_eq!(merge.theirs_branch.as_deref(), Some("feature"));
+    assert!(
+        merge.message.starts_with("Merge branch 'feature'"),
+        "{}",
+        merge.message
+    );
+
+    let file = repo
+        .conflict_file("shared.txt")
+        .expect("read")
+        .expect("conflicts");
+    let conflict = file.conflicts().next().expect("one conflict");
+    assert_eq!(conflict.ours, ["main"]);
+    assert_eq!(conflict.theirs, ["feature"]);
+    assert_eq!(conflict.base.as_deref(), Some(&["shared".to_owned()][..]));
+    assert_eq!(repo.conflict_file("missing.txt").expect("read"), None);
+}

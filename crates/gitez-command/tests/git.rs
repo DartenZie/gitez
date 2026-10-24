@@ -220,7 +220,7 @@ fn merges_a_branch_each_way() {
 
     let dir = diverged("feature");
     let root = dir.path();
-    Git::new(root)
+    let outcome = Git::new(root)
         .merge_branch(
             "feature",
             "main",
@@ -229,6 +229,7 @@ fn merges_a_branch_each_way() {
             Some("feature"),
         )
         .expect("merge");
+    assert_eq!(outcome, gitez_command::MergeOutcome::Merged);
     assert_eq!(git(root, &["branch", "--show-current"]), "main");
     assert_eq!(
         git(root, &["log", "-1", "--format=%B"]),
@@ -238,17 +239,19 @@ fn merges_a_branch_each_way() {
 
     let dir = diverged("feature");
     let root = dir.path();
-    Git::new(root)
+    let outcome = Git::new(root)
         .merge_branch("feature", "main", MergeMethod::Squash, "Add b", None)
         .expect("squash");
+    assert_eq!(outcome, gitez_command::MergeOutcome::Merged);
     assert_eq!(git(root, &["log", "--format=%s"]), "Add b\nc\na");
     assert_eq!(status(root), "");
 
     let dir = diverged("main");
     let root = dir.path();
-    Git::new(root)
+    let outcome = Git::new(root)
         .merge_branch("feature", "main", MergeMethod::Rebase, "", None)
         .expect("rebase");
+    assert_eq!(outcome, gitez_command::MergeOutcome::Merged);
     assert_eq!(git(root, &["log", "--format=%s"]), "b\nc\na");
     assert_eq!(
         git(root, &["rev-parse", "main"]),
@@ -275,8 +278,8 @@ fn merges_a_branch_each_way() {
 }
 
 #[test]
-fn a_conflicting_merge_is_undone() {
-    use gitez_command::MergeMethod;
+fn a_conflicting_merge_is_undone_or_left_to_resolve() {
+    use gitez_command::{MergeMethod, MergeOutcome, Side};
 
     let dir = diverged("feature");
     let root = dir.path();
@@ -288,9 +291,11 @@ fn a_conflicting_merge_is_undone() {
     git(root, &["switch", "--quiet", "feature"]);
     let main = git(root, &["rev-parse", "main"]);
     let feature = git(root, &["rev-parse", "feature"]);
+    let repo = Git::new(root);
 
-    for how in [MergeMethod::Merge, MergeMethod::Squash, MergeMethod::Rebase] {
-        let error = Git::new(root)
+    // A squash or a rebase cannot stop half way: they are undone.
+    for how in [MergeMethod::Squash, MergeMethod::Rebase] {
+        let error = repo
             .merge_branch("feature", "main", how, "Merge", Some("feature"))
             .expect_err("conflict");
         assert!(matches!(error, Error::Failed { .. }), "{how:?}: {error}");
@@ -303,6 +308,41 @@ fn a_conflicting_merge_is_undone() {
         assert_eq!(git(root, &["rev-parse", "main"]), main, "{how:?}");
         assert_eq!(git(root, &["rev-parse", "feature"]), feature, "{how:?}");
     }
+
+    // A merge commit stops on main with the conflict to resolve, in the
+    // diff3 style.
+    let outcome = repo
+        .merge_branch(
+            "feature",
+            "main",
+            MergeMethod::Merge,
+            "Merge feature",
+            Some("feature"),
+        )
+        .expect("stopped");
+    assert_eq!(outcome, MergeOutcome::Conflicts);
+    assert_eq!(git(root, &["branch", "--show-current"]), "main");
+    assert_eq!(repo.conflicted().expect("conflicted"), ["a.txt"]);
+    let text = std::fs::read_to_string(root.join("a.txt")).expect("read");
+    assert!(text.contains("|||||||"), "{text}");
+    // Given up: as before.
+    repo.abort_merge().expect("abort");
+    assert_eq!(status(root), "");
+    assert_eq!(git(root, &["rev-parse", "main"]), main);
+
+    // Resolved with theirs and committed with the prepared message.
+    repo.merge_branch("feature", "main", MergeMethod::Merge, "Merge feature", None)
+        .expect("stopped");
+    repo.take_side(&["a.txt".to_owned()], Side::Theirs)
+        .expect("theirs");
+    assert!(repo.conflicted().expect("conflicted").is_empty());
+    repo.commit_merge().expect("commit");
+    assert_eq!(git(root, &["log", "-1", "--format=%s"]), "Merge feature");
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).expect("read"),
+        "feature\n"
+    );
+    assert_eq!(status(root), "");
 }
 
 #[test]

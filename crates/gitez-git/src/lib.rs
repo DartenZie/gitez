@@ -9,6 +9,7 @@
 //! methods do blocking I/O, so call them off the UI thread.
 
 mod commits;
+mod conflict;
 mod details;
 mod diff;
 mod error;
@@ -21,6 +22,7 @@ mod status;
 mod watch;
 
 pub use commits::{Commit, CommitWalk, Order, Signature, Timestamp};
+pub use conflict::{Conflict, ConflictFile, Segment};
 pub use details::{ChangeKind, CommitDetails, FileChange, LineCounts};
 pub use diff::{
     BranchDiff, DiffContent, DiffLine, DiffOptions, FileDiff, Hunk, LineKind, LineSource, NewSide,
@@ -28,7 +30,7 @@ pub use diff::{
 };
 pub use error::{Error, Result};
 pub use follow::{ChangedLines, Followed};
-pub use merge::MergePreview;
+pub use merge::{MergeInProgress, MergePreview};
 pub use refs::{Branch, Head, RefKind, RefLabel, Refs, RemoteBranch, Stash, Tag};
 pub use repository::Repository;
 pub use status::{FileStatus, WorkingTreeStatus, WorktreeChange};
