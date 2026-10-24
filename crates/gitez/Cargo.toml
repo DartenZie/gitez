@@ -17,6 +17,7 @@ path = "src/main.rs"
 gpui-kit.workspace = true
 gitez-git.workspace = true
 anyhow.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

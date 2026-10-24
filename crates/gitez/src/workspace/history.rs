@@ -190,6 +190,72 @@ impl History {
         cx.notify();
     }
 
+    /// Reads the history of `snapshot`, a newer state of the repository on
+    /// screen, in full on a background thread and then replaces the list in
+    /// one step, keeping the selected commit and the scroll position.
+    pub fn reload(&mut self, snapshot: &Snapshot, cx: &mut Context<Self>) {
+        let repository = snapshot.repository.clone();
+        let tips = snapshot.refs.tips(true);
+        let labels = snapshot.refs.labels_by_commit();
+        let head = snapshot.refs.head.as_ref().and_then(|head| head.target());
+        self._load = Some(cx.spawn(async move |this, cx| {
+            let history = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut layout = GraphLayout::new();
+                    let commits = repository
+                        .walk(tips, Order::Date)?
+                        .collect::<gitez_git::Result<Vec<_>>>()?;
+                    let rows = commits
+                        .iter()
+                        .map(|commit| layout.push(commit.id, &commit.parents))
+                        .collect::<Vec<_>>();
+                    gitez_git::Result::Ok((commits, rows))
+                })
+                .await;
+            this.update(cx, |this, cx| match history {
+                Ok((commits, rows)) => this.replace(commits, rows, labels, head, cx),
+                Err(error) => this.fail(error, cx),
+            })
+            .ok();
+        }));
+    }
+
+    fn replace(
+        &mut self,
+        commits: Vec<Commit>,
+        rows: Vec<Row>,
+        labels: HashMap<Oid, Vec<RefLabel>>,
+        head: Option<Oid>,
+        cx: &mut Context<Self>,
+    ) {
+        let selected_commit = match self.selected {
+            Some(Entry::Commit(index)) => self.commits.get(index).map(|commit| commit.id),
+            _ => None,
+        };
+        self.lanes = rows.iter().map(|row| row.width).fold(1, usize::max);
+        self.head_index = head.and_then(|head| commits.iter().position(|commit| commit.id == head));
+        self.commits = commits;
+        self.rows = rows;
+        self.labels = labels;
+        self.head = head;
+        self.complete = true;
+        self.error = None;
+        self.now = time::now();
+        self._load = None;
+        self.set_graph_scroll(self.graph_scroll);
+        if let Some(id) = selected_commit {
+            self.selected = self
+                .commits
+                .iter()
+                .position(|commit| commit.id == id)
+                .map(Entry::Commit);
+            // Its refs may have changed, or it may be gone.
+            cx.emit(SelectionChanged);
+        }
+        cx.notify();
+    }
+
     /// Adds a batch of commits; returns whether more may follow.
     fn append(&mut self, commits: Vec<Commit>, rows: Vec<Row>, cx: &mut Context<Self>) -> bool {
         if commits.is_empty() {

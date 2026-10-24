@@ -11,8 +11,11 @@ use crate::theme::{self, color};
 /// Labels longer than this are cut short with an ellipsis, so a long branch
 /// name leaves room for the commit summary beside it.
 const MAX_LABEL_WIDTH: Pixels = px(200.);
-/// Labels shrink to this when several share a row with little space.
+/// Long labels shrink to this when several share a row with little space.
 const MIN_LABEL_WIDTH: Pixels = px(96.);
+/// Names up to this many characters fit in [`MIN_LABEL_WIDTH`]; their
+/// labels keep their natural width.
+const SHORT_NAME: usize = 12;
 
 /// A label for a branch, remote-tracking branch, tag or detached `HEAD`.
 pub fn ref_label(label: &RefLabel) -> impl IntoElement {
@@ -25,7 +28,13 @@ pub fn ref_label(label: &RefLabel) -> impl IntoElement {
     };
     let chip = div()
         .h_flex()
-        .min_w(MIN_LABEL_WIDTH)
+        .map(|this| {
+            if label.name.chars().count() <= SHORT_NAME {
+                this.flex_none()
+            } else {
+                this.min_w(MIN_LABEL_WIDTH)
+            }
+        })
         .max_w(MAX_LABEL_WIDTH)
         .h(px(20.))
         .px(px(7.))

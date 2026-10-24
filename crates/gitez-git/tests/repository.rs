@@ -6,8 +6,8 @@ use std::process::Command;
 
 use gitez_git::graph::GraphLayout;
 use gitez_git::{
-    ChangeKind, Commit, FileChange, FileStatus, Head, LineCounts, Oid, Order, RefKind, Repository,
-    WorktreeChange,
+    Affected, ChangeKind, Commit, FileChange, FileStatus, Head, LineCounts, Oid, Order, RefKind,
+    Repository, WorktreeChange,
 };
 use tempfile::TempDir;
 
@@ -394,6 +394,7 @@ fn types_can_move_to_background_threads() {
     assert_send::<gitez_git::CommitWalk>();
     assert_send_sync::<gitez_git::CommitDetails>();
     assert_send_sync::<gitez_git::WorkingTreeStatus>();
+    assert_send_sync::<gitez_git::Watcher>();
     assert_send_sync::<gitez_git::Refs>();
     assert_send_sync::<GraphLayout>();
 }
@@ -624,4 +625,82 @@ fn status_of_an_empty_repository_lists_untracked_files() {
             Some(WorktreeChange::Untracked)
         )]
     );
+}
+
+#[test]
+fn classify_tells_refs_from_working_tree_changes() {
+    let fixture = Fixture::new();
+    fixture.commit("tracked.txt", "one");
+    std::fs::write(fixture.root.join(".gitignore"), "target/\n*.log\n").expect("write");
+    std::fs::create_dir(fixture.root.join("target")).expect("mkdir");
+    let repo = fixture.open();
+    let git = fixture.root.join(".git");
+    let classify = |paths: &[PathBuf]| repo.classify(paths).expect("classify");
+    let working_tree = Affected {
+        refs: false,
+        working_tree: true,
+    };
+    let everything = Affected {
+        refs: true,
+        working_tree: true,
+    };
+
+    assert_eq!(classify(&[fixture.root.join("tracked.txt")]), working_tree);
+    assert_eq!(classify(&[fixture.root.join("new/file.txt")]), working_tree);
+    assert_eq!(classify(&[fixture.root.join(".gitignore")]), working_tree);
+    assert_eq!(classify(&[git.join("index")]), working_tree);
+    assert_eq!(classify(&[git.join("refs/heads/main")]), everything);
+    assert_eq!(classify(&[git.join("HEAD")]), everything);
+    // Losing events reports the git directory itself.
+    assert_eq!(classify(&[git.clone()]), everything);
+
+    for nothing in [
+        fixture.root.join("target/debug/build/output"),
+        fixture.root.join("target"),
+        fixture.root.join("debug.log"),
+        git.join("objects/ab/cdef"),
+        git.join("index.lock"),
+        git.join("refs/heads/main.lock"),
+        git.join("logs/HEAD"),
+        git.join("FETCH_HEAD"),
+        fixture._dir.path().join("elsewhere.txt"),
+    ] {
+        assert!(classify(&[nothing.clone()]).is_empty(), "{nothing:?}");
+    }
+    assert_eq!(
+        classify(&[
+            fixture.root.join("target/x"),
+            fixture.root.join("tracked.txt")
+        ]),
+        working_tree
+    );
+}
+
+#[test]
+fn watch_reports_changes_made_by_git() {
+    let fixture = Fixture::new();
+    fixture.commit("a.txt", "one");
+    let repo = fixture.open();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let _watcher = repo
+        .watch(move |paths| {
+            sender.send(paths).ok();
+        })
+        .expect("watch");
+    // Some backends start delivering events shortly after the watch begins.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    while receiver.try_recv().is_ok() {}
+
+    fixture.commit("a.txt", "two");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut affected = Affected::default();
+    while !affected.refs {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let paths = receiver
+            .recv_timeout(remaining)
+            .expect("a commit is reported within 5 seconds");
+        let part = repo.classify(&paths).expect("classify");
+        affected.refs |= part.refs;
+        affected.working_tree |= part.working_tree;
+    }
 }

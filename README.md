@@ -27,8 +27,9 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 > **Status:** early development. The current build opens a repository and
 > shows its history as a commit graph, with branches, remotes, tags and
 > stashes in the sidebar and the selected commit's details beside it.
-> Uncommitted changes appear as a row above the current commit and are read
-> again whenever the window gains focus. Nothing can be changed from GitEZ yet.
+> Uncommitted changes appear as a row above the current commit. Changes made
+> in an editor, a terminal or another git client show up as they happen.
+> Nothing can be changed from GitEZ yet.
 
 ## Technology
 
@@ -81,6 +82,11 @@ Performance is a primary goal: large repositories must stay smooth.
    A Vulkan-capable GPU driver is required at runtime. Both Wayland and X11 are
    supported.
 
+   GitEZ watches every directory of an open repository with inotify. In very
+   large working trees this can exceed the default watch limit; raise it with
+   `sudo sysctl fs.inotify.max_user_watches=524288` (and in
+   `/etc/sysctl.conf` to keep it after a restart).
+
 Windows support is planned but not yet available.
 
 ### Fonts (optional)
@@ -114,7 +120,8 @@ cargo test               # run tests
 Cargo.toml          workspace: dependency versions, lints, build profiles
 crates/gitez/       the application binary
 crates/gitez-git/   read-only repository access on gitoxide: refs, history, graph layout,
-                    commit messages and changed files, working-tree status
+                    commit messages and changed files, working-tree status, watching
+                    for changes
 rust-toolchain.toml pinned Rust toolchain
 CLAUDE.md           instructions for Claude Code when working in this repository
 ```

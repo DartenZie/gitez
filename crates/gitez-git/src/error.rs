@@ -15,6 +15,8 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+    #[error("could not watch the repository for changes")]
+    Watch(#[from] notify::Error),
     #[error(transparent)]
     Git(#[from] gix::Error),
 }

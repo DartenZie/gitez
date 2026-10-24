@@ -66,6 +66,11 @@ impl DetailPane {
             .as_ref()
             .is_some_and(|current| current.id == commit.id)
         {
+            // Refs may have moved to or from the commit.
+            if self.labels != labels {
+                self.labels = labels;
+                cx.notify();
+            }
             return;
         }
 

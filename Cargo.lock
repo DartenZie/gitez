@@ -2044,6 +2044,7 @@ name = "gitez"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures",
  "gitez-git",
  "gpui-kit",
  "tempfile",
@@ -2054,6 +2055,7 @@ name = "gitez-git"
 version = "0.1.0"
 dependencies = [
  "gix",
+ "notify",
  "tempfile",
  "thiserror 2.0.21",
 ]

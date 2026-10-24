@@ -11,6 +11,9 @@ mod toolbar;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
+
+use futures::StreamExt as _;
 
 use gpui_kit::component::button::*;
 use gpui_kit::component::notification::Notification;
@@ -18,7 +21,7 @@ use gpui_kit::component::{StyledExt as _, WindowExt as _, h_resizable, resizable
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use gitez_git::WorkingTreeStatus;
+use gitez_git::{Affected, Watcher, WorkingTreeStatus};
 
 use crate::repository::Snapshot;
 use crate::theme::{self, color};
@@ -29,6 +32,10 @@ use sidebar::Sidebar;
 pub use history::key_bindings as history_key_bindings;
 
 actions!(workspace, [OpenRepository]);
+
+/// How long to keep collecting file system events after the first one, so a
+/// burst (a checkout, a build) is handled once.
+const WATCH_BATCH: Duration = Duration::from_millis(150);
 
 /// The root view of a GitEZ window: one repository at a time.
 pub struct Workspace {
@@ -47,6 +54,12 @@ pub struct Workspace {
     /// The last status read error shown, so it is not repeated on every
     /// refresh.
     status_error: Option<String>,
+    /// Reports changes made outside GitEZ while the repository is open.
+    _watcher: Option<Watcher>,
+    /// Handles the watcher's reports.
+    _watch: Option<Task<()>>,
+    /// Re-reading the refs and history after they changed.
+    _reload: Option<Task<()>>,
     sidebar: Entity<Sidebar>,
     history: Entity<History>,
     detail: Entity<DetailPane>,
@@ -77,6 +90,9 @@ impl Workspace {
             status: None,
             status_load: None,
             status_error: None,
+            _watcher: None,
+            _watch: None,
+            _reload: None,
             sidebar: cx.new(|_| Sidebar::new()),
             history,
             detail: cx.new(|_| DetailPane::new()),
@@ -151,6 +167,7 @@ impl Workspace {
 
     fn show(&mut self, snapshot: Arc<Snapshot>, window: &mut Window, cx: &mut Context<Self>) {
         window.set_window_title(&format!("{} — GitEZ", snapshot.name));
+        self.watch(&snapshot, window, cx);
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.set_snapshot(snapshot.clone(), cx));
         self.history
@@ -162,6 +179,111 @@ impl Workspace {
         self.status_error = None;
         self.refresh_status(window, cx);
         cx.notify();
+    }
+
+    /// Starts watching the repository of `snapshot` for changes made outside
+    /// GitEZ, replacing any earlier watch.
+    fn watch(&mut self, snapshot: &Snapshot, window: &mut Window, cx: &mut Context<Self>) {
+        self._watcher = None;
+        let (sender, mut changes) = futures::channel::mpsc::unbounded::<Vec<PathBuf>>();
+        let repository = snapshot.repository.clone();
+        // Watching a large tree recursively can take a while on Linux.
+        let start = cx.background_executor().spawn(async move {
+            repository.watch(move |paths| {
+                sender.unbounded_send(paths).ok();
+            })
+        });
+        let repository = snapshot.repository.clone();
+        self._watch = Some(cx.spawn_in(window, async move |this, cx| {
+            match start.await {
+                Ok(watcher) => {
+                    if this.update(cx, |this, _| this._watcher = Some(watcher)).is_err() {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    this.update_in(cx, |_, window, cx| {
+                        window.push_notification(
+                            Notification::warning(format!(
+                                "Changes made outside GitEZ appear only when its window is focused again: {:#}",
+                                anyhow::Error::from(error)
+                            )),
+                            cx,
+                        );
+                    })
+                    .ok();
+                    return;
+                }
+            }
+            while let Some(mut paths) = changes.next().await {
+                cx.background_executor().timer(WATCH_BATCH).await;
+                while let Ok(more) = changes.try_recv() {
+                    paths.extend(more);
+                }
+                let repository = repository.clone();
+                let affected = cx
+                    .background_executor()
+                    .spawn(async move { repository.classify(&paths) })
+                    .await
+                    // Unsure what changed: read everything again.
+                    .unwrap_or(Affected {
+                        refs: true,
+                        working_tree: true,
+                    });
+                if affected.is_empty() {
+                    continue;
+                }
+                let updated = this.update_in(cx, |this, window, cx| {
+                    if affected.refs {
+                        this.reload(window, cx);
+                    } else {
+                        this.refresh_status(window, cx);
+                    }
+                });
+                if updated.is_err() {
+                    return;
+                }
+            }
+        }));
+    }
+
+    /// Reads the refs and history of the open repository again, keeping the
+    /// selection and scroll position, then the status.
+    fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.snapshot.as_ref().map(|snapshot| snapshot.path.clone()) else {
+            return;
+        };
+        let load = cx.background_executor().spawn({
+            let path = path.clone();
+            async move { Snapshot::load(&path) }
+        });
+        self._reload = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = load.await;
+            this.update_in(cx, |this, window, cx| {
+                this._reload = None;
+                if this
+                    .snapshot
+                    .as_ref()
+                    .is_none_or(|snapshot| snapshot.path != path)
+                {
+                    return;
+                }
+                match result {
+                    Ok(snapshot) => {
+                        let snapshot = Arc::new(snapshot);
+                        this.sidebar
+                            .update(cx, |sidebar, cx| sidebar.set_snapshot(snapshot.clone(), cx));
+                        this.history
+                            .update(cx, |history, cx| history.reload(&snapshot, cx));
+                        this.snapshot = Some(snapshot);
+                        this.refresh_status(window, cx);
+                        cx.notify();
+                    }
+                    Err(error) => this.show_error(error, window, cx),
+                }
+            })
+            .ok();
+        }));
     }
 
     /// Reads the working tree's status on a background thread.

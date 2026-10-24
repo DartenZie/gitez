@@ -24,6 +24,11 @@ thiserror = "2"
 # Read-only git access (writes go through the git CLI, see CLAUDE.md).
 gix = { version = "0.90", default-features = false, features = ["max-performance", "revision", "blob-diff", "status", "sha1"] }
 
+# File system events, for noticing changes made outside GitEZ.
+notify = "8"
+# Channels between GPUI's executors and other threads.
+futures = "0.3"
+
 tempfile = "3"
 
 gitez-git = { path = "crates/gitez-git" }
