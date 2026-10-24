@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use gitez_git::graph::GraphLayout;
-use gitez_git::{Commit, Head, Oid, Order, RefKind, Repository};
+use gitez_git::{
+    ChangeKind, Commit, FileChange, Head, LineCounts, Oid, Order, RefKind, Repository,
+};
 use tempfile::TempDir;
 
 /// A scratch repository driven through the git CLI.
@@ -389,6 +391,122 @@ fn types_can_move_to_background_threads() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Repository>();
     assert_send::<gitez_git::CommitWalk>();
+    assert_send_sync::<gitez_git::CommitDetails>();
     assert_send_sync::<gitez_git::Refs>();
     assert_send_sync::<GraphLayout>();
+}
+
+#[test]
+fn details_list_changed_files_against_the_first_parent() {
+    let fixture = Fixture::new();
+    let write = |path: &str, contents: &[u8]| {
+        std::fs::write(fixture.root.join(path), contents).expect("write file");
+    };
+    write("notes.txt", b"one\ntwo\nthree\n");
+    write("image.bin", b"\x00\x01\x02binary");
+    write(
+        "old-name.txt",
+        b"a file that keeps its content\nacross a rename\n",
+    );
+    fixture.git(&["add", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "Add files"]);
+    let root = fixture.rev("HEAD");
+
+    write("notes.txt", b"one\n2\nthree\nfour\n");
+    fixture.git(&["rm", "--quiet", "image.bin"]);
+    fixture.git(&["mv", "old-name.txt", "new-name.txt"]);
+    fixture.git(&["add", "."]);
+    fixture.git(&[
+        "commit",
+        "--quiet",
+        "-m",
+        "Edit, delete and rename\n\nThe body explains why.\nOver two lines.\n",
+    ]);
+    let head = fixture.rev("HEAD");
+
+    let repo = fixture.open();
+    let details = repo.commit_details(head).expect("read details");
+    assert_eq!(details.body, "The body explains why.\nOver two lines.");
+    assert_eq!(details.committer.name, "Ada Lovelace");
+    assert!(!details.signed);
+    assert_eq!(
+        details.files,
+        vec![
+            FileChange {
+                path: "image.bin".to_owned(),
+                kind: ChangeKind::Deleted,
+                lines: None,
+            },
+            FileChange {
+                path: "new-name.txt".to_owned(),
+                kind: ChangeKind::Renamed {
+                    from: "old-name.txt".to_owned()
+                },
+                lines: Some(LineCounts::default()),
+            },
+            FileChange {
+                path: "notes.txt".to_owned(),
+                kind: ChangeKind::Modified,
+                lines: Some(LineCounts {
+                    added: 2,
+                    removed: 1
+                }),
+            },
+        ]
+    );
+    assert_eq!(details.line_totals(), (2, 1));
+
+    let details = repo.commit_details(root).expect("read root details");
+    assert_eq!(details.body, "");
+    let added: Vec<_> = details
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), &file.kind, file.lines))
+        .collect();
+    assert_eq!(
+        added,
+        [
+            ("image.bin", &ChangeKind::Added, None),
+            (
+                "notes.txt",
+                &ChangeKind::Added,
+                Some(LineCounts {
+                    added: 3,
+                    removed: 0
+                })
+            ),
+            (
+                "old-name.txt",
+                &ChangeKind::Added,
+                Some(LineCounts {
+                    added: 2,
+                    removed: 0
+                })
+            ),
+        ]
+    );
+}
+
+#[test]
+fn details_of_a_shallow_boundary_compare_with_nothing() {
+    let (upstream, _) = branchy();
+    let parent = upstream.root.parent().expect("temp dir").to_owned();
+    let url = format!("file://{}", upstream.root.display());
+    git_in(
+        &parent,
+        &["clone", "--quiet", "--depth", "1", &url, "shallow"],
+        1_700_000_000,
+    );
+    let repo = Repository::open(parent.join("shallow")).expect("open shallow clone");
+    let [boundary] = &walk_all(&repo, Order::Date)[..] else {
+        panic!("a depth-1 clone has one commit");
+    };
+    let details = repo.commit_details(boundary.id).expect("read details");
+    assert!(
+        details
+            .files
+            .iter()
+            .all(|file| file.kind == ChangeKind::Added)
+    );
+    assert!(!details.files.is_empty());
 }

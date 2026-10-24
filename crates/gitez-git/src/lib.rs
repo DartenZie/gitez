@@ -9,12 +9,14 @@
 //! methods do blocking I/O, so call them off the UI thread.
 
 mod commits;
+mod details;
 mod error;
 pub mod graph;
 mod refs;
 mod repository;
 
 pub use commits::{Commit, CommitWalk, Order, Signature, Timestamp};
+pub use details::{ChangeKind, CommitDetails, FileChange, LineCounts};
 pub use error::{Error, Result};
 pub use refs::{Branch, Head, RefKind, RefLabel, Refs, RemoteBranch, Stash, Tag};
 pub use repository::Repository;

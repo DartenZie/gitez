@@ -20,7 +20,7 @@ use gpui_kit::*;
 
 use crate::repository::Snapshot;
 use crate::theme::{self, color};
-use detail::CommitDetail;
+use detail::DetailPane;
 use history::History;
 use sidebar::Sidebar;
 
@@ -40,6 +40,7 @@ pub struct Workspace {
     error: Option<SharedString>,
     sidebar: Entity<Sidebar>,
     history: Entity<History>,
+    detail: Entity<DetailPane>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -50,7 +51,7 @@ impl Workspace {
         window.focus(&focus_handle, cx);
         let history = cx.new(History::new);
         // The detail pane shows the selected commit.
-        let subscriptions = vec![cx.subscribe(&history, |_, _, _, cx| cx.notify())];
+        let subscriptions = vec![cx.subscribe(&history, |this, _, _, cx| this.show_selection(cx))];
         let mut workspace = Self {
             focus_handle,
             snapshot: None,
@@ -58,6 +59,7 @@ impl Workspace {
             error: None,
             sidebar: cx.new(|_| Sidebar::new()),
             history,
+            detail: cx.new(|_| DetailPane::new()),
             _subscriptions: subscriptions,
         };
         if let Some(path) = path {
@@ -139,6 +141,21 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Shows the commit selected in the history in the detail pane.
+    fn show_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let selection = self
+            .history
+            .read(cx)
+            .selected()
+            .map(|(commit, labels)| (commit.clone(), labels.to_vec()));
+        self.detail.update(cx, |detail, cx| {
+            detail.show(&snapshot.repository, selection, cx)
+        });
+    }
+
     fn show_error(&mut self, error: anyhow::Error, window: &mut Window, cx: &mut Context<Self>) {
         let message: SharedString = format!("{error:#}").into();
         if self.snapshot.is_some() {
@@ -189,7 +206,21 @@ impl Render for Workspace {
                                 .size(px(360.))
                                 .size_range(px(280.)..px(560.))
                                 .fixed()
-                                .child(self.render_detail(cx)),
+                                .map(|panel| {
+                                    if snapshot.is_some() {
+                                        panel.child(self.detail.clone())
+                                    } else {
+                                        panel.child(
+                                            div().v_flex().size_full().bg(rgb(color::PANEL)).child(
+                                                empty_state(
+                                                    "No commit selected",
+                                                    "Commit details appear here once a repository is open.",
+                                                    None::<Button>,
+                                                ),
+                                            ),
+                                        )
+                                    }
+                                }),
                         ),
                 ),
             )
@@ -225,30 +256,6 @@ impl Workspace {
             Some(open_button("open-repository", "Open repository…")),
         )
         .into_any_element()
-    }
-
-    /// Details of the selected commit.
-    fn render_detail(&self, cx: &App) -> impl IntoElement {
-        let selected = self
-            .snapshot
-            .as_ref()
-            .and_then(|_| self.history.read(cx).selected())
-            .map(|(commit, labels)| CommitDetail {
-                commit: commit.clone(),
-                labels: labels.to_vec(),
-            });
-        let pane = div().v_flex().size_full().bg(rgb(color::PANEL));
-        match selected {
-            Some(detail) => pane.child(detail),
-            None => {
-                let detail = if self.snapshot.is_some() {
-                    "Select a commit to see its details."
-                } else {
-                    "Commit details appear here once a repository is open."
-                };
-                pane.child(empty_state("No commit selected", detail, None::<Button>))
-            }
-        }
     }
 }
 

@@ -1,4 +1,5 @@
-//! Times reading refs, walking the whole history and laying out the graph.
+//! Times reading refs, walking the whole history, laying out the graph and
+//! reading the details (message and changed files) of the newest commits.
 //!
 //! ```sh
 //! cargo run --release -p gitez-git --example history -- <repository>
@@ -29,6 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let first = walk.next_batch(200)?;
     let first_batch = start.elapsed();
 
+    let newest: Vec<_> = first.iter().map(|commit| commit.id).collect();
     let mut layout = GraphLayout::new();
     let mut commits = 0;
     let mut max_width = 0;
@@ -44,5 +46,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "history: {commits} commits, first 200 in {first_batch:?}, all in {:?}, widest row {max_width} lanes",
         start.elapsed()
     );
+
+    let mut slowest = (Default::default(), newest.first().copied());
+    let mut files = 0;
+    let start = Instant::now();
+    for &id in &newest {
+        let started = Instant::now();
+        files += repo.commit_details(id)?.files.len();
+        let elapsed = started.elapsed();
+        if elapsed > slowest.0 {
+            slowest = (elapsed, Some(id));
+        }
+    }
+    if let (elapsed, Some(id)) = slowest {
+        println!(
+            "details: {} commits, {files} changed files in {:?}, slowest {id} in {elapsed:?}",
+            newest.len(),
+            start.elapsed()
+        );
+    }
     Ok(())
 }
