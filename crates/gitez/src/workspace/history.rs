@@ -1,5 +1,5 @@
 //! The commit history: every commit reachable from a ref, newest first, with
-//! its graph, labels, author, date and SHA, in a virtual list.
+//! its graph, labels, author and date, in a virtual list.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -45,10 +45,10 @@ mod columns {
     use gpui_kit::{Pixels, px};
 
     pub const GRAPH_MIN: Pixels = px(112.);
-    pub const GRAPH_MAX: Pixels = px(360.);
+    /// About ten lanes; wider graphs scroll sideways.
+    pub const GRAPH_MAX: Pixels = px(240.);
     pub const AUTHOR: Pixels = px(150.);
     pub const DATE: Pixels = px(96.);
-    pub const SHA: Pixels = px(70.);
     pub const GAP: Pixels = px(12.);
     pub const END_PADDING: Pixels = px(14.);
 }
@@ -65,6 +65,8 @@ pub struct History {
     rows: Vec<Row>,
     /// The widest row so far, in lanes.
     lanes: usize,
+    /// How far the graph is scrolled to the left, when wider than its column.
+    graph_scroll: Pixels,
     labels: HashMap<Oid, Vec<RefLabel>>,
     head: Option<Oid>,
     selected: Option<usize>,
@@ -87,6 +89,7 @@ impl History {
             commits: Vec::new(),
             rows: Vec::new(),
             lanes: 1,
+            graph_scroll: px(0.),
             labels: HashMap::new(),
             head: None,
             selected: None,
@@ -211,6 +214,10 @@ impl History {
         if self.selected != Some(index) {
             self.selected = Some(index);
             self.scroll.scroll_to_item(index, ScrollStrategy::Nearest);
+            if let Some(row) = self.rows.get(index) {
+                let scroll = graph::scroll_to_lane(row.lane, self.graph_scroll, self.graph_width());
+                self.set_graph_scroll(scroll);
+            }
             cx.emit(SelectionChanged);
             cx.notify();
         }
@@ -238,21 +245,56 @@ impl History {
         graph::column_width(self.lanes, columns::GRAPH_MIN, columns::GRAPH_MAX)
     }
 
+    /// How far the graph can scroll: zero when it fits its column.
+    fn max_graph_scroll(&self) -> Pixels {
+        (graph::content_width(self.lanes) - self.graph_width()).max(px(0.))
+    }
+
+    fn set_graph_scroll(&mut self, scroll: Pixels) -> bool {
+        let scroll = scroll.clamp(px(0.), self.max_graph_scroll());
+        let changed = scroll != self.graph_scroll;
+        self.graph_scroll = scroll;
+        changed
+    }
+
+    /// Scrolls the graph sideways on a horizontal scroll, or a vertical one
+    /// with Shift held, over the graph column. Other scrolls go to the list.
+    fn scroll_graph(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let delta = event.delta.pixel_delta(window.line_height());
+        let sideways = if event.modifiers.shift && delta.x == px(0.) {
+            delta.y
+        } else if delta.x.abs() > delta.y.abs() {
+            delta.x
+        } else {
+            return;
+        };
+        cx.stop_propagation();
+        if self.set_graph_scroll(self.graph_scroll - sideways) {
+            cx.notify();
+        }
+    }
+
     fn render_rows(&self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let graph_width = self.graph_width();
-        let mono = cx.theme().mono_font_family.clone();
         range
             .filter_map(|index| {
                 let commit = self.commits.get(index)?;
                 let row = self.rows.get(index)?;
                 let selected = self.selected == Some(index);
                 let labels = self.labels.get(&commit.id);
-                let sha = commit.id.to_hex_with_len(7).to_string();
 
                 Some(
                     div()
                         .id(index)
                         .h_flex()
+                        // Rows are laid out on their own and would otherwise
+                        // be as wide as their content, misaligning the columns.
+                        .w_full()
                         .h(ROW_HEIGHT)
                         .pr(columns::END_PADDING)
                         .gap(columns::GAP)
@@ -269,11 +311,18 @@ impl History {
                             window.focus(&this.focus_handle, cx);
                             this.select(index, cx);
                         }))
-                        .child(graph::cell(
-                            row.clone(),
-                            self.is_head(commit.id),
-                            graph_width,
-                        ))
+                        .child(
+                            div()
+                                .h_full()
+                                .flex_none()
+                                .on_scroll_wheel(cx.listener(Self::scroll_graph))
+                                .child(graph::cell(
+                                    row.clone(),
+                                    self.is_head(commit.id),
+                                    graph_width,
+                                    self.graph_scroll,
+                                )),
+                        )
                         .child(
                             div()
                                 .h_flex()
@@ -319,19 +368,39 @@ impl History {
                                 .whitespace_nowrap()
                                 .child(time::relative(commit.author.time, self.now)),
                         )
-                        .child(
-                            div()
-                                .w(columns::SHA)
-                                .flex_none()
-                                .font_family(mono.clone())
-                                .text_size(theme::SMALL_TEXT_SIZE)
-                                .text_color(rgb(color::TEXT_MUTED))
-                                .child(sha),
-                        )
                         .into_any_element(),
                 )
             })
             .collect()
+    }
+}
+
+impl History {
+    /// The "GRAPH" heading, with a scroll indicator along its bottom edge
+    /// when the graph is wider than its column.
+    fn render_graph_heading(&self) -> impl IntoElement {
+        let width = self.graph_width();
+        let content = graph::content_width(self.lanes);
+        div()
+            .relative()
+            .h_full()
+            .h_flex()
+            .w(width)
+            .flex_none()
+            .pl(px(14.))
+            .child("GRAPH")
+            .when(self.max_graph_scroll() > px(0.), |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .bottom(px(2.))
+                        .left(width * (self.graph_scroll / content))
+                        .w(width * (width / content))
+                        .h(px(3.))
+                        .rounded_full()
+                        .bg(theme::with_alpha(color::TEXT_FAINT, 0.5)),
+                )
+            })
     }
 }
 
@@ -432,11 +501,10 @@ impl Render for History {
                     .text_size(px(11.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(color::TEXT_FAINT))
-                    .child(column(self.graph_width(), "GRAPH").pl(px(14.)))
+                    .child(self.render_graph_heading())
                     .child(div().flex_1().min_w_0().child("DESCRIPTION"))
                     .child(column(columns::AUTHOR, "AUTHOR"))
-                    .child(column(columns::DATE, "DATE"))
-                    .child(column(columns::SHA, "SHA")),
+                    .child(column(columns::DATE, "DATE")),
             )
             .child(body)
     }

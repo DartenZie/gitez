@@ -23,21 +23,39 @@ const NODE_RADIUS: Pixels = px(6.);
 const HEAD_RING_RADIUS: Pixels = px(10.);
 const HEAD_RING_WIDTH: Pixels = px(2.);
 
-/// Width of the graph column for a graph `lanes` lanes wide, kept between
-/// `min` and `max`. Lanes past `max` are clipped.
-pub fn column_width(lanes: usize, min: Pixels, max: Pixels) -> Pixels {
-    let needed = FIRST_LANE + LANE_WIDTH * lanes.saturating_sub(1) as f32 + TRAILING;
-    needed.max(min).min(max)
+/// Width needed to show a graph `lanes` lanes wide in full.
+pub fn content_width(lanes: usize) -> Pixels {
+    FIRST_LANE + LANE_WIDTH * lanes.saturating_sub(1) as f32 + TRAILING
 }
 
-/// An element that paints `row` across its bounds. `is_head` adds the ring
-/// that marks the commit `HEAD` points at.
-pub fn cell(row: Row, is_head: bool, width: Pixels) -> impl IntoElement {
+/// Width of the graph column for a graph `lanes` lanes wide, kept between
+/// `min` and `max`. A wider graph scrolls within the column.
+pub fn column_width(lanes: usize, min: Pixels, max: Pixels) -> Pixels {
+    content_width(lanes).max(min).min(max)
+}
+
+/// The horizontal scroll that brings `lane` into a column `width` wide,
+/// starting from `scroll`. Leaves `scroll` alone if the lane is visible.
+pub fn scroll_to_lane(lane: usize, scroll: Pixels, width: Pixels) -> Pixels {
+    let centre = FIRST_LANE + LANE_WIDTH * lane as f32;
+    if centre - FIRST_LANE < scroll {
+        centre - FIRST_LANE
+    } else if centre + TRAILING > scroll + width {
+        centre + TRAILING - width
+    } else {
+        scroll
+    }
+}
+
+/// An element that paints `row` across its bounds, with the graph moved
+/// `scroll` to the left. `is_head` adds the ring that marks the commit `HEAD`
+/// points at.
+pub fn cell(row: Row, is_head: bool, width: Pixels, scroll: Pixels) -> impl IntoElement {
     canvas(
         |_, _, _| {},
         move |bounds, _, window, _| {
             window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                paint_row(&row, is_head, bounds, window);
+                paint_row(&row, is_head, bounds, scroll, window);
             });
         },
     )
@@ -46,11 +64,17 @@ pub fn cell(row: Row, is_head: bool, width: Pixels) -> impl IntoElement {
     .flex_none()
 }
 
-fn paint_row(row: &Row, is_head: bool, bounds: Bounds<Pixels>, window: &mut Window) {
+fn paint_row(
+    row: &Row,
+    is_head: bool,
+    bounds: Bounds<Pixels>,
+    scroll: Pixels,
+    window: &mut Window,
+) {
     let top = bounds.top();
     let bottom = bounds.bottom();
     let middle = bounds.center().y;
-    let x = |lane: usize| bounds.left() + FIRST_LANE + LANE_WIDTH * lane as f32;
+    let x = |lane: usize| bounds.left() - scroll + FIRST_LANE + LANE_WIDTH * lane as f32;
     let node = point(x(row.lane), middle);
 
     for segment in &row.segments {
@@ -111,7 +135,7 @@ fn curve(from: Point<Pixels>, to: Point<Pixels>) -> Option<Path<Pixels>> {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: it brings in GPUI's `test` macro, which shadows Rust's.
-    use super::column_width;
+    use super::{column_width, scroll_to_lane};
     use gpui_kit::px;
 
     #[test]
@@ -121,5 +145,17 @@ mod tests {
         assert_eq!(column_width(4, min, max), min);
         assert_eq!(column_width(5, min, max), px(18. + 4. * 22. + 14.));
         assert_eq!(column_width(100, min, max), max);
+    }
+
+    #[test]
+    fn scrolling_to_a_lane_moves_only_as_far_as_needed() {
+        let width = px(120.);
+        // Lane 2 (centre 62) is visible unscrolled.
+        assert_eq!(scroll_to_lane(2, px(0.), width), px(0.));
+        // Lane 10 (centre 238) needs its trailing space in view.
+        assert_eq!(scroll_to_lane(10, px(0.), width), px(238. + 14. - 120.));
+        // Back to lane 1 (centre 40) from far right.
+        assert_eq!(scroll_to_lane(1, px(200.), width), px(22.));
+        assert_eq!(scroll_to_lane(0, px(200.), width), px(0.));
     }
 }
