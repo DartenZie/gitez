@@ -29,8 +29,10 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 > stashes in the sidebar and the selected commit's details beside it. Press
 > Enter or double-click a commit to review its full diff, file by file; `[`
 > and `]` step to the newer and older commit, Esc goes back. Uncommitted
-> changes appear as a row above the current commit. Changes made
-> in an editor, a terminal or another git client show up as they happen.
+> changes appear as a row above the current commit; open it the same way to
+> review them, with each file marked staged, partly staged or untracked.
+> Changes made in an editor, a terminal or another git client show up as
+> they happen, in the open review too.
 > Nothing can be changed from GitEZ yet.
 
 ## Technology

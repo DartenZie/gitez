@@ -127,14 +127,16 @@ impl Render for DetailPane {
         let pane = div().v_flex().size_full().bg(rgb(color::PANEL));
         let mono = cx.theme().mono_font_family.clone();
         if let Some(status) = &self.working_tree {
-            return pane.child(
-                div()
-                    .id("working-tree-detail")
-                    .v_flex()
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .child(working_tree(status, mono)),
-            );
+            return pane
+                .child(
+                    div()
+                        .id("working-tree-detail")
+                        .v_flex()
+                        .flex_1()
+                        .overflow_y_scroll()
+                        .child(working_tree(status, mono)),
+                )
+                .when(!status.is_clean(), |this| this.child(review_footer()));
         }
         let Some(commit) = &self.commit else {
             return pane.child(
@@ -193,7 +195,8 @@ impl Render for DetailPane {
     }
 }
 
-/// "Review all changes", which opens the selected commit's diff.
+/// "Review all changes", which opens the diff of the selected commit or of
+/// the uncommitted changes.
 fn review_footer() -> impl IntoElement {
     let enter = Keystroke::parse("enter").expect("enter is a valid keystroke");
     div()

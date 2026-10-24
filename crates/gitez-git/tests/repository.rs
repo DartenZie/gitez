@@ -826,3 +826,52 @@ fn diff_shows_a_missing_newline_at_end_of_file() {
         ]
     );
 }
+
+#[test]
+fn working_tree_diff_compares_head_with_the_files_on_disk() {
+    let fixture = Fixture::new();
+    fixture.commit("edited.txt", "one");
+    fixture.commit("removed.txt", "gone");
+    fixture.commit("old-name.txt", "a line long enough for rename detection");
+
+    // Staged and unstaged edits to one file show as one diff against HEAD.
+    std::fs::write(fixture.root.join("edited.txt"), "one\ntwo\n").expect("write");
+    fixture.git(&["add", "edited.txt"]);
+    std::fs::write(fixture.root.join("edited.txt"), "one\ntwo\nthree\n").expect("write");
+    std::fs::remove_file(fixture.root.join("removed.txt")).expect("remove");
+    fixture.git(&["mv", "old-name.txt", "new-name.txt"]);
+    std::fs::write(
+        fixture.root.join("new-name.txt"),
+        "a line long enough for rename detection\nand one more\n",
+    )
+    .expect("write");
+    std::fs::write(fixture.root.join("untracked.txt"), "fresh\n").expect("write");
+
+    let diffs = fixture.open().working_tree_diff().expect("diff");
+    let summary: Vec<(&str, &ChangeKind, Option<(usize, usize)>)> = diffs
+        .iter()
+        .map(|diff| {
+            (
+                diff.path.as_str(),
+                &diff.kind,
+                diff.line_counts()
+                    .map(|counts| (counts.added, counts.removed)),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("edited.txt", &ChangeKind::Modified, Some((2, 0))),
+            (
+                "new-name.txt",
+                &ChangeKind::Renamed {
+                    from: "old-name.txt".to_owned()
+                },
+                Some((1, 0))
+            ),
+            ("removed.txt", &ChangeKind::Deleted, Some((0, 1))),
+            ("untracked.txt", &ChangeKind::Added, Some((1, 0))),
+        ]
+    );
+}

@@ -1,11 +1,12 @@
-//! Reviewing one commit: its message, then the diff of every file it changed,
-//! one after another, as in the `Commit.dc.html` artboard.
+//! Reviewing one commit, or the uncommitted changes: the commit's message,
+//! then the diff of every changed file, one after another, as in the
+//! `Commit.dc.html` artboard.
 
 use std::sync::Arc;
 
 use gitez_git::{
-    ChangeKind, Commit, CommitDetails, DiffContent, DiffLine, FileDiff, LineKind, RefLabel,
-    Repository,
+    ChangeKind, Commit, CommitDetails, DiffContent, DiffLine, FileDiff, FileStatus, LineKind,
+    RefKind, RefLabel, Repository, WorkingTreeStatus, WorktreeChange,
 };
 use gpui_kit::component::button::*;
 use gpui_kit::component::*;
@@ -77,14 +78,28 @@ impl Row {
     }
 }
 
-pub struct Review {
-    focus_handle: FocusHandle,
+/// What is being reviewed.
+enum Subject {
+    Commit(Box<CommitSubject>),
+    WorkingTree {
+        status: Arc<WorkingTreeStatus>,
+        /// The branch `HEAD` is on, or the detached `HEAD`.
+        head: Option<RefLabel>,
+    },
+}
+
+struct CommitSubject {
     commit: Commit,
     labels: Vec<RefLabel>,
     /// The commits before and after this one in the history, if any.
     newer: Option<Commit>,
     older: Option<Commit>,
     details: Option<Arc<CommitDetails>>,
+}
+
+pub struct Review {
+    focus_handle: FocusHandle,
+    subject: Subject,
     /// `None` while reading.
     files: Option<Result<Arc<Vec<FileDiff>>, SharedString>>,
     rows: Vec<Row>,
@@ -100,20 +115,13 @@ impl EventEmitter<ReviewEvent> for Review {}
 
 impl Review {
     /// Reviews `commit` of `repository`, reading its diff in the background.
-    pub fn new(
+    pub fn commit(
         repository: &Repository,
         commit: Commit,
         labels: Vec<RefLabel>,
         (newer, older): (Option<Commit>, Option<Commit>),
         cx: &mut Context<Self>,
     ) -> Self {
-        let list = ListState::new(0, ListAlignment::Top, OVERDRAW);
-        let this = cx.entity().downgrade();
-        list.set_scroll_handler(move |event, _, cx| {
-            let first = event.visible_range.start;
-            this.update(cx, |this, cx| this.scrolled_to(first, cx)).ok();
-        });
-
         let repository = repository.clone();
         let id = commit.id;
         let load = cx.spawn(async move |this, cx| {
@@ -121,17 +129,46 @@ impl Review {
                 .background_executor()
                 .spawn(async move { (repository.commit_details(id), repository.commit_diff(id)) })
                 .await;
-            this.update(cx, |this, cx| this.finish(details.ok(), files, cx))
-                .ok();
+            this.update(cx, |this, cx| {
+                if let Subject::Commit(subject) = &mut this.subject {
+                    subject.details = details.ok().map(Arc::new);
+                }
+                this.finish(files, cx);
+            })
+            .ok();
         });
-
-        Self {
-            focus_handle: cx.focus_handle(),
+        let subject = Subject::Commit(Box::new(CommitSubject {
             commit,
             labels,
             newer,
             older,
             details: None,
+        }));
+        Self::with_subject(subject, load, cx)
+    }
+
+    /// Reviews the uncommitted changes of `repository`, which has `status`,
+    /// reading their diff in the background.
+    pub fn working_tree(
+        repository: &Repository,
+        status: Arc<WorkingTreeStatus>,
+        head: Option<RefLabel>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let load = Self::load_working_tree(repository, cx);
+        Self::with_subject(Subject::WorkingTree { status, head }, load, cx)
+    }
+
+    fn with_subject(subject: Subject, load: Task<()>, cx: &mut Context<Self>) -> Self {
+        let list = ListState::new(0, ListAlignment::Top, OVERDRAW);
+        let this = cx.entity().downgrade();
+        list.set_scroll_handler(move |event, _, cx| {
+            let first = event.visible_range.start;
+            this.update(cx, |this, cx| this.scrolled_to(first, cx)).ok();
+        });
+        Self {
+            focus_handle: cx.focus_handle(),
+            subject,
             files: None,
             rows: Vec::new(),
             file_rows: Vec::new(),
@@ -141,17 +178,61 @@ impl Review {
         }
     }
 
-    fn finish(
+    fn load_working_tree(repository: &Repository, cx: &mut Context<Self>) -> Task<()> {
+        let repository = repository.clone();
+        cx.spawn(async move |this, cx| {
+            let files = cx
+                .background_executor()
+                .spawn(async move { repository.working_tree_diff() })
+                .await;
+            this.update(cx, |this, cx| this.finish(files, cx)).ok();
+        })
+    }
+
+    /// Shows the uncommitted changes again after they changed to `status`,
+    /// keeping the scroll position. Does nothing when reviewing a commit.
+    pub fn refresh_working_tree(
         &mut self,
-        details: Option<CommitDetails>,
-        files: gitez_git::Result<Vec<FileDiff>>,
+        repository: &Repository,
+        status: Arc<WorkingTreeStatus>,
         cx: &mut Context<Self>,
     ) {
-        self.details = details.map(Arc::new);
+        let Subject::WorkingTree { status: shown, .. } = &mut self.subject else {
+            return;
+        };
+        *shown = status;
+        self._load = Self::load_working_tree(repository, cx);
+        cx.notify();
+    }
+
+    fn finish(&mut self, files: gitez_git::Result<Vec<FileDiff>>, cx: &mut Context<Self>) {
         match files {
             Ok(files) => {
+                if matches!(&self.files, Some(Ok(shown)) if **shown == files) {
+                    return;
+                }
+                let anchor = self.scroll_anchor();
                 (self.rows, self.file_rows) = rows(&files);
                 self.list.reset(self.rows.len());
+                if let Some((path, row, offset_in_item)) = anchor
+                    && let Some(file) = files.iter().position(|file| file.path == path)
+                {
+                    // The same row of the same file, or the file's last row
+                    // if it got shorter.
+                    let end = self
+                        .file_rows
+                        .get(file + 1)
+                        .copied()
+                        .unwrap_or(self.rows.len());
+                    let item_ix = (self.file_rows[file] + row).min(end.saturating_sub(1));
+                    self.list.scroll_to(ListOffset {
+                        item_ix,
+                        offset_in_item,
+                    });
+                    self.current_file = file;
+                } else {
+                    self.current_file = 0;
+                }
                 self.files = Some(Ok(Arc::new(files)));
             }
             Err(error) => {
@@ -163,6 +244,21 @@ impl Review {
             }
         }
         cx.notify();
+    }
+
+    /// The file at the top of the list, the row within it and the offset
+    /// into that row.
+    fn scroll_anchor(&self) -> Option<(String, usize, Pixels)> {
+        let Some(Ok(files)) = &self.files else {
+            return None;
+        };
+        let top = self.list.logical_scroll_top();
+        let file = self.rows.get(top.item_ix)?.file()?;
+        Some((
+            files[file].path.clone(),
+            top.item_ix - self.file_rows[file],
+            top.offset_in_item,
+        ))
     }
 
     fn scrolled_to(&mut self, first_row: usize, cx: &mut Context<Self>) {
@@ -193,15 +289,27 @@ impl Review {
     }
 
     fn newer(&mut self, _: &Newer, _: &mut Window, cx: &mut Context<Self>) {
-        if self.newer.is_some() {
+        if let Subject::Commit(subject) = &self.subject
+            && subject.newer.is_some()
+        {
             cx.emit(ReviewEvent::Newer);
         }
     }
 
     fn older(&mut self, _: &Older, _: &mut Window, cx: &mut Context<Self>) {
-        if self.older.is_some() {
+        if let Subject::Commit(subject) = &self.subject
+            && subject.older.is_some()
+        {
             cx.emit(ReviewEvent::Older);
         }
+    }
+
+    /// How the uncommitted changes to `path` stand, when reviewing them.
+    fn file_status(&self, path: &str) -> Option<&FileStatus> {
+        let Subject::WorkingTree { status, .. } = &self.subject else {
+            return None;
+        };
+        status.files.iter().find(|file| file.path == path)
     }
 
     fn render_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -210,7 +318,10 @@ impl Review {
         };
         let mono = cx.theme().mono_font_family.clone();
         match self.rows.get(index).copied() {
-            Some(Row::File(file)) => file_header(&files[file], mono).into_any_element(),
+            Some(Row::File(file)) => {
+                let file = &files[file];
+                file_header(file, self.file_status(&file.path), mono).into_any_element()
+            }
             Some(Row::Hunk(file, hunk)) => {
                 let DiffContent::Text(hunks) = &files[file].content else {
                     return div().into_any_element();
@@ -262,8 +373,12 @@ impl Review {
         }
     }
 
-    /// "End of commit · Next: <older commit>".
+    /// "End of commit · Next: <older commit>", or "End of changes".
     fn render_end(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (end, older) = match &self.subject {
+            Subject::Commit(subject) => ("End of commit", subject.older.as_ref()),
+            Subject::WorkingTree { .. } => ("End of changes", None),
+        };
         div()
             .h_flex()
             .w_full()
@@ -277,8 +392,8 @@ impl Review {
             .border_color(rgb(color::BUTTON_BORDER))
             .text_size(px(12.5))
             .text_color(rgb(color::TEXT_MUTED))
-            .child("End of commit")
-            .when_some(self.older.as_ref(), |this, older| {
+            .child(end)
+            .when_some(older, |this, older| {
                 this.child("·").child(
                     div()
                         .id("review-next")
@@ -296,26 +411,11 @@ impl Review {
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mono = cx.theme().mono_font_family.clone();
-        let commit = &self.commit;
-        let details = self.details.as_deref();
-        let parent = match commit.parents.as_slice() {
-            [] => "root commit".to_owned(),
-            [parent, ..] => format!("parent {}", parent.to_hex_with_len(7)),
-        };
-        let mut when = format!("committed {}", time::absolute(commit.author.time));
-        if details.is_some_and(|details| details.signed) {
-            when.push_str(" · signed");
-        }
-        let body = details
-            .map(|details| details.body.clone())
-            .filter(|body| !body.is_empty());
         let totals = match &self.files {
             Some(Ok(files)) => Some(totals(files)),
             _ => None,
         };
-
-        div()
+        let header = div()
             .v_flex()
             .flex_none()
             .gap(px(14.))
@@ -324,125 +424,147 @@ impl Review {
             .pb(px(16.))
             .bg(rgb(color::PANEL))
             .border_b_1()
-            .border_color(rgb(color::BORDER))
-            .child(
-                div()
-                    .h_flex()
-                    .gap(px(10.))
-                    .text_size(px(12.5))
+            .border_color(rgb(color::BORDER));
+        let back = Button::new("review-back")
+            .ghost()
+            .h(px(30.))
+            .label("History")
+            .tooltip("Back to the history (Esc)")
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(ReviewEvent::Close)));
+        let breadcrumb = div().h_flex().gap(px(10.)).text_size(px(12.5)).child(back);
+        let mono = cx.theme().mono_font_family.clone();
+
+        match &self.subject {
+            Subject::Commit(subject) => {
+                let CommitSubject {
+                    commit,
+                    labels,
+                    newer,
+                    older,
+                    details,
+                } = &**subject;
+                let parent = match commit.parents.as_slice() {
+                    [] => "root commit".to_owned(),
+                    [parent, ..] => format!("parent {}", parent.to_hex_with_len(7)),
+                };
+                let mut when = format!("committed {}", time::absolute(commit.author.time));
+                if details.as_ref().is_some_and(|details| details.signed) {
+                    when.push_str(" · signed");
+                }
+                let body = details
+                    .as_ref()
+                    .map(|details| details.body.clone())
+                    .filter(|body| !body.is_empty());
+                header
                     .child(
-                        Button::new("review-back")
-                            .ghost()
-                            .h(px(30.))
-                            .label("History")
-                            .tooltip("Back to the history (Esc)")
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(ReviewEvent::Close))),
-                    )
-                    .children(self.labels.first().map(|label| {
-                        div()
-                            .h_flex()
-                            .gap(px(10.))
+                        breadcrumb
+                            .children(labels.first().map(crumb))
                             .child(muted("/"))
-                            .child(labels::ref_label(label))
-                    }))
-                    .child(muted("/"))
-                    .child(
-                        div()
-                            .font_family(mono.clone())
-                            .text_color(rgb(color::ACCENT))
-                            .child(commit.id.to_hex_with_len(7).to_string()),
-                    )
-                    .child(
-                        div()
-                            .font_family(mono.clone())
-                            .text_size(theme::SMALL_TEXT_SIZE)
-                            .text_color(rgb(color::TEXT_MUTED))
-                            .child(format!("({parent})")),
-                    )
-                    .child(
-                        div()
-                            .h_flex()
-                            .ml_auto()
-                            .gap(px(6.))
-                            .child(
-                                Button::new("review-newer")
-                                    .ghost()
-                                    .h(px(30.))
-                                    .label("Newer")
-                                    .tooltip("Review the next newer commit ([)")
-                                    .disabled(self.newer.is_none())
-                                    .on_click(
-                                        cx.listener(|_, _, _, cx| cx.emit(ReviewEvent::Newer)),
-                                    ),
-                            )
-                            .child(
-                                Button::new("review-older")
-                                    .ghost()
-                                    .h(px(30.))
-                                    .label("Older")
-                                    .tooltip("Review the next older commit (])")
-                                    .disabled(self.older.is_none())
-                                    .on_click(
-                                        cx.listener(|_, _, _, cx| cx.emit(ReviewEvent::Older)),
-                                    ),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .v_flex()
-                    .gap(px(8.))
-                    .max_w(px(900.))
-                    .child(
-                        div()
-                            .text_size(px(22.))
-                            .line_height(relative(1.3))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(commit.summary.clone()),
-                    )
-                    .when_some(body, |this, body| {
-                        this.child(
-                            div()
-                                .max_w(px(760.))
-                                .line_height(relative(1.55))
-                                .text_color(rgb(color::AUTHOR_TEXT))
-                                .child(body),
-                        )
-                    })
-                    .child(
-                        div()
-                            .h_flex()
-                            .flex_wrap()
-                            .gap(px(10.))
-                            .text_size(px(12.5))
-                            .child(labels::avatar(&commit.author.name, px(22.)))
                             .child(
                                 div()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(commit.author.name.clone()),
+                                    .font_family(mono.clone())
+                                    .text_color(rgb(color::ACCENT))
+                                    .child(commit.id.to_hex_with_len(7).to_string()),
                             )
-                            .child(muted(when))
-                            .when_some(totals, |this, (files, added, removed)| {
-                                this.child(muted("·"))
-                                    .child(match files {
-                                        1 => "1 file".to_owned(),
-                                        files => format!("{files} files"),
-                                    })
+                            .child(
+                                div()
+                                    .font_family(mono.clone())
+                                    .text_size(theme::SMALL_TEXT_SIZE)
+                                    .text_color(rgb(color::TEXT_MUTED))
+                                    .child(format!("({parent})")),
+                            )
+                            .child(
+                                div()
+                                    .h_flex()
+                                    .ml_auto()
+                                    .gap(px(6.))
                                     .child(
-                                        div()
-                                            .font_family(mono.clone())
-                                            .text_color(rgb(color::DIFF_ADDED))
-                                            .child(format!("+{added}")),
+                                        Button::new("review-newer")
+                                            .ghost()
+                                            .h(px(30.))
+                                            .label("Newer")
+                                            .tooltip("Review the next newer commit ([)")
+                                            .disabled(newer.is_none())
+                                            .on_click(cx.listener(|_, _, _, cx| {
+                                                cx.emit(ReviewEvent::Newer)
+                                            })),
                                     )
                                     .child(
+                                        Button::new("review-older")
+                                            .ghost()
+                                            .h(px(30.))
+                                            .label("Older")
+                                            .tooltip("Review the next older commit (])")
+                                            .disabled(older.is_none())
+                                            .on_click(cx.listener(|_, _, _, cx| {
+                                                cx.emit(ReviewEvent::Older)
+                                            })),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        title(commit.summary.clone())
+                            .when_some(body, |this, body| {
+                                this.child(
+                                    div()
+                                        .max_w(px(760.))
+                                        .line_height(relative(1.55))
+                                        .text_color(rgb(color::AUTHOR_TEXT))
+                                        .child(body),
+                                )
+                            })
+                            .child(
+                                byline()
+                                    .child(labels::avatar(&commit.author.name, px(22.)))
+                                    .child(
                                         div()
-                                            .font_family(mono.clone())
-                                            .text_color(rgb(color::DIFF_REMOVED))
-                                            .child(format!("−{removed}")),
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .child(commit.author.name.clone()),
                                     )
-                            }),
-                    ),
-            )
+                                    .child(muted(when))
+                                    .when_some(totals, |this, totals| {
+                                        this.child(muted("·")).children(total_parts(totals, mono))
+                                    }),
+                            ),
+                    )
+            }
+            Subject::WorkingTree { status, head } => {
+                let on = match head {
+                    Some(RefLabel {
+                        kind: RefKind::Branch,
+                        name,
+                        ..
+                    }) => {
+                        format!("On {name}")
+                    }
+                    Some(_) => "On a detached HEAD".to_owned(),
+                    None => "No commits yet".to_owned(),
+                };
+                header
+                    .child(
+                        breadcrumb
+                            .children(head.as_ref().map(crumb))
+                            .child(muted("/"))
+                            .child(
+                                div()
+                                    .text_color(rgb(color::ACCENT))
+                                    .child("Uncommitted changes"),
+                            ),
+                    )
+                    .child(
+                        title("Uncommitted changes").child(
+                            byline()
+                                .child(muted(format!(
+                                    "{on} · {}",
+                                    labels::working_tree_summary(status)
+                                )))
+                                .when_some(totals, |this, totals| {
+                                    this.children(total_parts(totals, mono).into_iter().skip(1))
+                                }),
+                        ),
+                    )
+            }
+        }
     }
 
     /// The changed files by directory; clicking one scrolls to it.
@@ -546,9 +668,11 @@ impl Render for Review {
         let body = match &self.files {
             None => message("Reading changes…").into_any_element(),
             Some(Err(error)) => message(error.clone()).into_any_element(),
-            Some(Ok(files)) if files.is_empty() => {
-                message("This commit changes no files.").into_any_element()
+            Some(Ok(files)) if files.is_empty() => match self.subject {
+                Subject::Commit(_) => message("This commit changes no files."),
+                Subject::WorkingTree { .. } => message("No uncommitted changes."),
             }
+            .into_any_element(),
             Some(Ok(files)) => {
                 let files = files.clone();
                 div()
@@ -636,16 +760,30 @@ fn card_row() -> Div {
         .border_color(rgb(color::DIFF_CARD_BORDER))
 }
 
-/// The top of a file's card: path, what happened to it and line counts.
-fn file_header(file: &FileDiff, mono: SharedString) -> impl IntoElement {
+/// The top of a file's card: path, what happened to it, how much of it is
+/// staged (for uncommitted changes) and line counts.
+fn file_header(
+    file: &FileDiff,
+    status: Option<&FileStatus>,
+    mono: SharedString,
+) -> impl IntoElement {
     let (directory, name) = split_path(&file.path);
-    let (label, label_color) = match &file.kind {
-        ChangeKind::Added => (Some("new file".to_owned()), color::DIFF_ADDED_TEXT),
-        ChangeKind::Deleted => (Some("deleted".to_owned()), color::DIFF_REMOVED),
-        ChangeKind::Renamed { from } => (Some(format!("renamed from {from}")), color::BRANCH_BLUE),
-        ChangeKind::Copied { from } => (Some(format!("copied from {from}")), color::BRANCH_BLUE),
-        ChangeKind::Modified => (None, color::TEXT),
+    let untracked = status.is_some_and(|status| status.unstaged == Some(WorktreeChange::Untracked));
+    let kind = match &file.kind {
+        ChangeKind::Added if untracked => None,
+        ChangeKind::Added => Some(("new file".to_owned(), color::DIFF_ADDED_TEXT)),
+        ChangeKind::Deleted => Some(("deleted".to_owned(), color::DIFF_REMOVED)),
+        ChangeKind::Renamed { from } => Some((format!("renamed from {from}"), color::BRANCH_BLUE)),
+        ChangeKind::Copied { from } => Some((format!("copied from {from}"), color::BRANCH_BLUE)),
+        ChangeKind::Modified => None,
     };
+    let staging = status.and_then(|status| match (&status.staged, status.unstaged) {
+        (_, Some(WorktreeChange::Conflicted)) => Some(("conflict".to_owned(), color::DIFF_REMOVED)),
+        (_, Some(WorktreeChange::Untracked)) => Some(("untracked".to_owned(), color::TEXT_MUTED)),
+        (Some(_), None) => Some(("staged".to_owned(), color::ACCENT)),
+        (Some(_), Some(_)) => Some(("partly staged".to_owned(), color::ACCENT)),
+        (None, _) => None,
+    });
     let counts = file.line_counts();
 
     div()
@@ -674,21 +812,19 @@ fn file_header(file: &FileDiff, mono: SharedString) -> impl IntoElement {
                 )
                 .child(div().min_w_0().text_ellipsis().child(name.to_owned())),
         )
-        .when_some(label, |this, label| {
-            this.child(
-                div()
-                    .flex_none()
-                    .h(px(20.))
-                    .px(px(7.))
-                    .rounded(px(4.))
-                    .h_flex()
-                    .text_size(theme::SMALL_TEXT_SIZE)
-                    .font_weight(FontWeight::MEDIUM)
-                    .bg(theme::with_alpha(label_color, 0.14))
-                    .text_color(rgb(label_color))
-                    .child(label),
-            )
-        })
+        .children(kind.into_iter().chain(staging).map(|(label, label_color)| {
+            div()
+                .flex_none()
+                .h(px(20.))
+                .px(px(7.))
+                .rounded(px(4.))
+                .h_flex()
+                .text_size(theme::SMALL_TEXT_SIZE)
+                .font_weight(FontWeight::MEDIUM)
+                .bg(theme::with_alpha(label_color, 0.14))
+                .text_color(rgb(label_color))
+                .child(label)
+        }))
         .when_some(counts, |this, counts| {
             this.child(
                 div()
@@ -793,6 +929,55 @@ fn split_path(path: &str) -> (&str, &str) {
         Some(slash) => path.split_at(slash + 1),
         None => ("", path),
     }
+}
+
+/// A ref label in the breadcrumb, after a "/".
+fn crumb(label: &RefLabel) -> impl IntoElement {
+    div()
+        .h_flex()
+        .gap(px(10.))
+        .child(muted("/"))
+        .child(labels::ref_label(label))
+}
+
+/// The title of the review, with room for more lines below it.
+fn title(text: impl Into<SharedString>) -> Div {
+    div().v_flex().gap(px(8.)).max_w(px(900.)).child(
+        div()
+            .text_size(px(22.))
+            .line_height(relative(1.3))
+            .font_weight(FontWeight::SEMIBOLD)
+            .child(text.into()),
+    )
+}
+
+/// The line under the title: author, date and totals.
+fn byline() -> Div {
+    div().h_flex().flex_wrap().gap(px(10.)).text_size(px(12.5))
+}
+
+/// "3 files", "+12" and "−4".
+fn total_parts(
+    (files, added, removed): (usize, usize, usize),
+    mono: SharedString,
+) -> [AnyElement; 3] {
+    [
+        match files {
+            1 => "1 file".to_owned(),
+            files => format!("{files} files"),
+        }
+        .into_any_element(),
+        div()
+            .font_family(mono.clone())
+            .text_color(rgb(color::DIFF_ADDED))
+            .child(format!("+{added}"))
+            .into_any_element(),
+        div()
+            .font_family(mono)
+            .text_color(rgb(color::DIFF_REMOVED))
+            .child(format!("−{removed}"))
+            .into_any_element(),
+    ]
 }
 
 fn muted(text: impl Into<SharedString>) -> Div {

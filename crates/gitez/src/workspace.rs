@@ -22,7 +22,7 @@ use gpui_kit::component::{StyledExt as _, WindowExt as _, h_resizable, resizable
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use gitez_git::{Affected, Watcher, WorkingTreeStatus};
+use gitez_git::{Affected, Head, RefKind, RefLabel, Watcher, WorkingTreeStatus};
 
 use crate::repository::Snapshot;
 use crate::theme::{self, color};
@@ -348,25 +348,52 @@ impl Workspace {
         let changed = status.as_ref().map(|status| status.files.len());
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.set_changed_files(changed, cx));
-        self.history
-            .update(cx, |history, cx| history.set_working_tree(status, cx));
+        self.history.update(cx, |history, cx| {
+            history.set_working_tree(status.clone(), cx)
+        });
+        if let (Some(snapshot), Some((review, _)), Some(status)) =
+            (&self.snapshot, &self.review, status)
+        {
+            review.update(cx, |review, cx| {
+                review.refresh_working_tree(&snapshot.repository, status, cx)
+            });
+        }
         cx.notify();
     }
 
-    /// Reviews the commit selected in the history.
+    /// Reviews the commit or the uncommitted changes selected in the
+    /// history.
     fn review_selected(&mut self, _: &ReviewSelected, window: &mut Window, cx: &mut Context<Self>) {
         let Some(snapshot) = &self.snapshot else {
             return;
         };
-        let history = self.history.read(cx);
-        let Some(Selection::Commit(commit, labels)) = history.selected() else {
-            return;
-        };
-        let (newer, older) = history.neighbors();
-        let (commit, labels) = (commit.clone(), labels.to_vec());
-        let neighbors = (newer.cloned(), older.cloned());
         let repository = snapshot.repository.clone();
-        let review = cx.new(|cx| Review::new(&repository, commit, labels, neighbors, cx));
+        let history = self.history.read(cx);
+        let review = match history.selected() {
+            Some(Selection::Commit(commit, labels)) => {
+                let (newer, older) = history.neighbors();
+                let (commit, labels) = (commit.clone(), labels.to_vec());
+                let neighbors = (newer.cloned(), older.cloned());
+                cx.new(|cx| Review::commit(&repository, commit, labels, neighbors, cx))
+            }
+            Some(Selection::WorkingTree(status)) => {
+                let status = status.clone();
+                let head = snapshot.refs.head.as_ref().map(|head| match head {
+                    Head::Branch { name, .. } | Head::Unborn { name } => RefLabel {
+                        kind: RefKind::Branch,
+                        name: name.clone(),
+                        is_head: true,
+                    },
+                    Head::Detached { .. } => RefLabel {
+                        kind: RefKind::Head,
+                        name: "HEAD".to_owned(),
+                        is_head: true,
+                    },
+                });
+                cx.new(|cx| Review::working_tree(&repository, status, head, cx))
+            }
+            None => return,
+        };
         let subscription = cx.subscribe_in(&review, window, |this, _, event, window, cx| {
             let delta = match event {
                 ReviewEvent::Close => {
