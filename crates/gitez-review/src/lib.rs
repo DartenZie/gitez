@@ -10,6 +10,7 @@
 mod error;
 mod follow;
 mod model;
+mod prompt;
 mod store;
 
 pub use error::{Error, Result};
@@ -18,6 +19,7 @@ pub use model::{
     Anchor, Comment, PromptOptions, PullRequest, Resolution, ResolvedBy, Side, State, Template,
     Thread, Tip,
 };
+pub use prompt::PromptContext;
 pub use store::{NewPullRequest, Run, RunHeader, Store};
 
 /// Times are stored as RFC 3339 UTC timestamps.
