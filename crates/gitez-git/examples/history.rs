@@ -72,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
     for &id in &newest {
         let started = Instant::now();
-        for file in repo.commit_diff(id)? {
+        for file in repo.commit_diff(id, Default::default())? {
             if let gitez_git::DiffContent::Text(hunks) = file.content {
                 lines += hunks.iter().map(|hunk| hunk.lines.len()).sum::<usize>();
             }

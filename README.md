@@ -29,7 +29,8 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 > stashes in the sidebar and the selected commit's details beside it. Press
 > Enter or double-click a commit to review its full diff, file by file; `[`
 > and `]` step to the newer and older commit, Esc goes back. Diffs show
-> unified or split side by side. Mark a file viewed to collapse it and
+> unified or split side by side, optionally hiding whitespace changes
+> (single hunks can't be staged then). Mark a file viewed to collapse it and
 > track progress; it opens again if it changes. Uncommitted
 > changes appear as a row above the current commit; open it the same way to
 > review them, with each file marked staged, partly staged or untracked.

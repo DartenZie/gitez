@@ -5,7 +5,9 @@ use gix::bstr::ByteSlice;
 use gix::diff::blob::pipeline::{Mode, WorktreeRoots};
 use gix::diff::blob::platform::prepare_diff::Operation;
 use gix::diff::blob::unified_diff::{ConsumeHunk, ContextSize, DiffLineKind, HunkHeader};
-use gix::diff::blob::{InternedInput, ResourceKind, UnifiedDiff, diff_with_slider_heuristics};
+use gix::diff::blob::{
+    InternedInput, Interner, ResourceKind, UnifiedDiff, diff_with_slider_heuristics,
+};
 use gix::object::tree::EntryKind;
 use gix::object::tree::diff::Change;
 
@@ -19,6 +21,15 @@ const MAX_FILE_LINES: usize = 10_000;
 /// Once a commit's diffs reach this many lines, the remaining files are not
 /// shown line by line, so a huge commit stays quick to open.
 const MAX_COMMIT_LINES: usize = 100_000;
+
+/// How to compare files.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiffOptions {
+    /// Compare lines as if they had no whitespace, as `git diff -w` does.
+    /// Hunks are then never [patchable](Hunk::patchable), since their lines
+    /// need not match the files exactly.
+    pub ignore_whitespace: bool,
+}
 
 /// The diff of one changed file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,7 +63,7 @@ impl DiffContent {
                 },
             )),
             DiffContent::TooLarge(lines) => Some(*lines),
-            DiffContent::Binary | DiffContent::Unchanged => None,
+            DiffContent::Binary | DiffContent::Unchanged | DiffContent::OnlyWhitespace => None,
         }
     }
 }
@@ -68,6 +79,9 @@ pub enum DiffContent {
     Binary,
     /// The content is the same: a rename, copy or mode change.
     Unchanged,
+    /// Only whitespace changed, and [`DiffOptions::ignore_whitespace`] is
+    /// set.
+    OnlyWhitespace,
 }
 
 /// A run of changed lines and their context. Ranges follow `git diff`: an
@@ -190,7 +204,7 @@ pub enum LineKind {
 impl Repository {
     /// The diff of every file commit `id` changed, against its first parent
     /// (or the empty tree), in path order.
-    pub fn commit_diff(&self, id: Oid) -> Result<Vec<FileDiff>> {
+    pub fn commit_diff(&self, id: Oid, options: DiffOptions) -> Result<Vec<FileDiff>> {
         let repo = self.local();
         let commit = repo.find_commit(id)?;
         let (old_tree, new_tree) = trees(&repo, &commit)?;
@@ -208,7 +222,7 @@ impl Repository {
                 if change.entry_mode().is_tree() {
                     return Ok(std::ops::ControlFlow::Continue(()));
                 }
-                match content(&change, &mut cache, &mut budget) {
+                match content(&change, &mut cache, &mut budget, options) {
                     Ok(content) => files.push(FileDiff {
                         path: change.location().to_str_lossy().into_owned(),
                         kind: kind(&change),
@@ -234,7 +248,7 @@ impl Repository {
     /// added. Each file's staged hunks (`git diff --cached`) come before its
     /// unstaged ones (`git diff`); see [`Hunk::staging`]. In path order;
     /// empty for a bare repository.
-    pub fn working_tree_diff(&self) -> Result<Vec<FileDiff>> {
+    pub fn working_tree_diff(&self, options: DiffOptions) -> Result<Vec<FileDiff>> {
         let status = self.status()?;
         let repo = self.local();
         let Some(workdir) = repo.workdir().map(ToOwned::to_owned) else {
@@ -312,7 +326,7 @@ impl Repository {
                     (id, old_kind, old_path),
                     (null, worktree_kind, &file.path),
                 )?;
-                prepared_content(&mut worktree_cache, &mut budget)?
+                prepared_content(&mut worktree_cache, &mut budget, options)?
             } else {
                 let staged = match &file.staged {
                     Some(_) => {
@@ -324,7 +338,7 @@ impl Repository {
                             (old_id, old_kind, old_path),
                             (new_id, new_kind, &file.path),
                         )?;
-                        let content = prepared_content(&mut staged_cache, &mut budget)?;
+                        let content = prepared_content(&mut staged_cache, &mut budget, options)?;
                         let patchable = head.is_some() && indexed.is_some();
                         Some(with_staging(content, Some(Staging::Staged), patchable))
                     }
@@ -339,7 +353,7 @@ impl Repository {
                             (old_id, old_kind, &file.path),
                             (null, worktree_kind, &file.path),
                         )?;
-                        let content = prepared_content(&mut worktree_cache, &mut budget)?;
+                        let content = prepared_content(&mut worktree_cache, &mut budget, options)?;
                         let patchable = indexed.is_some() && metadata.is_some();
                         Some(with_staging(content, Some(Staging::Unstaged), patchable))
                     }
@@ -404,7 +418,7 @@ fn with_staging(content: DiffContent, staging: Option<Staging>, patchable: bool)
 /// One file's staged and unstaged changes as one content: the staged
 /// hunks, then the unstaged ones.
 fn combine(staged: Option<DiffContent>, unstaged: Option<DiffContent>) -> DiffContent {
-    use DiffContent::{Binary, Text, TooLarge, Unchanged};
+    use DiffContent::{Binary, OnlyWhitespace, Text, TooLarge, Unchanged};
     match (staged, unstaged) {
         (Some(Text(mut staged)), Some(Text(unstaged))) => {
             staged.extend(unstaged);
@@ -421,6 +435,7 @@ fn combine(staged: Option<DiffContent>, unstaged: Option<DiffContent>) -> DiffCo
         (Some(Unchanged) | None, Some(content)) | (Some(content), Some(Unchanged) | None) => {
             content
         }
+        (Some(OnlyWhitespace), Some(content)) | (Some(content), Some(OnlyWhitespace)) => content,
         (None, None) => Unchanged,
     }
 }
@@ -441,13 +456,14 @@ fn content(
     change: &Change<'_, '_, '_>,
     cache: &mut gix::diff::blob::Platform,
     budget: &mut usize,
+    options: DiffOptions,
 ) -> Result<DiffContent> {
     if !change.entry_mode().is_blob_or_symlink() {
         // A submodule moved to another commit.
         return Ok(DiffContent::Unchanged);
     }
     change.diff(cache)?;
-    prepared_content(cache, budget)
+    prepared_content(cache, budget, options)
 }
 
 /// The diff of the two resources set in `cache`, using at most `budget`
@@ -455,6 +471,7 @@ fn content(
 fn prepared_content(
     cache: &mut gix::diff::blob::Platform,
     budget: &mut usize,
+    options: DiffOptions,
 ) -> Result<DiffContent> {
     cache.options.skip_internal_diff_if_external_is_configured = false;
     let prepared = cache.prepare_diff().map_err(gix::Error::from)?;
@@ -464,9 +481,17 @@ fn prepared_content(
             // the end of a file is a change, as in `git diff`.
             let input =
                 InternedInput::new(prepared.old.intern_source(), prepared.new.intern_source());
-            let diff = diff_with_slider_heuristics(algorithm, &input);
+            let diff = if options.ignore_whitespace {
+                // Diffed without whitespace, then shown from `input`: the
+                // lines are the same, one for one.
+                diff_with_slider_heuristics(algorithm, &without_whitespace(&input))
+            } else {
+                diff_with_slider_heuristics(algorithm, &input)
+            };
             let changed = (diff.count_additions() + diff.count_removals()) as usize;
-            if changed == 0 {
+            if changed == 0 && input.before != input.after {
+                DiffContent::OnlyWhitespace
+            } else if changed == 0 {
                 DiffContent::Unchanged
             } else if changed > MAX_FILE_LINES || changed > *budget {
                 DiffContent::TooLarge(LineCounts {
@@ -481,7 +506,13 @@ fn prepared_content(
                     ContextSize::symmetrical(CONTEXT_LINES),
                 )
                 .consume()
-                .map_err(Error::Diff)?;
+                .map_err(Error::Diff)?
+                .into_iter()
+                .map(|mut hunk| {
+                    hunk.patchable &= !options.ignore_whitespace;
+                    hunk
+                })
+                .collect::<Vec<_>>();
                 *budget = budget.saturating_sub(hunks.iter().map(|hunk| hunk.lines.len()).sum());
                 DiffContent::Text(hunks)
             }
@@ -494,6 +525,25 @@ fn prepared_content(
     // The cache only grows; one file's contents are all it needs to hold.
     cache.clear_resource_cache_keep_allocation();
     Ok(content)
+}
+
+/// `input` with every line stripped of its whitespace, line ending included.
+fn without_whitespace(input: &InternedInput<&[u8]>) -> InternedInput<Vec<u8>> {
+    let mut stripped = InternedInput {
+        before: Vec::new(),
+        after: Vec::new(),
+        interner: Interner::new(input.interner.num_tokens() as usize),
+    };
+    let strip = |&token: &_| -> Vec<u8> {
+        input.interner[token]
+            .iter()
+            .copied()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect()
+    };
+    stripped.update_before(input.before.iter().map(strip));
+    stripped.update_after(input.after.iter().map(strip));
+    stripped
 }
 
 /// Collects the hunks of a unified diff with numbered lines.

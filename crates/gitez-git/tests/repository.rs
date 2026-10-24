@@ -6,8 +6,8 @@ use std::process::Command;
 
 use gitez_git::graph::GraphLayout;
 use gitez_git::{
-    Affected, ChangeKind, Commit, DiffContent, DiffLine, FileChange, FileStatus, Head, Hunk,
-    LineCounts, LineKind, Oid, Order, RefKind, Repository, Staging, WorktreeChange,
+    Affected, ChangeKind, Commit, DiffContent, DiffLine, DiffOptions, FileChange, FileStatus, Head,
+    Hunk, LineCounts, LineKind, Oid, Order, RefKind, Repository, Staging, WorktreeChange,
 };
 use tempfile::TempDir;
 
@@ -731,7 +731,7 @@ fn diff_numbers_lines_and_keeps_three_lines_of_context() {
 
     let diffs = fixture
         .open()
-        .commit_diff(fixture.rev("HEAD"))
+        .commit_diff(fixture.rev("HEAD"), DiffOptions::default())
         .expect("diff");
     let paths: Vec<&str> = diffs.iter().map(|diff| diff.path.as_str()).collect();
     assert_eq!(paths, ["image.bin", "new.txt", "renamed.txt", "text.txt"]);
@@ -813,7 +813,7 @@ fn diff_shows_a_missing_newline_at_end_of_file() {
 
     let diffs = fixture
         .open()
-        .commit_diff(fixture.rev("HEAD"))
+        .commit_diff(fixture.rev("HEAD"), DiffOptions::default())
         .expect("diff");
     let DiffContent::Text(hunks) = &diffs[0].content else {
         panic!("a text diff: {:?}", diffs[0].content);
@@ -853,7 +853,10 @@ fn working_tree_diff_compares_head_with_the_files_on_disk() {
     .expect("write");
     std::fs::write(fixture.root.join("untracked.txt"), "fresh\n").expect("write");
 
-    let diffs = fixture.open().working_tree_diff().expect("diff");
+    let diffs = fixture
+        .open()
+        .working_tree_diff(DiffOptions::default())
+        .expect("diff");
     let summary: Vec<(&str, &ChangeKind, Option<(usize, usize)>)> = diffs
         .iter()
         .map(|diff| {
@@ -933,7 +936,10 @@ fn apply_to_index(fixture: &Fixture, patch: &str, reverse: bool) {
 /// The hunks of the uncommitted changes to `path`: staging, and the text of
 /// their changed lines.
 fn uncommitted_hunks(fixture: &Fixture, path: &str) -> Vec<(Option<Staging>, bool, Vec<String>)> {
-    let diffs = fixture.open().working_tree_diff().expect("diff");
+    let diffs = fixture
+        .open()
+        .working_tree_diff(DiffOptions::default())
+        .expect("diff");
     let diff = diffs
         .iter()
         .find(|diff| diff.path == path)
@@ -985,7 +991,10 @@ fn hunks_stage_and_unstage_one_at_a_time() {
     );
 
     // Stage the second hunk alone.
-    let diffs = fixture.open().working_tree_diff().expect("diff");
+    let diffs = fixture
+        .open()
+        .working_tree_diff(DiffOptions::default())
+        .expect("diff");
     let DiffContent::Text(hunks) = &diffs[0].content else {
         panic!("a text diff");
     };
@@ -1003,7 +1012,10 @@ fn hunks_stage_and_unstage_one_at_a_time() {
     );
 
     // And unstage it again.
-    let diffs = fixture.open().working_tree_diff().expect("diff");
+    let diffs = fixture
+        .open()
+        .working_tree_diff(DiffOptions::default())
+        .expect("diff");
     let DiffContent::Text(hunks) = &diffs[0].content else {
         panic!("a text diff");
     };
@@ -1030,4 +1042,66 @@ fn new_and_deleted_files_are_not_patchable_by_hunk() {
         assert_eq!(hunks.len(), 1, "{path}");
         assert_eq!((hunks[0].0, hunks[0].1), (Some(staging), false), "{path}");
     }
+}
+
+#[test]
+fn whitespace_can_be_ignored() {
+    let fixture = Fixture::new();
+    std::fs::write(fixture.root.join("code.rs"), "fn a() {\n    one();\n}\n").expect("write");
+    std::fs::write(fixture.root.join("spaces.txt"), "a b\n").expect("write");
+    fixture.git(&["add", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "first"]);
+
+    std::fs::write(
+        fixture.root.join("code.rs"),
+        "fn a() {\n\tone();\n    two();\n}\n",
+    )
+    .expect("write");
+    std::fs::write(fixture.root.join("spaces.txt"), "a  b\r\n").expect("write");
+    let ignore = DiffOptions {
+        ignore_whitespace: true,
+    };
+    let check = |diffs: Vec<gitez_git::FileDiff>| {
+        let [code, spaces] = diffs.as_slice() else {
+            panic!("two files: {diffs:?}");
+        };
+        let DiffContent::Text(hunks) = &code.content else {
+            panic!("a text diff: {:?}", code.content);
+        };
+        let lines: Vec<(LineKind, &str)> = hunks
+            .iter()
+            .flat_map(|hunk| &hunk.lines)
+            .map(|line| (line.kind, line.text.as_str()))
+            .collect();
+        // The re-indented line is context, shown as it was.
+        assert_eq!(
+            lines,
+            [
+                (LineKind::Context, "fn a() {"),
+                (LineKind::Context, "    one();"),
+                (LineKind::Added, "    two();"),
+                (LineKind::Context, "}"),
+            ]
+        );
+        assert!(hunks.iter().all(|hunk| !hunk.patchable));
+        assert_eq!(spaces.content, DiffContent::OnlyWhitespace);
+    };
+
+    let repository = fixture.open();
+    check(repository.working_tree_diff(ignore).expect("diff"));
+    let all = repository
+        .working_tree_diff(DiffOptions::default())
+        .expect("diff");
+    let counts = all[0]
+        .line_counts()
+        .map(|counts| (counts.added, counts.removed));
+    assert_eq!(counts, Some((2, 1)));
+
+    fixture.git(&["commit", "--quiet", "--all", "-m", "second"]);
+    check(
+        fixture
+            .open()
+            .commit_diff(fixture.rev("HEAD"), ignore)
+            .expect("diff"),
+    );
 }

@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use gitez_command::Git;
 use gitez_git::{
-    ChangeKind, Commit, CommitDetails, DiffContent, DiffLine, FileDiff, FileStatus, LineKind,
-    RefKind, RefLabel, Repository, Staging, WorkingTreeStatus, WorktreeChange,
+    ChangeKind, Commit, CommitDetails, DiffContent, DiffLine, DiffOptions, FileDiff, FileStatus,
+    LineKind, Oid, RefKind, RefLabel, Repository, Staging, WorkingTreeStatus, WorktreeChange,
 };
 use gpui_kit::component::button::*;
 use gpui_kit::component::checkbox::Checkbox;
@@ -95,8 +95,29 @@ impl Row {
     }
 }
 
-/// How diffs are laid out. One setting for the whole app, so it carries
+/// How reviews show diffs. One setting for the whole app, so it carries
 /// over to the next review.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ReviewSettings {
+    layout: DiffLayout,
+    hide_whitespace: bool,
+}
+
+impl Global for ReviewSettings {}
+
+impl ReviewSettings {
+    fn get(cx: &App) -> Self {
+        cx.try_global::<Self>().copied().unwrap_or_default()
+    }
+
+    fn diff_options(self) -> DiffOptions {
+        DiffOptions {
+            ignore_whitespace: self.hide_whitespace,
+        }
+    }
+}
+
+/// How diffs are laid out.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DiffLayout {
     /// Removed lines above the added lines that replace them.
@@ -104,14 +125,6 @@ pub enum DiffLayout {
     Unified,
     /// The old file on the left, the new file on the right.
     Split,
-}
-
-impl Global for DiffLayout {}
-
-impl DiffLayout {
-    fn current(cx: &App) -> Self {
-        cx.try_global::<Self>().copied().unwrap_or_default()
-    }
 }
 
 /// What is being reviewed.
@@ -189,6 +202,7 @@ struct CommitSubject {
 
 pub struct Review {
     focus_handle: FocusHandle,
+    repository: Repository,
     subject: Subject,
     /// `None` while reading.
     files: Option<Result<Arc<Vec<FileDiff>>, SharedString>>,
@@ -215,12 +229,30 @@ impl Review {
         (newer, older): (Option<Commit>, Option<Commit>),
         cx: &mut Context<Self>,
     ) -> Self {
+        let load = Self::load_commit(repository, commit.id, cx);
+        let subject = Subject::Commit(Box::new(CommitSubject {
+            commit,
+            labels,
+            newer,
+            older,
+            details: None,
+        }));
+        Self::with_subject(repository, subject, load, cx)
+    }
+
+    /// Reads the details and diff of commit `id` in the background.
+    fn load_commit(repository: &Repository, id: Oid, cx: &mut Context<Self>) -> Task<()> {
         let repository = repository.clone();
-        let id = commit.id;
-        let load = cx.spawn(async move |this, cx| {
+        let options = ReviewSettings::get(cx).diff_options();
+        cx.spawn(async move |this, cx| {
             let (details, files) = cx
                 .background_executor()
-                .spawn(async move { (repository.commit_details(id), repository.commit_diff(id)) })
+                .spawn(async move {
+                    (
+                        repository.commit_details(id),
+                        repository.commit_diff(id, options),
+                    )
+                })
                 .await;
             this.update(cx, |this, cx| {
                 if let Subject::Commit(subject) = &mut this.subject {
@@ -229,15 +261,7 @@ impl Review {
                 this.finish(files, cx);
             })
             .ok();
-        });
-        let subject = Subject::Commit(Box::new(CommitSubject {
-            commit,
-            labels,
-            newer,
-            older,
-            details: None,
-        }));
-        Self::with_subject(subject, load, cx)
+        })
     }
 
     /// Reviews the uncommitted changes of `repository`, which has `status`,
@@ -279,10 +303,15 @@ impl Review {
             last_commit,
             form: Box::new(form),
         };
-        Self::with_subject(subject, load, cx)
+        Self::with_subject(repository, subject, load, cx)
     }
 
-    fn with_subject(subject: Subject, load: Task<()>, cx: &mut Context<Self>) -> Self {
+    fn with_subject(
+        repository: &Repository,
+        subject: Subject,
+        load: Task<()>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let list = ListState::new(0, ListAlignment::Top, OVERDRAW);
         let this = cx.entity().downgrade();
         list.set_scroll_handler(move |event, _, cx| {
@@ -291,6 +320,7 @@ impl Review {
         });
         Self {
             focus_handle: cx.focus_handle(),
+            repository: repository.clone(),
             subject,
             files: None,
             rows: Vec::new(),
@@ -304,10 +334,11 @@ impl Review {
 
     fn load_working_tree(repository: &Repository, cx: &mut Context<Self>) -> Task<()> {
         let repository = repository.clone();
+        let options = ReviewSettings::get(cx).diff_options();
         cx.spawn(async move |this, cx| {
             let files = cx
                 .background_executor()
-                .spawn(async move { repository.working_tree_diff() })
+                .spawn(async move { repository.working_tree_diff(options) })
                 .await;
             this.update(cx, |this, cx| this.finish(files, cx)).ok();
         })
@@ -376,8 +407,11 @@ impl Review {
             return;
         };
         let files = files.clone();
-        (self.rows, self.file_rows) =
-            rows(&files, |file| self.is_viewed(file), DiffLayout::current(cx));
+        (self.rows, self.file_rows) = rows(
+            &files,
+            |file| self.is_viewed(file),
+            ReviewSettings::get(cx).layout,
+        );
         self.list.reset(self.rows.len());
         if let Some((path, row, offset_in_item)) = anchor
             && let Some(file) = files.iter().position(|file| file.path == path)
@@ -434,12 +468,31 @@ impl Review {
 
     /// Lays out the diffs as `layout`, here and in later reviews.
     fn set_layout(&mut self, layout: DiffLayout, cx: &mut Context<Self>) {
-        if DiffLayout::current(cx) == layout {
+        let settings = ReviewSettings::get(cx);
+        if settings.layout == layout {
             return;
         }
-        cx.set_global(layout);
+        cx.set_global(ReviewSettings { layout, ..settings });
         let anchor = self.scroll_anchor();
         self.rebuild_rows(anchor, cx);
+        cx.notify();
+    }
+
+    /// Compares lines without their whitespace, or with it, here and in
+    /// later reviews.
+    fn set_hide_whitespace(&mut self, hide_whitespace: bool, cx: &mut Context<Self>) {
+        let settings = ReviewSettings::get(cx);
+        if settings.hide_whitespace == hide_whitespace {
+            return;
+        }
+        cx.set_global(ReviewSettings {
+            hide_whitespace,
+            ..settings
+        });
+        self._load = match &self.subject {
+            Subject::Commit(subject) => Self::load_commit(&self.repository, subject.commit.id, cx),
+            Subject::WorkingTree { .. } => Self::load_working_tree(&self.repository, cx),
+        };
         cx.notify();
     }
 
@@ -1228,7 +1281,8 @@ impl Review {
     fn render_toolbar(&self, files: &[FileDiff], cx: &mut Context<Self>) -> impl IntoElement {
         let viewed = files.iter().filter(|file| self.is_viewed(file)).count();
         let total = files.len();
-        let layout = DiffLayout::current(cx);
+        let settings = ReviewSettings::get(cx);
+        let layout = settings.layout;
         div()
             .h_flex()
             .flex_none()
@@ -1260,6 +1314,14 @@ impl Review {
                             DiffLayout::Unified
                         };
                         this.set_layout(layout, cx)
+                    })),
+            )
+            .child(
+                Checkbox::new("hide-whitespace")
+                    .label("Hide whitespace")
+                    .checked(settings.hide_whitespace)
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                        this.set_hide_whitespace(*checked, cx)
                     })),
             )
             .child(
@@ -1492,7 +1554,10 @@ fn rows(
                     }
                 }
             }
-            DiffContent::TooLarge(_) | DiffContent::Binary | DiffContent::Unchanged => {
+            DiffContent::TooLarge(_)
+            | DiffContent::Binary
+            | DiffContent::Unchanged
+            | DiffContent::OnlyWhitespace => {
                 rows.push(Row::Notice(file));
             }
         }
@@ -1560,6 +1625,7 @@ fn fingerprint(file: &FileDiff) -> u64 {
         DiffContent::TooLarge(counts) => (1_u8, counts.added, counts.removed).hash(&mut hasher),
         DiffContent::Binary => 2_u8.hash(&mut hasher),
         DiffContent::Unchanged => 3_u8.hash(&mut hasher),
+        DiffContent::OnlyWhitespace => 4_u8.hash(&mut hasher),
     }
     hasher.finish()
 }
@@ -1811,6 +1877,7 @@ fn notice(file: &FileDiff) -> String {
             counts.added, counts.removed
         ),
         (DiffContent::Binary, _) => "Binary file not shown.".to_owned(),
+        (DiffContent::OnlyWhitespace, _) => "Only whitespace changed.".to_owned(),
         (_, ChangeKind::Renamed { .. }) => "Renamed without changes.".to_owned(),
         (_, ChangeKind::Copied { .. }) => "Copied without changes.".to_owned(),
         (_, ChangeKind::Added | ChangeKind::Deleted) => "Empty file.".to_owned(),
