@@ -1,5 +1,5 @@
-//! Line-by-line diffs of a commit's files, or of the uncommitted changes,
-//! for reviewing them.
+//! Line-by-line diffs of a commit's files, of a branch's changes, or of the
+//! uncommitted changes, for reviewing them.
 
 use gix::bstr::ByteSlice;
 use gix::diff::blob::pipeline::{Mode, WorktreeRoots};
@@ -38,6 +38,9 @@ pub struct FileDiff {
     pub path: String,
     pub kind: ChangeKind,
     pub content: DiffContent,
+    /// The blob of the new version, in a diff between commits; `None` for a
+    /// deleted file, a submodule and the uncommitted changes.
+    pub new_id: Option<Oid>,
 }
 
 impl FileDiff {
@@ -221,6 +224,17 @@ pub enum LineKind {
     Removed,
 }
 
+/// The changes a branch makes, as a pull request shows them; see
+/// [`Repository::branch_diff`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchDiff {
+    /// Where the branch left its base; `None` when they share no history.
+    pub merge_base: Option<Oid>,
+    /// How many commits the branch has that its base lacks.
+    pub ahead: usize,
+    pub files: Vec<FileDiff>,
+}
+
 impl Repository {
     /// The diff of every file commit `id` changed, against its first parent
     /// (or the empty tree), in path order.
@@ -228,39 +242,76 @@ impl Repository {
         let repo = self.local();
         let commit = repo.find_commit(id)?;
         let (old_tree, new_tree) = trees(&repo, &commit)?;
-
-        let mut cache = repo.diff_resource_cache_for_tree_diff()?;
-        let mut files = Vec::new();
-        let mut budget = MAX_COMMIT_LINES;
-        let mut error = None;
-        old_tree
-            .changes()?
-            .options(|options| {
-                options.track_path();
-            })
-            .for_each_to_obtain_tree(&new_tree, |change| {
-                if change.entry_mode().is_tree() {
-                    return Ok(std::ops::ControlFlow::Continue(()));
-                }
-                match content(&change, &mut cache, &mut budget, options) {
-                    Ok(content) => files.push(FileDiff {
-                        path: change.location().to_str_lossy().into_owned(),
-                        kind: kind(&change),
-                        content: with_staging(content, None, false),
-                    }),
-                    Err(err) => {
-                        error = Some(err);
-                        return Ok(std::ops::ControlFlow::Break(()));
-                    }
-                }
-                Ok(std::ops::ControlFlow::Continue(()))
-            })?;
-        if let Some(error) = error {
-            return Err(error);
-        }
-        files.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(files)
+        tree_diff(&repo, &old_tree, &new_tree, options)
     }
+
+    /// The changes commit `head` makes since it left commit `base`, like
+    /// `git diff base...head`: from their merge base (or the empty tree,
+    /// when there is none) to `head`, in path order.
+    pub fn branch_diff(&self, base: Oid, head: Oid, options: DiffOptions) -> Result<BranchDiff> {
+        let repo = self.local();
+        let merge_base = repo.merge_base(base, head)?;
+        let merge_base = merge_base.map(|id| id.detach());
+        let old_tree = match merge_base {
+            Some(id) => repo.find_commit(id)?.tree()?,
+            None => repo.empty_tree(),
+        };
+        let new_tree = repo.find_commit(head)?.tree()?;
+        let files = tree_diff(&repo, &old_tree, &new_tree, options)?;
+        let (ahead, _) = self.ahead_behind(head, base)?;
+        Ok(BranchDiff {
+            merge_base,
+            ahead,
+            files,
+        })
+    }
+}
+
+/// The diff of every file that differs between two trees, in path order.
+fn tree_diff(
+    repo: &gix::Repository,
+    old_tree: &gix::Tree<'_>,
+    new_tree: &gix::Tree<'_>,
+    options: DiffOptions,
+) -> Result<Vec<FileDiff>> {
+    let mut cache = repo.diff_resource_cache_for_tree_diff()?;
+    let mut files = Vec::new();
+    let mut budget = MAX_COMMIT_LINES;
+    let mut error = None;
+    let walked = old_tree
+        .changes()?
+        .options(|options| {
+            options.track_path();
+        })
+        .for_each_to_obtain_tree(new_tree, |change| {
+            if change.entry_mode().is_tree() {
+                return Ok(std::ops::ControlFlow::Continue(()));
+            }
+            match content(&change, &mut cache, &mut budget, options) {
+                Ok(content) => files.push(FileDiff {
+                    path: change.location().to_str_lossy().into_owned(),
+                    kind: kind(&change),
+                    content: with_staging(content, None, false),
+                    new_id: match change {
+                        Change::Deletion { .. } => None,
+                        _ if change.entry_mode().is_commit() => None,
+                        _ => Some(change.id().detach()),
+                    },
+                }),
+                Err(err) => {
+                    error = Some(err);
+                    return Ok(std::ops::ControlFlow::Break(()));
+                }
+            }
+            Ok(std::ops::ControlFlow::Continue(()))
+        });
+    // Stopping at an error is reported as the walk being cancelled.
+    if let Some(error) = error {
+        return Err(error);
+    }
+    walked?;
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
 }
 
 impl Repository {
@@ -399,6 +450,7 @@ impl Repository {
                 path: file.path.clone(),
                 kind,
                 content,
+                new_id: None,
             });
         }
         Ok(files)

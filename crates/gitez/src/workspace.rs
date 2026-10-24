@@ -5,6 +5,7 @@ mod detail;
 mod graph;
 mod history;
 mod labels;
+mod new_pull_request;
 mod review;
 mod sidebar;
 mod status_bar;
@@ -23,15 +24,17 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use gitez_git::{Affected, Head, RefKind, RefLabel, Watcher, WorkingTreeStatus};
+use gitez_review::Timestamp;
 
 use crate::repository::Snapshot;
 use crate::theme::{self, color};
 use detail::{DetailEvent, DetailPane};
 use history::{History, Selection};
-use review::{CommitDraft, LastCommit, Review, ReviewEvent};
-use sidebar::Sidebar;
+use new_pull_request::{FormEvent, NewPullRequestForm};
+use review::{CommitDraft, LastCommit, Review, ReviewEvent, Tips};
+use sidebar::{Sidebar, SidebarEvent};
 
-actions!(workspace, [OpenRepository, ReviewSelected]);
+actions!(workspace, [OpenRepository, ReviewSelected, NewPullRequest]);
 
 /// Key bindings of the views inside the workspace.
 pub fn key_bindings() -> Vec<KeyBinding> {
@@ -71,6 +74,12 @@ pub struct Workspace {
     review: Option<(Entity<Review>, Subscription)>,
     /// The message of the next commit, kept while the review is closed.
     commit_draft: Option<Entity<CommitDraft>>,
+    /// The "New local PR" form while its dialog is open.
+    new_pull_request: Option<(Entity<NewPullRequestForm>, Subscription)>,
+    /// Creating a local pull request.
+    _create: Option<Task<()>>,
+    /// The local pull request to show after the next reload.
+    open_after_reload: Option<u32>,
     sidebar: Entity<Sidebar>,
     history: Entity<History>,
     detail: Entity<DetailPane>,
@@ -84,7 +93,13 @@ impl Workspace {
         window.focus(&focus_handle, cx);
         let history = cx.new(History::new);
         let detail = cx.new(|_| DetailPane::new());
+        let sidebar = cx.new(|_| Sidebar::new());
         let subscriptions = vec![
+            cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| match event {
+                SidebarEvent::OpenPullRequest(number) => {
+                    this.open_pull_request(*number, window, cx)
+                }
+            }),
             // The detail pane shows the selected commit.
             cx.subscribe(&history, |this, _, _, cx| this.show_selection(cx)),
             cx.subscribe_in(&detail, window, |this, _, event, window, cx| match event {
@@ -110,7 +125,10 @@ impl Workspace {
             _reload: None,
             review: None,
             commit_draft: None,
-            sidebar: cx.new(|_| Sidebar::new()),
+            new_pull_request: None,
+            _create: None,
+            open_after_reload: None,
+            sidebar,
             history,
             detail,
             _subscriptions: subscriptions,
@@ -191,6 +209,9 @@ impl Workspace {
             .update(cx, |sidebar, cx| sidebar.set_snapshot(snapshot.clone(), cx));
         self.history
             .update(cx, |history, cx| history.load(&snapshot, cx));
+        if let Some(error) = &snapshot.pull_requests_error {
+            window.push_notification(Notification::warning(error.clone()), cx);
+        }
         window.focus(&self.history.focus_handle(cx), cx);
         self.snapshot = Some(snapshot);
         self.error = None;
@@ -296,10 +317,21 @@ impl Workspace {
                             .update(cx, |history, cx| history.reload(&snapshot, cx));
                         if let Some((review, _)) = &this.review {
                             let (head, last_commit) = head_of(&snapshot);
-                            review.update(cx, |review, cx| review.set_head(head, last_commit, cx));
+                            review.update(cx, |review, cx| {
+                                review.set_head(head, last_commit, cx);
+                                if let Some(tips) = review
+                                    .pull_request_number()
+                                    .and_then(|number| tips_of(&snapshot, number))
+                                {
+                                    review.set_tips(tips, cx);
+                                }
+                            });
                         }
                         this.snapshot = Some(snapshot);
                         this.refresh_status(window, cx);
+                        if let Some(number) = this.open_after_reload.take() {
+                            this.open_pull_request(number, window, cx);
+                        }
                         cx.notify();
                     }
                     Err(error) => this.show_error(error, window, cx),
@@ -407,6 +439,18 @@ impl Workspace {
             }
             None => return,
         };
+        self.show_review(review, path, window, cx);
+    }
+
+    /// Shows `review` instead of the history, scrolled to the file at
+    /// `path` if given.
+    fn show_review(
+        &mut self,
+        review: Entity<Review>,
+        path: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let subscription = cx.subscribe_in(&review, window, |this, _, event, window, cx| {
             let delta = match event {
                 ReviewEvent::Close => {
@@ -442,6 +486,142 @@ impl Workspace {
         window.focus(&review.focus_handle(cx), cx);
         self.review = Some((review, subscription));
         cx.notify();
+    }
+
+    /// Shows local pull request `number` instead of the history.
+    fn open_pull_request(&mut self, number: u32, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let Some(pull_request) = snapshot
+            .pull_requests
+            .iter()
+            .find(|pull_request| pull_request.number == number)
+        else {
+            return;
+        };
+        let Some(tips) = tips_of(snapshot, number) else {
+            return;
+        };
+        let (repository, store) = (snapshot.repository.clone(), snapshot.reviews.clone());
+        let pull_request = pull_request.clone();
+        let review = cx.new(|cx| Review::pull_request(&repository, store, pull_request, tips, cx));
+        self.show_review(review, None, window, cx);
+    }
+
+    /// Opens the "New local PR" dialog.
+    fn new_pull_request(
+        &mut self,
+        _: &NewPullRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        if snapshot.refs.branches.len() < 2 {
+            window.push_notification(
+                Notification::info(
+                    "A local pull request reviews one branch against another; this repository has fewer than two branches.",
+                ),
+                cx,
+            );
+            return;
+        }
+        let form = cx.new(|cx| NewPullRequestForm::new(snapshot, window, cx));
+        let subscription =
+            cx.subscribe_in(&form, window, |this, _, event, window, cx| match event {
+                FormEvent::Submit => this.create_pull_request(window, cx),
+            });
+        self.new_pull_request = Some((form.clone(), subscription));
+        let workspace = cx.entity().downgrade();
+        let focus_title = std::cell::Cell::new(true);
+        window.open_dialog(cx, move |dialog, window, cx| {
+            if focus_title.replace(false) {
+                let title = form.read(cx).title().focus_handle(cx);
+                window.focus(&title, cx);
+            }
+            let create = workspace.clone();
+            dialog
+                .title("New local pull request")
+                .w(px(460.))
+                .child(form.clone())
+                .footer(
+                    div()
+                        .h_flex()
+                        .justify_end()
+                        .gap(px(8.))
+                        .child(
+                            Button::new("new-pull-request-cancel")
+                                .ghost()
+                                .label("Cancel")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("new-pull-request-create")
+                                .primary()
+                                .label("Create")
+                                .on_click(move |_, window, cx| {
+                                    create
+                                        .update(cx, |this, cx| this.create_pull_request(window, cx))
+                                        .ok();
+                                }),
+                        ),
+                )
+                .on_close({
+                    let workspace = workspace.clone();
+                    move |_, _, cx| {
+                        workspace
+                            .update(cx, |this, _| this.new_pull_request = None)
+                            .ok();
+                    }
+                })
+        });
+    }
+
+    /// Creates the local pull request the open "New local PR" form
+    /// describes, then shows it.
+    fn create_pull_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(snapshot), Some((form, _))) = (&self.snapshot, &self.new_pull_request) else {
+            return;
+        };
+        let Some(new) = form.update(cx, |form, cx| form.submit(snapshot, cx)) else {
+            return;
+        };
+        window.close_dialog(cx);
+        self.new_pull_request = None;
+        let store = snapshot.reviews.clone();
+        let path = snapshot.path.clone();
+        let create = cx
+            .background_executor()
+            .spawn(async move { store.create(new, Timestamp::now()) });
+        self._create = Some(cx.spawn_in(window, async move |this, cx| {
+            let created = create.await;
+            this.update_in(cx, |this, window, cx| {
+                this._create = None;
+                match created {
+                    Ok(pull_request) => {
+                        if this
+                            .snapshot
+                            .as_ref()
+                            .is_some_and(|snapshot| snapshot.path == path)
+                        {
+                            // Shown once the sidebar lists it.
+                            this.open_after_reload = Some(pull_request.number);
+                            this.reload(window, cx);
+                        }
+                    }
+                    Err(error) => window.push_notification(
+                        Notification::error(format!(
+                            "Could not create the local pull request: {:#}",
+                            anyhow::Error::from(error)
+                        )),
+                        cx,
+                    ),
+                }
+            })
+            .ok();
+        }));
     }
 
     fn close_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -496,6 +676,7 @@ impl Render for Workspace {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::prompt_for_repository))
             .on_action(cx.listener(Self::review_selected))
+            .on_action(cx.listener(Self::new_pull_request))
             .v_flex()
             .size_full()
             .bg(rgb(color::BACKGROUND))
@@ -637,6 +818,19 @@ fn head_of(snapshot: &Snapshot) -> (Option<RefLabel>, Option<LastCommit>) {
         ),
         None => (None, None),
     }
+}
+
+/// The commits the branches of local pull request `number` are on in
+/// `snapshot`; `None` if there is no such pull request.
+fn tips_of(snapshot: &Snapshot, number: u32) -> Option<Tips> {
+    let pull_request = snapshot
+        .pull_requests
+        .iter()
+        .find(|pull_request| pull_request.number == number)?;
+    Some(Tips {
+        head: snapshot.branch_tip(&pull_request.head.branch),
+        base: snapshot.branch_tip(&pull_request.base.branch),
+    })
 }
 
 fn branch_label(name: &str) -> RefLabel {

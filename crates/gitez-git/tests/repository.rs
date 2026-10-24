@@ -993,6 +993,46 @@ fn ahead_behind_counts_only_the_commits_one_side_lacks() {
     assert_eq!(repo.ahead_behind(ahead, other).expect("diverged"), (1, 1));
 }
 
+#[test]
+fn branch_diff_shows_the_changes_since_the_branch_left_its_base() {
+    let fixture = Fixture::new();
+    fixture.commit("shared.txt", "shared");
+    fixture.git(&["checkout", "--quiet", "-b", "feature"]);
+    fixture.commit("feature.txt", "feature one");
+    let head = fixture.commit("feature.txt", "feature two");
+    fixture.git(&["checkout", "--quiet", "main"]);
+    // Changes on the base after the branch left are not the branch's.
+    let base = fixture.commit("shared.txt", "main moved on");
+    let fork = fixture.rev("feature~2");
+    let repo = fixture.open();
+
+    let diff = repo
+        .branch_diff(base, head, DiffOptions::default())
+        .expect("branch diff");
+    assert_eq!(diff.merge_base, Some(fork));
+    assert_eq!(diff.ahead, 2);
+    let paths: Vec<&str> = diff.files.iter().map(|file| file.path.as_str()).collect();
+    assert_eq!(paths, ["feature.txt"]);
+    let blob = fixture.rev("feature:feature.txt");
+    assert_eq!(diff.files[0].new_id, Some(blob));
+    assert_eq!(
+        diff.files[0].line_counts(),
+        Some(LineCounts {
+            added: 2,
+            removed: 0
+        })
+    );
+
+    // Merged: nothing left to review.
+    fixture.merge("feature", "Merge feature");
+    let merged = fixture.rev("HEAD");
+    let diff = repo
+        .branch_diff(merged, head, DiffOptions::default())
+        .expect("merged");
+    assert_eq!((diff.merge_base, diff.ahead), (Some(head), 0));
+    assert!(diff.files.is_empty());
+}
+
 /// `git apply --cached` of `patch`, reversed if `reverse`.
 fn apply_to_index(fixture: &Fixture, patch: &str, reverse: bool) {
     let file = fixture.root.join("../hunk.patch");

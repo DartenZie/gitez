@@ -6,7 +6,7 @@ use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::*;
 use gpui_kit::*;
 
-use super::OpenRepository;
+use super::{NewPullRequest, OpenRepository};
 use crate::theme::{self, color};
 
 /// Height of toolbar buttons in the design.
@@ -15,8 +15,8 @@ const BUTTON_HEIGHT: Pixels = px(30.);
 /// Repository switcher, undo and redo, remote operations, branch and stash,
 /// the command palette entry and "New local PR".
 ///
-/// Only the repository switcher works so far; the git actions are disabled
-/// until their write paths exist.
+/// Only the repository switcher and "New local PR" work so far; the git
+/// actions are disabled until their write paths exist.
 #[derive(IntoElement)]
 pub struct Toolbar {
     /// Name of the open repository.
@@ -29,6 +29,7 @@ impl RenderOnce for Toolbar {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
         let repository_label = self
             .repository_name
+            .clone()
             .unwrap_or_else(|| "Open repository…".into());
         div()
             .h_flex()
@@ -84,7 +85,9 @@ impl RenderOnce for Toolbar {
                     .h(BUTTON_HEIGHT)
                     .icon(IconName::GitPullRequestArrow)
                     .label("New local PR")
-                    .disabled(true),
+                    .tooltip("Review a branch as a local pull request")
+                    .disabled(self.repository_name.is_none())
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(NewPullRequest), cx)),
             )
     }
 }

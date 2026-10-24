@@ -42,7 +42,12 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 > run your own `git`, so hooks and signing work as in the terminal, and a
 > hook that rejects the commit shows its output. Changes made in an
 > editor, a terminal or another git client show up as they happen, in the
-> open review too. Nothing else can be changed from GitEZ yet.
+> open review too. **New local PR** creates a local pull request for a
+> branch against its base (`main` by default); the sidebar lists them,
+> and opening one shows the branch's changes since it left the base,
+> with the files marked viewed kept between sessions. Comments on lines
+> and the agent prompt come next. Nothing else can be changed from GitEZ
+> yet.
 
 ## Technology
 
@@ -138,7 +143,7 @@ crates/gitez-git/   read-only repository access on gitoxide: refs, history, grap
 crates/gitez-command/ changes made by running the user's git binary: staging,
                     unstaging files or hunks, committing, amending
 crates/gitez-review/ local pull requests, their comment threads and agent run
-                    transcripts, stored in .git/gitez/reviews (not in the app yet)
+                    transcripts, stored in .git/gitez/reviews
 rust-toolchain.toml pinned Rust toolchain
 CLAUDE.md           instructions for Claude Code when working in this repository
 ```

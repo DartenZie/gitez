@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use gitez_git::{Refs, Repository};
+use gitez_review::{PullRequest, State, Store};
 use gpui_kit::SharedString;
 
 /// What the window shows about a repository, read in one go on a background
@@ -21,6 +22,12 @@ pub struct Snapshot {
     pub refs: Refs,
     /// How each local branch with an upstream compares to it, by branch name.
     pub tracking: HashMap<String, Tracking>,
+    /// Where the local pull requests are stored.
+    pub reviews: Store,
+    /// The local pull requests: open ones first, then newest first.
+    pub pull_requests: Vec<PullRequest>,
+    /// Why some local pull requests could not be read, if any could not.
+    pub pull_requests_error: Option<String>,
 }
 
 /// How a local branch compares to its upstream.
@@ -68,6 +75,9 @@ impl Snapshot {
             );
         }
 
+        let reviews = Store::new(&repository.common_dir());
+        let (pull_requests, pull_requests_error) = load_pull_requests(&reviews);
+
         Ok(Self {
             name: repository.name().into(),
             path: repository
@@ -77,8 +87,56 @@ impl Snapshot {
             repository,
             refs,
             tracking,
+            reviews,
+            pull_requests,
+            pull_requests_error,
         })
     }
+
+    /// The tip of the local branch `name`, if it exists.
+    pub fn branch_tip(&self, name: &str) -> Option<gitez_git::Oid> {
+        self.refs
+            .branches
+            .iter()
+            .find(|branch| branch.name == name)
+            .map(|branch| branch.target)
+    }
+}
+
+/// Every pull request in `store` that can be read, sorted for the sidebar,
+/// and why the others cannot. One unreadable pull request does not hide the
+/// rest.
+fn load_pull_requests(store: &Store) -> (Vec<PullRequest>, Option<String>) {
+    let numbers = match store.numbers() {
+        Ok(numbers) => numbers,
+        Err(error) => {
+            let error = anyhow::Error::from(error).context("could not list local pull requests");
+            return (Vec::new(), Some(format!("{error:#}")));
+        }
+    };
+    let mut pull_requests = Vec::with_capacity(numbers.len());
+    let mut errors = Vec::new();
+    for number in numbers {
+        match store.load(number) {
+            Ok(pull_request) => pull_requests.push(pull_request),
+            // Being created by another GitEZ: its file is not written yet.
+            Err(gitez_review::Error::NotFound(_)) => {}
+            Err(error) => errors.push(format!("#{number}: {:#}", anyhow::Error::from(error))),
+        }
+    }
+    pull_requests.sort_by_key(|pull_request| {
+        (
+            pull_request.state != State::Open,
+            std::cmp::Reverse(pull_request.number),
+        )
+    });
+    let error = (!errors.is_empty()).then(|| {
+        format!(
+            "Could not read some local pull requests: {}",
+            errors.join("; ")
+        )
+    });
+    (pull_requests, error)
 }
 
 /// Compares strings with runs of digits ordered by value, so that `v0.10.0`

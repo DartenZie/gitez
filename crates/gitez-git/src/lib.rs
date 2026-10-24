@@ -22,7 +22,8 @@ mod watch;
 pub use commits::{Commit, CommitWalk, Order, Signature, Timestamp};
 pub use details::{ChangeKind, CommitDetails, FileChange, LineCounts};
 pub use diff::{
-    DiffContent, DiffLine, DiffOptions, FileDiff, Hunk, LineKind, LineSource, NewSide, Staging,
+    BranchDiff, DiffContent, DiffLine, DiffOptions, FileDiff, Hunk, LineKind, LineSource, NewSide,
+    Staging,
 };
 pub use error::{Error, Result};
 pub use follow::{ChangedLines, Followed};

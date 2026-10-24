@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use gitez_git::{Branch, Stash};
+use gitez_review::{PullRequest, State};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -28,6 +29,12 @@ enum Section {
     Remotes,
     Tags,
     Stashes,
+}
+
+/// What the sidebar asks of the window.
+pub enum SidebarEvent {
+    /// Show the local pull request with this number.
+    OpenPullRequest(u32),
 }
 
 pub struct Sidebar {
@@ -131,6 +138,8 @@ impl Sidebar {
     }
 }
 
+impl EventEmitter<SidebarEvent> for Sidebar {}
+
 impl Render for Sidebar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let snapshot = self.snapshot.clone();
@@ -175,12 +184,17 @@ impl Render for Sidebar {
                 }
                 let now = time::now();
 
+                let pull_request_rows = snapshot
+                    .pull_requests
+                    .iter()
+                    .map(|pull_request| pull_request_row(pull_request, cx).into_any_element())
+                    .collect::<Vec<_>>();
                 this.child(self.section(
                     Section::LocalPullRequests,
                     "Local pull requests",
-                    0,
+                    snapshot.pull_requests.len(),
                     "No local pull requests",
-                    Vec::new,
+                    || pull_request_rows,
                     cx,
                 ))
                 .child(self.section(
@@ -350,6 +364,65 @@ fn branch_row(branch: &Branch, tracking: Option<&Tracking>) -> impl IntoElement 
         .when_some(ahead_behind, |this, text| {
             this.child(trailing(text).font_weight(FontWeight::NORMAL))
         })
+}
+
+/// "#3  Title / In review · 3 open comments", as in the `Main.dc.html`
+/// artboard.
+fn pull_request_row(pull_request: &PullRequest, cx: &mut Context<Sidebar>) -> impl IntoElement {
+    let open = pull_request.state == State::Open;
+    let detail = match pull_request.state {
+        State::Open => match pull_request.open_threads() {
+            0 => "In review".to_owned(),
+            1 => "In review · 1 open comment".to_owned(),
+            count => format!("In review · {count} open comments"),
+        },
+        State::Merged => "Merged".to_owned(),
+        State::Closed => "Closed".to_owned(),
+    };
+    let number = pull_request.number;
+    div()
+        .id(("sidebar-pull-request", number as usize))
+        .h_flex()
+        .items_start()
+        .gap(px(8.))
+        .py(px(6.))
+        .px(px(14.))
+        .text_size(ROW_TEXT_SIZE)
+        .text_color(rgb(if open {
+            color::TEXT_SECONDARY
+        } else {
+            color::TEXT_MUTED
+        }))
+        .hover(|style| style.bg(rgb(color::NAV_HOVER)).text_color(rgb(color::TEXT)))
+        .cursor_pointer()
+        .on_click(cx.listener(move |_, _, _, cx| cx.emit(SidebarEvent::OpenPullRequest(number))))
+        .child(
+            div()
+                .flex_none()
+                .pt(px(1.))
+                .font_family(cx.theme().mono_font_family.clone())
+                .text_size(theme::SMALL_TEXT_SIZE)
+                .text_color(rgb(if open {
+                    color::PULL_REQUEST_OPEN_TEXT
+                } else {
+                    color::TEXT_FAINT
+                }))
+                .child(format!("#{number}")),
+        )
+        .child(
+            div()
+                .v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap(px(2.))
+                .child(label(pull_request.title.clone()))
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(color::TEXT_FAINT))
+                        .child(detail),
+                ),
+        )
 }
 
 fn remote_row(remote: &str, branches: usize) -> impl IntoElement {

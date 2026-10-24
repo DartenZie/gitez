@@ -44,6 +44,9 @@ pub mod color {
     pub const BRANCH_VIOLET: u32 = 0xc0_8c_f0;
     pub const BRANCH_TEAL: u32 = 0x4f_c6_b0;
 
+    /// An open pull request's number and state chip text.
+    pub const PULL_REQUEST_OPEN_TEXT: u32 = 0x7f_d8_c6;
+
     pub const DIFF_ADDED: u32 = 0x6c_c5_8a;
     pub const DIFF_REMOVED: u32 = 0xf0_8a_7e;
 

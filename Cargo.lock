@@ -2047,6 +2047,7 @@ dependencies = [
  "futures",
  "gitez-command",
  "gitez-git",
+ "gitez-review",
  "gpui-kit",
  "tempfile",
 ]

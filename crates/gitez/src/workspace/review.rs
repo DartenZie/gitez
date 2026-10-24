@@ -1,16 +1,21 @@
-//! The diff of one commit, or of the uncommitted changes: every changed
-//! file, one after another, as in the `Commit.dc.html` artboard. The
-//! uncommitted changes can be staged and committed from here.
+//! The diff of one commit, of the uncommitted changes or of a local pull
+//! request: every changed file, one after another, as in the
+//! `Commit.dc.html` and `LocalPR.dc.html` artboards. The uncommitted changes
+//! can be staged and committed from here.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::sync::Arc;
 
+use anyhow::Context as _;
 use gitez_command::Git;
 use gitez_git::{
-    ChangeKind, Commit, DiffContent, DiffLine, DiffOptions, FileDiff, FileStatus, Hunk, LineKind,
-    LineSource, Oid, RefKind, RefLabel, Repository, Staging, WorkingTreeStatus, WorktreeChange,
+    BranchDiff, ChangeKind, Commit, DiffContent, DiffLine, DiffOptions, FileDiff, FileStatus,
+    Followed, Hunk, LineKind, LineSource, Oid, RefKind, RefLabel, Repository, Staging,
+    WorkingTreeStatus, WorktreeChange,
 };
+use gitez_review::{FileUpdate, LineChange, PullRequest, State, Store, Timestamp};
+use gpui_kit::assets::IconName;
 use gpui_kit::component::button::*;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
@@ -227,6 +232,7 @@ struct Anchor {
 /// What is being reviewed.
 enum Subject {
     Commit(Box<CommitSubject>),
+    PullRequest(Box<PullRequestSubject>),
     WorkingTree {
         status: Arc<WorkingTreeStatus>,
         /// The branch `HEAD` is on, or the detached `HEAD`.
@@ -296,6 +302,27 @@ struct CommitSubject {
     older: Option<Commit>,
 }
 
+/// The commits a local pull request's branches are on now; `None` for a
+/// branch that no longer exists, which is then taken as it was last seen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tips {
+    pub head: Option<Oid>,
+    pub base: Option<Oid>,
+}
+
+struct PullRequestSubject {
+    store: Store,
+    /// As last read or changed here.
+    pull_request: PullRequest,
+    tips: Tips,
+    /// How many commits the head has that the base lacks, once read.
+    ahead: Option<usize>,
+    /// Saving the pull request; each save waits for the one before.
+    saving: Task<()>,
+    /// Why the last save failed.
+    save_error: Option<SharedString>,
+}
+
 pub struct Review {
     focus_handle: FocusHandle,
     repository: Repository,
@@ -308,9 +335,9 @@ pub struct Review {
     list: ListState,
     /// The file at the top of the list.
     current_file: usize,
-    /// The files marked viewed, by path, with the [`fingerprint`] of their
-    /// diff then: a file that changes since counts as not viewed again.
-    viewed: HashMap<String, u64>,
+    /// The files marked viewed, by path, with their [`Self::view_key`]
+    /// then: a file that changes since counts as not viewed again.
+    viewed: HashMap<String, String>,
     /// The gaps shown in full, by file path, with the [`fingerprint`] of
     /// the file's diff then.
     expanded: HashMap<String, (u64, HashSet<GapAt>)>,
@@ -398,6 +425,132 @@ impl Review {
             form: Box::new(form),
         };
         Self::with_subject(repository, subject, load, cx)
+    }
+
+    /// Reviews `pull_request`, stored in `store`, with its branches on
+    /// `tips`. It is read again from `store` with its diff in the
+    /// background, and its threads follow the head if it moved.
+    pub fn pull_request(
+        repository: &Repository,
+        store: Store,
+        pull_request: PullRequest,
+        tips: Tips,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let load = Self::load_pull_request(repository, &store, pull_request.number, tips, cx);
+        let subject = Subject::PullRequest(Box::new(PullRequestSubject {
+            store,
+            pull_request,
+            tips,
+            ahead: None,
+            saving: Task::ready(()),
+            save_error: None,
+        }));
+        Self::with_subject(repository, subject, load, cx)
+    }
+
+    /// Reads pull request `number` and its diff in the background.
+    fn load_pull_request(
+        repository: &Repository,
+        store: &Store,
+        number: u32,
+        tips: Tips,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        let (repository, store) = (repository.clone(), store.clone());
+        let options = ReviewSettings::get(cx).diff_options();
+        cx.spawn(async move |this, cx| {
+            let read = cx
+                .background_executor()
+                .spawn(async move { read_pull_request(&repository, &store, number, tips, options) })
+                .await;
+            this.update(cx, |this, cx| match read {
+                Ok((pull_request, diff)) => this.finish_pull_request(pull_request, diff, cx),
+                Err(error) => {
+                    this.files = Some(Err(format!(
+                        "Could not read local pull request #{number}: {error:#}"
+                    )
+                    .into()));
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+    }
+
+    fn finish_pull_request(
+        &mut self,
+        pull_request: PullRequest,
+        diff: BranchDiff,
+        cx: &mut Context<Self>,
+    ) {
+        let Subject::PullRequest(subject) = &mut self.subject else {
+            return;
+        };
+        self.viewed = pull_request
+            .viewed
+            .iter()
+            .map(|(path, key)| (path.clone(), key.clone()))
+            .collect();
+        subject.pull_request = pull_request;
+        subject.ahead = Some(diff.ahead);
+        self.finish(Ok(diff.files), cx);
+        // The viewed files may differ while the diff does not.
+        let anchor = self.scroll_anchor();
+        self.rebuild_rows(anchor, cx);
+    }
+
+    /// Shows the pull request's branches on `tips` after the refs changed.
+    /// Does nothing for other reviews.
+    pub fn set_tips(&mut self, tips: Tips, cx: &mut Context<Self>) {
+        let Subject::PullRequest(subject) = &mut self.subject else {
+            return;
+        };
+        if subject.tips == tips {
+            return;
+        }
+        subject.tips = tips;
+        let number = subject.pull_request.number;
+        let store = subject.store.clone();
+        self._load = Self::load_pull_request(&self.repository, &store, number, tips, cx);
+    }
+
+    /// The number of the local pull request reviewed, if one is.
+    pub fn pull_request_number(&self) -> Option<u32> {
+        match &self.subject {
+            Subject::PullRequest(subject) => Some(subject.pull_request.number),
+            _ => None,
+        }
+    }
+
+    /// Saves the pull request in the background, after any save still
+    /// running.
+    fn save_pull_request(&mut self, cx: &mut Context<Self>) {
+        let Subject::PullRequest(subject) = &mut self.subject else {
+            return;
+        };
+        let previous = std::mem::replace(&mut subject.saving, Task::ready(()));
+        let (store, pull_request) = (subject.store.clone(), subject.pull_request.clone());
+        subject.saving = cx.spawn(async move |this, cx| {
+            previous.await;
+            let saved = cx
+                .background_executor()
+                .spawn(async move { store.save(&pull_request) })
+                .await;
+            this.update(cx, |this, cx| {
+                if let Subject::PullRequest(subject) = &mut this.subject {
+                    subject.save_error = saved.err().map(|error| {
+                        format!(
+                            "Could not save the review: {:#}",
+                            anyhow::Error::from(error)
+                        )
+                        .into()
+                    });
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
     }
 
     fn with_subject(
@@ -690,7 +843,17 @@ impl Review {
 
     /// Whether `file` is marked viewed and has not changed since.
     fn is_viewed(&self, file: &FileDiff) -> bool {
-        self.viewed.get(&file.path) == Some(&fingerprint(file))
+        self.viewed.get(&file.path) == Some(&self.view_key(file))
+    }
+
+    /// What a file marked viewed is compared with later: in a pull request,
+    /// which is saved, the id of its new version (empty when deleted);
+    /// otherwise the [`fingerprint`] of its diff.
+    fn view_key(&self, file: &FileDiff) -> String {
+        match &self.subject {
+            Subject::PullRequest(_) => file.new_id.map(|id| id.to_string()).unwrap_or_default(),
+            _ => format!("{:016x}", fingerprint(file)),
+        }
     }
 
     /// Marks the file at `index` viewed, which collapses it, or not viewed.
@@ -701,12 +864,21 @@ impl Review {
         let Some(file) = files.get(index) else {
             return;
         };
-        let (file_path, file_print) = (file.path.clone(), fingerprint(file));
+        let (file_path, key) = (file.path.clone(), self.view_key(file));
         let mut anchor = self.scroll_anchor();
         if viewed {
-            self.viewed.insert(file_path.clone(), file_print);
+            self.viewed.insert(file_path.clone(), key.clone());
         } else {
             self.viewed.remove(&file_path);
+        }
+        if let Subject::PullRequest(subject) = &mut self.subject {
+            let saved = &mut subject.pull_request.viewed;
+            if viewed {
+                saved.insert(file_path.clone(), key);
+            } else {
+                saved.remove(&file_path);
+            }
+            self.save_pull_request(cx);
         }
         if let Some(anchor) = &mut anchor
             && anchor.path == file_path
@@ -747,6 +919,13 @@ impl Review {
         self._load = match &self.subject {
             Subject::Commit(subject) => Self::load_commit(&self.repository, subject.commit.id, cx),
             Subject::WorkingTree { .. } => Self::load_working_tree(&self.repository, cx),
+            Subject::PullRequest(subject) => Self::load_pull_request(
+                &self.repository,
+                &subject.store,
+                subject.pull_request.number,
+                subject.tips,
+                cx,
+            ),
         };
         cx.notify();
     }
@@ -1415,7 +1594,7 @@ impl Review {
     fn render_end(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (end, older) = match &self.subject {
             Subject::Commit(subject) => ("End of commit", subject.older.as_ref()),
-            Subject::WorkingTree { .. } => ("End of changes", None),
+            Subject::WorkingTree { .. } | Subject::PullRequest(_) => ("End of changes", None),
         };
         div()
             .h_flex()
@@ -1542,6 +1721,16 @@ impl Review {
                         ),
                 )
             }
+            Subject::PullRequest(subject) => header
+                .pb(px(18.))
+                .child(
+                    breadcrumb
+                        .child(muted("/"))
+                        .child(muted("Local pull requests"))
+                        .child(muted("/"))
+                        .child(format!("#{}", subject.pull_request.number)),
+                )
+                .child(self.render_pull_request_title(subject, totals, mono, cx)),
             Subject::WorkingTree {
                 status,
                 head,
@@ -1585,6 +1774,85 @@ impl Review {
                     .child(self.render_commit_form(status, last_commit.as_ref(), form, cx))
             }
         }
+    }
+
+    /// The title, state, branches and totals of a pull request, and what
+    /// can be done with it, as in the `LocalPR.dc.html` artboard.
+    fn render_pull_request_title(
+        &self,
+        subject: &PullRequestSubject,
+        totals: Option<(usize, usize, usize)>,
+        mono: SharedString,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let pull_request = &subject.pull_request;
+        let branch = |name: &str| {
+            labels::ref_label(&RefLabel {
+                kind: RefKind::Branch,
+                name: name.to_owned(),
+                is_head: false,
+            })
+            .into_any_element()
+        };
+        let commits = subject.ahead.map(|ahead| match ahead {
+            1 => "1 commit".to_owned(),
+            ahead => format!("{ahead} commits"),
+        });
+        let missing = [
+            (subject.tips.head.is_none(), &pull_request.head.branch),
+            (subject.tips.base.is_none(), &pull_request.base.branch),
+        ]
+        .into_iter()
+        .filter(|(missing, _)| *missing)
+        .map(|(_, name)| format!("{name} no longer exists"))
+        .collect::<Vec<_>>();
+        div()
+            .h_flex()
+            .items_start()
+            .gap(px(20.))
+            .child(
+                title(pull_request.title.clone()).flex_1().min_w_0().child(
+                    byline()
+                        .child(state_chip(pull_request.state))
+                        .child(branch(&pull_request.head.branch))
+                        .child(
+                            Icon::new(IconName::ArrowRight)
+                                .size(px(16.))
+                                .text_color(rgb(color::TEXT_MUTED)),
+                        )
+                        .child(branch(&pull_request.base.branch))
+                        .children(commits.map(|commits| muted(format!("· {commits}"))))
+                        .when_some(totals, |this, totals| {
+                            let [files, added, removed] = total_parts(totals, mono);
+                            this.child(muted("·"))
+                                .child(div().text_color(rgb(color::TEXT_MUTED)).child(files))
+                                .child(added)
+                                .child(removed)
+                        })
+                        .children(
+                            (!missing.is_empty())
+                                .then(|| muted(format!("· {}", missing.join(", ")))),
+                        ),
+                ),
+            )
+            .child(
+                div()
+                    .h_flex()
+                    .flex_none()
+                    .gap(px(6.))
+                    .child(
+                        Button::new("pull-request-checkout")
+                            .h(px(30.))
+                            .label("Checkout branch")
+                            .disabled(true),
+                    )
+                    .child(
+                        Button::new("pull-request-merge")
+                            .h(px(30.))
+                            .label(format!("Merge into {}…", pull_request.base.branch))
+                            .disabled(true),
+                    ),
+            )
     }
 
     /// The strip above the diff: how many files are marked viewed.
@@ -1635,17 +1903,20 @@ impl Review {
                     })),
             )
             .child(self.expand_all_button(files, cx))
-            .when_some(self.sources_error.clone(), |this, error| {
-                this.child(
-                    div()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .text_color(rgb(color::DIFF_REMOVED))
-                        .child(error),
-                )
-            })
+            .when_some(
+                self.save_error().or(self.sources_error.clone()),
+                |this, error| {
+                    this.child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_color(rgb(color::DIFF_REMOVED))
+                            .child(error),
+                    )
+                },
+            )
             .child(
                 div()
                     .h_flex()
@@ -1668,6 +1939,13 @@ impl Review {
                     )
                     .child(format!("{viewed} of {total}")),
             )
+    }
+
+    fn save_error(&self) -> Option<SharedString> {
+        match &self.subject {
+            Subject::PullRequest(subject) => subject.save_error.clone(),
+            _ => None,
+        }
     }
 
     /// "Expand all context", or "Collapse context" once every gap is shown.
@@ -1820,6 +2098,7 @@ impl Render for Review {
             Some(Ok(files)) if files.is_empty() => match self.subject {
                 Subject::Commit(_) => message("This commit changes no files."),
                 Subject::WorkingTree { .. } => message("No uncommitted changes."),
+                Subject::PullRequest(_) => message("This branch changes no files."),
             }
             .into_any_element(),
             Some(Ok(files)) => {
@@ -1868,6 +2147,77 @@ impl Render for Review {
             .child(self.render_header(cx))
             .child(body)
     }
+}
+
+/// Pull request `number` read from `store` with its branches moved to
+/// `tips`, saved again if that changed it, and its diff. Blocks; run it on
+/// a background thread.
+fn read_pull_request(
+    repository: &Repository,
+    store: &Store,
+    number: u32,
+    tips: Tips,
+    options: DiffOptions,
+) -> anyhow::Result<(PullRequest, BranchDiff)> {
+    let mut pull_request = store.load(number)?;
+    let read = pull_request.clone();
+    let commit = |hex: &str| {
+        Oid::from_hex(hex.as_bytes()).with_context(|| format!("{hex} is not a commit id"))
+    };
+    let last_head = commit(&pull_request.head.commit)?;
+    let head = tips.head.unwrap_or(last_head);
+    let base = match tips.base {
+        Some(base) => base,
+        None => commit(&pull_request.base.commit)?,
+    };
+    if head != last_head {
+        pull_request.move_head(&head.to_string(), Timestamp::now(), |path| {
+            Ok::<_, gitez_git::Error>(match repository.follow_lines(path, last_head, head)? {
+                Followed::Unchanged => FileUpdate::Unchanged,
+                Followed::Changed { path, lines } => FileUpdate::Changed {
+                    path,
+                    lines: lines
+                        .into_iter()
+                        .map(|lines| LineChange {
+                            old: lines.old,
+                            new: lines.new,
+                        })
+                        .collect(),
+                },
+                Followed::Gone => FileUpdate::Gone,
+            })
+        })?;
+    }
+    pull_request.base.commit = base.to_string();
+    let diff = repository.branch_diff(base, head, options)?;
+    if pull_request != read {
+        store.save(&pull_request)?;
+    }
+    Ok((pull_request, diff))
+}
+
+/// "In review", "Merged" or "Closed", with a dot.
+fn state_chip(state: State) -> impl IntoElement {
+    let (label, dot, text) = match state {
+        State::Open => (
+            "In review",
+            color::BRANCH_TEAL,
+            color::PULL_REQUEST_OPEN_TEXT,
+        ),
+        State::Merged => ("Merged", color::BRANCH_VIOLET, color::BRANCH_VIOLET),
+        State::Closed => ("Closed", color::TEXT_FAINT, color::TEXT_MUTED),
+    };
+    div()
+        .h_flex()
+        .h(px(22.))
+        .px(px(8.))
+        .gap(px(5.))
+        .rounded(px(11.))
+        .bg(theme::with_alpha(dot, 0.16))
+        .text_color(rgb(text))
+        .text_size(theme::SMALL_TEXT_SIZE)
+        .child(div().size(px(7.)).rounded_full().bg(rgb(dot)))
+        .child(label)
 }
 
 /// The rows of the diff list for `files`, and the row of each file's header.
@@ -2400,6 +2750,7 @@ mod tests {
             path: "f".to_owned(),
             kind: ChangeKind::Modified,
             content: DiffContent::Text(vec![ranged((3, 1), (3, 1), false, 3)]),
+            new_id: None,
         }];
         let (rows, _) = rows(
             &files,
@@ -2425,6 +2776,7 @@ mod tests {
             path: path.to_owned(),
             kind: ChangeKind::Modified,
             content: DiffContent::Text(hunks),
+            new_id: None,
         }
     }
 

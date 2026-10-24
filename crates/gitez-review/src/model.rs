@@ -192,6 +192,14 @@ impl PullRequest {
         Ok(())
     }
 
+    /// How many threads are not resolved.
+    pub fn open_threads(&self) -> usize {
+        self.threads
+            .iter()
+            .filter(|thread| thread.is_open())
+            .count()
+    }
+
     pub fn thread(&self, thread: u32) -> Option<&Thread> {
         self.threads.iter().find(|candidate| candidate.id == thread)
     }
