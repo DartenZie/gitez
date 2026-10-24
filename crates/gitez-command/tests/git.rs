@@ -904,3 +904,59 @@ fn resets_softly_or_keeping_local_changes() {
     git_.switch_detached(&second).expect("detach");
     assert_eq!(git(root, &["branch", "--show-current"]), "");
 }
+
+#[test]
+fn discards_files_and_brings_them_back() {
+    let dir = repository();
+    let root = dir.path();
+    let git_ = Git::new(root);
+    std::fs::write(root.join("a.txt"), "a\n").expect("write");
+    std::fs::write(root.join("[b].txt"), "b\n").expect("write");
+    git_.stage_all().expect("stage");
+    git_.commit("Add a and b").expect("commit");
+    std::fs::write(root.join("a.txt"), "a\nolder\n").expect("write");
+    assert!(git_.stash(Some("Older"), false).expect("stash"));
+    std::fs::write(root.join("a.txt"), "a\nstaged\n").expect("write");
+    git_.stage(&["a.txt".to_owned()]).expect("stage");
+    std::fs::write(root.join("a.txt"), "a\nstaged\nunstaged\n").expect("write");
+    std::fs::write(root.join("[b].txt"), "B\n").expect("write");
+    std::fs::write(root.join("new.txt"), "new\n").expect("write");
+    let dirty = status(root);
+
+    let saved = git_
+        .discard(Some(&["a.txt".to_owned(), "new.txt".to_owned()]))
+        .expect("discard")
+        .expect("something was discarded");
+    assert_eq!(status(root), "M [b].txt");
+    // The stashes already there are left alone.
+    assert_eq!(git(root, &["stash", "list"]), "stash@{0}: On main: Older");
+
+    git_.restore_discarded(&saved).expect("restore");
+    assert_eq!(status(root), dirty);
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).expect("read"),
+        "a\nstaged\nunstaged\n"
+    );
+
+    git_.discard(None).expect("discard everything");
+    assert_eq!(status(root), "");
+    assert_eq!(git_.discard(None).expect("discard nothing"), None);
+}
+
+#[test]
+fn discards_a_hunk_from_the_working_tree_and_brings_it_back() {
+    let dir = repository();
+    let git_ = Git::new(dir.path());
+    std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").expect("write");
+    git_.stage_all().expect("stage");
+    git_.commit("Add a").expect("commit");
+    std::fs::write(dir.path().join("a.txt"), "one\nTWO\n").expect("write");
+    let patch =
+        "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+TWO\n";
+
+    git_.apply_to_worktree(patch, true)
+        .expect("discard the hunk");
+    assert_eq!(status(dir.path()), "");
+    git_.apply_to_worktree(patch, false).expect("bring it back");
+    assert_eq!(status(dir.path()), "M a.txt");
+}

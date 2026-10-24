@@ -124,11 +124,15 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 > files too unless you untick that, with an optional message; right-click
 > a stash in the sidebar to pop it, apply it and keep it, or drop it. A
 > stash that conflicts with your files is kept, with the conflicts marked
-> in them. **Undo** (`⌘Z`, the arrows in the toolbar, the palette, or the
+> in them. In the working tree, **Discard** on a file throws away its
+> changes, staged or not, and deletes it if git does not track it yet;
+> **Discard hunk** throws away one unstaged hunk, and **Discard all**
+> every uncommitted change. **Undo** (`⌘Z`, the arrows in the toolbar, the palette, or the
 > button on the notification) takes back what GitEZ last did: a commit or
 > amend (its changes come back staged), a checkout, a branch created,
 > renamed or deleted, a pull, merge, rebase, cherry-pick or rewrite, a
-> stash made or dropped, and a local pull request marked merged. **Redo**
+> stash made or dropped, changes discarded, and a local pull request
+> marked merged. **Redo**
 > (`⇧⌘Z`) does it again. GitEZ keeps its own list of these steps while it
 > runs, and refuses one when a branch it would move has moved since, so
 > nothing done elsewhere is overwritten. Fetch, push and commands run as

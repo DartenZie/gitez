@@ -877,6 +877,75 @@ impl Git {
         self.run(args, Some(patch.as_bytes())).map(drop)
     }
 
+    /// Applies `patch` to the working tree only, like `git apply`; with
+    /// `reverse`, takes it back out. Discards part of a file's unstaged
+    /// changes, or brings them back.
+    pub fn apply_to_worktree(&self, patch: &str, reverse: bool) -> Result<()> {
+        let mut args = vec!["apply", "--whitespace=nowarn"];
+        if reverse {
+            args.push("--reverse");
+        }
+        args.push("-");
+        self.run(args, Some(patch.as_bytes())).map(drop)
+    }
+
+    /// Throws away the uncommitted changes to `paths`, or to every file
+    /// when `None`, staged or not, and deletes the files git does not track
+    /// yet. They are kept in a stash commit that is left off the stash
+    /// list; its id, returned, brings them back with
+    /// [`Git::restore_discarded`]. `None` when there was nothing to discard.
+    pub fn discard(&self, paths: Option<&[String]>) -> Result<Option<String>> {
+        let top = || {
+            self.run(["rev-parse", "--quiet", "--verify", "refs/stash"], None)
+                .ok()
+                .map(|id| String::from_utf8_lossy(&id).trim().to_owned())
+        };
+        let before = top();
+        let args = [
+            "stash",
+            "push",
+            "--quiet",
+            "--include-untracked",
+            "-m",
+            "GitEZ: discarded changes",
+        ];
+        // Literal pathspecs stop `git stash` from cleaning the untracked
+        // files it stashed, so each path is marked literal instead.
+        let literal = [("GIT_LITERAL_PATHSPECS", "0")];
+        match paths {
+            Some([]) => return Ok(None),
+            Some(paths) => {
+                let mut input = Vec::new();
+                for path in paths {
+                    input.extend_from_slice(b":(literal)");
+                    input.extend_from_slice(path.as_bytes());
+                    input.push(0);
+                }
+                let args = args
+                    .into_iter()
+                    .chain(["--pathspec-from-file=-", "--pathspec-file-nul"]);
+                self.run_with_env(args, Some(&input), &literal)?;
+            }
+            None => {
+                self.run_with_env(args, None, &literal)?;
+            }
+        }
+        let after = top();
+        if after.is_none() || after == before {
+            return Ok(None);
+        }
+        self.drop_stash(0)?;
+        Ok(after)
+    }
+
+    /// Brings back the changes [`Git::discard`] kept in stash commit `id`,
+    /// staged as they were. Fails, changing nothing, when they would
+    /// overwrite changes made since.
+    pub fn restore_discarded(&self, id: &str) -> Result<()> {
+        self.run(["stash", "apply", "--quiet", "--index", id], None)
+            .map(drop)
+    }
+
     /// Runs `git <args>` with `paths` passed on standard input, so any
     /// number of paths fits and none is read as an option or a pattern.
     fn run_with_paths<const N: usize>(&self, args: [&str; N], paths: &[String]) -> Result<()> {

@@ -34,7 +34,7 @@ mod threads;
 
 use super::labels;
 use crate::theme::{self, color};
-use crate::undo::{self, Recorder};
+use crate::undo::{self, Discard, Recorded, Recorder};
 
 actions!(review, [Close, Newer, Older, CommitStaged]);
 
@@ -68,6 +68,11 @@ pub enum ReviewEvent {
     CheckedOut,
     /// A merge stopped with conflicts to resolve.
     MergeStopped,
+    /// Uncommitted changes were thrown away; `step` is the undo step.
+    Discarded {
+        message: SharedString,
+        step: Option<u64>,
+    },
     /// The local pull request was merged, which moved the branches and
     /// may have checked out another; `step` is the undo step.
     Merged {
@@ -1197,6 +1202,38 @@ impl Review {
         );
     }
 
+    /// Throws away the uncommitted changes to the files at `paths`, or to
+    /// every file when `None`, as one undo step.
+    fn discard(&mut self, paths: Option<Vec<String>>, window: &mut Window, cx: &mut Context<Self>) {
+        let (label, message) = match paths.as_deref() {
+            Some([path, ..]) => (
+                format!("Discard the changes to {path}"),
+                format!("Discarded the changes to {path}"),
+            ),
+            _ => (
+                "Discard all changes".to_owned(),
+                "Discarded every uncommitted change".to_owned(),
+            ),
+        };
+        self.run_git(
+            move |git| {
+                let saved = git.discard(paths.as_deref())?;
+                Ok(saved.and_then(|saved| {
+                    Recorded::discard(git.work_dir(), Discard::Files { paths, saved })
+                }))
+            },
+            move |_, recorded, _, cx| {
+                let step = undo::record(cx, recorded, label);
+                cx.emit(ReviewEvent::Discarded {
+                    message: message.into(),
+                    step,
+                });
+            },
+            window,
+            cx,
+        );
+    }
+
     /// Commits the staged changes with the message typed, or amends the
     /// last commit with them.
     fn commit_staged(&mut self, _: &CommitStaged, window: &mut Window, cx: &mut Context<Self>) {
@@ -1307,10 +1344,22 @@ impl Review {
             unstage_paths.push(from.clone());
         }
         let stage_paths = vec![status.path.clone()];
+        let discard_paths = unstage_paths.clone();
         div()
             .h_flex()
             .flex_none()
             .gap(px(4.))
+            .child(
+                Button::new(("discard-file", index))
+                    .ghost()
+                    .xsmall()
+                    .label("Discard")
+                    .tooltip("Throw away the changes to this file; Undo brings them back")
+                    .disabled(running)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.discard(Some(discard_paths.clone()), window, cx)
+                    })),
+            )
             .when(status.staged.is_some(), |this| {
                 this.child(
                     Button::new(("unstage-file", index))
@@ -1339,7 +1388,7 @@ impl Review {
 
     /// "Unstage all" and "Stage all" above the files, when reviewing the
     /// uncommitted changes.
-    fn stage_all_buttons(&self, cx: &mut Context<Self>) -> Option<[AnyElement; 2]> {
+    fn stage_all_buttons(&self, cx: &mut Context<Self>) -> Option<[AnyElement; 3]> {
         let Subject::WorkingTree { status, form, .. } = &self.subject else {
             return None;
         };
@@ -1347,6 +1396,14 @@ impl Review {
         let anything_staged = status.staged() > 0;
         let anything_unstaged = status.files.iter().any(|file| file.unstaged.is_some());
         Some([
+            Button::new("discard-all")
+                .ghost()
+                .xsmall()
+                .label("Discard all")
+                .tooltip("Throw away every uncommitted change; Undo brings them back")
+                .disabled(running || status.files.is_empty())
+                .on_click(cx.listener(|this, _, window, cx| this.discard(None, window, cx)))
+                .into_any_element(),
             Button::new("unstage-all")
                 .ghost()
                 .xsmall()
@@ -1392,6 +1449,19 @@ impl Review {
                         .child("staged"),
                 )
             })
+            .when(patchable && staging == Staging::Unstaged, |this| {
+                this.child(
+                    Button::new(("discard-hunk", file * 100_000 + hunk))
+                        .ghost()
+                        .xsmall()
+                        .h(px(18.))
+                        .label("Discard hunk")
+                        .disabled(self.is_running())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.discard_hunk(file, hunk, window, cx)
+                        })),
+                )
+            })
             .when(patchable, |this| {
                 this.child(
                     Button::new((id, file * 100_000 + hunk))
@@ -1435,6 +1505,48 @@ impl Review {
         self.run_git(
             move |git| git.apply_to_index(&patch, reverse),
             |_, (), _, cx| cx.emit(ReviewEvent::Staged),
+            window,
+            cx,
+        );
+    }
+
+    /// Throws away an unstaged hunk alone, as one undo step.
+    fn discard_hunk(
+        &mut self,
+        file: usize,
+        hunk: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(Ok(files)) = &self.files else {
+            return;
+        };
+        let Some(file) = files.get(file) else {
+            return;
+        };
+        let DiffContent::Text(hunks) = &file.content else {
+            return;
+        };
+        let Some(hunk) = hunks
+            .get(hunk)
+            .filter(|hunk| hunk.patchable && hunk.staging == Some(Staging::Unstaged))
+        else {
+            return;
+        };
+        let patch = hunk.patch(&file.path);
+        let path = file.path.clone();
+        self.run_git(
+            move |git| {
+                git.apply_to_worktree(&patch, true)?;
+                Ok(Recorded::discard(git.work_dir(), Discard::Hunk { patch }))
+            },
+            move |_, recorded, _, cx| {
+                let step = undo::record(cx, recorded, format!("Discard a hunk of {path}"));
+                cx.emit(ReviewEvent::Discarded {
+                    message: format!("Discarded a hunk of {path}").into(),
+                    step,
+                });
+            },
             window,
             cx,
         );

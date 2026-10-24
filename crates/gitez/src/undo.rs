@@ -73,6 +73,19 @@ pub struct ReviewChange {
     pub after: ReviewTips,
 }
 
+/// Uncommitted changes thrown away, which undo brings back.
+#[derive(Debug, Clone)]
+pub enum Discard {
+    /// The changes to whole files, `None` for every file, kept in the
+    /// stash commit `saved`.
+    Files {
+        paths: Option<Vec<String>>,
+        saved: String,
+    },
+    /// One hunk of a file's unstaged changes, as a patch.
+    Hunk { patch: String },
+}
+
 /// What one change did.
 #[derive(Debug, Clone)]
 pub struct Change {
@@ -83,6 +96,7 @@ pub struct Change {
     /// How the branch checked out moves back and forth.
     mode: ResetMode,
     review: Option<ReviewChange>,
+    discard: Option<Discard>,
 }
 
 impl Change {
@@ -119,6 +133,7 @@ impl Change {
             stash,
             mode,
             review: None,
+            discard: None,
         })
     }
 
@@ -280,6 +295,22 @@ impl Change {
             pull_request.updated = gitez_review::Timestamp::now();
             review.store.save(&pull_request)?;
         }
+
+        match (&mut self.discard, direction) {
+            (Some(Discard::Files { saved, .. }), Direction::Undo) => {
+                git.restore_discarded(saved)?;
+            }
+            (Some(Discard::Files { paths, saved }), Direction::Redo) => {
+                // Discarding again keeps them in a new stash commit.
+                *saved = git
+                    .discard(paths.as_deref())?
+                    .context("There are no changes to discard again.")?;
+            }
+            (Some(Discard::Hunk { patch }), direction) => {
+                git.apply_to_worktree(patch, direction == Direction::Redo)?;
+            }
+            (None, _) => {}
+        }
         Ok(())
     }
 }
@@ -326,6 +357,22 @@ pub struct Recorded {
 }
 
 impl Recorded {
+    /// The changes `discard` threw away in the repository in `dir`.
+    pub fn discard(dir: &Path, discard: Discard) -> Option<Self> {
+        let key = Repository::open(dir).ok()?.common_dir();
+        Some(Self {
+            key,
+            change: Change {
+                head: None,
+                branches: Vec::new(),
+                stash: None,
+                mode: ResetMode::Keep,
+                review: None,
+                discard: Some(discard),
+            },
+        })
+    }
+
     /// Also puts back the local pull request `review`.
     pub fn with_review(self, review: ReviewChange) -> Self {
         Self {
@@ -452,7 +499,7 @@ mod tests {
     use gitez_git::Repository;
     use gitez_review::{NewPullRequest, State, Store, Timestamp, Tip};
 
-    use super::{Change, Direction, Recorder, ReviewChange, ReviewTips};
+    use super::{Change, Direction, Discard, Recorded, Recorder, ReviewChange, ReviewTips};
 
     fn git(dir: &std::path::Path, args: &[&str]) -> String {
         let output = Command::new("git")
@@ -669,6 +716,38 @@ mod tests {
         change.apply(&tool, Direction::Redo).expect("redo");
         let again = store.load(opened.number).expect("load");
         assert_eq!(ReviewTips::of(&again), ReviewTips::of(&merged));
+    }
+
+    #[test]
+    fn undoes_and_redoes_a_discard() {
+        let dir = repository();
+        let root = dir.path();
+        let tool = Git::new(root);
+        std::fs::write(root.join("a.txt"), "a\nlocal\n").expect("write");
+        std::fs::write(root.join("new.txt"), "new\n").expect("write");
+        let dirty = state(root);
+        let paths = vec!["a.txt".to_owned(), "new.txt".to_owned()];
+        let saved = tool
+            .discard(Some(&paths))
+            .expect("discard")
+            .expect("something to discard");
+        let clean = state(root);
+        let mut change = Recorded::discard(
+            root,
+            Discard::Files {
+                paths: Some(paths),
+                saved,
+            },
+        )
+        .expect("a repository")
+        .change;
+
+        change.apply(&tool, Direction::Undo).expect("undo");
+        assert_eq!(state(root), dirty);
+        change.apply(&tool, Direction::Redo).expect("redo");
+        assert_eq!(state(root), clean);
+        change.apply(&tool, Direction::Undo).expect("undo again");
+        assert_eq!(state(root), dirty);
     }
 
     #[test]

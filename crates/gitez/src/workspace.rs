@@ -607,6 +607,11 @@ impl Workspace {
                     this.open_conflicts(window, cx);
                     return;
                 }
+                ReviewEvent::Discarded { message, step } => {
+                    this.notify_done(Notification::success(message.clone()), *step, window, cx);
+                    this.refresh_status(window, cx);
+                    return;
+                }
                 ReviewEvent::Merged { message, step } => {
                     this.notify_done(Notification::success(message.clone()), *step, window, cx);
                     this.reload(window, cx);
