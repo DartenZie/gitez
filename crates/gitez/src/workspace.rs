@@ -17,7 +17,6 @@ use std::time::Duration;
 use futures::StreamExt as _;
 
 use gpui_kit::component::button::*;
-use gpui_kit::component::input::TextareaState;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{StyledExt as _, WindowExt as _, h_resizable, resizable_panel};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -29,7 +28,7 @@ use crate::repository::Snapshot;
 use crate::theme::{self, color};
 use detail::DetailPane;
 use history::{History, Selection};
-use review::{Review, ReviewEvent};
+use review::{CommitDraft, LastCommit, Review, ReviewEvent};
 use sidebar::Sidebar;
 
 actions!(workspace, [OpenRepository, ReviewSelected]);
@@ -71,7 +70,7 @@ pub struct Workspace {
     /// The commit being reviewed, shown instead of the history.
     review: Option<(Entity<Review>, Subscription)>,
     /// The message of the next commit, kept while the review is closed.
-    commit_message: Option<Entity<TextareaState>>,
+    commit_draft: Option<Entity<CommitDraft>>,
     sidebar: Entity<Sidebar>,
     history: Entity<History>,
     detail: Entity<DetailPane>,
@@ -106,7 +105,7 @@ impl Workspace {
             _watch: None,
             _reload: None,
             review: None,
-            commit_message: None,
+            commit_draft: None,
             sidebar: cx.new(|_| Sidebar::new()),
             history,
             detail: cx.new(|_| DetailPane::new()),
@@ -182,7 +181,7 @@ impl Workspace {
     fn show(&mut self, snapshot: Arc<Snapshot>, window: &mut Window, cx: &mut Context<Self>) {
         window.set_window_title(&format!("{} — GitEZ", snapshot.name));
         self.review = None;
-        self.commit_message = None;
+        self.commit_draft = None;
         self.watch(&snapshot, window, cx);
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.set_snapshot(snapshot.clone(), cx));
@@ -291,6 +290,10 @@ impl Workspace {
                             .update(cx, |sidebar, cx| sidebar.set_snapshot(snapshot.clone(), cx));
                         this.history
                             .update(cx, |history, cx| history.reload(&snapshot, cx));
+                        if let Some((review, _)) = &this.review {
+                            let (head, last_commit) = head_of(&snapshot);
+                            review.update(cx, |review, cx| review.set_head(head, last_commit, cx));
+                        }
                         this.snapshot = Some(snapshot);
                         this.refresh_status(window, cx);
                         cx.notify();
@@ -383,29 +386,14 @@ impl Workspace {
             }
             Some(Selection::WorkingTree(status)) => {
                 let status = status.clone();
-                let head = snapshot.refs.head.as_ref().map(|head| match head {
-                    Head::Branch { name, .. } | Head::Unborn { name } => RefLabel {
-                        kind: RefKind::Branch,
-                        name: name.clone(),
-                        is_head: true,
-                    },
-                    Head::Detached { .. } => RefLabel {
-                        kind: RefKind::Head,
-                        name: "HEAD".to_owned(),
-                        is_head: true,
-                    },
-                });
-                let message = self
-                    .commit_message
-                    .get_or_insert_with(|| {
-                        cx.new(|cx| {
-                            TextareaState::new(window, cx)
-                                .auto_grow(2, 10)
-                                .placeholder("Commit message")
-                        })
-                    })
+                let (head, last_commit) = head_of(snapshot);
+                let draft = self
+                    .commit_draft
+                    .get_or_insert_with(|| cx.new(|cx| CommitDraft::new(window, cx)))
                     .clone();
-                cx.new(|cx| Review::working_tree(&repository, status, head, message, window, cx))
+                cx.new(|cx| {
+                    Review::working_tree(&repository, status, head, last_commit, draft, window, cx)
+                })
             }
             None => return,
         };
@@ -612,4 +600,36 @@ fn empty_state(
         .when_some(action, |this, action| {
             this.child(div().mt(px(10.)).child(action))
         })
+}
+
+/// The label of where `HEAD` is in `snapshot`, and the commit it is on.
+fn head_of(snapshot: &Snapshot) -> (Option<RefLabel>, Option<LastCommit>) {
+    match &snapshot.refs.head {
+        Some(Head::Branch { name, .. }) => {
+            let pushed_to = snapshot
+                .tracking
+                .get(name)
+                .filter(|tracking| tracking.ahead == 0)
+                .map(|tracking| tracking.upstream.clone());
+            (Some(branch_label(name)), Some(LastCommit { pushed_to }))
+        }
+        Some(Head::Unborn { name }) => (Some(branch_label(name)), None),
+        Some(Head::Detached { .. }) => (
+            Some(RefLabel {
+                kind: RefKind::Head,
+                name: "HEAD".to_owned(),
+                is_head: true,
+            }),
+            Some(LastCommit { pushed_to: None }),
+        ),
+        None => (None, None),
+    }
+}
+
+fn branch_label(name: &str) -> RefLabel {
+    RefLabel {
+        kind: RefKind::Branch,
+        name: name.to_owned(),
+        is_head: true,
+    }
 }

@@ -79,6 +79,16 @@ impl Git {
             .map(drop)
     }
 
+    /// Replaces the last commit with one that has `message` and also the
+    /// staged changes, like `git commit --amend`.
+    pub fn amend(&self, message: &str) -> Result<()> {
+        self.run(
+            ["commit", "--quiet", "--amend", "--file=-"],
+            Some(message.as_bytes()),
+        )
+        .map(drop)
+    }
+
     /// Runs `git <args>` with `paths` passed on standard input, so any
     /// number of paths fits and none is read as an option or a pattern.
     fn run_with_paths<const N: usize>(&self, args: [&str; N], paths: &[String]) -> Result<()> {

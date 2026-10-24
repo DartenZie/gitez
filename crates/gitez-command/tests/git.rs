@@ -119,3 +119,32 @@ fn nothing_staged_is_an_error() {
         .expect_err("nothing to commit");
     assert!(matches!(error, Error::Failed { .. }), "{error:?}");
 }
+
+#[test]
+fn amends_the_message_and_adds_the_staged_changes() {
+    let dir = repository();
+    let git_ = Git::new(dir.path());
+    std::fs::write(dir.path().join("a.txt"), "a\n").expect("write");
+    git_.stage_all().expect("stage");
+    git_.commit("First").expect("commit");
+    std::fs::write(dir.path().join("b.txt"), "b\n").expect("write");
+    git_.stage_all().expect("stage");
+    git_.commit("Second").expect("commit");
+    let parent = git(dir.path(), &["rev-parse", "HEAD~"]);
+
+    std::fs::write(dir.path().join("c.txt"), "c\n").expect("write");
+    git_.stage(&["c.txt".to_owned()]).expect("stage");
+    git_.amend("Second, amended\n\nWith c.txt too.")
+        .expect("amend");
+
+    assert_eq!(git(dir.path(), &["rev-parse", "HEAD~"]), parent);
+    assert_eq!(
+        git(dir.path(), &["log", "-1", "--format=%B"]),
+        "Second, amended\n\nWith c.txt too."
+    );
+    assert_eq!(
+        git(dir.path(), &["show", "--name-only", "--format="]),
+        "b.txt\nc.txt"
+    );
+    assert_eq!(status(dir.path()), "");
+}

@@ -70,6 +70,18 @@ pub struct LineCounts {
 }
 
 impl Repository {
+    /// The full message of the commit `HEAD` is on, as written, without
+    /// trailing whitespace; `None` before the first commit.
+    pub fn head_message(&self) -> Result<Option<String>> {
+        let repo = self.local();
+        if repo.head()?.is_unborn() {
+            return Ok(None);
+        }
+        let commit = repo.head_commit()?;
+        let message = commit.message_raw()?;
+        Ok(Some(message.to_str_lossy().trim_end().to_owned()))
+    }
+
     /// Reads the message and changed files of commit `id`. Merges are compared
     /// with their first parent, like the history's first-parent line.
     pub fn commit_details(&self, id: Oid) -> Result<CommitDetails> {

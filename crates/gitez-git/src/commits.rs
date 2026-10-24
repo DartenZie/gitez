@@ -82,8 +82,13 @@ impl Repository {
         order: Order,
     ) -> Result<CommitWalk> {
         let repo = self.local();
+        let hidden: Vec<Oid> = hidden.into_iter().collect();
         let mut commit_tips = Vec::new();
         for tip in tips {
+            // The topological walk yields a tip even when it is also hidden.
+            if hidden.contains(&tip) {
+                continue;
+            }
             if repo.find_header(tip)?.kind() == gix::object::Kind::Commit {
                 commit_tips.push(tip);
             }

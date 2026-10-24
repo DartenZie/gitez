@@ -11,6 +11,7 @@ use gitez_git::{
     RefKind, RefLabel, Repository, WorkingTreeStatus, WorktreeChange,
 };
 use gpui_kit::component::button::*;
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::*;
@@ -95,16 +96,56 @@ enum Subject {
         status: Arc<WorkingTreeStatus>,
         /// The branch `HEAD` is on, or the detached `HEAD`.
         head: Option<RefLabel>,
-        form: CommitForm,
+        /// The commit `HEAD` is on, if any.
+        last_commit: Option<LastCommit>,
+        form: Box<CommitForm>,
     },
+}
+
+/// The commit `HEAD` is on, which can be amended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastCommit {
+    /// The upstream that already has the commit, if any: amending it
+    /// rewrites history others may have.
+    pub pushed_to: Option<String>,
+}
+
+/// The message of the next commit. It belongs to the window, so it survives
+/// leaving the review.
+pub struct CommitDraft {
+    message: Entity<TextareaState>,
+    /// Set while amending: the message typed before, which comes back when
+    /// amending is turned off. The message box holds the last commit's
+    /// message meanwhile.
+    saved: Option<String>,
+}
+
+impl CommitDraft {
+    pub fn new(window: &mut Window, cx: &mut App) -> Self {
+        Self {
+            message: cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .auto_grow(2, 10)
+                    .placeholder("Commit message")
+            }),
+            saved: None,
+        }
+    }
+
+    fn is_amending(&self) -> bool {
+        self.saved.is_some()
+    }
 }
 
 /// Staging and committing the uncommitted changes.
 struct CommitForm {
     git: Git,
-    /// The commit message. It belongs to the window, so a draft survives
-    /// leaving the review.
+    repository: Repository,
+    draft: Entity<CommitDraft>,
+    /// The message box of `draft`.
     message: Entity<TextareaState>,
+    /// Reading the last commit's message to amend it.
+    reading_message: Option<Task<()>>,
     /// The `git` command running. Only one runs at a time.
     running: Option<Task<()>>,
     /// Why the last command failed: often the output of a hook.
@@ -178,11 +219,13 @@ impl Review {
         repository: &Repository,
         status: Arc<WorkingTreeStatus>,
         head: Option<RefLabel>,
-        message: Entity<TextareaState>,
+        last_commit: Option<LastCommit>,
+        draft: Entity<CommitDraft>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let load = Self::load_working_tree(repository, cx);
+        let message = draft.read(cx).message.clone();
         let message_events =
             cx.subscribe_in(&message, window, |this, _, event, window, cx| match event {
                 InputEvent::PressEnter {
@@ -194,12 +237,21 @@ impl Review {
         let form = CommitForm {
             // A bare repository has no uncommitted changes to review.
             git: Git::new(repository.work_dir().unwrap_or(repository.git_dir())),
+            repository: repository.clone(),
+            draft,
             message,
+            reading_message: None,
             running: None,
             error: None,
             _message_events: message_events,
         };
-        Self::with_subject(Subject::WorkingTree { status, head, form }, load, cx)
+        let subject = Subject::WorkingTree {
+            status,
+            head,
+            last_commit,
+            form: Box::new(form),
+        };
+        Self::with_subject(subject, load, cx)
     }
 
     fn with_subject(subject: Subject, load: Task<()>, cx: &mut Context<Self>) -> Self {
@@ -230,6 +282,25 @@ impl Review {
                 .await;
             this.update(cx, |this, cx| this.finish(files, cx)).ok();
         })
+    }
+
+    /// Updates where `HEAD` is after the refs changed.
+    pub fn set_head(
+        &mut self,
+        head: Option<RefLabel>,
+        last_commit: Option<LastCommit>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Subject::WorkingTree {
+            head: shown,
+            last_commit: shown_commit,
+            ..
+        } = &mut self.subject
+        {
+            *shown = head;
+            *shown_commit = last_commit;
+            cx.notify();
+        }
     }
 
     /// Shows the uncommitted changes again after they changed to `status`,
@@ -415,20 +486,30 @@ impl Review {
         );
     }
 
-    /// Commits the staged changes with the message typed.
+    /// Commits the staged changes with the message typed, or amends the
+    /// last commit with them.
     fn commit_staged(&mut self, _: &CommitStaged, window: &mut Window, cx: &mut Context<Self>) {
         let Subject::WorkingTree { status, form, .. } = &self.subject else {
             return;
         };
         let message = form.message.read(cx).value().trim().to_owned();
-        if message.is_empty() || status.staged() == 0 {
+        let amend = form.draft.read(cx).is_amending();
+        if message.is_empty() || form.reading_message.is_some() || (!amend && status.staged() == 0)
+        {
             return;
         }
         let everything = status.files.iter().all(|file| file.unstaged.is_none());
         self.run_git(
-            move |git| git.commit(&message),
+            move |git| {
+                if amend {
+                    git.amend(&message)
+                } else {
+                    git.commit(&message)
+                }
+            },
             move |this, window, cx| {
                 if let Subject::WorkingTree { form, .. } = &this.subject {
+                    form.draft.update(cx, |draft, _| draft.saved = None);
                     form.message
                         .update(cx, |message, cx| message.set_value("", window, cx));
                 }
@@ -437,6 +518,61 @@ impl Review {
             window,
             cx,
         );
+    }
+
+    /// Starts or stops amending the last commit. Starting puts its message
+    /// in the message box; stopping brings back what was typed before.
+    fn set_amending(&mut self, amend: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Subject::WorkingTree { form, .. } = &mut self.subject else {
+            return;
+        };
+        if form.running.is_some() || form.draft.read(cx).is_amending() == amend {
+            return;
+        }
+        let message = form.message.clone();
+        if !amend {
+            form.reading_message = None;
+            let saved = form.draft.update(cx, |draft, _| draft.saved.take());
+            message.update(cx, |message, cx| {
+                message.set_value(saved.unwrap_or_default(), window, cx)
+            });
+            cx.notify();
+            return;
+        }
+
+        let typed = message.read(cx).value().to_string();
+        form.draft.update(cx, |draft, _| draft.saved = Some(typed));
+        form.error = None;
+        let repository = form.repository.clone();
+        form.reading_message = Some(cx.spawn_in(window, async move |this, cx| {
+            let read = cx
+                .background_executor()
+                .spawn(async move { repository.head_message() })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                let Subject::WorkingTree { form, .. } = &mut this.subject else {
+                    return;
+                };
+                form.reading_message = None;
+                match read {
+                    Ok(last) => message.update(cx, |message, cx| {
+                        message.set_value(last.unwrap_or_default(), window, cx)
+                    }),
+                    Err(error) => {
+                        form.error = Some(
+                            format!(
+                                "Could not read the last commit: {:#}",
+                                anyhow::Error::from(error)
+                            )
+                            .into(),
+                        )
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 
     /// "Stage" and "Unstage" for the file at `index` of the list, as far as
@@ -521,24 +657,34 @@ impl Review {
     fn render_commit_form(
         &self,
         status: &WorkingTreeStatus,
+        last_commit: Option<&LastCommit>,
         form: &CommitForm,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let staged = status.staged();
-        let running = form.running.is_some();
+        let running = form.running.is_some() || form.reading_message.is_some();
         let empty = form.message.read(cx).value().trim().is_empty();
-        let label = match staged {
-            0 => "Commit".to_owned(),
-            1 => "Commit 1 staged file".to_owned(),
-            staged => format!("Commit {staged} staged files"),
+        let amend = form.draft.read(cx).is_amending();
+        let files = match staged {
+            1 => "1 staged file".to_owned(),
+            staged => format!("{staged} staged files"),
         };
-        let hint = if staged == 0 {
+        let label = match (amend, staged) {
+            (true, 0) => "Amend last commit".to_owned(),
+            (true, _) => format!("Amend with {files}"),
+            (false, 0) => "Commit".to_owned(),
+            (false, _) => format!("Commit {files}"),
+        };
+        let hint = if !amend && staged == 0 {
             "Stage the changes to commit."
-        } else if empty {
+        } else if empty && form.reading_message.is_none() {
             "Write a message to commit."
         } else {
             ""
         };
+        let pushed_to = last_commit
+            .filter(|_| amend)
+            .and_then(|last| last.pushed_to.clone());
         let commit = Keystroke::parse("secondary-enter").expect("a valid keystroke");
 
         div()
@@ -561,14 +707,38 @@ impl Review {
                             .h(px(30.))
                             .label(label)
                             .loading(running)
-                            .disabled(staged == 0 || empty || running)
+                            .disabled((!amend && staged == 0) || empty || running)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.commit_staged(&CommitStaged, window, cx)
                             })),
                     )
                     .child(Kbd::new(commit))
-                    .child(muted(hint)),
+                    .child(muted(hint))
+                    .when(last_commit.is_some(), |this| {
+                        this.child(
+                            div().ml_auto().child(
+                                Checkbox::new("amend")
+                                    .label("Amend last commit")
+                                    .checked(amend)
+                                    .disabled(running)
+                                    .on_click(cx.listener(|this, checked: &bool, window, cx| {
+                                        this.set_amending(*checked, window, cx)
+                                    })),
+                            ),
+                        )
+                    }),
             )
+            .when_some(pushed_to, |this, upstream| {
+                this.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(color::ACCENT))
+                        .child(format!(
+                            "The last commit is already on {upstream}. Amending it rewrites \
+                             history others may have; pushing it then needs --force."
+                        )),
+                )
+            })
             .when_some(form.error.clone(), |this, error| {
                 this.child(
                     div()
@@ -816,7 +986,12 @@ impl Review {
                             ),
                     )
             }
-            Subject::WorkingTree { status, head, form } => {
+            Subject::WorkingTree {
+                status,
+                head,
+                last_commit,
+                form,
+            } => {
                 let on = match head {
                     Some(RefLabel {
                         kind: RefKind::Branch,
@@ -851,7 +1026,7 @@ impl Review {
                                 }),
                         ),
                     )
-                    .child(self.render_commit_form(status, form, cx))
+                    .child(self.render_commit_form(status, last_commit.as_ref(), form, cx))
             }
         }
     }

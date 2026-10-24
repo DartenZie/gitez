@@ -875,3 +875,39 @@ fn working_tree_diff_compares_head_with_the_files_on_disk() {
         ]
     );
 }
+
+#[test]
+fn head_message_is_the_full_message_of_head() {
+    let fixture = Fixture::new();
+    let repo = fixture.open();
+    assert_eq!(repo.head_message().expect("no commits"), None);
+
+    fixture.commit("a.txt", "Summary line");
+    fixture.git(&[
+        "commit",
+        "--quiet",
+        "--amend",
+        "-m",
+        "Summary line\n\nBody, with # a hash.\n\n",
+    ]);
+    let repo = fixture.open();
+    assert_eq!(
+        repo.head_message().expect("message").as_deref(),
+        Some("Summary line\n\nBody, with # a hash.")
+    );
+}
+
+#[test]
+fn ahead_behind_counts_only_the_commits_one_side_lacks() {
+    let fixture = Fixture::new();
+    let base = fixture.commit("a.txt", "base");
+    let ahead = fixture.commit("a.txt", "ahead");
+    fixture.git(&["checkout", "--quiet", "-b", "other", &base.to_string()]);
+    let other = fixture.commit("b.txt", "other");
+    let repo = fixture.open();
+
+    assert_eq!(repo.ahead_behind(base, base).expect("same"), (0, 0));
+    assert_eq!(repo.ahead_behind(ahead, base).expect("ahead"), (1, 0));
+    assert_eq!(repo.ahead_behind(base, ahead).expect("behind"), (0, 1));
+    assert_eq!(repo.ahead_behind(ahead, other).expect("diverged"), (1, 1));
+}
