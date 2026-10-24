@@ -70,6 +70,9 @@ enum Row {
     Hunk(usize, usize),
     /// A diff line: file, hunk and line index.
     Line(usize, usize, usize),
+    /// In the split layout, a line's old side beside a line's new side:
+    /// file, hunk, and the indices of the two lines, if any.
+    Pair(usize, usize, Option<usize>, Option<usize>),
     /// Why a file has no lines to show: binary, too large, unchanged.
     Notice(usize),
     /// The bottom edge of a file's card.
@@ -84,10 +87,30 @@ impl Row {
             Row::File(file)
             | Row::Hunk(file, _)
             | Row::Line(file, _, _)
+            | Row::Pair(file, _, _, _)
             | Row::Notice(file)
             | Row::FileEnd(file) => Some(file),
             Row::End => None,
         }
+    }
+}
+
+/// How diffs are laid out. One setting for the whole app, so it carries
+/// over to the next review.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DiffLayout {
+    /// Removed lines above the added lines that replace them.
+    #[default]
+    Unified,
+    /// The old file on the left, the new file on the right.
+    Split,
+}
+
+impl Global for DiffLayout {}
+
+impl DiffLayout {
+    fn current(cx: &App) -> Self {
+        cx.try_global::<Self>().copied().unwrap_or_default()
     }
 }
 
@@ -333,7 +356,7 @@ impl Review {
                 }
                 let anchor = self.scroll_anchor();
                 self.files = Some(Ok(Arc::new(files)));
-                self.rebuild_rows(anchor);
+                self.rebuild_rows(anchor, cx);
             }
             Err(error) => {
                 self.files = Some(Err(format!(
@@ -348,12 +371,13 @@ impl Review {
 
     /// Lays out the rows of the files again, then scrolls back to `anchor`,
     /// from [`Self::scroll_anchor`] before the change.
-    fn rebuild_rows(&mut self, anchor: Option<(String, usize, Pixels)>) {
+    fn rebuild_rows(&mut self, anchor: Option<(String, usize, Pixels)>, cx: &App) {
         let Some(Ok(files)) = &self.files else {
             return;
         };
         let files = files.clone();
-        (self.rows, self.file_rows) = rows(&files, |file| self.is_viewed(file));
+        (self.rows, self.file_rows) =
+            rows(&files, |file| self.is_viewed(file), DiffLayout::current(cx));
         self.list.reset(self.rows.len());
         if let Some((path, row, offset_in_item)) = anchor
             && let Some(file) = files.iter().position(|file| file.path == path)
@@ -404,7 +428,18 @@ impl Review {
             *row = 0;
             *offset = px(0.);
         }
-        self.rebuild_rows(anchor);
+        self.rebuild_rows(anchor, cx);
+        cx.notify();
+    }
+
+    /// Lays out the diffs as `layout`, here and in later reviews.
+    fn set_layout(&mut self, layout: DiffLayout, cx: &mut Context<Self>) {
+        if DiffLayout::current(cx) == layout {
+            return;
+        }
+        cx.set_global(layout);
+        let anchor = self.scroll_anchor();
+        self.rebuild_rows(anchor, cx);
         cx.notify();
     }
 
@@ -947,6 +982,18 @@ impl Review {
                 };
                 diff_line(&hunks[hunk].lines[line], mono).into_any_element()
             }
+            Some(Row::Pair(file, hunk, old, new)) => {
+                let DiffContent::Text(hunks) = &files[file].content else {
+                    return div().into_any_element();
+                };
+                let lines = &hunks[hunk].lines;
+                split_line(
+                    old.and_then(|old| lines.get(old)),
+                    new.and_then(|new| lines.get(new)),
+                    mono,
+                )
+                .into_any_element()
+            }
             Some(Row::Notice(file)) => card_row()
                 .px(px(14.))
                 .py(px(10.))
@@ -1178,9 +1225,10 @@ impl Review {
     }
 
     /// The strip above the diff: how many files are marked viewed.
-    fn render_toolbar(&self, files: &[FileDiff]) -> impl IntoElement {
+    fn render_toolbar(&self, files: &[FileDiff], cx: &mut Context<Self>) -> impl IntoElement {
         let viewed = files.iter().filter(|file| self.is_viewed(file)).count();
         let total = files.len();
+        let layout = DiffLayout::current(cx);
         div()
             .h_flex()
             .flex_none()
@@ -1191,6 +1239,29 @@ impl Review {
             .border_b_1()
             .border_color(rgb(color::BORDER))
             .text_size(px(12.5))
+            .child(
+                ButtonGroup::new("diff-layout")
+                    .outline()
+                    .small()
+                    .child(
+                        Button::new("unified")
+                            .label("Unified")
+                            .selected(layout == DiffLayout::Unified),
+                    )
+                    .child(
+                        Button::new("split")
+                            .label("Split")
+                            .selected(layout == DiffLayout::Split),
+                    )
+                    .on_click(cx.listener(|this, clicked: &Vec<usize>, _, cx| {
+                        let layout = if clicked.contains(&1) {
+                            DiffLayout::Split
+                        } else {
+                            DiffLayout::Unified
+                        };
+                        this.set_layout(layout, cx)
+                    })),
+            )
             .child(
                 div()
                     .h_flex()
@@ -1350,7 +1421,7 @@ impl Render for Review {
                     .v_flex()
                     .flex_1()
                     .min_h_0()
-                    .child(self.render_toolbar(&files))
+                    .child(self.render_toolbar(&files, cx))
                     .child(
                         div()
                             .h_flex()
@@ -1394,7 +1465,11 @@ impl Render for Review {
 
 /// The rows of the diff list for `files`, and the row of each file's header.
 /// A file that is `viewed` shows only its header.
-fn rows(files: &[FileDiff], viewed: impl Fn(&FileDiff) -> bool) -> (Vec<Row>, Vec<usize>) {
+fn rows(
+    files: &[FileDiff],
+    viewed: impl Fn(&FileDiff) -> bool,
+    layout: DiffLayout,
+) -> (Vec<Row>, Vec<usize>) {
     let mut rows = Vec::new();
     let mut file_rows = Vec::with_capacity(files.len());
     for (file, diff) in files.iter().enumerate() {
@@ -1405,9 +1480,16 @@ fn rows(files: &[FileDiff], viewed: impl Fn(&FileDiff) -> bool) -> (Vec<Row>, Ve
             DiffContent::Text(hunks) => {
                 for (hunk_index, hunk) in hunks.iter().enumerate() {
                     rows.push(Row::Hunk(file, hunk_index));
-                    rows.extend(
-                        (0..hunk.lines.len()).map(|line| Row::Line(file, hunk_index, line)),
-                    );
+                    match layout {
+                        DiffLayout::Unified => rows.extend(
+                            (0..hunk.lines.len()).map(|line| Row::Line(file, hunk_index, line)),
+                        ),
+                        DiffLayout::Split => rows.extend(
+                            split_pairs(&hunk.lines)
+                                .into_iter()
+                                .map(|(old, new)| Row::Pair(file, hunk_index, old, new)),
+                        ),
+                    }
                 }
             }
             DiffContent::TooLarge(_) | DiffContent::Binary | DiffContent::Unchanged => {
@@ -1418,6 +1500,43 @@ fn rows(files: &[FileDiff], viewed: impl Fn(&FileDiff) -> bool) -> (Vec<Row>, Ve
     }
     rows.push(Row::End);
     (rows, file_rows)
+}
+
+/// The rows of a hunk in the split layout, as indices into `lines`: each
+/// context line on both sides, and each run of removed lines beside the
+/// added lines that follow it.
+fn split_pairs(lines: &[DiffLine]) -> Vec<(Option<usize>, Option<usize>)> {
+    fn flush(
+        pairs: &mut Vec<(Option<usize>, Option<usize>)>,
+        removed: &mut Vec<usize>,
+        added: &mut Vec<usize>,
+    ) {
+        for row in 0..removed.len().max(added.len()) {
+            pairs.push((removed.get(row).copied(), added.get(row).copied()));
+        }
+        removed.clear();
+        added.clear();
+    }
+
+    let mut pairs = Vec::with_capacity(lines.len());
+    let (mut removed, mut added) = (Vec::new(), Vec::new());
+    for (index, line) in lines.iter().enumerate() {
+        match line.kind {
+            LineKind::Context => {
+                flush(&mut pairs, &mut removed, &mut added);
+                pairs.push((Some(index), Some(index)));
+            }
+            LineKind::Removed => {
+                if !added.is_empty() {
+                    flush(&mut pairs, &mut removed, &mut added);
+                }
+                removed.push(index);
+            }
+            LineKind::Added => added.push(index),
+        }
+    }
+    flush(&mut pairs, &mut removed, &mut added);
+    pairs
 }
 
 /// What a file's diff looks like, to tell whether it changed since it was
@@ -1582,61 +1701,106 @@ fn file_header(
 
 /// One line of a diff: old and new line numbers, `+` or `−`, and the text.
 fn diff_line(line: &DiffLine, mono: SharedString) -> impl IntoElement {
-    let (sign, tint) = match line.kind {
-        LineKind::Context => ("", None),
-        LineKind::Added => ("+", Some(color::DIFF_ADDED)),
-        LineKind::Removed => ("−", Some(color::DIFF_REMOVED)),
-    };
-    let number = |number: Option<u32>| {
-        div()
-            .w(px(48.))
-            .flex_none()
-            .h_full()
-            .pr(px(10.))
-            .text_right()
-            .text_color(rgb(color::DIFF_LINE_NUMBER))
-            .when_some(tint, |this, tint| this.bg(theme::with_alpha(tint, 0.08)))
-            .children(number.map(|number| number.to_string()))
-    };
-
+    let (sign, tint) = line_style(line.kind);
     card_row()
         .h(LINE_HEIGHT)
         .font_family(mono)
         .text_size(theme::MONO_TEXT_SIZE)
         .when_some(tint, |this, tint| this.bg(theme::with_alpha(tint, 0.10)))
-        .child(number(line.old))
-        .child(number(line.new))
+        .child(line_number(line.old, tint))
+        .child(line_number(line.new, tint))
+        .child(line_sign(sign, tint))
+        .child(line_text(line))
+        .when(line.no_newline, |this| this.child(no_newline_note()))
+}
+
+/// A row of the split layout: the `old` side of a line on the left, the
+/// `new` side of a line on the right.
+fn split_line(
+    old: Option<&DiffLine>,
+    new: Option<&DiffLine>,
+    mono: SharedString,
+) -> impl IntoElement {
+    card_row()
+        .h(LINE_HEIGHT)
+        .font_family(mono)
+        .text_size(theme::MONO_TEXT_SIZE)
+        .child(split_half(old, |line| line.old))
         .child(
             div()
-                .w(px(20.))
+                .w(px(1.))
+                .h_full()
                 .flex_none()
-                .text_center()
-                .text_color(rgb(tint.unwrap_or(color::DIFF_LINE_NUMBER)))
-                .child(sign),
+                .bg(rgb(color::DIFF_CARD_BORDER)),
         )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .pr(px(12.))
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_ellipsis()
-                .text_color(rgb(color::DIFF_TEXT))
-                // A carriage return is shown only as part of the text when
-                // no newline follows it.
-                .child(line.text.trim_end_matches('\r').replace('\t', TAB)),
-        )
-        .when(line.no_newline, |this| {
-            this.child(
-                div()
-                    .flex_none()
-                    .pr(px(12.))
-                    .text_size(theme::SMALL_TEXT_SIZE)
-                    .text_color(rgb(color::TEXT_FAINT))
-                    .child("no newline at end of file"),
-            )
-        })
+        .child(split_half(new, |line| line.new))
+}
+
+/// One side of a split row, numbered by `number`; blank without a line.
+fn split_half(line: Option<&DiffLine>, number: fn(&DiffLine) -> Option<u32>) -> Div {
+    let half = div().h_flex().flex_1().min_w_0().h_full();
+    let Some(line) = line else {
+        return half.bg(rgb(color::DIFF_FILE_HEADER));
+    };
+    let (sign, tint) = line_style(line.kind);
+    half.when_some(tint, |this, tint| this.bg(theme::with_alpha(tint, 0.10)))
+        .child(line_number(number(line), tint))
+        .child(line_sign(sign, tint))
+        .child(line_text(line))
+        .when(line.no_newline, |this| this.child(no_newline_note()))
+}
+
+/// The sign of a line of `kind` and the colour it is tinted with.
+fn line_style(kind: LineKind) -> (&'static str, Option<u32>) {
+    match kind {
+        LineKind::Context => ("", None),
+        LineKind::Added => ("+", Some(color::DIFF_ADDED)),
+        LineKind::Removed => ("−", Some(color::DIFF_REMOVED)),
+    }
+}
+
+fn line_number(number: Option<u32>, tint: Option<u32>) -> Div {
+    div()
+        .w(px(48.))
+        .flex_none()
+        .h_full()
+        .pr(px(10.))
+        .text_right()
+        .text_color(rgb(color::DIFF_LINE_NUMBER))
+        .when_some(tint, |this, tint| this.bg(theme::with_alpha(tint, 0.08)))
+        .children(number.map(|number| number.to_string()))
+}
+
+fn line_sign(sign: &'static str, tint: Option<u32>) -> Div {
+    div()
+        .w(px(20.))
+        .flex_none()
+        .text_center()
+        .text_color(rgb(tint.unwrap_or(color::DIFF_LINE_NUMBER)))
+        .child(sign)
+}
+
+fn line_text(line: &DiffLine) -> Div {
+    div()
+        .flex_1()
+        .min_w_0()
+        .pr(px(12.))
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_ellipsis()
+        .text_color(rgb(color::DIFF_TEXT))
+        // A carriage return is shown only as part of the text when no
+        // newline follows it.
+        .child(line.text.trim_end_matches('\r').replace('\t', TAB))
+}
+
+fn no_newline_note() -> Div {
+    div()
+        .flex_none()
+        .pr(px(12.))
+        .text_size(theme::SMALL_TEXT_SIZE)
+        .text_color(rgb(color::TEXT_FAINT))
+        .child("no newline at end of file")
 }
 
 /// Why `file` shows no lines.
@@ -1731,7 +1895,7 @@ fn message(text: impl Into<SharedString>) -> impl IntoElement {
 mod tests {
     use gitez_git::{ChangeKind, DiffContent, DiffLine, FileDiff, Hunk, LineKind, Staging};
 
-    use super::{fingerprint, rows};
+    use super::{DiffLayout, fingerprint, rows, split_pairs};
 
     fn line(kind: LineKind, text: &str) -> DiffLine {
         DiffLine {
@@ -1813,7 +1977,7 @@ mod tests {
                 vec![hunk(1, Staging::Unstaged, vec![line(LineKind::Added, "y")])],
             ),
         ];
-        let (rows, file_rows) = rows(&files, |file| file.path == "a");
+        let (rows, file_rows) = rows(&files, |file| file.path == "a", DiffLayout::Unified);
         let rows: Vec<String> = rows.iter().map(|row| format!("{row:?}")).collect();
         assert_eq!(
             rows,
@@ -1828,5 +1992,25 @@ mod tests {
             ]
         );
         assert_eq!(file_rows, [0, 2]);
+    }
+
+    #[test]
+    fn split_rows_pair_removed_lines_with_the_added_lines_after_them() {
+        use LineKind::{Added, Context, Removed};
+        let lines: Vec<DiffLine> = [Context, Removed, Removed, Added, Context, Added, Removed]
+            .into_iter()
+            .map(|kind| line(kind, ""))
+            .collect();
+        assert_eq!(
+            split_pairs(&lines),
+            [
+                (Some(0), Some(0)),
+                (Some(1), Some(3)),
+                (Some(2), None),
+                (Some(4), Some(4)),
+                (None, Some(5)),
+                (Some(6), None),
+            ]
+        );
     }
 }
