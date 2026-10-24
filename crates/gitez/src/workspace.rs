@@ -1,6 +1,7 @@
 //! The main window: toolbar, repository sidebar, history, commit detail and
 //! status bar, laid out as in the `Main.dc.html` artboard.
 
+mod cherry_pick;
 mod conflicts;
 mod detail;
 mod graph;
@@ -32,9 +33,12 @@ use gitez_review::{NewPullRequest as NewPullRequestFields, State, Timestamp, Tip
 
 use crate::repository::Snapshot;
 use crate::theme::{self, color};
+use cherry_pick::{CherryPick, CherryPickEvent};
 use conflicts::{Conflicts, ConflictsEvent};
 use detail::{DetailEvent, DetailPane};
-use history::{BranchDropped, History, Selection, SelectionChanged};
+use history::{
+    BranchDropped, CherryPickRequested, History, PickedChanged, Selection, SelectionChanged,
+};
 use new_pull_request::{FormEvent, NewPullRequestForm};
 use review::{
     CommitDraft, LastCommit, MergeDialog, MergeEvent, MergedPullRequest, Merging, Review,
@@ -89,6 +93,8 @@ pub struct Workspace {
     new_pull_request: Option<(Entity<NewPullRequestForm>, Subscription)>,
     /// Creating a local pull request.
     _create: Option<Task<()>>,
+    /// The cherry-pick panel, shown in place of the commit detail.
+    cherry_pick: Option<(Entity<CherryPick>, Subscription)>,
     /// The dialog offering to merge a branch dropped on another, while
     /// open.
     merge_dialog: Option<Subscription>,
@@ -121,6 +127,23 @@ impl Workspace {
             cx.subscribe_in(&history, window, |this, _, dropped, window, cx| {
                 this.open_branch_merge(dropped, window, cx)
             }),
+            cx.subscribe_in(
+                &history,
+                window,
+                |this, _, _: &CherryPickRequested, window, cx| this.open_cherry_pick(window, cx),
+            ),
+            cx.subscribe(&history, |this, history, _: &PickedChanged, cx| {
+                let Some((panel, _)) = &this.cherry_pick else {
+                    return;
+                };
+                let commits = history.read(cx).picked();
+                if commits.is_empty() {
+                    this.cherry_pick = None;
+                    cx.notify();
+                } else {
+                    panel.update(cx, |panel, cx| panel.set_commits(commits, cx));
+                }
+            }),
             cx.subscribe_in(&detail, window, |this, _, event, window, cx| match event {
                 DetailEvent::OpenFile(path) => this.open_review(Some(path.clone()), window, cx),
             }),
@@ -148,6 +171,7 @@ impl Workspace {
             new_pull_request: None,
             _create: None,
             merge_dialog: None,
+            cherry_pick: None,
             open_after_reload: None,
             sidebar,
             history,
@@ -772,6 +796,32 @@ impl Workspace {
         });
     }
 
+    /// Shows the cherry-pick panel for the commits picked in the history.
+    fn open_cherry_pick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let commits = self.history.read(cx).picked();
+        if commits.is_empty() {
+            return;
+        }
+        let uncommitted = self.status.as_ref().map_or(0, |status| status.files.len());
+        let panel = cx.new(|cx| CherryPick::new(snapshot, commits, uncommitted, window, cx));
+        let subscription = cx.subscribe_in(&panel, window, |this, _, event, window, cx| {
+            this.cherry_pick = None;
+            if let CherryPickEvent::Done(done) = event {
+                window.push_notification(Notification::success(done.clone()), cx);
+                this.history
+                    .update(cx, |history, cx| history.clear_picked(cx));
+                this.reload(window, cx);
+                this.refresh_status(window, cx);
+            }
+            cx.notify();
+        });
+        self.cherry_pick = Some((panel, subscription));
+        cx.notify();
+    }
+
     /// Shows the conflicts of the merge in progress.
     fn open_conflicts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(snapshot) = &self.snapshot else {
@@ -904,7 +954,9 @@ impl Render for Workspace {
                                 .size_range(px(280.)..px(560.))
                                 .fixed()
                                 .map(|panel| {
-                                    if snapshot.is_some() {
+                                    if let Some((cherry_pick, _)) = &self.cherry_pick {
+                                        panel.child(cherry_pick.clone())
+                                    } else if snapshot.is_some() {
                                         panel.child(self.detail.clone())
                                     } else {
                                         panel.child(

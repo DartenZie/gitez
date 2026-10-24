@@ -77,6 +77,13 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 > a squash, a rebase of the dragged branch onto the other, a fast-forward,
 > or opening the two as a local pull request (Esc cancels the drag). A
 > merge of branches that have an open pull request marks it merged.
+> ⌘-click (Ctrl-click on Linux) commits in the history to select several,
+> ⇧-click for a range; **Cherry-pick onto…** lists every branch with a
+> trial run of the pick against it (applies cleanly, already there, or
+> conflicts), and applies the commits oldest first to the branch you
+> choose, optionally noting the source commit (`-x`), only staging the
+> changes (`-n`), or stashing your uncommitted changes around it. A
+> cherry-pick that conflicts is given up, leaving everything as it was.
 > Nothing else can be changed
 > from GitEZ yet.
 

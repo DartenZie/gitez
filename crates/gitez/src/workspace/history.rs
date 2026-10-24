@@ -2,7 +2,8 @@
 //! its graph, labels, author and date, in a virtual list. Uncommitted changes
 //! get a row of their own right above the commit `HEAD` points at. A local
 //! branch's label can be dragged onto another branch to merge it there, as
-//! in the `Merge.dc.html` artboard.
+//! in the `Merge.dc.html` artboard. ⌘-click and ⇧-click pick several
+//! commits, to cherry-pick them, as in the `CherryPick.dc.html` artboard.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -11,6 +12,7 @@ use std::sync::Arc;
 use gitez_git::graph::{GraphLayout, Row};
 use gitez_git::{Commit, Oid, Order, RefKind, RefLabel, Repository, WorkingTreeStatus};
 use gpui_kit::assets::IconName;
+use gpui_kit::component::button::*;
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -74,6 +76,12 @@ mod columns {
 /// Emitted when the selected row changes, or the uncommitted changes while
 /// their row is selected.
 pub struct SelectionChanged;
+
+/// Emitted when the commits picked with ⌘-click or ⇧-click change.
+pub struct PickedChanged;
+
+/// Emitted when the picked commits are to be cherry-picked.
+pub struct CherryPickRequested;
 
 /// Emitted when a branch is dropped on another, to merge it there.
 pub struct BranchDropped {
@@ -151,6 +159,10 @@ pub struct History {
     selected: Option<Entry>,
     /// The branch being dragged onto another, if any.
     drag: Option<Drag>,
+    /// Commits picked with ⌘-click or ⇧-click, in the order picked.
+    picked: Vec<Oid>,
+    /// Index of the commit a ⇧-click picks from.
+    pick_anchor: Option<usize>,
     /// Whether the whole history has been read.
     complete: bool,
     error: Option<SharedString>,
@@ -162,6 +174,8 @@ pub struct History {
 
 impl EventEmitter<SelectionChanged> for History {}
 impl EventEmitter<BranchDropped> for History {}
+impl EventEmitter<PickedChanged> for History {}
+impl EventEmitter<CherryPickRequested> for History {}
 
 impl History {
     pub fn new(cx: &mut Context<Self>) -> Self {
@@ -179,6 +193,8 @@ impl History {
             working_tree: None,
             selected: None,
             drag: None,
+            picked: Vec::new(),
+            pick_anchor: None,
             complete: false,
             error: None,
             now: time::now(),
@@ -314,6 +330,14 @@ impl History {
         self.now = time::now();
         self._load = None;
         self.set_graph_scroll(self.graph_scroll);
+        let picked = self.picked.len();
+        let commits = &self.commits;
+        self.picked
+            .retain(|id| commits.iter().any(|commit| commit.id == *id));
+        self.pick_anchor = None;
+        if self.picked.len() != picked {
+            cx.emit(PickedChanged);
+        }
         if let Some(id) = selected_commit {
             self.selected = self
                 .commits
@@ -686,13 +710,160 @@ impl History {
         });
     }
 
+    /// Esc: stops dragging a branch, or else unpicks the picked commits.
     fn cancel_drag(&mut self, _: &CancelDrag, window: &mut Window, cx: &mut Context<Self>) {
         let dragging = cx.stop_active_drag(window);
         if self.drag.take().is_some() || dragging {
             cx.notify();
+        } else if !self.picked.is_empty() {
+            self.clear_picked(cx);
         } else {
             cx.propagate();
         }
+    }
+
+    /// Picks or unpicks the commit at list position `index`, or with
+    /// `range`, picks every commit from the last one picked to it. The
+    /// first commit picked brings the selected one along.
+    fn pick(&mut self, index: usize, range: bool, cx: &mut Context<Self>) {
+        let Entry::Commit(commit) = self.entry(index) else {
+            return;
+        };
+        let Some(id) = self.commits.get(commit).map(|commit| commit.id) else {
+            return;
+        };
+        let selected = match self.selected {
+            Some(Entry::Commit(selected)) => Some(selected),
+            _ => None,
+        };
+        if range && let Some(anchor) = self.pick_anchor.or(selected) {
+            let (first, last) = (anchor.min(commit), anchor.max(commit));
+            for other in &self.commits[first..=last] {
+                if !self.picked.contains(&other.id) {
+                    self.picked.push(other.id);
+                }
+            }
+        } else if let Some(position) = self.picked.iter().position(|picked| *picked == id) {
+            self.picked.remove(position);
+        } else {
+            if self.picked.is_empty()
+                && let Some(selected) = selected.filter(|selected| *selected != commit)
+                && let Some(other) = self.commits.get(selected)
+            {
+                self.picked.push(other.id);
+            }
+            self.picked.push(id);
+        }
+        self.pick_anchor = Some(commit);
+        cx.emit(PickedChanged);
+        cx.notify();
+    }
+
+    /// Unpicks every picked commit.
+    pub fn clear_picked(&mut self, cx: &mut Context<Self>) {
+        self.pick_anchor = None;
+        if self.picked.is_empty() {
+            return;
+        }
+        self.picked.clear();
+        cx.emit(PickedChanged);
+        cx.notify();
+    }
+
+    /// The picked commits, oldest first, as far as the history has been
+    /// read.
+    pub fn picked(&self) -> Vec<Commit> {
+        self.commits
+            .iter()
+            .rev()
+            .filter(|commit| self.picked.contains(&commit.id))
+            .cloned()
+            .collect()
+    }
+
+    /// The tick box column shown while commits are picked.
+    fn pick_cell(&self, commit: Option<usize>) -> Option<Div> {
+        if self.picked.is_empty() {
+            return None;
+        }
+        let picked = commit
+            .and_then(|index| self.commits.get(index))
+            .is_some_and(|commit| self.picked.contains(&commit.id));
+        Some(div().w(px(22.)).flex_none().h_flex().justify_center().when(
+            commit.is_some(),
+            |this| {
+                this.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(15.))
+                        .rounded(px(4.))
+                        .border_1()
+                        .map(|this| {
+                            if picked {
+                                this.bg(rgb(color::ACCENT)).border_color(rgb(color::ACCENT))
+                            } else {
+                                this.border_color(rgb(color::PICK_BORDER))
+                            }
+                        })
+                        .when(picked, |this| {
+                            this.child(
+                                Icon::new(IconName::Check)
+                                    .size(px(11.))
+                                    .text_color(rgb(color::ON_ACCENT)),
+                            )
+                        }),
+                )
+            },
+        ))
+    }
+
+    /// The bar over the bottom of the list while commits are picked.
+    fn render_pick_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let count = self.picked.len();
+        div()
+            .absolute()
+            .bottom(px(22.))
+            .left_0()
+            .right_0()
+            .h_flex()
+            .justify_center()
+            .child(
+                div()
+                    .h_flex()
+                    .gap(px(6.))
+                    .pl(px(16.))
+                    .pr(px(8.))
+                    .py(px(8.))
+                    .rounded(px(12.))
+                    .bg(rgb(color::BUTTON))
+                    .border_1()
+                    .border_color(rgb(color::PICK_BAR_BORDER))
+                    .shadow_lg()
+                    .child(div().mr(px(6.)).font_weight(FontWeight::SEMIBOLD).child(
+                        if count == 1 {
+                            "1 commit selected".to_owned()
+                        } else {
+                            format!("{count} commits selected")
+                        },
+                    ))
+                    .child(
+                        Button::new("cherry-pick")
+                            .label("Cherry-pick onto…")
+                            .bg(rgb(color::SELECTED))
+                            .border_color(rgb(color::PICK_TARGET_BORDER))
+                            .text_color(rgb(color::CHIP_TEXT))
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(CherryPickRequested))),
+                    )
+                    .child(
+                        Button::new("clear-picked")
+                            .ghost()
+                            .icon(IconName::Close)
+                            .tooltip("Clear selection")
+                            .on_click(cx.listener(|this, _, _, cx| this.clear_picked(cx))),
+                    ),
+            )
     }
 
     /// How the row of commit `index` looks while a branch is dragged onto
@@ -764,7 +935,14 @@ impl History {
         range
             .filter_map(|index| {
                 let entry = self.entry(index);
-                let row = self.row_shell(index, self.selected == Some(entry), cx);
+                let picked = match entry {
+                    Entry::Commit(commit) => self
+                        .commits
+                        .get(commit)
+                        .is_some_and(|commit| self.picked.contains(&commit.id)),
+                    Entry::WorkingTree => false,
+                };
+                let row = self.row_shell(index, picked || self.selected == Some(entry), cx);
                 match entry {
                     Entry::WorkingTree => self.render_working_tree(row, cx),
                     Entry::Commit(commit) => self.render_commit(row, commit, cx),
@@ -806,6 +984,12 @@ impl History {
             })
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 window.focus(&this.focus_handle, cx);
+                let modifiers = event.modifiers();
+                if modifiers.secondary() || modifiers.shift {
+                    this.pick(index, modifiers.shift, cx);
+                    return;
+                }
+                this.clear_picked(cx);
                 this.select(index, cx);
                 if event.click_count() == 2 {
                     window.dispatch_action(Box::new(super::ReviewSelected), cx);
@@ -834,6 +1018,7 @@ impl History {
         Some(
             row.when(self.drag_role(None).is_some(), |this| this.opacity(0.45))
                 .child(self.graph_column(cell, cx))
+                .children(self.pick_cell(None))
                 .child(
                     div()
                         .flex_1()
@@ -900,6 +1085,7 @@ impl History {
             ))
             .on_drop(cx.listener(|this, _: &DraggedBranch, _, cx| this.drop_branch(cx)))
             .child(self.graph_column(cell, cx))
+            .children(self.pick_cell(Some(index)))
             .child(
                 div()
                     .h_flex()
@@ -1036,6 +1222,7 @@ impl Render for History {
             .on_action(cx.listener(Self::select_first))
             .on_action(cx.listener(Self::select_last))
             .on_action(cx.listener(Self::cancel_drag))
+            .relative()
             .v_flex()
             .size_full()
             .min_w_0()
@@ -1078,6 +1265,9 @@ impl Render for History {
                                 )
                             })
                         })
+                    })
+                    .when(self.drag.is_none() && !self.picked.is_empty(), |this| {
+                        this.child(pick_hint(cx))
                     }),
             )
             .child(
@@ -1093,11 +1283,17 @@ impl Render for History {
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(color::TEXT_FAINT))
                     .child(self.render_graph_heading())
+                    .when(!self.picked.is_empty(), |this| {
+                        this.child(div().w(px(22.)).flex_none())
+                    })
                     .child(div().flex_1().min_w_0().child("DESCRIPTION"))
                     .child(column(columns::AUTHOR, "AUTHOR"))
                     .child(column(columns::DATE, "DATE")),
             )
             .child(body)
+            .when(!self.picked.is_empty(), |this| {
+                this.child(self.render_pick_bar(cx))
+            })
     }
 }
 
@@ -1151,6 +1347,39 @@ fn moving(branch: &SharedString) -> impl IntoElement {
                 .child(Kbd::new(escape))
                 .child("cancel"),
         )
+}
+
+/// How to pick commits, shown while some are picked.
+fn pick_hint(cx: &App) -> impl IntoElement {
+    // A modifier alone is not a keystroke `Kbd` can show.
+    let key = |key: &'static str| {
+        div()
+            .px(px(5.))
+            .rounded(px(4.))
+            .border_1()
+            .border_b_2()
+            .border_color(rgb(color::REMOTE_LABEL_BORDER))
+            .font_family(cx.theme().mono_font_family.clone())
+            .text_size(px(10.5))
+            .text_color(rgb(color::REMOTE_LABEL_TEXT))
+            .child(key)
+    };
+    let secondary = if cfg!(target_os = "macos") {
+        "⌘"
+    } else {
+        "Ctrl"
+    };
+    div()
+        .h_flex()
+        .ml_auto()
+        .flex_none()
+        .gap(px(6.))
+        .text_size(px(12.))
+        .text_color(rgb(color::TEXT_MUTED))
+        .child(key(secondary))
+        .child("click to select several ·")
+        .child(key("⇧"))
+        .child("click for a range")
 }
 
 /// What follows the pointer while a branch is dragged: its label, lifted.

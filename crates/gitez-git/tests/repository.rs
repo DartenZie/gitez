@@ -1420,3 +1420,62 @@ fn a_merge_stopped_by_conflicts_is_read() {
     assert_eq!(conflict.base.as_deref(), Some(&["shared".to_owned()][..]));
     assert_eq!(repo.conflict_file("missing.txt").expect("read"), None);
 }
+
+#[test]
+fn cherry_pick_trial_applies_skips_and_finds_conflicts() {
+    use gitez_git::PickTrial;
+
+    let fixture = Fixture::new();
+    fixture.commit("shared.txt", "shared");
+    fixture.git(&["checkout", "--quiet", "-b", "feature"]);
+    fixture.commit("new.txt", "new");
+    let adds_new = fixture.rev("HEAD");
+    std::fs::write(fixture.root.join("shared.txt"), "feature's line\n").expect("write");
+    fixture.git(&["commit", "--quiet", "-am", "feature edits shared"]);
+    let edits_shared = fixture.rev("HEAD");
+    fixture.git(&["checkout", "--quiet", "main"]);
+    let main = fixture.rev("main");
+    let repo = fixture.open();
+
+    assert_eq!(
+        repo.cherry_pick_trial(main, &[adds_new, edits_shared])
+            .expect("trial"),
+        PickTrial::Clean {
+            applied: vec![adds_new, edits_shared],
+            skipped: 0
+        }
+    );
+
+    // Main already has new.txt and changes shared.txt its own way.
+    fixture.commit("new.txt", "new");
+    std::fs::write(fixture.root.join("shared.txt"), "main's line\n").expect("write");
+    fixture.git(&["commit", "--quiet", "-am", "main edits shared"]);
+    let main = fixture.rev("main");
+    assert_eq!(
+        repo.cherry_pick_trial(main, &[adds_new]).expect("trial"),
+        PickTrial::Clean {
+            applied: vec![],
+            skipped: 1
+        }
+    );
+    assert_eq!(
+        repo.cherry_pick_trial(main, &[adds_new, edits_shared])
+            .expect("trial"),
+        PickTrial::Conflict {
+            commit: edits_shared,
+            files: vec!["shared.txt".to_owned()]
+        }
+    );
+    // Feature contains both, though they no longer apply to its tip.
+    let feature = fixture.rev("feature");
+    assert_eq!(
+        repo.cherry_pick_trial(feature, &[adds_new, edits_shared])
+            .expect("trial"),
+        PickTrial::Clean {
+            applied: vec![],
+            skipped: 2
+        }
+    );
+    // Nothing was written.
+    assert_eq!(fixture.git(&["status", "--porcelain"]), "");
+}

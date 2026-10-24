@@ -395,3 +395,48 @@ fn sets_and_removes_a_config_value() {
         .expect("git runs");
     assert!(!output.status.success());
 }
+
+#[test]
+fn cherry_picks_onto_a_branch_and_gives_up_on_a_conflict() {
+    use gitez_command::PickOptions;
+
+    // b.txt is feature's commit; pick it onto main from feature, with a
+    // change in the working tree stashed along the way.
+    let dir = diverged("feature");
+    let root = dir.path();
+    let b = git(root, &["rev-parse", "feature"]);
+    std::fs::write(root.join("a.txt"), "edited\n").expect("write");
+    let options = PickOptions {
+        note_source: true,
+        stash: true,
+        ..PickOptions::default()
+    };
+    Git::new(root)
+        .cherry_pick(std::slice::from_ref(&b), "main", options, Some("feature"))
+        .expect("cherry-pick");
+    assert_eq!(git(root, &["branch", "--show-current"]), "main");
+    assert_eq!(git(root, &["log", "--format=%s", "main"]), "b\nc\na");
+    assert!(
+        git(root, &["log", "-1", "--format=%b"])
+            .contains(&format!("cherry picked from commit {b}"))
+    );
+    assert_eq!(status(root), "M a.txt");
+
+    // Main changes b.txt its own way: the pick conflicts and is undone.
+    let dir = diverged("feature");
+    let root = dir.path();
+    let b = git(root, &["rev-parse", "feature"]);
+    git(root, &["switch", "--quiet", "main"]);
+    std::fs::write(root.join("b.txt"), "main\n").expect("write");
+    git(root, &["add", "b.txt"]);
+    git(root, &["commit", "--quiet", "-m", "main adds b"]);
+    git(root, &["switch", "--quiet", "feature"]);
+    let main = git(root, &["rev-parse", "main"]);
+    let error = Git::new(root)
+        .cherry_pick(&[b], "main", PickOptions::default(), Some("feature"))
+        .expect_err("conflict");
+    assert!(matches!(error, Error::Failed { .. }), "{error}");
+    assert_eq!(git(root, &["rev-parse", "main"]), main);
+    assert_eq!(git(root, &["branch", "--show-current"]), "feature");
+    assert_eq!(status(root), "");
+}

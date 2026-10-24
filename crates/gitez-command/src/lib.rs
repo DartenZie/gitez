@@ -58,6 +58,17 @@ pub enum MergeMethod {
     FastForward,
 }
 
+/// How [`Git::cherry_pick`] applies commits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PickOptions {
+    /// Adds "(cherry picked from commit …)" to each message (`-x`).
+    pub note_source: bool,
+    /// Leaves the changes staged instead of committing them (`-n`).
+    pub no_commit: bool,
+    /// Stashes uncommitted changes first and brings them back afterwards.
+    pub stash: bool,
+}
+
 /// Runs `git` in one working tree.
 #[derive(Debug, Clone)]
 pub struct Git {
@@ -215,6 +226,84 @@ impl Git {
             }
         }
         rebased.map(drop)
+    }
+
+    /// Applies `commits` (full ids, oldest first) to branch `onto` and
+    /// leaves it checked out, like `git switch onto` then
+    /// `git cherry-pick commits`. When git cannot finish, because of a
+    /// conflict or a hook, the cherry-pick is given up and `return_to`, the
+    /// branch checked out before, is checked out again. Stashed changes come
+    /// back either way; if they cannot, they stay in the stash and that is
+    /// the error.
+    pub fn cherry_pick(
+        &self,
+        commits: &[String],
+        onto: &str,
+        options: PickOptions,
+        return_to: Option<&str>,
+    ) -> Result<()> {
+        if commits.is_empty() {
+            return Ok(());
+        }
+        let stashed = options.stash && self.stash_push("GitEZ: before cherry-picking")?;
+        let mut picked = self.switch(onto).and_then(|()| {
+            let mut args = vec!["cherry-pick"];
+            if options.note_source {
+                args.push("-x");
+            }
+            if options.no_commit {
+                args.push("--no-commit");
+            }
+            args.extend(commits.iter().map(String::as_str));
+            let picked = self.run(args, None).map(drop);
+            if picked.is_err() && self.run(["cherry-pick", "--abort"], None).is_err() {
+                // Nothing to abort after `--no-commit`: undo what it staged.
+                self.run(["reset", "--quiet", "--merge"], None).ok();
+            }
+            picked
+        });
+        if picked.is_err()
+            && let Some(branch) = return_to
+        {
+            // Best effort: the error that stopped the cherry-pick is the one
+            // to report.
+            self.switch(branch).ok();
+        }
+        if stashed && let Err(error) = self.run(["stash", "pop", "--quiet"], None) {
+            let Error::Failed { command, output } = error else {
+                return Err(error);
+            };
+            let output = format!(
+                "Your uncommitted changes could not be brought back; they are kept in the \
+                 stash.\n{output}"
+            );
+            picked = picked.and(Err(Error::Failed { command, output }));
+        }
+        picked
+    }
+
+    /// Stashes every uncommitted change, untracked files too, like
+    /// `git stash push --include-untracked`; returns whether there was
+    /// anything to stash.
+    fn stash_push(&self, message: &str) -> Result<bool> {
+        let before = self
+            .run(["rev-parse", "--quiet", "--verify", "refs/stash"], None)
+            .ok();
+        self.run(
+            [
+                "stash",
+                "push",
+                "--quiet",
+                "--include-untracked",
+                "-m",
+                message,
+            ],
+            None,
+        )?;
+        let after = self
+            .run(["rev-parse", "--quiet", "--verify", "refs/stash"], None)
+            .ok();
+        Ok(after.is_some() && after != before)
     }
 
     /// The paths with unresolved conflicts, like `git diff --diff-filter=U`.

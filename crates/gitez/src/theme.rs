@@ -76,6 +76,19 @@ pub mod color {
     pub const INCOMING_ROW: u32 = 0x4f_c6_b0_12;
     pub const TARGET_ROW: u32 = 0xe8_b0_4b_17;
 
+    /// Cherry-picking: the bar over the history while commits are picked,
+    /// the chosen target branch's border and a target's hover, a picked
+    /// commit in the panel, and the trial run's verdicts.
+    pub const PICK_BAR_BORDER: u32 = 0x36_36_3c;
+    pub const PICK_TARGET_BORDER: u32 = 0x5a_4a_26;
+    pub const PICK_TARGET_HOVER: u32 = 0x22_22_26;
+    pub const PICK_COMMIT: u32 = 0x1b_1b_1e;
+    pub const PICK_COMMIT_BORDER: u32 = 0x29_29_2e;
+    pub const TRIAL_CLEAN: u32 = 0x17_20_1a;
+    pub const TRIAL_CLEAN_BORDER: u32 = 0x28_40_33;
+    pub const TRIAL_CLEAN_TEXT: u32 = 0xb9_dc_c5;
+    pub const TRIAL_CONFLICT: u32 = 0x22_1d_14;
+
     /// The agent prompt panel: a comment in it, and the prompt text.
     pub const PROMPT_COMMENT: u32 = 0x18_18_1b;
     pub const PROMPT: u32 = 0x0f_0f_11;
