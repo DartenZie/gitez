@@ -193,3 +193,114 @@ fn switches_to_a_branch_unless_changes_would_be_lost() {
     assert!(matches!(error, Error::Failed { .. }), "{error}");
     assert_eq!(git(root, &["branch", "--show-current"]), "feature");
 }
+
+/// A repository where `feature` adds b.txt and `main` then adds c.txt,
+/// on `checked_out`.
+fn diverged(checked_out: &str) -> tempfile::TempDir {
+    let dir = repository();
+    let root = dir.path();
+    std::fs::write(root.join("a.txt"), "a\n").expect("write");
+    git(root, &["add", "a.txt"]);
+    git(root, &["commit", "--quiet", "-m", "a"]);
+    git(root, &["switch", "--quiet", "-c", "feature"]);
+    std::fs::write(root.join("b.txt"), "b\n").expect("write");
+    git(root, &["add", "b.txt"]);
+    git(root, &["commit", "--quiet", "-m", "b"]);
+    git(root, &["switch", "--quiet", "main"]);
+    std::fs::write(root.join("c.txt"), "c\n").expect("write");
+    git(root, &["add", "c.txt"]);
+    git(root, &["commit", "--quiet", "-m", "c"]);
+    git(root, &["switch", "--quiet", checked_out]);
+    dir
+}
+
+#[test]
+fn merges_a_branch_each_way() {
+    use gitez_command::MergeMethod;
+
+    let dir = diverged("feature");
+    let root = dir.path();
+    Git::new(root)
+        .merge_branch(
+            "feature",
+            "main",
+            MergeMethod::Merge,
+            "Merge feature\n\nWhy.",
+            Some("feature"),
+        )
+        .expect("merge");
+    assert_eq!(git(root, &["branch", "--show-current"]), "main");
+    assert_eq!(
+        git(root, &["log", "-1", "--format=%B"]),
+        "Merge feature\n\nWhy."
+    );
+    assert_eq!(git(root, &["rev-list", "--count", "--merges", "HEAD"]), "1");
+
+    let dir = diverged("feature");
+    let root = dir.path();
+    Git::new(root)
+        .merge_branch("feature", "main", MergeMethod::Squash, "Add b", None)
+        .expect("squash");
+    assert_eq!(git(root, &["log", "--format=%s"]), "Add b\nc\na");
+    assert_eq!(status(root), "");
+
+    let dir = diverged("main");
+    let root = dir.path();
+    Git::new(root)
+        .merge_branch("feature", "main", MergeMethod::Rebase, "", None)
+        .expect("rebase");
+    assert_eq!(git(root, &["log", "--format=%s"]), "b\nc\na");
+    assert_eq!(
+        git(root, &["rev-parse", "main"]),
+        git(root, &["rev-parse", "feature"])
+    );
+    assert_eq!(git(root, &["branch", "--show-current"]), "main");
+
+    // Main has a commit of its own: no fast-forward, and nothing changes.
+    let dir = diverged("feature");
+    let root = dir.path();
+    let main = git(root, &["rev-parse", "main"]);
+    let error = Git::new(root)
+        .merge_branch(
+            "feature",
+            "main",
+            MergeMethod::FastForward,
+            "",
+            Some("feature"),
+        )
+        .expect_err("diverged");
+    assert!(matches!(error, Error::Failed { .. }), "{error}");
+    assert_eq!(git(root, &["rev-parse", "main"]), main);
+    assert_eq!(git(root, &["branch", "--show-current"]), "feature");
+}
+
+#[test]
+fn a_conflicting_merge_is_undone() {
+    use gitez_command::MergeMethod;
+
+    let dir = diverged("feature");
+    let root = dir.path();
+    std::fs::write(root.join("a.txt"), "feature\n").expect("write");
+    git(root, &["commit", "--quiet", "-am", "feature edits a"]);
+    git(root, &["switch", "--quiet", "main"]);
+    std::fs::write(root.join("a.txt"), "main\n").expect("write");
+    git(root, &["commit", "--quiet", "-am", "main edits a"]);
+    git(root, &["switch", "--quiet", "feature"]);
+    let main = git(root, &["rev-parse", "main"]);
+    let feature = git(root, &["rev-parse", "feature"]);
+
+    for how in [MergeMethod::Merge, MergeMethod::Squash, MergeMethod::Rebase] {
+        let error = Git::new(root)
+            .merge_branch("feature", "main", how, "Merge", Some("feature"))
+            .expect_err("conflict");
+        assert!(matches!(error, Error::Failed { .. }), "{how:?}: {error}");
+        assert_eq!(status(root), "", "{how:?}");
+        assert_eq!(
+            git(root, &["branch", "--show-current"]),
+            "feature",
+            "{how:?}"
+        );
+        assert_eq!(git(root, &["rev-parse", "main"]), main, "{how:?}");
+        assert_eq!(git(root, &["rev-parse", "feature"]), feature, "{how:?}");
+    }
+}

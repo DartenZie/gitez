@@ -44,6 +44,13 @@ pub mod color {
     pub const BRANCH_VIOLET: u32 = 0xc0_8c_f0;
     pub const BRANCH_TEAL: u32 = 0x4f_c6_b0;
 
+    /// The merge dialog: an option under the pointer, the box of an
+    /// option's icon (the suggested option's own), and its dividers.
+    pub const MERGE_OPTION_HOVER: u32 = 0x26_26_2b;
+    pub const MERGE_ICON: u32 = 0x23_23_27;
+    pub const MERGE_ICON_PRIMARY: u32 = 0x3a_2f_18;
+    pub const MERGE_DIVIDER: u32 = 0x2a_2a_2f;
+
     /// The agent prompt panel: a comment in it, and the prompt text.
     pub const PROMPT_COMMENT: u32 = 0x18_18_1b;
     pub const PROMPT: u32 = 0x0f_0f_11;

@@ -56,7 +56,11 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 > Claude Code** runs `claude` headless in the working tree, with all
 > permissions, and streams what it does into the panel (it needs the
 > branch checked out, which **Checkout branch** does). Each run's
-> transcript is kept, and the last one shows when you come back. Nothing
+> transcript is kept, and the last one shows when you come back.
+> **Merge into …** merges the branch into its base with a merge commit,
+> a squash, a rebase or a fast-forward, and warns beforehand about files
+> that would conflict; if git stops, nothing is changed. The pull request
+> is then marked merged and keeps showing the changes it had. Nothing
 > else can be changed from GitEZ yet.
 
 ## Technology
@@ -154,9 +158,10 @@ Cargo.toml          workspace: dependency versions, lints, build profiles
 crates/gitez/       the application binary
 crates/gitez-git/   read-only repository access on gitoxide: refs, history, graph layout,
                     commit messages, changed files and diffs, working-tree status,
-                    watching for changes
+                    merge previews, watching for changes
 crates/gitez-command/ changes made by running the user's git binary: staging,
-                    unstaging files or hunks, committing, amending, switching branches
+                    unstaging files or hunks, committing, amending, switching branches,
+                    merging
 crates/gitez-review/ local pull requests, their comment threads and agent run
                     transcripts, stored in .git/gitez/reviews
 crates/gitez-agent/ coding agents a review prompt is sent to: Claude Code run as

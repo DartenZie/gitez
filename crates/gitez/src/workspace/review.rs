@@ -25,6 +25,7 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+mod merge;
 mod prompt;
 mod threads;
 
@@ -344,6 +345,8 @@ struct PullRequestSubject {
     panel: prompt::PromptPanel,
     /// Checking out the head branch.
     checking_out: Option<Task<()>>,
+    /// Set while the merge dialog is open.
+    merge_dialog: Option<Subscription>,
 }
 
 pub struct Review {
@@ -477,6 +480,7 @@ impl Review {
             },
             panel,
             checking_out: None,
+            merge_dialog: None,
         }));
         let mut review = Self::with_subject(repository, subject, load, cx);
         review.find_run(cx);
@@ -1981,7 +1985,15 @@ impl Review {
                         Button::new("pull-request-merge")
                             .h(px(30.))
                             .label(format!("Merge into {}…", pull_request.base.branch))
-                            .disabled(true),
+                            .disabled(
+                                pull_request.state != State::Open
+                                    || subject.tips.head.is_none()
+                                    || subject.tips.base.is_none()
+                                    || self.repository.work_dir().is_none(),
+                            )
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.open_merge(window, cx)),
+                            ),
                     ),
             )
     }
@@ -2305,35 +2317,56 @@ fn read_pull_request(
         Oid::from_hex(hex.as_bytes()).with_context(|| format!("{hex} is not a commit id"))
     };
     let last_head = commit(&pull_request.head.commit)?;
-    let head = tips.head.unwrap_or(last_head);
-    let base = match tips.base {
-        Some(base) => base,
-        None => commit(&pull_request.base.commit)?,
+    let last_base = commit(&pull_request.base.commit)?;
+    // A merged or closed pull request keeps the changes it had then.
+    let (head, base) = if pull_request.state == State::Open {
+        (
+            tips.head.unwrap_or(last_head),
+            tips.base.unwrap_or(last_base),
+        )
+    } else {
+        (last_head, last_base)
     };
-    if head != last_head {
-        pull_request.move_head(&head.to_string(), Timestamp::now(), |path| {
-            Ok::<_, gitez_git::Error>(match repository.follow_lines(path, last_head, head)? {
-                Followed::Unchanged => FileUpdate::Unchanged,
-                Followed::Changed { path, lines } => FileUpdate::Changed {
-                    path,
-                    lines: lines
-                        .into_iter()
-                        .map(|lines| LineChange {
-                            old: lines.old,
-                            new: lines.new,
-                        })
-                        .collect(),
-                },
-                Followed::Gone => FileUpdate::Gone,
-            })
-        })?;
-    }
+    follow_head(repository, &mut pull_request, head, Timestamp::now())?;
     pull_request.base.commit = base.to_string();
     let diff = repository.branch_diff(base, head, options)?;
     if pull_request != read {
         store.save(&pull_request)?;
     }
     Ok((pull_request, diff))
+}
+
+/// Moves `pull_request`'s head to commit `head`, if it is not there yet:
+/// threads whose lines changed resolve themselves and the others follow
+/// their lines. Blocks; run it on a background thread.
+fn follow_head(
+    repository: &Repository,
+    pull_request: &mut PullRequest,
+    head: Oid,
+    now: Timestamp,
+) -> anyhow::Result<()> {
+    let last_head = Oid::from_hex(pull_request.head.commit.as_bytes())
+        .with_context(|| format!("{} is not a commit id", pull_request.head.commit))?;
+    if head == last_head {
+        return Ok(());
+    }
+    pull_request.move_head(&head.to_string(), now, |path| {
+        Ok::<_, gitez_git::Error>(match repository.follow_lines(path, last_head, head)? {
+            Followed::Unchanged => FileUpdate::Unchanged,
+            Followed::Changed { path, lines } => FileUpdate::Changed {
+                path,
+                lines: lines
+                    .into_iter()
+                    .map(|lines| LineChange {
+                        old: lines.old,
+                        new: lines.new,
+                    })
+                    .collect(),
+            },
+            Followed::Gone => FileUpdate::Gone,
+        })
+    })?;
+    Ok(())
 }
 
 /// "In review", "Merged" or "Closed", with a dot.

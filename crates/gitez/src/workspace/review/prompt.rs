@@ -230,6 +230,9 @@ impl Review {
         if self.repository.work_dir().is_none() {
             return Some("A bare repository has no working tree for the agent to work in.".into());
         }
+        if subject.pull_request.state != gitez_review::State::Open {
+            return Some("This pull request is no longer open.".into());
+        }
         if !subject.tips.checked_out {
             return Some(format!(
                 "The agent commits to the branch that is checked out. Check out {} to send.",

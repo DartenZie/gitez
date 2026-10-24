@@ -25,6 +25,22 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// How [`Git::merge_branch`] brings a branch's commits into another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeMethod {
+    /// A merge commit, even when a fast-forward is possible
+    /// (`git merge --no-ff`).
+    Merge,
+    /// One new commit with all the changes (`git merge --squash`).
+    Squash,
+    /// The branch's commits replayed on top of the other branch, which
+    /// then fast-forwards to them (`git rebase`).
+    Rebase,
+    /// The other branch moved to the branch's last commit; only possible
+    /// when it has no commits of its own (`git merge --ff-only`).
+    FastForward,
+}
+
 /// Runs `git` in one working tree.
 #[derive(Debug, Clone)]
 pub struct Git {
@@ -83,6 +99,58 @@ impl Git {
     /// git's explanation, when uncommitted changes would be overwritten.
     pub fn switch(&self, branch: &str) -> Result<()> {
         self.run(["switch", "--quiet", branch], None).map(drop)
+    }
+
+    /// Brings the commits of branch `head` into branch `base` the way `how`
+    /// says, and leaves `base` checked out. When git cannot finish, because
+    /// of a conflict or a hook, everything it did is undone and
+    /// `return_to`, the branch checked out before, is checked out again.
+    pub fn merge_branch(
+        &self,
+        head: &str,
+        base: &str,
+        how: MergeMethod,
+        message: &str,
+        return_to: Option<&str>,
+    ) -> Result<()> {
+        let merged = self.merge_steps(head, base, how, message);
+        if merged.is_err()
+            && let Some(branch) = return_to
+        {
+            // Best effort: the error that stopped the merge is the one to
+            // report.
+            self.switch(branch).ok();
+        }
+        merged
+    }
+
+    fn merge_steps(&self, head: &str, base: &str, how: MergeMethod, message: &str) -> Result<()> {
+        if how == MergeMethod::Rebase {
+            // Checks out `head` and replays its commits on top of `base`.
+            if let Err(error) = self.run(["rebase", "--quiet", base, head], None) {
+                self.run(["rebase", "--abort"], None).ok();
+                return Err(error);
+            }
+        }
+        self.switch(base)?;
+        let merged = match how {
+            MergeMethod::Merge => self
+                .run(["merge", "--quiet", "--no-ff", "-m", message, head], None)
+                .map(drop),
+            MergeMethod::Squash => self
+                .run(["merge", "--quiet", "--squash", head], None)
+                .and_then(|_| self.commit(message)),
+            MergeMethod::FastForward | MergeMethod::Rebase => self
+                .run(["merge", "--quiet", "--ff-only", head], None)
+                .map(drop),
+        };
+        if merged.is_err() {
+            // As `git merge --abort` does; a squash leaves no merge to
+            // abort, so this undoes it too. Git refused to start if
+            // uncommitted changes were in the way, so none are lost.
+            self.run(["reset", "--quiet", "--merge"], None).ok();
+        }
+        merged
     }
 
     /// Replaces the last commit with one that has `message` and also the

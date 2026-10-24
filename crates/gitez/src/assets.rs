@@ -14,13 +14,19 @@ icon_assets!(
     [
         Archive,
         ArrowRight,
+        ArrowRightToLine,
         Bot,
+        CircleAlert,
         Cloud,
+        Combine,
         Copy,
         GitBranch,
+        GitFork,
         GitGraph,
+        GitMerge,
         GitPullRequestArrow,
         ListTree,
+        LoaderCircle,
         Square,
         Terminal
     ]

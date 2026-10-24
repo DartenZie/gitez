@@ -25,6 +25,8 @@ pub enum Error {
     Diff(#[source] std::io::Error),
     #[error("could not watch the repository for changes")]
     Watch(#[from] notify::Error),
+    #[error("could not work out the merge")]
+    Merge(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error(transparent)]
     Git(#[from] gix::Error),
 }

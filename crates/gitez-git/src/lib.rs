@@ -14,6 +14,7 @@ mod diff;
 mod error;
 mod follow;
 pub mod graph;
+mod merge;
 mod refs;
 mod repository;
 mod status;
@@ -27,6 +28,7 @@ pub use diff::{
 };
 pub use error::{Error, Result};
 pub use follow::{ChangedLines, Followed};
+pub use merge::MergePreview;
 pub use refs::{Branch, Head, RefKind, RefLabel, Refs, RemoteBranch, Stash, Tag};
 pub use repository::Repository;
 pub use status::{FileStatus, WorkingTreeStatus, WorktreeChange};
