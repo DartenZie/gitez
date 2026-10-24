@@ -1349,7 +1349,7 @@ fn merge_preview_finds_the_files_that_would_conflict() {
 
     // The base has not moved: a fast-forward.
     let preview = repo.merge_preview(base, fast).expect("fast-forward");
-    assert_eq!((preview.ahead, preview.behind), (1, 0));
+    assert_eq!((preview.ahead, preview.behind, preview.files), (1, 0, 1));
     assert!(preview.conflicts.is_empty());
 
     // Both change the same line of shared.txt; only feature changes
@@ -1362,7 +1362,7 @@ fn merge_preview_finds_the_files_that_would_conflict() {
     fixture.git(&["commit", "--quiet", "-am", "main edits shared"]);
     let base = fixture.rev("HEAD");
     let preview = repo.merge_preview(base, head).expect("diverged");
-    assert_eq!((preview.ahead, preview.behind), (2, 1));
+    assert_eq!((preview.ahead, preview.behind, preview.files), (2, 1, 2));
     assert_eq!(preview.conflicts, ["shared.txt"]);
     // Nothing was written: the merge leaves no trace.
     assert_eq!(fixture.git(&["status", "--porcelain"]), "");

@@ -1,6 +1,7 @@
-//! Merging a local pull request into its base, as in the dialog of the
-//! `Merge.dc.html` artboard: how the branches compare, whether they would
-//! conflict, and the ways to bring the branch in.
+//! Merging one branch into another, as in the dialog of the `Merge.dc.html`
+//! artboard: how the branches compare, whether they would conflict, and
+//! the ways to bring the branch in. It opens for a local pull request, or
+//! when a branch is dropped on another in the history.
 
 use gitez_command::{Git, MergeMethod, MergeOutcome};
 use gitez_git::{Head, MergePreview, Oid, RefKind, RefLabel, Repository};
@@ -15,35 +16,58 @@ use super::{Review, ReviewEvent, Subject, follow_head, muted};
 use crate::theme::{self, color};
 use crate::workspace::labels;
 
-/// What the dialog asks of the review.
-pub(super) enum MergeEvent {
-    /// The branch was merged and the pull request saved as merged.
-    Merged(Box<PullRequest>),
+/// What the dialog asks of its owner.
+pub(crate) enum MergeEvent {
+    /// The branch was merged, and the pull request merged with it, if any,
+    /// saved as merged.
+    Merged(Option<Box<PullRequest>>),
+    /// The branch was rebased onto the other.
+    Rebased,
     /// The merge stopped with conflicts to resolve.
     Stopped,
+    /// Review the branch as a local pull request: this open one, or a new
+    /// one.
+    Review(Option<u32>),
 }
 
-/// The pull request as the dialog merges it.
-pub(super) struct Merging {
-    pub number: u32,
-    pub title: String,
-    pub description: String,
+/// The branches as the dialog merges them.
+pub(crate) struct Merging {
+    /// The open local pull request of these branches, which a merge marks
+    /// merged.
+    pub pull_request: Option<MergedPullRequest>,
     pub head: String,
     pub base: String,
     pub head_tip: Oid,
     pub base_tip: Oid,
-    /// Files the branch changes.
-    pub files: usize,
 }
 
-pub(super) struct MergeDialog {
+pub(crate) struct MergedPullRequest {
+    pub number: u32,
+    pub title: String,
+    pub description: String,
+}
+
+/// One of the dialog's options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Choice {
+    Merge(MergeMethod),
+    /// Rebase the branch onto the other, which stays where it is.
+    Rebase,
+    /// Review it as a local pull request first.
+    Review,
+}
+
+pub(crate) struct MergeDialog {
     repository: Repository,
     store: Store,
     merging: Merging,
+    /// Opened by dropping a branch on another, rather than for a pull
+    /// request: the branch can be rebased alone, or reviewed first.
+    dropped: bool,
     /// `None` while working it out.
     preview: Option<Result<MergePreview, SharedString>>,
-    /// The way being merged now.
-    running: Option<MergeMethod>,
+    /// The option being carried out now.
+    running: Option<Choice>,
     /// Why the last attempt failed: git's own words.
     error: Option<SharedString>,
     _task: Task<()>,
@@ -52,10 +76,11 @@ pub(super) struct MergeDialog {
 impl EventEmitter<MergeEvent> for MergeDialog {}
 
 impl MergeDialog {
-    pub(super) fn new(
+    pub(crate) fn new(
         repository: Repository,
         store: Store,
         merging: Merging,
+        dropped: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         let (base, head) = (merging.base_tip, merging.head_tip);
@@ -82,6 +107,7 @@ impl MergeDialog {
             repository,
             store,
             merging,
+            dropped,
             preview: None,
             running: None,
             error: None,
@@ -89,45 +115,63 @@ impl MergeDialog {
         }
     }
 
-    /// Merges the way `how` says in the background, then saves the pull
-    /// request as merged.
-    fn merge(&mut self, how: MergeMethod, cx: &mut Context<Self>) {
-        if self.running.is_some() || self.why_not(how).is_some() {
+    /// Carries out `choice` in the background; a merge saves the pull
+    /// request, if any, as merged.
+    fn choose(&mut self, choice: Choice, cx: &mut Context<Self>) {
+        if self.running.is_some() || self.why_not(choice).is_some() {
             return;
         }
+        let how = match choice {
+            Choice::Review => {
+                let number = self.merging.pull_request.as_ref().map(|pr| pr.number);
+                cx.emit(MergeEvent::Review(number));
+                return;
+            }
+            Choice::Merge(how) => Some(how),
+            Choice::Rebase => None,
+        };
         let Some(dir) = self.repository.work_dir() else {
             return;
         };
         let git = Git::new(dir);
         let (repository, store) = (self.repository.clone(), self.store.clone());
         let merging = &self.merging;
-        let (number, head, base) = (merging.number, merging.head.clone(), merging.base.clone());
-        let message = message(merging, how, self.ahead());
+        let number = merging.pull_request.as_ref().map(|pr| pr.number);
+        let (head, base) = (merging.head.clone(), merging.base.clone());
+        let message = how.map(|how| message(merging, how, self.ahead()));
         let base_before = merging.base_tip;
-        self.running = Some(how);
+        self.running = Some(choice);
         self.error = None;
         self._task = cx.spawn(async move |this, cx| {
-            let merged = cx
+            let done = cx
                 .background_executor()
                 .spawn(async move {
                     let return_to = match repository.refs()?.head {
                         Some(Head::Branch { name, .. }) => Some(name),
                         _ => None,
                     };
+                    let (Some(how), Some(message)) = (how, message) else {
+                        git.rebase_branch(&head, &base, return_to.as_deref())?;
+                        return anyhow::Ok(MergeEvent::Rebased);
+                    };
                     match git.merge_branch(&head, &base, how, &message, return_to.as_deref())? {
                         MergeOutcome::Merged => {
-                            record_merge(&repository, &store, number, base_before).map(Some)
+                            let pull_request = number
+                                .map(|number| {
+                                    record_merge(&repository, &store, number, base_before)
+                                })
+                                .transpose()?;
+                            Ok(MergeEvent::Merged(pull_request.map(Box::new)))
                         }
                         // Recorded once the merge is committed.
-                        MergeOutcome::Conflicts => Ok(None),
+                        MergeOutcome::Conflicts => Ok(MergeEvent::Stopped),
                     }
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.running = None;
-                match merged {
-                    Ok(Some(pull_request)) => cx.emit(MergeEvent::Merged(Box::new(pull_request))),
-                    Ok(None) => cx.emit(MergeEvent::Stopped),
+                match done {
+                    Ok(event) => cx.emit(event),
                     Err(error) => this.error = Some(format!("{error:#}").into()),
                 }
                 cx.notify();
@@ -148,27 +192,33 @@ impl MergeDialog {
         }
     }
 
-    /// Why merging the way `how` says is not possible, if it is not.
-    fn why_not(&self, how: MergeMethod) -> Option<String> {
+    /// Why `choice` is not possible, if it is not.
+    fn why_not(&self, choice: Choice) -> Option<String> {
         let preview = match &self.preview {
             None => return Some("Comparing the branches…".into()),
             Some(Err(_)) => return Some("The branches could not be compared.".into()),
             Some(Ok(preview)) => preview,
         };
-        let base = &self.merging.base;
+        let (head, base) = (&self.merging.head, &self.merging.base);
         if preview.ahead == 0 {
-            return Some(format!("{base} already has every commit of this branch"));
+            return Some(format!("{base} already has every commit of {head}"));
+        }
+        if choice == Choice::Review {
+            return None;
         }
         if self.repository.work_dir().is_none() {
             return Some("A bare repository has no working tree to merge in".into());
         }
-        match how {
-            MergeMethod::FastForward if preview.behind > 0 => {
+        match choice {
+            Choice::Merge(MergeMethod::FastForward) if preview.behind > 0 => {
                 Some("Not possible — the branches have diverged".into())
             }
-            MergeMethod::FastForward => None,
+            Choice::Merge(MergeMethod::FastForward) => None,
+            Choice::Rebase if preview.behind == 0 => {
+                Some(format!("{head} is already on top of {base}"))
+            }
             // The conflict editor opens to resolve them.
-            MergeMethod::Merge => None,
+            Choice::Merge(MergeMethod::Merge) => None,
             _ if !preview.conflicts.is_empty() => Some(format!(
                 "Would conflict — merge into {base} instead and resolve {} there",
                 if preview.conflicts.len() == 1 {
@@ -183,21 +233,23 @@ impl MergeDialog {
 
     fn render_option(
         &self,
-        how: MergeMethod,
+        choice: Choice,
         icon: IconName,
         title: String,
         detail: String,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let why_not = self.why_not(how);
+        let why_not = self.why_not(choice);
         let enabled = why_not.is_none() && self.running.is_none();
-        let primary = how == MergeMethod::Merge && enabled;
+        let primary = choice == Choice::Merge(MergeMethod::Merge) && enabled;
         div()
-            .id(match how {
-                MergeMethod::Merge => "merge-commit",
-                MergeMethod::Squash => "merge-squash",
-                MergeMethod::Rebase => "merge-rebase",
-                MergeMethod::FastForward => "merge-fast-forward",
+            .id(match choice {
+                Choice::Merge(MergeMethod::Merge) => "merge-commit",
+                Choice::Merge(MergeMethod::Squash) => "merge-squash",
+                Choice::Merge(MergeMethod::Rebase) => "merge-rebase",
+                Choice::Merge(MergeMethod::FastForward) => "merge-fast-forward",
+                Choice::Rebase => "rebase",
+                Choice::Review => "review",
             })
             .h_flex()
             .items_start()
@@ -209,7 +261,7 @@ impl MergeDialog {
             .when(enabled, |this| {
                 this.cursor_pointer()
                     .hover(|style| style.bg(rgb(color::MERGE_OPTION_HOVER)))
-                    .on_click(cx.listener(move |this, _, _, cx| this.merge(how, cx)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.choose(choice, cx)))
             })
             .child(
                 div()
@@ -263,7 +315,7 @@ impl MergeDialog {
                             .child(why_not.unwrap_or(detail)),
                     ),
             )
-            .when(self.running == Some(how), |this| {
+            .when(self.running == Some(choice), |this| {
                 this.child(
                     Icon::new(IconName::LoaderCircle)
                         .size(px(16.))
@@ -304,7 +356,7 @@ impl Render for MergeDialog {
                 let mut parts = vec![
                     div().child(format!("{commits} in")).into_any_element(),
                     div()
-                        .child(count(merging.files, "file", "files"))
+                        .child(count(preview.files, "file", "files"))
                         .into_any_element(),
                 ];
                 if preview.behind > 0 {
@@ -377,7 +429,7 @@ impl Render for MergeDialog {
                     .gap(px(2.))
                     .py(px(4.))
                     .child(self.render_option(
-                        MergeMethod::Merge,
+                        Choice::Merge(MergeMethod::Merge),
                         IconName::GitMerge,
                         format!("Merge into {base}"),
                         if self.conflicts() {
@@ -388,7 +440,7 @@ impl Render for MergeDialog {
                         cx,
                     ))
                     .child(self.render_option(
-                        MergeMethod::Squash,
+                        Choice::Merge(MergeMethod::Squash),
                         IconName::Combine,
                         "Squash and merge".into(),
                         if ahead == 1 {
@@ -398,15 +450,39 @@ impl Render for MergeDialog {
                         },
                         cx,
                     ))
+                    .map(|this| {
+                        if self.dropped {
+                            this.child(self.render_option(
+                                Choice::Rebase,
+                                IconName::GitFork,
+                                format!("Rebase {head} onto {base}"),
+                                format!("Replays {commits} on top of {base}. Linear history."),
+                                cx,
+                            ))
+                            .child(self.render_option(
+                                Choice::Review,
+                                IconName::GitPullRequestArrow,
+                                match &merging.pull_request {
+                                    Some(pull_request) => {
+                                        format!("Open local pull request #{}", pull_request.number)
+                                    }
+                                    None => "Open as local pull request".into(),
+                                },
+                                "Review the diff and leave comments before merging".into(),
+                                cx,
+                            ))
+                        } else {
+                            this.child(self.render_option(
+                                Choice::Merge(MergeMethod::Rebase),
+                                IconName::GitFork,
+                                format!("Rebase onto {base} and merge"),
+                                format!("Replays {commits} on top of {base}. Linear history."),
+                                cx,
+                            ))
+                        }
+                    })
                     .child(self.render_option(
-                        MergeMethod::Rebase,
-                        IconName::GitFork,
-                        format!("Rebase onto {base} and merge"),
-                        format!("Replays {commits} on top of {base}. Linear history."),
-                        cx,
-                    ))
-                    .child(self.render_option(
-                        MergeMethod::FastForward,
+                        Choice::Merge(MergeMethod::FastForward),
                         IconName::ArrowRightToLine,
                         format!("Fast-forward {base}"),
                         format!("Moves {base} to the branch’s last commit"),
@@ -428,10 +504,21 @@ impl Render for MergeDialog {
                 )
             })
             .child(
-                muted(format!(
-                    "Runs your git. Afterwards {base} is checked out and the pull request \
-                     is marked merged; if git stops, nothing is changed."
-                ))
+                muted(match (&merging.pull_request, self.dropped) {
+                    (Some(_), false) => format!(
+                        "Runs your git. Afterwards {base} is checked out and the pull request \
+                         is marked merged; if git stops, nothing is changed."
+                    ),
+                    (Some(pull_request), true) => format!(
+                        "Runs your git. A merge leaves {base} checked out and marks pull \
+                         request #{} merged; if git stops, nothing is changed.",
+                        pull_request.number
+                    ),
+                    (None, _) => format!(
+                        "Runs your git. A merge leaves {base} checked out; if git stops, \
+                         nothing is changed."
+                    ),
+                })
                 .pt(px(8.))
                 .border_t_1()
                 .border_color(rgb(color::MERGE_DIVIDER))
@@ -452,29 +539,29 @@ impl Review {
         };
         let pull_request = &subject.pull_request;
         let merging = Merging {
-            number: pull_request.number,
-            title: pull_request.title.clone(),
-            description: pull_request.description.clone(),
+            pull_request: Some(MergedPullRequest {
+                number: pull_request.number,
+                title: pull_request.title.clone(),
+                description: pull_request.description.clone(),
+            }),
             head: pull_request.head.branch.clone(),
             base: pull_request.base.branch.clone(),
             head_tip,
             base_tip,
-            files: match &self.files {
-                Some(Ok(files)) => files.len(),
-                _ => 0,
-            },
         };
         let (repository, store) = (self.repository.clone(), subject.store.clone());
-        let dialog = cx.new(|cx| MergeDialog::new(repository, store, merging, cx));
+        let dialog = cx.new(|cx| MergeDialog::new(repository, store, merging, false, cx));
         let subscription =
             cx.subscribe_in(&dialog, window, |this, _, event, window, cx| match event {
-                MergeEvent::Merged(pull_request) => {
+                MergeEvent::Merged(Some(pull_request)) => {
                     this.merged(pull_request.as_ref().clone(), window, cx)
                 }
                 MergeEvent::Stopped => {
                     window.close_dialog(cx);
                     cx.emit(ReviewEvent::MergeStopped);
                 }
+                // Not offered for a pull request.
+                MergeEvent::Merged(None) | MergeEvent::Rebased | MergeEvent::Review(_) => {}
             });
         if let Subject::PullRequest(subject) = &mut self.subject {
             subject.merge_dialog = Some(subscription);
@@ -551,15 +638,25 @@ pub(crate) fn record_merge(
 /// The commit message for merging `merging` the way `how` says, with
 /// `ahead` commits.
 fn message(merging: &Merging, how: MergeMethod, ahead: usize) -> String {
-    let description = merging.description.trim();
-    let mut message = match how {
-        MergeMethod::Merge => format!(
-            "Merge branch '{}'\n\nLocal pull request #{}: {}",
-            merging.head, merging.number, merging.title
+    let (head, base) = (&merging.head, &merging.base);
+    let pull_request = merging.pull_request.as_ref();
+    let description = pull_request.map_or("", |pull_request| pull_request.description.trim());
+    let mut message = match (how, pull_request) {
+        (MergeMethod::Merge, Some(pull_request)) => format!(
+            "Merge branch '{head}'\n\nLocal pull request #{}: {}",
+            pull_request.number, pull_request.title
         ),
-        MergeMethod::Squash => format!("{} (#{})", merging.title, merging.number),
+        // As git words it: the default branch goes unnamed.
+        (MergeMethod::Merge, None) if DEFAULT_BRANCHES.contains(&base.as_str()) => {
+            format!("Merge branch '{head}'")
+        }
+        (MergeMethod::Merge, None) => format!("Merge branch '{head}' into {base}"),
+        (MergeMethod::Squash, Some(pull_request)) => {
+            format!("{} (#{})", pull_request.title, pull_request.number)
+        }
+        (MergeMethod::Squash, None) => format!("Squash branch '{head}'"),
         // No commit of its own.
-        MergeMethod::Rebase | MergeMethod::FastForward => return String::new(),
+        (MergeMethod::Rebase | MergeMethod::FastForward, _) => return String::new(),
     };
     if !description.is_empty() {
         message.push_str("\n\n");
@@ -569,11 +666,14 @@ fn message(merging: &Merging, how: MergeMethod, ahead: usize) -> String {
         message.push_str(&format!(
             "\n\nSquashed from {} on {}.",
             count(ahead, "commit", "commits"),
-            merging.head
+            head
         ));
     }
     message
 }
+
+/// Branches git leaves out of its merge messages (`merge.suppressDest`).
+const DEFAULT_BRANCHES: [&str; 2] = ["main", "master"];
 
 fn count(n: usize, one: &str, many: &str) -> String {
     if n == 1 {
@@ -588,18 +688,19 @@ mod tests {
     use gitez_command::MergeMethod;
     use gitez_git::Oid;
 
-    use super::{Merging, message};
+    use super::{MergedPullRequest, Merging, message};
 
     fn merging(description: &str) -> Merging {
         Merging {
-            number: 3,
-            title: "Anchor comments to hunks".into(),
-            description: description.into(),
+            pull_request: Some(MergedPullRequest {
+                number: 3,
+                title: "Anchor comments to hunks".into(),
+                description: description.into(),
+            }),
             head: "feature/review".into(),
             base: "main".into(),
             head_tip: commit(),
             base_tip: commit(),
-            files: 2,
         }
     }
 
@@ -618,5 +719,24 @@ mod tests {
             "Anchor comments to hunks (#3)\n\nWhy.\n\nSquashed from 2 commits on feature/review."
         );
         assert_eq!(message(&merging("Why."), MergeMethod::Rebase, 2), "");
+    }
+
+    #[test]
+    fn branch_merge_messages_follow_git() {
+        let mut branches = merging("");
+        branches.pull_request = None;
+        assert_eq!(
+            message(&branches, MergeMethod::Merge, 2),
+            "Merge branch 'feature/review'"
+        );
+        assert_eq!(
+            message(&branches, MergeMethod::Squash, 2),
+            "Squash branch 'feature/review'\n\nSquashed from 2 commits on feature/review."
+        );
+        branches.base = "develop".into();
+        assert_eq!(
+            message(&branches, MergeMethod::Merge, 1),
+            "Merge branch 'feature/review' into develop"
+        );
     }
 }

@@ -68,6 +68,14 @@ pub mod color {
     /// The strip under the result.
     pub const RESULT_FOOTER: u32 = 0x17_17_1a;
 
+    /// Dragging a branch onto another in the history: the strip naming it,
+    /// and with alpha, the commits it would bring in and the row of the
+    /// branch it would land on.
+    pub const MOVING: u32 = 0x1d_2a_28;
+    pub const MOVING_TEXT: u32 = 0x7f_d8_c6;
+    pub const INCOMING_ROW: u32 = 0x4f_c6_b0_12;
+    pub const TARGET_ROW: u32 = 0xe8_b0_4b_17;
+
     /// The agent prompt panel: a comment in it, and the prompt text.
     pub const PROMPT_COMMENT: u32 = 0x18_18_1b;
     pub const PROMPT: u32 = 0x0f_0f_11;

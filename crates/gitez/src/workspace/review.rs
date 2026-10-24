@@ -28,7 +28,7 @@ use gpui_kit::*;
 mod edit;
 mod merge;
 
-pub(crate) use merge::record_merge;
+pub(crate) use merge::{MergeDialog, MergeEvent, MergedPullRequest, Merging, record_merge};
 mod prompt;
 mod threads;
 

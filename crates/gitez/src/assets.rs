@@ -31,6 +31,7 @@ icon_assets!(
         GitPullRequestArrow,
         ListTree,
         LoaderCircle,
+        Move,
         Pencil,
         Square,
         Terminal

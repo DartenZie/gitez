@@ -18,7 +18,7 @@ const MIN_LABEL_WIDTH: Pixels = px(96.);
 const SHORT_NAME: usize = 12;
 
 /// A label for a branch, remote-tracking branch, tag or detached `HEAD`.
-pub fn ref_label(label: &RefLabel) -> impl IntoElement {
+pub fn ref_label(label: &RefLabel) -> Div {
     let name = || {
         div()
             .min_w_0()

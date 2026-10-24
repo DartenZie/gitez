@@ -71,7 +71,13 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 > is then marked merged and keeps showing the changes it had. **Edit**
 > changes a pull request's title and description; **Close** sets it aside
 > without merging, keeping its changes and comments, and **Reopen** brings
-> it back on its branches as they are now. Nothing else can be changed
+> it back on its branches as they are now. In the history, drag a local
+> branch's label onto another branch to merge it there: the commits it
+> would bring in are highlighted, and dropping it offers a merge commit,
+> a squash, a rebase of the dragged branch onto the other, a fast-forward,
+> or opening the two as a local pull request (Esc cancels the drag). A
+> merge of branches that have an open pull request marks it merged.
+> Nothing else can be changed
 > from GitEZ yet.
 
 ## Technology

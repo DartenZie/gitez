@@ -278,6 +278,34 @@ fn merges_a_branch_each_way() {
 }
 
 #[test]
+fn rebases_a_branch_and_returns_to_the_one_checked_out() {
+    let dir = diverged("main");
+    let root = dir.path();
+    let main = git(root, &["rev-parse", "main"]);
+    Git::new(root)
+        .rebase_branch("feature", "main", Some("main"))
+        .expect("rebase");
+    assert_eq!(git(root, &["log", "--format=%s", "feature"]), "b\nc\na");
+    assert_eq!(git(root, &["rev-parse", "main"]), main);
+    assert_eq!(git(root, &["branch", "--show-current"]), "main");
+
+    // A conflict gives the rebase up.
+    let dir = diverged("main");
+    let root = dir.path();
+    std::fs::write(root.join("b.txt"), "main\n").expect("write");
+    git(root, &["add", "b.txt"]);
+    git(root, &["commit", "--quiet", "-m", "main adds b"]);
+    let feature = git(root, &["rev-parse", "feature"]);
+    let error = Git::new(root)
+        .rebase_branch("feature", "main", Some("main"))
+        .expect_err("conflict");
+    assert!(matches!(error, Error::Failed { .. }), "{error}");
+    assert_eq!(git(root, &["rev-parse", "feature"]), feature);
+    assert_eq!(git(root, &["branch", "--show-current"]), "main");
+    assert_eq!(status(root), "");
+}
+
+#[test]
 fn a_conflicting_merge_is_undone_or_left_to_resolve() {
     use gitez_command::{MergeMethod, MergeOutcome, Side};
 

@@ -28,15 +28,18 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use gitez_git::{Affected, Head, RefKind, RefLabel, Watcher, WorkingTreeStatus};
-use gitez_review::Timestamp;
+use gitez_review::{NewPullRequest as NewPullRequestFields, State, Timestamp, Tip};
 
 use crate::repository::Snapshot;
 use crate::theme::{self, color};
 use conflicts::{Conflicts, ConflictsEvent};
 use detail::{DetailEvent, DetailPane};
-use history::{History, Selection};
+use history::{BranchDropped, History, Selection, SelectionChanged};
 use new_pull_request::{FormEvent, NewPullRequestForm};
-use review::{CommitDraft, LastCommit, Review, ReviewEvent, Tips};
+use review::{
+    CommitDraft, LastCommit, MergeDialog, MergeEvent, MergedPullRequest, Merging, Review,
+    ReviewEvent, Tips,
+};
 use sidebar::{Sidebar, SidebarEvent};
 
 actions!(workspace, [OpenRepository, ReviewSelected, NewPullRequest]);
@@ -86,6 +89,9 @@ pub struct Workspace {
     new_pull_request: Option<(Entity<NewPullRequestForm>, Subscription)>,
     /// Creating a local pull request.
     _create: Option<Task<()>>,
+    /// The dialog offering to merge a branch dropped on another, while
+    /// open.
+    merge_dialog: Option<Subscription>,
     /// The local pull request to show after the next reload.
     open_after_reload: Option<u32>,
     sidebar: Entity<Sidebar>,
@@ -109,7 +115,12 @@ impl Workspace {
                 }
             }),
             // The detail pane shows the selected commit.
-            cx.subscribe(&history, |this, _, _, cx| this.show_selection(cx)),
+            cx.subscribe(&history, |this, _, _: &SelectionChanged, cx| {
+                this.show_selection(cx)
+            }),
+            cx.subscribe_in(&history, window, |this, _, dropped, window, cx| {
+                this.open_branch_merge(dropped, window, cx)
+            }),
             cx.subscribe_in(&detail, window, |this, _, event, window, cx| match event {
                 DetailEvent::OpenFile(path) => this.open_review(Some(path.clone()), window, cx),
             }),
@@ -136,6 +147,7 @@ impl Workspace {
             commit_draft: None,
             new_pull_request: None,
             _create: None,
+            merge_dialog: None,
             open_after_reload: None,
             sidebar,
             history,
@@ -626,6 +638,14 @@ impl Workspace {
         };
         window.close_dialog(cx);
         self.new_pull_request = None;
+        self.create(new, window, cx);
+    }
+
+    /// Creates the local pull request `new`, then shows it.
+    fn create(&mut self, new: NewPullRequestFields, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
         let store = snapshot.reviews.clone();
         let path = snapshot.path.clone();
         let create = cx
@@ -658,6 +678,98 @@ impl Workspace {
             })
             .ok();
         }));
+    }
+
+    /// Offers the ways to bring branch `head` into `base`, dropped on it in
+    /// the history.
+    fn open_branch_merge(
+        &mut self,
+        dropped: &BranchDropped,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let (head, base) = (dropped.head.clone(), dropped.base.clone());
+        // Merging the branches merges their pull request.
+        let pull_request = snapshot
+            .pull_requests
+            .iter()
+            .find(|pull_request| {
+                pull_request.state == State::Open
+                    && pull_request.head.branch == head
+                    && pull_request.base.branch == base
+            })
+            .map(|pull_request| MergedPullRequest {
+                number: pull_request.number,
+                title: pull_request.title.clone(),
+                description: pull_request.description.clone(),
+            });
+        let merging = Merging {
+            pull_request,
+            head: head.clone(),
+            base: base.clone(),
+            head_tip: dropped.head_tip,
+            base_tip: dropped.base_tip,
+        };
+        let (repository, store) = (snapshot.repository.clone(), snapshot.reviews.clone());
+        let dialog = cx.new(|cx| MergeDialog::new(repository, store, merging, true, cx));
+        let (head_tip, base_tip) = (dropped.head_tip, dropped.base_tip);
+        let subscription = cx.subscribe_in(&dialog, window, move |this, _, event, window, cx| {
+            window.close_dialog(cx);
+            this.merge_dialog = None;
+            let done = match event {
+                MergeEvent::Merged(Some(pull_request)) => format!(
+                    "Merged #{} into {}",
+                    pull_request.number, pull_request.base.branch
+                ),
+                MergeEvent::Merged(None) => format!("Merged {head} into {base}"),
+                MergeEvent::Rebased => format!("Rebased {head} onto {base}"),
+                MergeEvent::Stopped => {
+                    this.reload(window, cx);
+                    this.refresh_status(window, cx);
+                    this.open_conflicts(window, cx);
+                    return;
+                }
+                MergeEvent::Review(Some(number)) => {
+                    this.open_pull_request(*number, window, cx);
+                    return;
+                }
+                MergeEvent::Review(None) => {
+                    let new = NewPullRequestFields {
+                        title: head.clone(),
+                        description: String::new(),
+                        base: Tip {
+                            branch: base.clone(),
+                            commit: base_tip.to_string(),
+                        },
+                        head: Tip {
+                            branch: head.clone(),
+                            commit: head_tip.to_string(),
+                        },
+                    };
+                    this.create(new, window, cx);
+                    return;
+                }
+            };
+            window.push_notification(Notification::success(done), cx);
+            this.reload(window, cx);
+            this.refresh_status(window, cx);
+        });
+        self.merge_dialog = Some(subscription);
+        let workspace = cx.entity().downgrade();
+        window.open_dialog(cx, move |modal, _, _| {
+            let workspace = workspace.clone();
+            modal
+                .w(px(460.))
+                .child(dialog.clone())
+                .on_close(move |_, _, cx| {
+                    workspace
+                        .update(cx, |this, _| this.merge_dialog = None)
+                        .ok();
+                })
+        });
     }
 
     /// Shows the conflicts of the merge in progress.

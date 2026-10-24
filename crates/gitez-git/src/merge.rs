@@ -14,6 +14,9 @@ pub struct MergePreview {
     /// Commits on the target that the branch lacks: when there are none,
     /// the target can be fast-forwarded.
     pub behind: usize,
+    /// Files the branch changes since it left the target, like
+    /// `git diff --name-only target...branch`.
+    pub files: usize,
     /// The files a merge would leave with conflicts, in path order.
     pub conflicts: Vec<String>,
 }
@@ -49,8 +52,29 @@ impl Repository {
         Ok(MergePreview {
             ahead,
             behind,
+            files: self.changed_files(base, head)?,
             conflicts,
         })
+    }
+
+    /// How many files commit `head` changes since it left commit `base`.
+    fn changed_files(&self, base: Oid, head: Oid) -> Result<usize> {
+        let repo = self.local();
+        let old_tree = match repo.merge_base(base, head)? {
+            Some(id) => repo.find_commit(id.detach())?.tree()?,
+            None => repo.empty_tree(),
+        };
+        let new_tree = repo.find_commit(head)?.tree()?;
+        let mut files = 0;
+        old_tree
+            .changes()?
+            .for_each_to_obtain_tree(&new_tree, |change| {
+                if !change.entry_mode().is_tree() {
+                    files += 1;
+                }
+                Ok(std::ops::ControlFlow::Continue(()))
+            })?;
+        Ok(files)
     }
 }
 

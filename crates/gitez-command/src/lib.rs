@@ -196,6 +196,27 @@ impl Git {
         merged.map(|()| MergeOutcome::Merged)
     }
 
+    /// Replays the commits of branch `branch` on top of branch `onto`, like
+    /// `git rebase onto branch`; `onto` does not move. When git cannot
+    /// finish, the rebase is given up and nothing changes. Afterwards
+    /// `return_to`, the branch checked out before, is checked out again.
+    pub fn rebase_branch(&self, branch: &str, onto: &str, return_to: Option<&str>) -> Result<()> {
+        let rebased = self.run(["rebase", "--quiet", onto, branch], None);
+        if rebased.is_err() {
+            self.run(["rebase", "--abort"], None).ok();
+        }
+        if let Some(return_to) = return_to
+            && return_to != branch
+        {
+            let switched = self.switch(return_to);
+            // The error that stopped the rebase is the one to report.
+            if rebased.is_ok() {
+                switched?;
+            }
+        }
+        rebased.map(drop)
+    }
+
     /// The paths with unresolved conflicts, like `git diff --diff-filter=U`.
     pub fn conflicted(&self) -> Result<Vec<String>> {
         let output = self.run(["diff", "--name-only", "-z", "--diff-filter=U"], None)?;

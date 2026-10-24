@@ -1,13 +1,17 @@
 //! The commit history: every commit reachable from a ref, newest first, with
 //! its graph, labels, author and date, in a virtual list. Uncommitted changes
-//! get a row of their own right above the commit `HEAD` points at.
+//! get a row of their own right above the commit `HEAD` points at. A local
+//! branch's label can be dragged onto another branch to merge it there, as
+//! in the `Merge.dc.html` artboard.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
 use gitez_git::graph::{GraphLayout, Row};
-use gitez_git::{Commit, Oid, Order, RefLabel, WorkingTreeStatus};
+use gitez_git::{Commit, Oid, Order, RefKind, RefLabel, Repository, WorkingTreeStatus};
+use gpui_kit::assets::IconName;
+use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -19,7 +23,13 @@ use crate::time;
 
 actions!(
     history,
-    [SelectPrevious, SelectNext, SelectFirst, SelectLast]
+    [
+        SelectPrevious,
+        SelectNext,
+        SelectFirst,
+        SelectLast,
+        CancelDrag
+    ]
 );
 
 /// Key bindings of the history list.
@@ -33,6 +43,7 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("home", SelectFirst, CONTEXT),
         KeyBinding::new("end", SelectLast, CONTEXT),
         KeyBinding::new("enter", super::ReviewSelected, CONTEXT),
+        KeyBinding::new("escape", CancelDrag, CONTEXT),
     ]
 }
 
@@ -44,6 +55,8 @@ const BATCH: usize = 5_000;
 pub const ROW_HEIGHT: Pixels = px(36.);
 /// Room kept for a commit's summary beside its ref labels.
 const SUMMARY_MIN_WIDTH: Pixels = px(160.);
+/// The most commits highlighted as coming in with a dragged branch.
+const MAX_INCOMING: usize = 2_000;
 
 /// Column widths, shared by the header and the rows.
 mod columns {
@@ -62,6 +75,46 @@ mod columns {
 /// their row is selected.
 pub struct SelectionChanged;
 
+/// Emitted when a branch is dropped on another, to merge it there.
+pub struct BranchDropped {
+    pub head: String,
+    pub head_tip: Oid,
+    pub base: String,
+    pub base_tip: Oid,
+}
+
+/// A local branch being dragged.
+pub struct DraggedBranch {
+    name: SharedString,
+    tip: Oid,
+}
+
+/// The branch being dragged and where it would land.
+struct Drag {
+    branch: SharedString,
+    tip: Oid,
+    /// The commit under the pointer, by index into `commits`.
+    over_commit: Option<usize>,
+    /// The branch label under the pointer.
+    over_label: Option<SharedString>,
+    /// The branch it would be dropped on, and the index of its commit.
+    target: Option<(SharedString, usize)>,
+    /// The commits the dragged branch would bring into the target, once
+    /// read.
+    incoming: HashSet<Oid>,
+    _incoming: Option<Task<()>>,
+}
+
+/// How a row looks while a branch is dragged.
+enum DragRole {
+    /// The commit of the branch it would be dropped on.
+    Target,
+    /// A commit it would bring in.
+    Incoming,
+    /// Any other row, dimmed.
+    Other,
+}
+
 /// What the selected row shows.
 pub enum Selection<'a> {
     WorkingTree(&'a Arc<WorkingTreeStatus>),
@@ -78,6 +131,8 @@ enum Entry {
 
 pub struct History {
     focus_handle: FocusHandle,
+    /// The repository shown, once loaded.
+    repository: Option<Repository>,
     scroll: UniformListScrollHandle,
     /// Commits in history order, as far as they have been read.
     commits: Vec<Commit>,
@@ -94,6 +149,8 @@ pub struct History {
     /// Uncommitted changes; the list shows their row while not clean.
     working_tree: Option<Arc<WorkingTreeStatus>>,
     selected: Option<Entry>,
+    /// The branch being dragged onto another, if any.
+    drag: Option<Drag>,
     /// Whether the whole history has been read.
     complete: bool,
     error: Option<SharedString>,
@@ -104,11 +161,13 @@ pub struct History {
 }
 
 impl EventEmitter<SelectionChanged> for History {}
+impl EventEmitter<BranchDropped> for History {}
 
 impl History {
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
+            repository: None,
             scroll: UniformListScrollHandle::new(),
             commits: Vec::new(),
             rows: Vec::new(),
@@ -119,6 +178,7 @@ impl History {
             head_index: None,
             working_tree: None,
             selected: None,
+            drag: None,
             complete: false,
             error: None,
             now: time::now(),
@@ -133,6 +193,7 @@ impl History {
         *self = Self {
             focus_handle: self.focus_handle.clone(),
             scroll: self.scroll.clone(),
+            repository: Some(snapshot.repository.clone()),
             labels: snapshot.refs.labels_by_commit(),
             head: snapshot.refs.head.as_ref().and_then(|head| head.target()),
             ..Self::new(cx)
@@ -195,6 +256,7 @@ impl History {
     /// screen, in full on a background thread and then replaces the list in
     /// one step, keeping the selected commit and the scroll position.
     pub fn reload(&mut self, snapshot: &Snapshot, cx: &mut Context<Self>) {
+        self.repository = Some(snapshot.repository.clone());
         let repository = snapshot.repository.clone();
         let tips = snapshot.refs.tips(true);
         let labels = snapshot.refs.labels_by_commit();
@@ -239,6 +301,13 @@ impl History {
         self.commits = commits;
         self.rows = rows;
         self.labels = labels;
+        // Its rows may have moved.
+        if let Some(drag) = &mut self.drag {
+            drag.over_commit = None;
+            drag.target = None;
+            drag.incoming.clear();
+            drag._incoming = None;
+        }
         self.head = head;
         self.complete = true;
         self.error = None;
@@ -486,6 +555,211 @@ impl History {
         }
     }
 
+    fn start_drag(&mut self, dragged: &DraggedBranch, window: &mut Window, cx: &mut Context<Self>) {
+        // For Esc to cancel it.
+        window.focus(&self.focus_handle, cx);
+        self.drag = Some(Drag {
+            branch: dragged.name.clone(),
+            tip: dragged.tip,
+            over_commit: None,
+            over_label: None,
+            target: None,
+            incoming: HashSet::new(),
+            _incoming: None,
+        });
+        cx.notify();
+    }
+
+    /// The pointer moved, inside the row of commit `index` or not, while a
+    /// branch is dragged.
+    fn drag_over_commit(&mut self, index: usize, inside: bool, cx: &mut Context<Self>) {
+        let Some(drag) = &mut self.drag else {
+            return;
+        };
+        if inside {
+            drag.over_commit = Some(index);
+        } else if drag.over_commit == Some(index) {
+            drag.over_commit = None;
+        } else {
+            return;
+        }
+        self.update_target(cx);
+    }
+
+    /// The pointer moved, inside the label of branch `name` or not, while a
+    /// branch is dragged.
+    fn drag_over_label(&mut self, name: &SharedString, inside: bool, cx: &mut Context<Self>) {
+        let Some(drag) = &mut self.drag else {
+            return;
+        };
+        if inside {
+            drag.over_label = Some(name.clone());
+        } else if drag.over_label.as_ref() == Some(name) {
+            drag.over_label = None;
+        } else {
+            return;
+        }
+        self.update_target(cx);
+    }
+
+    /// The branch the dragged one would land on: the one under the pointer,
+    /// or else the first other local branch on the commit under it.
+    fn drop_target(&self, drag: &Drag) -> Option<(SharedString, usize)> {
+        let index = drag.over_commit?;
+        let commit = self.commits.get(index)?;
+        let mut branches = self
+            .labels
+            .get(&commit.id)?
+            .iter()
+            .filter(|label| label.kind == RefKind::Branch && label.name != *drag.branch);
+        let first = branches.clone().next()?;
+        let label = branches
+            .find(|label| drag.over_label.as_deref() == Some(label.name.as_str()))
+            .unwrap_or(first);
+        Some((label.name.clone().into(), index))
+    }
+
+    /// Works out the drop target again, and when it changed, which commits
+    /// the dragged branch would bring into it.
+    fn update_target(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = &self.drag else {
+            return;
+        };
+        let target = self.drop_target(drag);
+        if drag.target == target {
+            return;
+        }
+        let base = target
+            .as_ref()
+            .and_then(|(_, index)| self.commits.get(*index))
+            .map(|commit| commit.id);
+        let repository = self.repository.clone();
+        let Some(drag) = &mut self.drag else {
+            return;
+        };
+        drag.target = target;
+        drag.incoming.clear();
+        drag._incoming = None;
+        if let (Some(base), Some(repository)) = (base, repository) {
+            let head = drag.tip;
+            drag._incoming = Some(cx.spawn(async move |this, cx| {
+                let incoming = cx
+                    .background_executor()
+                    .spawn(async move {
+                        repository
+                            .walk_excluding([head], [base], Order::Date)?
+                            .take(MAX_INCOMING)
+                            .map(|commit| commit.map(|commit| commit.id))
+                            .collect::<gitez_git::Result<HashSet<Oid>>>()
+                    })
+                    .await;
+                this.update(cx, |this, cx| {
+                    if let Some(drag) = &mut this.drag {
+                        // Only the highlight is lost if the walk fails.
+                        drag.incoming = incoming.unwrap_or_default();
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }));
+        }
+        cx.notify();
+    }
+
+    /// The dragged branch was dropped on a row.
+    fn drop_branch(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = self.drag.take() else {
+            return;
+        };
+        cx.notify();
+        let Some((base, index)) = drag.target else {
+            return;
+        };
+        let Some(base_tip) = self.commits.get(index).map(|commit| commit.id) else {
+            return;
+        };
+        cx.emit(BranchDropped {
+            head: drag.branch.to_string(),
+            head_tip: drag.tip,
+            base: base.to_string(),
+            base_tip,
+        });
+    }
+
+    fn cancel_drag(&mut self, _: &CancelDrag, window: &mut Window, cx: &mut Context<Self>) {
+        let dragging = cx.stop_active_drag(window);
+        if self.drag.take().is_some() || dragging {
+            cx.notify();
+        } else {
+            cx.propagate();
+        }
+    }
+
+    /// How the row of commit `index` looks while a branch is dragged onto
+    /// a target; `None` otherwise.
+    fn drag_role(&self, index: Option<usize>) -> Option<DragRole> {
+        let drag = self.drag.as_ref()?;
+        let (_, target) = drag.target.as_ref()?;
+        Some(match index {
+            Some(index) if index == *target => DragRole::Target,
+            Some(index)
+                if self
+                    .commits
+                    .get(index)
+                    .is_some_and(|commit| drag.incoming.contains(&commit.id)) =>
+            {
+                DragRole::Incoming
+            }
+            _ => DragRole::Other,
+        })
+    }
+
+    /// The label of `label`, on commit `index`; a local branch's can be
+    /// dragged onto another branch.
+    fn render_label(&self, label: &RefLabel, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let chip = labels::ref_label(label);
+        let Some(tip) = self.commits.get(index).map(|commit| commit.id) else {
+            return chip.into_any_element();
+        };
+        if label.kind != RefKind::Branch {
+            return chip.into_any_element();
+        }
+        let name: SharedString = label.name.clone().into();
+        let drag = self.drag.as_ref();
+        let lifted = drag.is_some_and(|drag| drag.branch == name);
+        let target = drag
+            .and_then(|drag| drag.target.as_ref())
+            .is_some_and(|(target, at)| *target == name && *at == index);
+        let history = cx.weak_entity();
+        let over = name.clone();
+        chip.id(SharedString::from(format!("branch-{name}")))
+            .cursor_grab()
+            .when(lifted, |this| this.opacity(0.35))
+            .when(target, |this| {
+                this.bg(rgb(color::ACCENT))
+                    .text_color(rgb(color::ON_ACCENT))
+            })
+            .on_drag(
+                DraggedBranch {
+                    name: name.clone(),
+                    tip,
+                },
+                move |dragged, _, window, cx| {
+                    history
+                        .update(cx, |this, cx| this.start_drag(dragged, window, cx))
+                        .ok();
+                    cx.new(|_| DraggedLabel(dragged.name.clone()))
+                },
+            )
+            .on_drag_move(
+                cx.listener(move |this, event: &DragMoveEvent<DraggedBranch>, _, cx| {
+                    let inside = event.bounds.contains(&event.event.position);
+                    this.drag_over_label(&over, inside, cx);
+                }),
+            )
+            .into_any_element()
+    }
+
     fn render_rows(&self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {
         range
             .filter_map(|index| {
@@ -558,7 +832,8 @@ impl History {
         let cell =
             graph::working_tree_cell(head_row.cloned(), self.graph_width(), self.graph_scroll);
         Some(
-            row.child(self.graph_column(cell, cx))
+            row.when(self.drag_role(None).is_some(), |this| this.opacity(0.45))
+                .child(self.graph_column(cell, cx))
                 .child(
                     div()
                         .flex_1()
@@ -609,56 +884,74 @@ impl History {
             self.graph_scroll,
         );
 
+        let row = match self.drag_role(Some(index)) {
+            Some(DragRole::Target) => row.bg(rgba(color::TARGET_ROW)),
+            Some(DragRole::Incoming) => row.bg(rgba(color::INCOMING_ROW)),
+            Some(DragRole::Other) => row.opacity(0.45),
+            None => row,
+        };
+
         Some(
-            row.child(self.graph_column(cell, cx))
-                .child(
-                    div()
-                        .h_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .gap(px(6.))
-                        .overflow_hidden()
-                        .when_some(labels, |this, labels| {
-                            this.children(labels.iter().map(labels::ref_label))
-                        })
-                        .child(
-                            div()
-                                // Labels shrink before the summary goes below
-                                // this.
-                                .min_w(SUMMARY_MIN_WIDTH)
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .child(commit.summary.clone()),
-                        ),
-                )
-                .child(
-                    div()
-                        .h_flex()
-                        .w(columns::AUTHOR)
-                        .flex_none()
-                        .gap(px(7.))
-                        .text_color(rgb(color::AUTHOR_TEXT))
-                        .child(labels::avatar(&commit.author.name, px(20.)))
-                        .child(
-                            div()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .child(commit.author.name.clone()),
-                        ),
-                )
-                .child(
-                    div()
-                        .w(columns::DATE)
-                        .flex_none()
-                        .text_size(px(12.))
-                        .text_color(rgb(color::TEXT_MUTED))
-                        .whitespace_nowrap()
-                        .child(time::relative(commit.author.time, self.now)),
-                )
-                .into_any_element(),
+            row.on_drag_move(cx.listener(
+                move |this, event: &DragMoveEvent<DraggedBranch>, _, cx| {
+                    let inside = event.bounds.contains(&event.event.position);
+                    this.drag_over_commit(index, inside, cx);
+                },
+            ))
+            .on_drop(cx.listener(|this, _: &DraggedBranch, _, cx| this.drop_branch(cx)))
+            .child(self.graph_column(cell, cx))
+            .child(
+                div()
+                    .h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(6.))
+                    .overflow_hidden()
+                    .when_some(labels, |this, labels| {
+                        this.children(
+                            labels
+                                .iter()
+                                .map(|label| self.render_label(label, index, cx)),
+                        )
+                    })
+                    .child(
+                        div()
+                            // Labels shrink before the summary goes below
+                            // this.
+                            .min_w(SUMMARY_MIN_WIDTH)
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(commit.summary.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .h_flex()
+                    .w(columns::AUTHOR)
+                    .flex_none()
+                    .gap(px(7.))
+                    .text_color(rgb(color::AUTHOR_TEXT))
+                    .child(labels::avatar(&commit.author.name, px(20.)))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(commit.author.name.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .w(columns::DATE)
+                    .flex_none()
+                    .text_size(px(12.))
+                    .text_color(rgb(color::TEXT_MUTED))
+                    .whitespace_nowrap()
+                    .child(time::relative(commit.author.time, self.now)),
+            )
+            .into_any_element(),
         )
     }
 }
@@ -700,6 +993,10 @@ impl Focusable for History {
 
 impl Render for History {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Released away from any branch: GPUI ends the drag on its own.
+        if self.drag.is_some() && !cx.has_active_drag() {
+            self.drag = None;
+        }
         let column = |width: Pixels, label: &'static str| div().w(width).flex_none().child(label);
         let count = format_count(self.commits.len());
         let summary = match (self.complete, self.commits.len()) {
@@ -738,6 +1035,7 @@ impl Render for History {
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_first))
             .on_action(cx.listener(Self::select_last))
+            .on_action(cx.listener(Self::cancel_drag))
             .v_flex()
             .size_full()
             .min_w_0()
@@ -750,30 +1048,35 @@ impl Render for History {
                     .gap(px(8.))
                     .border_b_1()
                     .border_color(rgb(color::BORDER))
-                    .child(
-                        div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("All branches"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(rgb(color::TEXT_MUTED))
-                            .child(summary),
-                    )
-                    // A walk that failed part-way keeps what it read.
-                    .when(!self.commits.is_empty(), |this| {
-                        this.when_some(self.error.clone(), |this, error| {
-                            this.child(
-                                div()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .text_size(px(12.))
-                                    .text_color(rgb(color::DIFF_REMOVED))
-                                    .child(error),
-                            )
+                    .when_some(self.drag.as_ref(), |this, drag| {
+                        this.child(moving(&drag.branch))
+                    })
+                    .when(self.drag.is_none(), |this| {
+                        this.child(
+                            div()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("All branches"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(rgb(color::TEXT_MUTED))
+                                .child(summary),
+                        )
+                        // A walk that failed part-way keeps what it read.
+                        .when(!self.commits.is_empty(), |this| {
+                            this.when_some(self.error.clone(), |this, error| {
+                                this.child(
+                                    div()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .text_size(px(12.))
+                                        .text_color(rgb(color::DIFF_REMOVED))
+                                        .child(error),
+                                )
+                            })
                         })
                     }),
             )
@@ -795,6 +1098,85 @@ impl Render for History {
                     .child(column(columns::DATE, "DATE")),
             )
             .child(body)
+    }
+}
+
+/// The strip saying which branch is being dragged, in place of the list's
+/// title.
+fn moving(branch: &SharedString) -> impl IntoElement {
+    let escape = Keystroke::parse("escape").expect("escape is a valid keystroke");
+    div()
+        .h_flex()
+        .flex_1()
+        .min_w_0()
+        .gap(px(8.))
+        .child(
+            div()
+                .h_flex()
+                .min_w_0()
+                .gap(px(8.))
+                .h(px(30.))
+                .px(px(12.))
+                .rounded(px(15.))
+                .bg(rgb(color::MOVING))
+                .text_color(rgb(color::MOVING_TEXT))
+                .text_size(px(12.5))
+                .child(Icon::new(IconName::Move).size(px(14.)))
+                .child(
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(
+                            StyledText::new(format!("Moving {branch} — drop it on any branch"))
+                                .with_highlights([(
+                                    "Moving ".len().."Moving ".len() + branch.len(),
+                                    HighlightStyle {
+                                        font_weight: Some(FontWeight::SEMIBOLD),
+                                        ..Default::default()
+                                    },
+                                )]),
+                        ),
+                ),
+        )
+        .child(
+            div()
+                .h_flex()
+                .ml_auto()
+                .flex_none()
+                .gap(px(6.))
+                .text_size(px(12.))
+                .text_color(rgb(color::TEXT_MUTED))
+                .child(Kbd::new(escape))
+                .child("cancel"),
+        )
+}
+
+/// What follows the pointer while a branch is dragged: its label, lifted.
+struct DraggedLabel(SharedString);
+
+impl Render for DraggedLabel {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let branch_color = theme::branch_color(&self.0);
+        div()
+            .rounded(px(5.))
+            .bg(rgb(color::PANEL))
+            .shadow_lg()
+            .font_family(cx.theme().font_family.clone())
+            .child(
+                div()
+                    .h_flex()
+                    .h(px(24.))
+                    .px(px(10.))
+                    .rounded(px(5.))
+                    .bg(theme::with_alpha(branch_color, 0.3))
+                    .text_color(rgb(branch_color))
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .whitespace_nowrap()
+                    .child(self.0.clone()),
+            )
     }
 }
 
