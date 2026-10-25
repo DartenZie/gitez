@@ -134,8 +134,8 @@ pub struct Workspace {
     _watch: Option<Task<()>>,
     /// Re-reading the refs and history after they changed.
     _reload: Option<Task<()>>,
-    /// The commit or pull request being reviewed, shown instead of the
-    /// history, or the uncommitted changes, shown in its place.
+    /// The local pull request being reviewed, shown instead of the
+    /// history, or the commit or uncommitted changes, shown in its place.
     review: Option<(Entity<Review>, Subscription)>,
     /// The conflicts of a merge being resolved, shown instead of the
     /// history or a review.
@@ -257,7 +257,25 @@ impl Workspace {
                 }
             }),
             cx.subscribe_in(&detail, window, |this, _, event, window, cx| match event {
-                DetailEvent::OpenFile(path) => this.open_review(Some(path.clone()), window, cx),
+                DetailEvent::OpenFile(path) => {
+                    let selected = match this.history.read(cx).selected() {
+                        Some(Selection::Commit(commit, _)) => Some(commit.id),
+                        _ => None,
+                    };
+                    let shown = this
+                        .review
+                        .as_ref()
+                        .map(|(review, _)| review.clone())
+                        .filter(|review| {
+                            selected.is_some() && review.read(cx).commit_id() == selected
+                        });
+                    match shown {
+                        Some(review) => {
+                            review.update(cx, |review, cx| review.show_file(path.clone(), cx))
+                        }
+                        None => this.open_review(Some(path.clone()), window, cx),
+                    }
+                }
                 DetailEvent::CherryPick(id) => {
                     this.history
                         .update(cx, |history, cx| history.pick_only(*id, cx));
@@ -385,7 +403,7 @@ impl Workspace {
 
     fn show(&mut self, snapshot: Arc<Snapshot>, window: &mut Window, cx: &mut Context<Self>) {
         window.set_window_title(&format!("{} — GitEZ", snapshot.name));
-        self.review = None;
+        self.close_diff(cx);
         self.rewrite = None;
         self.open_changes_for(&snapshot, window, cx);
         self.open_palette_for(&snapshot, window, cx);
@@ -657,8 +675,14 @@ impl Workspace {
                     return;
                 }
                 ReviewEvent::FileShown(path) => {
-                    if let Some((changes, _)) = &this.changes {
-                        changes.update(cx, |changes, cx| changes.show_current(path, cx));
+                    if this.working_tree_selected {
+                        if let Some((changes, _)) = &this.changes {
+                            changes.update(cx, |changes, cx| changes.show_current(path, cx));
+                        }
+                    } else {
+                        let path = Some(path.clone());
+                        this.detail
+                            .update(cx, |detail, cx| detail.show_current(path, cx));
                     }
                     return;
                 }
@@ -692,6 +716,8 @@ impl Workspace {
                 this.review_selected(&ReviewSelected, window, cx);
             }
         });
+        self.detail
+            .update(cx, |detail, cx| detail.show_current(None, cx));
         if let Some(path) = path {
             review.update(cx, |review, cx| review.show_file(path, cx));
         }
@@ -1321,7 +1347,7 @@ impl Workspace {
 
     /// Shows the history with commit `id` selected.
     fn select_commit(&mut self, id: Oid, window: &mut Window, cx: &mut Context<Self>) {
-        self.review = None;
+        self.close_diff(cx);
         self.rewrite = None;
         let found = self
             .history
@@ -1351,7 +1377,7 @@ impl Workspace {
             .as_ref()
             .is_some_and(|(review, _)| !review.read(cx).is_working_tree())
         {
-            self.review = None;
+            self.close_diff(cx);
         }
         if let Some((changes, _)) = &self.changes {
             changes.update(cx, |changes, cx| changes.focus_summary(window, cx));
@@ -1482,9 +1508,17 @@ impl Workspace {
     }
 
     fn close_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.review = None;
+        self.close_diff(cx);
         window.focus(&self.history.focus_handle(cx), cx);
         cx.notify();
+    }
+
+    /// Drops the review shown, if any, and the commit detail's mark on the
+    /// file it showed.
+    fn close_diff(&mut self, cx: &mut Context<Self>) {
+        self.review = None;
+        self.detail
+            .update(cx, |detail, cx| detail.show_current(None, cx));
     }
 
     /// Shows the commit selected in the history in the detail pane, or the
@@ -1501,14 +1535,21 @@ impl Workspace {
             self.working_tree_selected = working_tree;
             cx.notify();
         }
-        if !working_tree
-            && self
-                .review
-                .as_ref()
-                .is_some_and(|(review, _)| review.read(cx).is_working_tree())
-        {
-            // The diff of changes no longer selected.
+        let selected_commit = match self.history.read(cx).selected() {
+            Some(Selection::Commit(commit, _)) => Some(commit.id),
+            _ => None,
+        };
+        if self.review.as_ref().is_some_and(|(review, _)| {
+            let review = review.read(cx);
+            (review.is_working_tree() && !working_tree)
+                || review
+                    .commit_id()
+                    .is_some_and(|id| Some(id) != selected_commit)
+        }) {
+            // The diff of a selection no longer selected.
             self.review = None;
+            self.detail
+                .update(cx, |detail, cx| detail.show_current(None, cx));
             cx.notify();
         }
         let selection = match self.history.read(cx).selected() {
@@ -1606,14 +1647,16 @@ impl Render for Workspace {
                 if let Some((rewrite, _)) = &self.rewrite {
                     return this.child(rewrite.clone());
                 }
-                let working_tree_review = self
+                // The diff of a commit or of the uncommitted changes takes
+                // the history's place; a local pull request the window's.
+                let selection_review = self
                     .review
                     .as_ref()
                     .map(|(review, _)| review)
-                    .filter(|review| review.read(cx).is_working_tree())
+                    .filter(|review| review.read(cx).pull_request_number().is_none())
                     .cloned();
                 if let Some((review, _)) = &self.review
-                    && working_tree_review.is_none()
+                    && selection_review.is_none()
                 {
                     return this.child(review.clone());
                 }
@@ -1626,7 +1669,7 @@ impl Render for Workspace {
                                 .fixed()
                                 .child(self.sidebar.clone()),
                         )
-                        .child(resizable_panel().child(match working_tree_review {
+                        .child(resizable_panel().child(match selection_review {
                             Some(review) => review.into_any_element(),
                             None => self.render_history(),
                         }))

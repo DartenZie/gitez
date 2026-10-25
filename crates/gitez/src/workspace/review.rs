@@ -57,7 +57,8 @@ pub enum ReviewEvent {
     Older,
     /// The index changed: read the status again.
     Staged,
-    /// The uncommitted file at this path is now at the top of the diff.
+    /// The file at this path is now at the top of the diff of a commit or
+    /// of the uncommitted changes.
     FileShown(String),
     /// The local pull request was saved.
     PullRequestSaved,
@@ -326,8 +327,9 @@ pub struct Review {
     list: ListState,
     /// The file at the top of the list.
     current_file: usize,
-    /// The files marked viewed, by path, with their [`Self::view_key`]
-    /// then: a file that changes since counts as not viewed again.
+    /// The files of a local pull request marked viewed, by path, with the
+    /// id of their new version then (empty when deleted): a file that
+    /// changes since counts as not viewed again.
     viewed: HashMap<String, String>,
     /// The gaps shown in full, by file path, with the [`fingerprint`] of
     /// the file's diff then.
@@ -398,6 +400,14 @@ impl Review {
     /// Whether this reviews the uncommitted changes.
     pub fn is_working_tree(&self) -> bool {
         matches!(self.subject, Subject::WorkingTree { .. })
+    }
+
+    /// The commit reviewed, if one is.
+    pub fn commit_id(&self) -> Option<Oid> {
+        match &self.subject {
+            Subject::Commit(subject) => Some(subject.commit.id),
+            _ => None,
+        }
     }
 
     /// Reviews `pull_request`, stored in `store`, with its branches on
@@ -873,22 +883,20 @@ impl Review {
         });
     }
 
-    /// Whether `file` is marked viewed and has not changed since.
+    /// Whether this reviews a local pull request, whose files can be
+    /// marked viewed.
+    fn is_pull_request(&self) -> bool {
+        matches!(self.subject, Subject::PullRequest(_))
+    }
+
+    /// Whether `file` of the local pull request is marked viewed and has
+    /// not changed since.
     fn is_viewed(&self, file: &FileDiff) -> bool {
-        self.viewed.get(&file.path) == Some(&self.view_key(file))
+        self.viewed.get(&file.path) == Some(&view_key(file))
     }
 
-    /// What a file marked viewed is compared with later: in a pull request,
-    /// which is saved, the id of its new version (empty when deleted);
-    /// otherwise the [`fingerprint`] of its diff.
-    fn view_key(&self, file: &FileDiff) -> String {
-        match &self.subject {
-            Subject::PullRequest(_) => file.new_id.map(|id| id.to_string()).unwrap_or_default(),
-            _ => format!("{:016x}", fingerprint(file)),
-        }
-    }
-
-    /// Marks the file at `index` viewed, which collapses it, or not viewed.
+    /// Marks the file at `index` of the local pull request viewed, which
+    /// collapses it, or not viewed.
     fn set_viewed(&mut self, index: usize, viewed: bool, cx: &mut Context<Self>) {
         let Some(Ok(files)) = &self.files else {
             return;
@@ -896,22 +904,20 @@ impl Review {
         let Some(file) = files.get(index) else {
             return;
         };
-        let (file_path, key) = (file.path.clone(), self.view_key(file));
+        let (file_path, key) = (file.path.clone(), view_key(file));
         let mut anchor = self.scroll_anchor();
+        let Subject::PullRequest(subject) = &mut self.subject else {
+            return;
+        };
+        let saved = &mut subject.pull_request.viewed;
         if viewed {
-            self.viewed.insert(file_path.clone(), key.clone());
+            saved.insert(file_path.clone(), key.clone());
+            self.viewed.insert(file_path.clone(), key);
         } else {
+            saved.remove(&file_path);
             self.viewed.remove(&file_path);
         }
-        if let Subject::PullRequest(subject) = &mut self.subject {
-            let saved = &mut subject.pull_request.viewed;
-            if viewed {
-                saved.insert(file_path.clone(), key);
-            } else {
-                saved.remove(&file_path);
-            }
-            self.save_pull_request(cx);
-        }
+        self.save_pull_request(cx);
         if let Some(anchor) = &mut anchor
             && anchor.path == file_path
         {
@@ -989,11 +995,11 @@ impl Review {
         }
     }
 
-    /// Makes the file at `file` the one at the top, and tells the changes
-    /// panel when reviewing the uncommitted changes.
+    /// Makes the file at `file` the one at the top, and tells the panel
+    /// beside that lists the files, if any.
     fn set_current_file(&mut self, file: usize, cx: &mut Context<Self>) {
         self.current_file = file;
-        if self.is_working_tree()
+        if !self.is_pull_request()
             && let Some(Ok(files)) = &self.files
             && let Some(shown) = files.get(file)
         {
@@ -1359,7 +1365,7 @@ impl Review {
         let element = self.render_plain_row(index, cx);
         match self.rows.get(index).copied() {
             Some(row @ (Row::Line(..) | Row::Pair(..) | Row::Context(..)))
-                if matches!(self.subject, Subject::PullRequest(_)) =>
+                if self.is_pull_request() =>
             {
                 self.commentable(element, index, row, cx)
             }
@@ -1398,14 +1404,18 @@ impl Review {
                             .when_some(status, |this, status| {
                                 this.child(self.staging_buttons(index, status, cx))
                             })
-                            .child(
-                                Checkbox::new(("viewed", index))
-                                    .label("Viewed")
-                                    .checked(viewed)
-                                    .on_click(cx.listener(move |this, checked: &bool, _, cx| {
-                                        this.set_viewed(index, *checked, cx)
-                                    })),
-                            ),
+                            .when(self.is_pull_request(), |this| {
+                                this.child(
+                                    Checkbox::new(("viewed", index))
+                                        .label("Viewed")
+                                        .checked(viewed)
+                                        .on_click(cx.listener(
+                                            move |this, checked: &bool, _, cx| {
+                                                this.set_viewed(index, *checked, cx)
+                                            },
+                                        )),
+                                )
+                            }),
                     )
                     .into_any_element()
             }
@@ -1886,7 +1896,9 @@ impl Review {
             )
     }
 
-    /// The strip above the diff: how many files are marked viewed.
+    /// The strip above the diff: the layout, whitespace and context
+    /// options, and in a local pull request how many files are marked
+    /// viewed.
     fn render_toolbar(&self, files: &[FileDiff], cx: &mut Context<Self>) -> impl IntoElement {
         let viewed = files.iter().filter(|file| self.is_viewed(file)).count();
         let total = files.len();
@@ -1948,28 +1960,30 @@ impl Review {
                     )
                 },
             )
-            .child(
-                div()
-                    .h_flex()
-                    .ml_auto()
-                    .gap(px(10.))
-                    .child(muted("Viewed"))
-                    .child(
-                        div()
-                            .w(px(120.))
-                            .h(px(6.))
-                            .rounded(px(3.))
-                            .bg(rgb(color::BORDER))
-                            .overflow_hidden()
-                            .child(
-                                div()
-                                    .h_full()
-                                    .w(relative(viewed as f32 / total.max(1) as f32))
-                                    .bg(rgb(color::DIFF_ADDED)),
-                            ),
-                    )
-                    .child(format!("{viewed} of {total}")),
-            )
+            .when(self.is_pull_request(), |this| {
+                this.child(
+                    div()
+                        .h_flex()
+                        .ml_auto()
+                        .gap(px(10.))
+                        .child(muted("Viewed"))
+                        .child(
+                            div()
+                                .w(px(120.))
+                                .h(px(6.))
+                                .rounded(px(3.))
+                                .bg(rgb(color::BORDER))
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .w(relative(viewed as f32 / total.max(1) as f32))
+                                        .bg(rgb(color::DIFF_ADDED)),
+                                ),
+                        )
+                        .child(format!("{viewed} of {total}")),
+                )
+            })
     }
 
     fn save_error(&self) -> Option<SharedString> {
@@ -2149,8 +2163,9 @@ impl Render for Review {
                             .gap(px(20.))
                             .pt(px(20.))
                             .px(px(24.))
-                            // The changes panel lists the uncommitted files.
-                            .when(!self.is_working_tree(), |this| {
+                            // Beside the history, the changes panel or the
+                            // commit detail lists the files.
+                            .when(self.is_pull_request(), |this| {
                                 this.child(self.render_files(&files, cx))
                             })
                             .child(
@@ -2372,9 +2387,15 @@ fn split_pairs(lines: &[DiffLine]) -> Vec<(Option<usize>, Option<usize>)> {
     pairs
 }
 
-/// What a file's diff looks like, to tell whether it changed since it was
-/// marked viewed. Where the lines are and whether they are staged is left
-/// out, so staging a hunk does not count as a change.
+/// What a file of a local pull request marked viewed is compared with
+/// later: the id of its new version, empty when deleted.
+fn view_key(file: &FileDiff) -> String {
+    file.new_id.map(|id| id.to_string()).unwrap_or_default()
+}
+
+/// What a file's diff looks like, to tell whether it changed since its
+/// gaps were expanded. Where the lines are and whether they are staged is
+/// left out, so staging a hunk does not count as a change.
 fn fingerprint(file: &FileDiff) -> u64 {
     let mut hasher = DefaultHasher::new();
     match &file.content {
@@ -2841,7 +2862,7 @@ mod tests {
     }
 
     #[test]
-    fn staging_a_hunk_keeps_a_file_viewed_but_editing_it_does_not() {
+    fn staging_a_hunk_keeps_the_fingerprint_but_editing_does_not() {
         let first = || vec![line(LineKind::Removed, "a"), line(LineKind::Added, "b")];
         let second = || vec![line(LineKind::Added, "z")];
         let unstaged = file(

@@ -29,13 +29,13 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 > menu or the palette; a clone is named after its URL unless you rename
 > it) and shows its history as a commit graph, with branches, remotes, tags and
 > stashes in the sidebar and the selected commit's details beside it. Press
-> Enter or double-click a commit to see its full diff, file by file, or
-> click a file in its details to jump straight to that file; `[` and `]`
-> step to the newer and older commit, Esc goes back. Diffs show
+> Enter or double-click a commit to see its full diff, file by file, in
+> place of the graph, or click a file in its details to jump straight to
+> that file (the details mark the file in view); `[` and `]` step to the
+> newer and older commit, Esc goes back. Diffs show
 > unified or split side by side, optionally hiding whitespace changes
 > (single hunks can't be staged then), and show the unchanged lines
-> between hunks one gap at a time or all at once. Mark a file viewed to
-> collapse it and track progress; it opens again if it changes.
+> between hunks one gap at a time or all at once.
 > Uncommitted changes appear as a row above the current commit. Selecting
 > it shows them beside the history as unstaged and staged files, listed
 > by path or as a tree: stage, unstage or discard a file (or all of them),
@@ -50,7 +50,9 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 > open diff too. **New local PR** creates a local pull request for a
 > branch against its base (`main` by default); the sidebar lists them,
 > and opening one shows the branch's changes since it left the base,
-> with the files marked viewed kept between sessions. Hover a line and
+> file by file. Mark a file viewed to collapse it and track progress; it
+> opens again if it changes, and the files marked viewed are kept between
+> sessions. Hover a line and
 > click **+** (or drag from it across several lines) to comment; threads
 > show under their lines, with replies, Resolve and whether they go into
 > the agent prompt. A thread whose lines change in a new commit on the

@@ -48,6 +48,8 @@ pub struct DetailPane {
     labels: Vec<RefLabel>,
     /// `None` while the details are being read.
     details: Option<Result<Arc<CommitDetails>, SharedString>>,
+    /// The file at the top of the commit's diff, while it is shown.
+    current: Option<String>,
     /// The read in flight. Dropping it before the debounce ends skips it.
     _load: Option<Task<()>>,
 }
@@ -60,6 +62,7 @@ impl DetailPane {
             commit: None,
             labels: Vec::new(),
             details: None,
+            current: None,
             _load: None,
         }
     }
@@ -94,6 +97,7 @@ impl DetailPane {
         self.commit = Some(commit);
         self.labels = labels;
         self.details = None;
+        self.current = None;
         let repository = repository.clone();
         self._load = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(DEBOUNCE).await;
@@ -105,6 +109,15 @@ impl DetailPane {
                 .ok();
         }));
         cx.notify();
+    }
+
+    /// Marks the file at `path` as the one at the top of the commit's diff,
+    /// or none.
+    pub fn show_current(&mut self, path: Option<String>, cx: &mut Context<Self>) {
+        if self.current != path {
+            self.current = path;
+            cx.notify();
+        }
     }
 
     fn finish(
@@ -185,7 +198,7 @@ impl Render for DetailPane {
                     )
                 })
                 .when_some(details, |this, details| {
-                    this.child(files(&details, mono, cx))
+                    this.child(files(&details, self.current.as_deref(), mono, cx))
                 }),
         )
     }
@@ -369,9 +382,11 @@ fn header(
         })
 }
 
-/// "N files changed +A −R" and one row per file.
+/// "N files changed +A −R" and one row per file, with the one at `current`
+/// marked.
 fn files(
     details: &CommitDetails,
+    current: Option<&str>,
     mono: SharedString,
     cx: &Context<DetailPane>,
 ) -> impl IntoElement {
@@ -427,7 +442,10 @@ fn files(
                     opens_file(
                         ("commit-file", index),
                         &file.path,
-                        commit_file_row(file, mono.clone()),
+                        commit_file_row(file, mono.clone())
+                            .when(current == Some(file.path.as_str()), |this| {
+                                this.bg(rgb(color::SELECTED))
+                            }),
                         cx,
                     )
                 }),
@@ -466,7 +484,7 @@ fn rename_source(kind: &ChangeKind) -> Option<String> {
     }
 }
 
-fn commit_file_row(file: &FileChange, mono: SharedString) -> impl IntoElement {
+fn commit_file_row(file: &FileChange, mono: SharedString) -> Div {
     let (letter, letter_color) = labels::change_letter(&file.kind);
     file_row(
         letter,
@@ -487,7 +505,7 @@ fn file_row(
     from: Option<String>,
     lines: Option<LineCounts>,
     mono: SharedString,
-) -> impl IntoElement {
+) -> Div {
     let (directory, name) = match path.rfind('/') {
         Some(slash) => path.split_at(slash + 1),
         None => ("", path),
