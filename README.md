@@ -210,6 +210,3 @@ cargo run --release -p gitez-git --example history -- <path-to-repository>
 The UI uses [gpui-kit](https://gpui-kit.com), which pins the matching GPUI
 release. [CLAUDE.md](CLAUDE.md) describes the architecture decisions, the
 design tokens and the process to update GPUI.
-
-The reference design is available as a
-[design canvas](https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8).
