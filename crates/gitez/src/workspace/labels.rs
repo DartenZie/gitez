@@ -84,7 +84,12 @@ fn head_badge(background: u32) -> impl IntoElement {
 }
 
 /// A round avatar showing the initials of `name`.
+///
+/// The initials are nudged down and right by a fraction of the diameter
+/// (half a pixel at 20px): capitals such as `P` carry their weight at the top
+/// left, so text centred by its box looks high and to the left.
 pub fn avatar(name: &str, diameter: Pixels) -> impl IntoElement {
+    let nudge = diameter * 0.025;
     div()
         .flex()
         .flex_none()
@@ -96,7 +101,13 @@ pub fn avatar(name: &str, diameter: Pixels) -> impl IntoElement {
         .text_color(rgb(color::AVATAR_TEXT))
         .text_size(diameter * 0.45)
         .font_weight(FontWeight::SEMIBOLD)
-        .child(initials(name))
+        .child(
+            div()
+                .relative()
+                .top(nudge)
+                .left(nudge)
+                .child(initials(name)),
+        )
 }
 
 /// Up to two initials: the first letters of the first and last words.
