@@ -1,6 +1,8 @@
 //! Fetch, pull and push: when each can run, and what it does.
 
-use gitez_command::{Git, PullMethod, PullOutcome, PushRejection, ResetMode, needs_pull_method};
+use gitez_command::{
+    Git, PullMethod, PullOutcome, PushRejection, ResetMode, needs_pull_method, not_fast_forward,
+};
 use gitez_git::Head;
 use gpui_kit::component::button::*;
 use gpui_kit::component::notification::Notification;
@@ -52,11 +54,17 @@ pub struct RemoteActions {
 }
 
 impl RemoteActions {
+    /// For the branch checked out.
     pub fn of(snapshot: &Snapshot) -> Self {
         let branch = match &snapshot.refs.head {
             Some(Head::Branch { name, .. }) => Some(name.as_str()),
             _ => None,
         };
+        Self::of_branch(snapshot, branch)
+    }
+
+    /// For local branch `branch`, checked out or not.
+    fn of_branch(snapshot: &Snapshot, branch: Option<&str>) -> Self {
         let upstream = branch.and_then(|name| {
             snapshot
                 .refs
@@ -203,6 +211,58 @@ impl Workspace {
         );
     }
 
+    /// Brings the upstream's new commits into local branch `branch`: as
+    /// [`Pull`] does for the branch checked out, and only by fast-forwarding
+    /// for any other.
+    pub(super) fn pull_branch(
+        &mut self,
+        branch: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        if checked_out(snapshot, &branch) {
+            return self.pull_with(PullMethod::Configured, window, cx);
+        }
+        let Some(upstream) = snapshot
+            .refs
+            .branches
+            .iter()
+            .find(|local| local.name == branch)
+            .and_then(|local| local.upstream.clone())
+        else {
+            return;
+        };
+        let name = branch.clone();
+        self.run_remote(
+            RemoteOp::Pull,
+            None,
+            move |git| git.pull_branch(&name),
+            move |this, result, _, window, cx| match result {
+                Ok(()) => window.push_notification(
+                    Notification::success(format!("Pulled {upstream} into {branch}")),
+                    cx,
+                ),
+                Err(error) if not_fast_forward(&error) => this.notify_with_action(
+                    Notification::warning(format!(
+                        "{branch} has commits {upstream} does not. Check it out to merge or \
+                         rebase them."
+                    )),
+                    "Check out",
+                    move |this, window, cx| this.switch_branch(branch.clone(), window, cx),
+                    window,
+                    cx,
+                ),
+                Err(error) => window
+                    .push_notification(Notification::error(format!("Could not pull: {error}")), cx),
+            },
+            window,
+            cx,
+        );
+    }
+
     pub(super) fn push(&mut self, _: &Push, window: &mut Window, cx: &mut Context<Self>) {
         self.push_with(false, window, cx);
     }
@@ -216,11 +276,46 @@ impl Workspace {
         let Ok(plan) = RemoteActions::of(snapshot).push else {
             return;
         };
+        self.push_planned(plan, true, force, window, cx);
+    }
+
+    /// Pushes local branch `branch`, checked out or not, as [`Push`] does.
+    pub(super) fn push_branch(
+        &mut self,
+        branch: String,
+        force: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        if checked_out(snapshot, &branch) {
+            return self.push_with(force, window, cx);
+        }
+        let Ok(plan) = RemoteActions::of_branch(snapshot, Some(&branch)).push else {
+            return;
+        };
+        self.push_planned(plan, false, force, window, cx);
+    }
+
+    /// Runs `plan`, for a branch `checked_out` or not.
+    fn push_planned(
+        &mut self,
+        plan: PushPlan,
+        checked_out: bool,
+        force: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let (branch, publish_to) = (plan.branch.clone(), plan.publish.then(|| plan.to.clone()));
         self.run_remote(
             RemoteOp::Push,
             None,
-            move |git| git.push(&branch, publish_to.as_deref(), force),
+            move |git| match publish_to {
+                None if !checked_out => git.push_branch(&branch, force),
+                publish_to => git.push(&branch, publish_to.as_deref(), force),
+            },
             move |this, result, _, window, cx| match result {
                 Ok(()) => {
                     let done = if plan.publish {
@@ -237,7 +332,10 @@ impl Workspace {
                             plan.to
                         )),
                         "Pull",
-                        |this, window, cx| this.pull_with(PullMethod::Configured, window, cx),
+                        {
+                            let branch = plan.branch.clone();
+                            move |this, window, cx| this.pull_branch(branch.clone(), window, cx)
+                        },
                         window,
                         cx,
                     ),
@@ -248,7 +346,12 @@ impl Workspace {
                             plan.to, plan.branch
                         )),
                         "Force push",
-                        |this, window, cx| this.push_with(true, window, cx),
+                        {
+                            let branch = plan.branch.clone();
+                            move |this, window, cx| {
+                                this.push_branch(branch.clone(), true, window, cx)
+                            }
+                        },
                         window,
                         cx,
                     ),
@@ -343,6 +446,11 @@ impl Workspace {
             cx,
         );
     }
+}
+
+/// Whether local branch `branch` is the one checked out.
+fn checked_out(snapshot: &Snapshot, branch: &str) -> bool {
+    matches!(&snapshot.refs.head, Some(Head::Branch { name, .. }) if name == branch)
 }
 
 #[cfg(test)]

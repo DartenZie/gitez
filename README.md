@@ -108,7 +108,8 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 > runs any of them exactly as typed with your own `git`, the output
 > streaming into the palette. Tab fills in the selected branch, commit or
 > file as the next argument. Nothing can prompt or open an editor there.
-> **Fetch** fetches every remote, **Pull** brings the upstream's commits
+> **Fetch** fetches every remote and drops remote branches deleted
+> there, **Pull** brings the upstream's commits
 > into the branch checked out as your git configuration says, and
 > **Push** sends it to its upstream, publishing a new branch to `origin`
 > first. They run your own `git`, so credential helpers and hooks apply;
@@ -119,8 +120,11 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 > **Branch** in the toolbar, **Branch…** on a commit, or the palette
 > creates a branch at the selected commit (or `HEAD`) and checks it out
 > unless you untick that; the name is checked as you type. Double-click a
-> branch in the sidebar to check it out, or right-click it to start a
-> branch from it, rename it or delete it. A branch whose commits are on
+> branch in the sidebar to check it out, or right-click it to pull or
+> push it, start a branch from it, rename it or delete it. Pull and push
+> work on any branch without checking it out; a branch not checked out
+> is pulled only by fast-forwarding, and one that has diverged from its
+> upstream offers to check it out instead. A branch whose commits are on
 > no other branch is deleted only after you confirm. Branches of an open
 > local pull request cannot be renamed or deleted. Click a remote in the
 > sidebar to list its branches; double-click one, or find it in the

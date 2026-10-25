@@ -158,6 +158,12 @@ pub fn needs_pull_method(error: &Error) -> bool {
     matches!(error, Error::Failed { output, .. } if output.contains("divergent branches"))
 }
 
+/// Whether `error`, from [`Git::pull_branch`], says the branch has commits
+/// its upstream lacks, so it cannot be fast-forwarded.
+pub fn not_fast_forward(error: &Error) -> bool {
+    matches!(error, Error::Failed { output, .. } if output.contains("[rejected]"))
+}
+
 /// Whether `error`, from [`Git::delete_branch`], says the branch has
 /// commits that would be lost.
 pub fn not_merged(error: &Error) -> bool {
@@ -527,14 +533,17 @@ impl Git {
         picked
     }
 
-    /// Fetches from every remote, like `git fetch --all`.
+    /// Fetches from every remote, like `git fetch --all --prune`, so
+    /// branches deleted on a remote disappear from its remote branches.
     pub fn fetch(&self) -> Result<()> {
-        self.run(["fetch", "--all", "--quiet"], None).map(drop)
+        self.run(["fetch", "--all", "--prune", "--quiet"], None)
+            .map(drop)
     }
 
-    /// Fetches remote `name` alone, like `git fetch <name>`.
+    /// Fetches remote `name` alone, like `git fetch --prune <name>`.
     pub fn fetch_remote(&self, name: &str) -> Result<()> {
-        self.run(["fetch", "--quiet", name], None).map(drop)
+        self.run(["fetch", "--prune", "--quiet", name], None)
+            .map(drop)
     }
 
     /// Adds remote `name` fetching from `url`, like `git remote add`. It is
@@ -608,6 +617,55 @@ impl Git {
             args.extend(["--set-upstream", remote, branch]);
         }
         self.run(args, None).map(drop)
+    }
+
+    /// Fast-forwards branch `branch`, not checked out, to its upstream on
+    /// the remote, like `git fetch <remote> <upstream>:<branch>`. Fails,
+    /// changing nothing, when the branch has commits its upstream lacks
+    /// (see [`not_fast_forward`]) or has no upstream.
+    pub fn pull_branch(&self, branch: &str) -> Result<()> {
+        let (remote, merge) = self.upstream_of(branch)?;
+        let refspec = format!("{merge}:refs/heads/{branch}");
+        // Not `--quiet`: it hides the line saying why a fetch was rejected.
+        self.run(["fetch", &remote, &refspec], None).map(drop)
+    }
+
+    /// Sends branch `branch`, checked out or not, to its upstream, like
+    /// `git push <remote> <branch>:<upstream>`. With `force`, the remote
+    /// branch is replaced if it is still where it was last fetched
+    /// (`--force-with-lease`). Rejections are those of [`Git::push`].
+    pub fn push_branch(&self, branch: &str, force: bool) -> Result<()> {
+        let (remote, merge) = self.upstream_of(branch)?;
+        let refspec = format!("refs/heads/{branch}:{merge}");
+        let mut args = vec!["push", "--quiet"];
+        if force {
+            args.push("--force-with-lease");
+        }
+        args.extend([remote.as_str(), &refspec]);
+        self.run(args, None).map(drop)
+    }
+
+    /// The remote local branch `branch` tracks and the branch there, such
+    /// as `origin` and `refs/heads/main`.
+    fn upstream_of(&self, branch: &str) -> Result<(String, String)> {
+        let output = self.run(
+            [
+                "for-each-ref",
+                "--format=%(upstream:remotename)%00%(upstream:remoteref)",
+                &format!("refs/heads/{branch}"),
+            ],
+            None,
+        )?;
+        let output = String::from_utf8_lossy(&output);
+        match output.trim_end().split_once('\0') {
+            Some((remote, merge)) if !remote.is_empty() && !merge.is_empty() => {
+                Ok((remote.to_owned(), merge.to_owned()))
+            }
+            _ => Err(Error::Failed {
+                command: format!("git for-each-ref refs/heads/{branch}"),
+                output: format!("{branch} has no upstream"),
+            }),
+        }
     }
 
     /// Brings the changes of stash `index` (`stash@{index}`) back into the

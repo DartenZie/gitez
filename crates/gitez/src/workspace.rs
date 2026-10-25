@@ -222,6 +222,10 @@ impl Workspace {
                     this.remove_remote(name.clone(), false, window, cx)
                 }
                 SidebarEvent::SetUpstream(branch) => this.set_upstream(branch.clone(), window, cx),
+                SidebarEvent::PullBranch(branch) => this.pull_branch(branch.clone(), window, cx),
+                SidebarEvent::PushBranch(branch) => {
+                    this.push_branch(branch.clone(), false, window, cx)
+                }
                 SidebarEvent::Unstash { index, pop } => this.unstash(*index, *pop, window, cx),
                 SidebarEvent::DropStash(index) => this.drop_stash(*index, window, cx),
             }),

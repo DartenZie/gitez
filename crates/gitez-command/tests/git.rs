@@ -3,7 +3,7 @@ use std::process::Command;
 
 use gitez_command::{
     Error, Git, PullMethod, PullOutcome, PushRejection, RefUpdate, ResetMode, RevertOutcome,
-    UnstashOutcome, not_merged,
+    UnstashOutcome, not_fast_forward, not_merged,
 };
 
 /// `git <args>` in `dir`, returning its trimmed output.
@@ -701,6 +701,56 @@ fn publishes_fetches_and_pulls_a_branch() {
 }
 
 #[test]
+fn pulls_and_pushes_a_branch_not_checked_out() {
+    let (_dir, a, b) = remote_and_clones();
+    git(a.work_dir(), &["switch", "--quiet", "-c", "feature"]);
+    commit_file(&a, "f.txt", "f\n");
+    a.push("feature", Some("origin"), false).expect("publish");
+    b.fetch().expect("fetch");
+    git(
+        b.work_dir(),
+        &["branch", "--quiet", "--track", "feature", "origin/feature"],
+    );
+
+    // a moves on; b fast-forwards its feature while on main.
+    commit_file(&a, "f.txt", "f2\n");
+    a.push("feature", None, false).expect("push");
+    b.pull_branch("feature").expect("fast-forward");
+    assert_eq!(
+        git(b.work_dir(), &["rev-parse", "feature"]),
+        git(a.work_dir(), &["rev-parse", "feature"])
+    );
+    assert_eq!(git(b.work_dir(), &["branch", "--show-current"]), "main");
+
+    // b's commit on feature goes back without checking it out.
+    git(b.work_dir(), &["switch", "--quiet", "feature"]);
+    commit_file(&b, "g.txt", "g\n");
+    git(b.work_dir(), &["switch", "--quiet", "main"]);
+    b.push_branch("feature", false).expect("push");
+    assert_eq!(
+        git(b.work_dir(), &["rev-parse", "feature"]),
+        git(b.work_dir(), &["rev-parse", "origin/feature"])
+    );
+
+    // Diverged, nothing moves.
+    a.pull(PullMethod::Configured).expect("pull");
+    commit_file(&a, "f.txt", "f3\n");
+    a.push("feature", None, false).expect("push");
+    git(b.work_dir(), &["switch", "--quiet", "feature"]);
+    commit_file(&b, "h.txt", "h\n");
+    git(b.work_dir(), &["switch", "--quiet", "main"]);
+    let before = git(b.work_dir(), &["rev-parse", "feature"]);
+    let error = b.pull_branch("feature").expect_err("diverged");
+    assert!(not_fast_forward(&error), "{error}");
+    assert_eq!(git(b.work_dir(), &["rev-parse", "feature"]), before);
+
+    // The branch checked out is pulled with `pull`.
+    assert!(b.pull_branch("main").is_err());
+    git(b.work_dir(), &["branch", "--quiet", "lonely"]);
+    assert!(b.pull_branch("lonely").is_err());
+}
+
+#[test]
 fn a_rejected_push_says_why_and_can_be_forced() {
     let (_dir, a, b) = remote_and_clones();
     commit_file(&a, "a.txt", "from a\n");
@@ -992,6 +1042,27 @@ fn checks_out_a_remote_branch_and_deletes_it_on_the_remote() {
         ),
         ""
     );
+}
+
+#[test]
+fn fetch_prunes_branches_deleted_on_the_remote() {
+    let (_dir, a, b) = remote_and_clones();
+    git(a.work_dir(), &["switch", "--quiet", "-c", "feature/y"]);
+    commit_file(&a, "y.txt", "y\n");
+    a.push("feature/y", Some("origin"), false).expect("publish");
+    b.fetch().expect("fetch");
+    let listed = |r: &Git| {
+        git(
+            r.work_dir(),
+            &["branch", "--remotes", "--list", "origin/feature/y"],
+        )
+    };
+    assert_eq!(listed(&b), "origin/feature/y");
+
+    a.delete_remote_branch("origin", "feature/y")
+        .expect("delete");
+    b.fetch().expect("fetch");
+    assert_eq!(listed(&b), "");
 }
 
 #[test]

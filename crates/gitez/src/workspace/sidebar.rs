@@ -77,6 +77,9 @@ pub enum SidebarEvent {
     RemoveRemote(String),
     /// Ask which remote branch the branch with this name tracks.
     SetUpstream(String),
+    /// Pull or push the branch with this name, checked out or not.
+    PullBranch(String),
+    PushBranch(String),
 }
 
 pub struct Sidebar {
@@ -468,6 +471,7 @@ fn branch_row(
         .context_menu({
             let sidebar = cx.entity().downgrade();
             let (name, tip, is_head) = (branch.name.clone(), branch.target, branch.is_head);
+            let tracked = branch.upstream.is_some();
             move |menu, _, _| {
                 let item = |label: &'static str, event: fn(&str, Oid) -> SidebarEvent| {
                     let (sidebar, name) = (sidebar.clone(), name.clone());
@@ -481,6 +485,15 @@ fn branch_row(
                     })
                     .disabled(is_head),
                 )
+                .separator()
+                .item(
+                    item("Pull", |name, _| SidebarEvent::PullBranch(name.to_owned()))
+                        .disabled(!tracked),
+                )
+                .item(item(if tracked { "Push" } else { "Publish" }, |name, _| {
+                    SidebarEvent::PushBranch(name.to_owned())
+                }))
+                .separator()
                 .item(item("New branch from here…", |_, tip| {
                     SidebarEvent::NewBranchFrom(tip)
                 }))
