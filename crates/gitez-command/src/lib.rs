@@ -228,6 +228,31 @@ impl Git {
         &self.work_dir
     }
 
+    /// Clones `url` into `dest`, which must not exist yet or be empty, like
+    /// `git clone`. The folder `dest` is in must exist. Returns the clone.
+    pub fn clone_repository(url: &str, dest: &Path) -> Result<Self> {
+        let parent = dest.parent().unwrap_or(dest);
+        Self::new(parent)
+            .run(
+                [
+                    OsStr::new("clone"),
+                    OsStr::new("--quiet"),
+                    OsStr::new("--"),
+                    OsStr::new(url),
+                    dest.as_os_str(),
+                ],
+                None,
+            )
+            .map(|_| Self::new(dest))
+    }
+
+    /// Makes `dir`, which must exist, a new repository with no commits,
+    /// like `git init`. Returns it.
+    pub fn init_repository(dir: &Path) -> Result<Self> {
+        let git = Self::new(dir);
+        git.run(["init", "--quiet"], None).map(|_| git)
+    }
+
     /// Stages every change to `paths`, including deletions and untracked
     /// files, like `git add`. Paths are relative to the working tree and
     /// taken literally, not as patterns.

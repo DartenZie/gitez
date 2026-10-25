@@ -53,6 +53,8 @@ pub enum PaletteEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaletteCommand {
     OpenRepository,
+    CloneRepository,
+    InitRepository,
     NewPullRequest,
     CommitChanges,
     RewordLast,
@@ -306,8 +308,20 @@ fn actions() -> Vec<Action> {
         Action {
             title: "Open repository…",
             icon: IconName::FolderOpen,
-            keywords: &["open", "init", "clone"],
+            keywords: &["open", "repository", "folder"],
             command: PaletteCommand::OpenRepository,
+        },
+        Action {
+            title: "Clone repository…",
+            icon: IconName::FolderOpen,
+            keywords: &["clone", "download", "url", "repository"],
+            command: PaletteCommand::CloneRepository,
+        },
+        Action {
+            title: "New repository…",
+            icon: IconName::FolderOpen,
+            keywords: &["init", "new", "create", "repository"],
+            command: PaletteCommand::InitRepository,
         },
     ]
 }

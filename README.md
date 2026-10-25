@@ -24,8 +24,10 @@ command palette (`⌘K`) that runs any git command.
 
 The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 
-> **Status:** early development. The current build opens a repository and
-> shows its history as a commit graph, with branches, remotes, tags and
+> **Status:** early development. The current build opens a repository
+> (or clones one, or creates a new one, from the start screen, the File
+> menu or the palette; a clone is named after its URL unless you rename
+> it) and shows its history as a commit graph, with branches, remotes, tags and
 > stashes in the sidebar and the selected commit's details beside it. Press
 > Enter or double-click a commit to see its full diff, file by file, or
 > click a file in its details to jump straight to that file; `[` and `]`
@@ -230,7 +232,7 @@ GitEZ uses them; otherwise it falls back to the system UI and monospace fonts.
 ## Build and run
 
 ```sh
-cargo run                         # then open a repository with ⌘O (Ctrl+O on Linux)
+cargo run                         # then open (⌘O, Ctrl+O on Linux), clone or create a repository
 cargo run -- <path-to-repository> # open a repository straight away
 ```
 
@@ -259,7 +261,8 @@ crates/gitez-git/   read-only repository access on gitoxide: refs, history, grap
 crates/gitez-command/ changes made by running the user's git binary: staging,
                     unstaging files or hunks, committing, amending, switching branches,
                     merging and resolving conflicts, cherry-picking, rewriting history,
-                    adding and changing remotes, setting config values
+                    adding and changing remotes, cloning and creating repositories,
+                    setting config values
 crates/gitez-review/ local pull requests, their comment threads and agent run
                     transcripts, stored in .git/gitez/reviews
 crates/gitez-agent/ coding agents a review prompt is sent to: Claude Code run as

@@ -1143,3 +1143,40 @@ fn adds_renames_repoints_and_removes_remotes() {
         ""
     );
 }
+
+#[test]
+fn clones_a_repository_and_creates_one() {
+    let (dir, a, _b) = remote_and_clones();
+    let url = dir.path().join("origin.git").display().to_string();
+    let dest = dir.path().join("copy");
+    let copy = Git::clone_repository(&url, &dest).expect("clone");
+    assert_eq!(copy.work_dir(), dest);
+    assert_eq!(
+        git(&dest, &["rev-parse", "HEAD"]),
+        git(a.work_dir(), &["rev-parse", "origin/main"])
+    );
+    assert!(
+        Git::clone_repository(&url, &dest).is_err(),
+        "the folder is not empty"
+    );
+    assert!(Git::clone_repository("/nowhere/at/all.git", &dir.path().join("none")).is_err());
+    assert!(
+        !dir.path().join("none").exists(),
+        "a failed clone leaves nothing"
+    );
+
+    let fresh = dir.path().join("fresh");
+    std::fs::create_dir(&fresh).expect("create folder");
+    Git::init_repository(&fresh).expect("init");
+    assert_eq!(git(&fresh, &["rev-parse", "--is-inside-work-tree"]), "true");
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&fresh)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(false),
+        "no commits yet"
+    );
+}

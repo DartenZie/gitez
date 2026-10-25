@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use gpui_kit::*;
 
-use workspace::{OpenRepository, Workspace};
+use workspace::{CloneRepository, InitRepository, OpenRepository, Workspace};
 
 actions!(gitez, [Quit]);
 
@@ -44,7 +44,11 @@ fn main() {
                 },
                 Menu {
                     name: "File".into(),
-                    items: vec![MenuItem::action("Open Repository…", OpenRepository)],
+                    items: vec![
+                        MenuItem::action("Open Repository…", OpenRepository),
+                        MenuItem::action("Clone Repository…", CloneRepository),
+                        MenuItem::action("New Repository…", InitRepository),
+                    ],
                     disabled: false,
                 },
             ]);

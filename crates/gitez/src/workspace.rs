@@ -16,6 +16,7 @@ mod reset;
 mod review;
 mod rewrite;
 mod sidebar;
+mod start;
 mod stash;
 mod status_bar;
 mod steps;
@@ -62,6 +63,7 @@ use review::{
 };
 use rewrite::{Rewrite, RewriteEvent};
 use sidebar::{Sidebar, SidebarEvent};
+use start::CloneForm;
 use stash::StashForm;
 use tag::TagForm;
 
@@ -69,6 +71,8 @@ actions!(
     workspace,
     [
         OpenRepository,
+        CloneRepository,
+        InitRepository,
         ReviewSelected,
         NewPullRequest,
         OpenPalette,
@@ -111,6 +115,10 @@ pub struct Workspace {
     snapshot: Option<Arc<Snapshot>>,
     /// The repository being opened. Dropping the task cancels the load.
     loading: Option<(PathBuf, Task<()>)>,
+    /// The folder a repository is being cloned into.
+    cloning: Option<(PathBuf, Task<()>)>,
+    /// The "Clone repository" form, while its dialog is open.
+    clone_form: Option<(Entity<CloneForm>, Subscription)>,
     /// Why the last attempt to open a repository failed, shown while no
     /// repository is open.
     error: Option<SharedString>,
@@ -267,6 +275,8 @@ impl Workspace {
             focus_handle,
             snapshot: None,
             loading: None,
+            cloning: None,
+            clone_form: None,
             error: None,
             status: None,
             status_load: None,
@@ -1203,6 +1213,8 @@ impl Workspace {
             PaletteCommand::OpenRepository => {
                 self.prompt_for_repository(&OpenRepository, window, cx)
             }
+            PaletteCommand::CloneRepository => self.clone_repository(&CloneRepository, window, cx),
+            PaletteCommand::InitRepository => self.init_repository(&InitRepository, window, cx),
             PaletteCommand::NewPullRequest => self.new_pull_request(&NewPullRequest, window, cx),
             PaletteCommand::CommitChanges => self.open_working_tree(None, window, cx),
             PaletteCommand::OpenFile(path) => self.open_working_tree(Some(path), window, cx),
@@ -1449,6 +1461,8 @@ impl Render for Workspace {
             .key_context("Workspace")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::prompt_for_repository))
+            .on_action(cx.listener(Self::clone_repository))
+            .on_action(cx.listener(Self::init_repository))
             .on_action(cx.listener(Self::review_selected))
             .on_action(cx.listener(Self::new_pull_request))
             .on_action(cx.listener(Self::open_palette))
@@ -1469,7 +1483,7 @@ impl Render for Workspace {
             .text_size(theme::TEXT_SIZE)
             .child(toolbar::Toolbar {
                 repository_name: snapshot.as_ref().map(|snapshot| snapshot.name.clone()),
-                loading: self.loading.is_some(),
+                loading: self.loading.is_some() || self.cloning.is_some(),
                 remote: snapshot.as_deref().map(RemoteActions::of),
                 running: self.remote_op.as_ref().map(|(op, _)| *op),
                 can_branch: snapshot
@@ -1591,29 +1605,49 @@ impl Workspace {
             )
             .into_any_element();
         }
+        if let Some((dest, _)) = &self.cloning {
+            return empty_state(
+                "Cloning repository…",
+                dest.display().to_string(),
+                None::<Button>,
+            )
+            .into_any_element();
+        }
         if let Some(error) = &self.error {
             return empty_state(
                 "Could not open the repository",
                 error.clone(),
-                Some(open_button("open-repository-retry", "Open another…")),
+                Some(start_buttons("Open another…")),
             )
             .into_any_element();
         }
         empty_state(
             "No repository open",
-            "Open a repository to see its history.",
-            Some(open_button("open-repository", "Open repository…")),
+            "Open a repository to see its history, clone one, or create a new one.",
+            Some(start_buttons("Open repository…")),
         )
         .into_any_element()
     }
 }
 
-fn open_button(id: &'static str, label: &'static str) -> Button {
-    Button::new(id)
-        .primary()
-        .h(px(30.))
-        .label(label)
-        .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenRepository), cx))
+/// Opening, cloning or creating a repository; `open` labels the first.
+fn start_buttons(open: &'static str) -> impl IntoElement {
+    let button = |id: &'static str, label: &'static str, action: fn() -> Box<dyn Action>| {
+        Button::new(id)
+            .h(px(30.))
+            .label(label)
+            .on_click(move |_, window, cx| window.dispatch_action(action(), cx))
+    };
+    div()
+        .h_flex()
+        .gap(px(8.))
+        .child(button("open-repository", open, || Box::new(OpenRepository)).primary())
+        .child(button("clone-repository", "Clone…", || {
+            Box::new(CloneRepository)
+        }))
+        .child(button("init-repository", "New repository…", || {
+            Box::new(InitRepository)
+        }))
 }
 
 /// A centred title, an explanation and an optional action, filling the rest
