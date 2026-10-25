@@ -8,6 +8,7 @@ use gitez_git::{
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::*;
+use gpui_kit::component::text::TextView;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -337,7 +338,13 @@ fn header(
                     .text_size(px(12.5))
                     .line_height(relative(1.55))
                     .text_color(rgb(color::AUTHOR_TEXT))
-                    .child(body),
+                    .child(
+                        TextView::markdown(
+                            SharedString::from(format!("commit-body-{}", commit.id)),
+                            body,
+                        )
+                        .selectable(true),
+                    ),
             )
         })
         .child(
