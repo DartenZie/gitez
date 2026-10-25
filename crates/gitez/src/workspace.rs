@@ -1144,6 +1144,9 @@ impl Workspace {
         let (head, last_commit) = head_of(snapshot);
         let changes =
             cx.new(|cx| ChangesPanel::new(&snapshot.repository, head, last_commit, window, cx));
+        let summary = changes.read(cx).graph_summary();
+        self.history
+            .update(cx, |history, cx| history.set_summary_input(summary, cx));
         let subscription =
             cx.subscribe_in(&changes, window, |this, _, event, window, cx| match event {
                 ChangesEvent::OpenFile(path) => {

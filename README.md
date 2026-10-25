@@ -53,7 +53,9 @@ tree, so it cannot be committed or pushed by accident. Linked worktrees share it
   stashes and local PRs in the sidebar, and commit details and full diffs
   beside it.
 - **Working tree**: stage, unstage or discard files and single hunks. Commit,
-  amend, sign off or skip hooks. Changes made in other tools appear as they happen.
+  amend, sign off or skip hooks; type the commit summary in the panel or right
+  in the uncommitted-changes row of the graph. Changes made in other tools
+  appear as they happen.
 - **Drag-and-drop merge**: drag a branch label onto another branch to merge,
   squash, rebase, fast-forward, or open the two branches as a local PR.
 - **Conflict editor**: see our and their lines side by side (with the base if

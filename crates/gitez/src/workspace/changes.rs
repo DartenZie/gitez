@@ -108,6 +108,9 @@ pub struct ChangesPanel {
     scroll: HashMap<Section, ScrollHandle>,
     tab: Tab,
     summary: Entity<InputState>,
+    /// The same summary, typed in the uncommitted-changes row of the
+    /// history; the two are kept in step.
+    graph_summary: Entity<InputState>,
     description: Entity<TextareaState>,
     /// Set while amending: the summary and description typed before, which
     /// come back when amending is turned off. The boxes hold the last
@@ -138,6 +141,9 @@ impl ChangesPanel {
         cx: &mut Context<Self>,
     ) -> Self {
         let summary = cx.new(|cx| InputState::new(window, cx).placeholder("Commit summary"));
+        let graph_summary = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Uncommitted changes — write a commit summary")
+        });
         let description = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(4, 12)
@@ -153,9 +159,36 @@ impl ChangesPanel {
                     let description = this.description.focus_handle(cx);
                     window.focus(&description, cx);
                 }
-                InputEvent::Change => cx.notify(),
+                InputEvent::Change => {
+                    let value = this.summary.read(cx).value();
+                    this.graph_summary
+                        .update(cx, |input, cx| input.set_value(value, window, cx));
+                    cx.notify();
+                }
                 _ => {}
             }),
+            cx.subscribe_in(
+                &graph_summary,
+                window,
+                |this, _, event, window, cx| match event {
+                    InputEvent::PressEnter {
+                        secondary: true, ..
+                    } => this.commit(window, cx),
+                    InputEvent::PressEnter { .. } => {
+                        this.tab = Tab::Commit;
+                        let description = this.description.focus_handle(cx);
+                        window.focus(&description, cx);
+                        cx.notify();
+                    }
+                    InputEvent::Change => {
+                        let value = this.graph_summary.read(cx).value();
+                        this.summary
+                            .update(cx, |input, cx| input.set_value(value, window, cx));
+                        cx.notify();
+                    }
+                    _ => {}
+                },
+            ),
             cx.subscribe_in(
                 &description,
                 window,
@@ -192,6 +225,7 @@ impl ChangesPanel {
             ]),
             tab: Tab::Commit,
             summary,
+            graph_summary,
             description,
             saved: None,
             show_options: false,
@@ -239,6 +273,12 @@ impl ChangesPanel {
         self.head = head;
         self.last_commit = last_commit;
         cx.notify();
+    }
+
+    /// The commit summary input shown in the uncommitted-changes row of
+    /// the history.
+    pub fn graph_summary(&self) -> Entity<InputState> {
+        self.graph_summary.clone()
     }
 
     /// Puts the cursor in the commit summary.
@@ -409,6 +449,8 @@ impl ChangesPanel {
         cx: &mut Context<Self>,
     ) {
         let (summary, description) = (summary.to_owned(), description.to_owned());
+        self.graph_summary
+            .update(cx, |input, cx| input.set_value(summary.clone(), window, cx));
         self.summary
             .update(cx, |input, cx| input.set_value(summary, window, cx));
         self.description

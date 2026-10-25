@@ -13,6 +13,7 @@ use gitez_git::graph::{GraphLayout, Row};
 use gitez_git::{Commit, Oid, Order, RefKind, RefLabel, Repository, WorkingTreeStatus};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::*;
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -36,7 +37,8 @@ actions!(
 
 /// Key bindings of the history list.
 pub fn key_bindings() -> Vec<KeyBinding> {
-    const CONTEXT: Option<&str> = Some("History");
+    // Not while typing the commit summary in the uncommitted-changes row.
+    const CONTEXT: Option<&str> = Some("History && !Input");
     vec![
         KeyBinding::new("up", SelectPrevious, CONTEXT),
         KeyBinding::new("k", SelectPrevious, CONTEXT),
@@ -156,6 +158,9 @@ pub struct History {
     head_index: Option<usize>,
     /// Uncommitted changes; the list shows their row while not clean.
     working_tree: Option<Arc<WorkingTreeStatus>>,
+    /// The commit summary typed in the uncommitted-changes row, shared with
+    /// the changes panel.
+    summary: Option<(Entity<InputState>, Subscription)>,
     selected: Option<Entry>,
     /// The branch being dragged onto another, if any.
     drag: Option<Drag>,
@@ -191,6 +196,7 @@ impl History {
             head: None,
             head_index: None,
             working_tree: None,
+            summary: None,
             selected: None,
             drag: None,
             picked: Vec::new(),
@@ -209,6 +215,7 @@ impl History {
         *self = Self {
             focus_handle: self.focus_handle.clone(),
             scroll: self.scroll.clone(),
+            summary: self.summary.take(),
             repository: Some(snapshot.repository.clone()),
             labels: snapshot.refs.labels_by_commit(),
             head: snapshot.refs.head.as_ref().and_then(|head| head.target()),
@@ -408,6 +415,19 @@ impl History {
             }
             cx.emit(SelectionChanged);
         }
+        cx.notify();
+    }
+
+    /// Shows `input` in the uncommitted-changes row, to type the commit
+    /// summary there; the row is selected when it gets the cursor.
+    pub fn set_summary_input(&mut self, input: Entity<InputState>, cx: &mut Context<Self>) {
+        let subscription = cx.subscribe(&input, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Focus) && this.selected != Some(Entry::WorkingTree) {
+                this.clear_picked(cx);
+                this.select_working_tree(cx);
+            }
+        });
+        self.summary = Some((input, subscription));
         cx.notify();
     }
 
@@ -1024,7 +1044,14 @@ impl History {
                 }
             })
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                window.focus(&this.focus_handle, cx);
+                // A click in the commit summary keeps the cursor there.
+                let typing = this
+                    .summary
+                    .as_ref()
+                    .is_some_and(|(input, _)| input.focus_handle(cx).is_focused(window));
+                if !typing {
+                    window.focus(&this.focus_handle, cx);
+                }
                 let modifiers = event.modifiers();
                 if modifiers.secondary() || modifiers.shift {
                     this.pick(index, modifiers.shift, cx);
@@ -1060,8 +1087,28 @@ impl History {
             row.when(self.drag_role(None).is_some(), |this| this.opacity(0.45))
                 .child(self.graph_column(cell, cx))
                 .children(self.pick_cell(None))
-                .child(
-                    div()
+                .child(match &self.summary {
+                    Some((input, _)) => div()
+                        .h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap(columns::GAP)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(Input::new(input).appearance(false).small()),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .whitespace_nowrap()
+                                .italic()
+                                .text_size(px(12.))
+                                .text_color(rgb(color::WORKING_TREE_TEXT))
+                                .child(labels::working_tree_summary(status)),
+                        ),
+                    None => div()
                         .flex_1()
                         .min_w_0()
                         .overflow_hidden()
@@ -1073,7 +1120,7 @@ impl History {
                             "Uncommitted changes — {}",
                             labels::working_tree_summary(status)
                         )),
-                )
+                })
                 .child(div().w(columns::AUTHOR).flex_none())
                 .child(
                     div()
