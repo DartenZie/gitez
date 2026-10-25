@@ -295,6 +295,12 @@ impl Workspace {
                     this.refresh_status(window, cx);
                 }
             }),
+            // The focused input can go away, as the commit summary does with
+            // the uncommitted-changes row once everything is committed. The
+            // toolbar's actions dispatch from the focus, so take it back.
+            cx.on_focus_lost(window, |this, window, cx| {
+                window.focus(&this.focus_handle, cx);
+            }),
         ];
         let mut workspace = Self {
             focus_handle,
