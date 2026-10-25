@@ -75,6 +75,17 @@ pub struct PickOptions {
     pub stash: bool,
 }
 
+/// How [`Git::commit_with`] commits, beyond the message.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CommitOptions {
+    /// Replaces the last commit instead of adding one (`--amend`).
+    pub amend: bool,
+    /// Skips the pre-commit and commit-msg hooks (`--no-verify`).
+    pub no_verify: bool,
+    /// Adds a Signed-off-by trailer with the committer (`--signoff`).
+    pub sign_off: bool,
+}
+
 /// What [`Git::rewrite`] does with one commit, as in `git rebase -i`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RewriteAction {
@@ -291,8 +302,24 @@ impl Git {
     /// Commits the staged changes with `message`. Hooks run as usual; when
     /// one rejects the commit, its output is the error.
     pub fn commit(&self, message: &str) -> Result<()> {
-        self.run(["commit", "--quiet", "--file=-"], Some(message.as_bytes()))
-            .map(drop)
+        self.commit_with(message, CommitOptions::default())
+    }
+
+    /// Commits the staged changes with `message` as `options` say. Hooks
+    /// run unless skipped; when one rejects the commit, its output is the
+    /// error.
+    pub fn commit_with(&self, message: &str, options: CommitOptions) -> Result<()> {
+        let mut args = vec!["commit", "--quiet", "--file=-"];
+        if options.amend {
+            args.push("--amend");
+        }
+        if options.no_verify {
+            args.push("--no-verify");
+        }
+        if options.sign_off {
+            args.push("--signoff");
+        }
+        self.run(args, Some(message.as_bytes())).map(drop)
     }
 
     /// Checks out the local branch `branch`, like `git switch`. Fails, with
@@ -1075,11 +1102,13 @@ impl Git {
     /// Replaces the last commit with one that has `message` and also the
     /// staged changes, like `git commit --amend`.
     pub fn amend(&self, message: &str) -> Result<()> {
-        self.run(
-            ["commit", "--quiet", "--amend", "--file=-"],
-            Some(message.as_bytes()),
+        self.commit_with(
+            message,
+            CommitOptions {
+                amend: true,
+                ..CommitOptions::default()
+            },
         )
-        .map(drop)
     }
 
     /// Applies `patch` to the index only, like `git apply --cached`; with

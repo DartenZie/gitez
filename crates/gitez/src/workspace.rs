@@ -2,6 +2,7 @@
 //! status bar, laid out as in the `Main.dc.html` artboard.
 
 mod branch;
+mod changes;
 mod cherry_pick;
 mod conflicts;
 mod detail;
@@ -47,6 +48,7 @@ use crate::repository::Snapshot;
 use crate::theme::{self, color};
 use crate::undo::{Direction, UndoLog};
 use branch::BranchForm;
+use changes::{ChangesEvent, ChangesPanel, LastCommit};
 use cherry_pick::{CherryPick, CherryPickEvent};
 use conflicts::{Conflicts, ConflictsEvent};
 use detail::{DetailEvent, DetailPane};
@@ -57,10 +59,7 @@ use new_pull_request::{FormEvent, NewPullRequestForm};
 use palette::{Palette, PaletteCommand, PaletteContext, PaletteEvent};
 use remote::{RemoteActions, RemoteOp};
 use remotes::RemoteForm;
-use review::{
-    CommitDraft, LastCommit, MergeDialog, MergeEvent, MergedPullRequest, Merging, Review,
-    ReviewEvent, Tips,
-};
+use review::{MergeDialog, MergeEvent, MergedPullRequest, Merging, Review, ReviewEvent, Tips};
 use rewrite::{Rewrite, RewriteEvent};
 use sidebar::{Sidebar, SidebarEvent};
 use start::CloneForm;
@@ -135,13 +134,17 @@ pub struct Workspace {
     _watch: Option<Task<()>>,
     /// Re-reading the refs and history after they changed.
     _reload: Option<Task<()>>,
-    /// The commit being reviewed, shown instead of the history.
+    /// The commit or pull request being reviewed, shown instead of the
+    /// history, or the uncommitted changes, shown in its place.
     review: Option<(Entity<Review>, Subscription)>,
     /// The conflicts of a merge being resolved, shown instead of the
     /// history or a review.
     conflicts: Option<(Entity<Conflicts>, Subscription)>,
-    /// The message of the next commit, kept while the review is closed.
-    commit_draft: Option<Entity<CommitDraft>>,
+    /// The uncommitted changes of the open repository, to stage and commit,
+    /// shown instead of the commit detail while their row is selected.
+    changes: Option<(Entity<ChangesPanel>, Subscription)>,
+    /// Whether the uncommitted changes are selected in the history.
+    working_tree_selected: bool,
     /// The "New local PR" form while its dialog is open.
     new_pull_request: Option<(Entity<NewPullRequestForm>, Subscription)>,
     /// Creating a local pull request.
@@ -290,7 +293,8 @@ impl Workspace {
             _reload: None,
             review: None,
             conflicts: None,
-            commit_draft: None,
+            changes: None,
+            working_tree_selected: false,
             new_pull_request: None,
             _create: None,
             merge_dialog: None,
@@ -383,7 +387,7 @@ impl Workspace {
         window.set_window_title(&format!("{} — GitEZ", snapshot.name));
         self.review = None;
         self.rewrite = None;
-        self.commit_draft = None;
+        self.open_changes_for(&snapshot, window, cx);
         self.open_palette_for(&snapshot, window, cx);
         self.watch(&snapshot, window, cx);
         self.sidebar
@@ -496,10 +500,15 @@ impl Workspace {
                             .update(cx, |sidebar, cx| sidebar.set_snapshot(snapshot.clone(), cx));
                         this.history
                             .update(cx, |history, cx| history.reload(&snapshot, cx));
+                        let (head, last_commit) = head_of(&snapshot);
+                        if let Some((changes, _)) = &this.changes {
+                            changes.update(cx, |changes, cx| {
+                                changes.set_head(head.clone(), last_commit, window, cx)
+                            });
+                        }
                         if let Some((review, _)) = &this.review {
-                            let (head, last_commit) = head_of(&snapshot);
                             review.update(cx, |review, cx| {
-                                review.set_head(head, last_commit, cx);
+                                review.set_head(head, cx);
                                 if let Some(tips) = review
                                     .pull_request_number()
                                     .and_then(|number| tips_of(&snapshot, number))
@@ -576,6 +585,10 @@ impl Workspace {
         self.history.update(cx, |history, cx| {
             history.set_working_tree(status.clone(), cx)
         });
+        if let (Some((changes, _)), Some(status)) = (&self.changes, &status) {
+            let status = status.clone();
+            changes.update(cx, |changes, cx| changes.set_status(status, cx));
+        }
         if let (Some(snapshot), Some((review, _)), Some(status)) =
             (&self.snapshot, &self.review, status)
         {
@@ -609,14 +622,8 @@ impl Workspace {
             }
             Some(Selection::WorkingTree(status)) => {
                 let status = status.clone();
-                let (head, last_commit) = head_of(snapshot);
-                let draft = self
-                    .commit_draft
-                    .get_or_insert_with(|| cx.new(|cx| CommitDraft::new(window, cx)))
-                    .clone();
-                cx.new(|cx| {
-                    Review::working_tree(&repository, status, head, last_commit, draft, window, cx)
-                })
+                let (head, _) = head_of(snapshot);
+                cx.new(|cx| Review::working_tree(&repository, status, head, cx))
             }
             None => return,
         };
@@ -649,6 +656,12 @@ impl Workspace {
                     this.refresh_status(window, cx);
                     return;
                 }
+                ReviewEvent::FileShown(path) => {
+                    if let Some((changes, _)) = &this.changes {
+                        changes.update(cx, |changes, cx| changes.show_current(path, cx));
+                    }
+                    return;
+                }
                 ReviewEvent::MergeStopped => {
                     this.reload(window, cx);
                     this.refresh_status(window, cx);
@@ -669,15 +682,6 @@ impl Workspace {
                 ReviewEvent::CheckedOut => {
                     this.reload(window, cx);
                     this.refresh_status(window, cx);
-                    return;
-                }
-                ReviewEvent::Committed { everything } => {
-                    // The watcher would notice too, but later.
-                    this.reload(window, cx);
-                    this.refresh_status(window, cx);
-                    if *everything {
-                        this.close_review(window, cx);
-                    }
                     return;
                 }
             };
@@ -1104,6 +1108,46 @@ impl Workspace {
         );
     }
 
+    /// Makes the changes panel for the repository of `snapshot`.
+    fn open_changes_for(
+        &mut self,
+        snapshot: &Snapshot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (head, last_commit) = head_of(snapshot);
+        let changes =
+            cx.new(|cx| ChangesPanel::new(&snapshot.repository, head, last_commit, window, cx));
+        let subscription =
+            cx.subscribe_in(&changes, window, |this, _, event, window, cx| match event {
+                ChangesEvent::OpenFile(path) => {
+                    let shown = this
+                        .review
+                        .as_ref()
+                        .map(|(review, _)| review.clone())
+                        .filter(|review| review.read(cx).is_working_tree());
+                    match shown {
+                        Some(review) => {
+                            review.update(cx, |review, cx| review.show_file(path.clone(), cx))
+                        }
+                        None => this.open_working_tree(Some(path.clone()), window, cx),
+                    }
+                }
+                ChangesEvent::Staged => this.refresh_status(window, cx),
+                ChangesEvent::Discarded { message, step } => {
+                    this.notify_done(Notification::success(message.clone()), *step, window, cx);
+                    this.refresh_status(window, cx);
+                }
+                ChangesEvent::Committed => {
+                    // The watcher would notice too, but later.
+                    this.reload(window, cx);
+                    this.refresh_status(window, cx);
+                }
+                ChangesEvent::Stash(request) => this.stash(request.clone(), window, cx),
+            });
+        self.changes = Some((changes, subscription));
+    }
+
     /// Makes the command palette for the repository of `snapshot`.
     fn open_palette_for(
         &mut self,
@@ -1220,7 +1264,7 @@ impl Workspace {
             PaletteCommand::CloneRepository => self.clone_repository(&CloneRepository, window, cx),
             PaletteCommand::InitRepository => self.init_repository(&InitRepository, window, cx),
             PaletteCommand::NewPullRequest => self.new_pull_request(&NewPullRequest, window, cx),
-            PaletteCommand::CommitChanges => self.open_working_tree(None, window, cx),
+            PaletteCommand::CommitChanges => self.start_commit(window, cx),
             PaletteCommand::OpenFile(path) => self.open_working_tree(Some(path), window, cx),
             PaletteCommand::RewordLast => {
                 let head = self
@@ -1292,8 +1336,31 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Shows the uncommitted changes to review and commit, scrolled to the
-    /// file at `path` if given.
+    /// Selects the uncommitted changes and puts the cursor in the commit
+    /// summary.
+    fn start_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let selected = self
+            .history
+            .update(cx, |history, cx| history.select_working_tree(cx));
+        if !selected {
+            return;
+        }
+        self.rewrite = None;
+        if self
+            .review
+            .as_ref()
+            .is_some_and(|(review, _)| !review.read(cx).is_working_tree())
+        {
+            self.review = None;
+        }
+        if let Some((changes, _)) = &self.changes {
+            changes.update(cx, |changes, cx| changes.focus_summary(window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Shows the diff of the uncommitted changes in place of the history,
+    /// scrolled to the file at `path` if given.
     fn open_working_tree(
         &mut self,
         path: Option<String>,
@@ -1420,18 +1487,32 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Shows the commit selected in the history in the detail pane.
+    /// Shows the commit selected in the history in the detail pane, or the
+    /// uncommitted changes in the changes panel.
     fn show_selection(&mut self, cx: &mut Context<Self>) {
         let Some(snapshot) = &self.snapshot else {
             return;
         };
+        let working_tree = matches!(
+            self.history.read(cx).selected(),
+            Some(Selection::WorkingTree(_))
+        );
+        if working_tree != self.working_tree_selected {
+            self.working_tree_selected = working_tree;
+            cx.notify();
+        }
+        if !working_tree
+            && self
+                .review
+                .as_ref()
+                .is_some_and(|(review, _)| review.read(cx).is_working_tree())
+        {
+            // The diff of changes no longer selected.
+            self.review = None;
+            cx.notify();
+        }
         let selection = match self.history.read(cx).selected() {
-            Some(Selection::WorkingTree(status)) => {
-                let status = status.clone();
-                self.detail
-                    .update(cx, |detail, cx| detail.show_working_tree(status, cx));
-                return;
-            }
+            Some(Selection::WorkingTree(_)) => return,
             Some(Selection::Commit(commit, labels)) => Some((commit.clone(), labels.to_vec())),
             None => None,
         };
@@ -1525,7 +1606,15 @@ impl Render for Workspace {
                 if let Some((rewrite, _)) = &self.rewrite {
                     return this.child(rewrite.clone());
                 }
-                if let Some((review, _)) = &self.review {
+                let working_tree_review = self
+                    .review
+                    .as_ref()
+                    .map(|(review, _)| review)
+                    .filter(|review| review.read(cx).is_working_tree())
+                    .cloned();
+                if let Some((review, _)) = &self.review
+                    && working_tree_review.is_none()
+                {
                     return this.child(review.clone());
                 }
                 this.child(
@@ -1537,7 +1626,10 @@ impl Render for Workspace {
                                 .fixed()
                                 .child(self.sidebar.clone()),
                         )
-                        .child(resizable_panel().child(self.render_history()))
+                        .child(resizable_panel().child(match working_tree_review {
+                            Some(review) => review.into_any_element(),
+                            None => self.render_history(),
+                        }))
                         .child(
                             resizable_panel()
                                 .size(px(360.))
@@ -1546,6 +1638,12 @@ impl Render for Workspace {
                                 .map(|panel| {
                                     if let Some((cherry_pick, _)) = &self.cherry_pick {
                                         panel.child(cherry_pick.clone())
+                                    } else if let Some((changes, _)) = self
+                                        .changes
+                                        .as_ref()
+                                        .filter(|_| self.working_tree_selected)
+                                    {
+                                        panel.child(changes.clone())
                                     } else if snapshot.is_some() {
                                         panel.child(self.detail.clone())
                                     } else {

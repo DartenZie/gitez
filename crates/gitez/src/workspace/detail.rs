@@ -1,16 +1,13 @@
-//! Details of the selected commit, or of the uncommitted changes, in the
-//! right-hand pane.
+//! Details of the selected commit in the right-hand pane.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use gitez_git::{
-    ChangeKind, Commit, CommitDetails, FileChange, FileStatus, LineCounts, Oid, RefLabel,
-    Repository, WorkingTreeStatus, WorktreeChange,
+    ChangeKind, Commit, CommitDetails, FileChange, LineCounts, Oid, RefLabel, Repository,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::*;
-use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -45,10 +42,8 @@ pub enum DetailEvent {
 }
 
 /// The selected commit: SHA, parents, message, author, refs and changed files.
-/// Or, with the uncommitted-changes row selected, the files they touch.
 /// Clicking a file opens its diff.
 pub struct DetailPane {
-    working_tree: Option<Arc<WorkingTreeStatus>>,
     commit: Option<Commit>,
     labels: Vec<RefLabel>,
     /// `None` while the details are being read.
@@ -62,7 +57,6 @@ impl EventEmitter<DetailEvent> for DetailPane {}
 impl DetailPane {
     pub fn new() -> Self {
         Self {
-            working_tree: None,
             commit: None,
             labels: Vec::new(),
             details: None,
@@ -113,15 +107,6 @@ impl DetailPane {
         cx.notify();
     }
 
-    /// Shows the uncommitted changes in `status`.
-    pub fn show_working_tree(&mut self, status: Arc<WorkingTreeStatus>, cx: &mut Context<Self>) {
-        *self = Self {
-            working_tree: Some(status),
-            ..Self::new()
-        };
-        cx.notify();
-    }
-
     fn finish(
         &mut self,
         id: Oid,
@@ -147,18 +132,6 @@ impl Render for DetailPane {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pane = div().v_flex().size_full().bg(rgb(color::PANEL));
         let mono = cx.theme().mono_font_family.clone();
-        if let Some(status) = &self.working_tree {
-            return pane
-                .child(
-                    div()
-                        .id("working-tree-detail")
-                        .v_flex()
-                        .flex_1()
-                        .overflow_y_scroll()
-                        .child(working_tree(status, mono, cx)),
-                )
-                .when(!status.is_clean(), |this| this.child(commit_footer()));
-        }
         let Some(commit) = &self.commit else {
             return pane.child(
                 div()
@@ -216,41 +189,6 @@ impl Render for DetailPane {
                 }),
         )
     }
-}
-
-/// "Commit changes", which opens the uncommitted changes to stage and
-/// commit them.
-fn commit_footer() -> impl IntoElement {
-    let enter = Keystroke::parse("enter").expect("enter is a valid keystroke");
-    div()
-        .v_flex()
-        .flex_none()
-        .gap(px(8.))
-        .px(px(16.))
-        .py(px(14.))
-        .border_t_1()
-        .border_color(rgb(color::BORDER))
-        .child(
-            Button::new("commit-changes")
-                .primary()
-                .h(px(36.))
-                .w_full()
-                .label("Commit changes")
-                .icon(Icon::new(IconName::ArrowRight).size(px(14.)))
-                .on_click(|_, window, cx| {
-                    window.dispatch_action(Box::new(super::ReviewSelected), cx)
-                }),
-        )
-        .child(
-            div()
-                .h_flex()
-                .justify_center()
-                .gap(px(4.))
-                .text_size(theme::SMALL_TEXT_SIZE)
-                .text_color(rgb(color::TEXT_MUTED))
-                .child("Double-click any row or press")
-                .child(Kbd::new(enter)),
-        )
 }
 
 /// What can be done with the commit.
@@ -497,103 +435,6 @@ fn files(
         .when(hidden > 0, |this| this.child(more_files(hidden)))
 }
 
-/// "Uncommitted changes", then the staged files and the other changes.
-fn working_tree(
-    status: &WorkingTreeStatus,
-    mono: SharedString,
-    cx: &Context<DetailPane>,
-) -> impl IntoElement {
-    let staged: Vec<&FileStatus> = status
-        .files
-        .iter()
-        .filter(|file| file.staged.is_some())
-        .collect();
-    let unstaged: Vec<&FileStatus> = status
-        .files
-        .iter()
-        .filter(|file| file.unstaged.is_some())
-        .collect();
-    let group = |title: &'static str,
-                 files: &[&FileStatus],
-                 row: &dyn Fn(usize, &FileStatus) -> AnyElement| {
-        let hidden = files.len().saturating_sub(MAX_FILES_SHOWN);
-        div()
-            .v_flex()
-            .pb(px(8.))
-            .child(
-                div()
-                    .h_flex()
-                    .gap(px(8.))
-                    .pt(px(12.))
-                    .px(px(16.))
-                    .pb(px(6.))
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(rgb(color::TEXT_MUTED))
-                            .child(files.len().to_string()),
-                    ),
-            )
-            .children(
-                files
-                    .iter()
-                    .take(MAX_FILES_SHOWN)
-                    .enumerate()
-                    .map(|(index, file)| row(index, file)),
-            )
-            .when(hidden > 0, |this| this.child(more_files(hidden)))
-    };
-
-    div()
-        .v_flex()
-        .child(
-            div()
-                .v_flex()
-                .gap(px(4.))
-                .pt(px(16.))
-                .px(px(18.))
-                .pb(px(14.))
-                .border_b_1()
-                .border_color(rgb(color::BORDER))
-                .child(
-                    div()
-                        .text_size(px(17.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child("Uncommitted changes"),
-                )
-                .child(
-                    div()
-                        .text_size(theme::SMALL_TEXT_SIZE)
-                        .text_color(rgb(color::TEXT_MUTED))
-                        .child(labels::working_tree_summary(status)),
-                ),
-        )
-        .when(!staged.is_empty(), |this| {
-            this.child(group("Staged", &staged, &|index, file| {
-                let kind = file.staged.as_ref().unwrap_or(&ChangeKind::Modified);
-                let (letter, letter_color) = labels::change_letter(kind);
-                let row = file_row(
-                    letter,
-                    letter_color,
-                    &file.path,
-                    rename_source(kind),
-                    None,
-                    mono.clone(),
-                );
-                opens_file(("staged-file", index), &file.path, row, cx).into_any_element()
-            }))
-        })
-        .when(!unstaged.is_empty(), |this| {
-            this.child(group("Changes", &unstaged, &|index, file| {
-                let (letter, letter_color) =
-                    worktree_letter(file.unstaged.unwrap_or(WorktreeChange::Modified));
-                let row = file_row(letter, letter_color, &file.path, None, None, mono.clone());
-                opens_file(("unstaged-file", index), &file.path, row, cx).into_any_element()
-            }))
-        })
-}
-
 /// `row`, which opens the diff of the file at `path` when clicked.
 fn opens_file(
     id: impl Into<ElementId>,
@@ -616,16 +457,6 @@ fn more_files(hidden: usize) -> impl IntoElement {
         .text_size(px(12.))
         .text_color(rgb(color::TEXT_MUTED))
         .child(format!("and {hidden} more files"))
-}
-
-/// The status letter of an unstaged change: `?` untracked, `U` unmerged.
-fn worktree_letter(change: WorktreeChange) -> (&'static str, u32) {
-    match change {
-        WorktreeChange::Modified => ("M", color::ACCENT),
-        WorktreeChange::Deleted => ("D", color::DIFF_REMOVED),
-        WorktreeChange::Untracked => ("?", color::DIFF_ADDED),
-        WorktreeChange::Conflicted => ("U", color::DIFF_REMOVED),
-    }
 }
 
 fn rename_source(kind: &ChangeKind) -> Option<String> {

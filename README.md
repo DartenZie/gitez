@@ -36,15 +36,18 @@ The design is at <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>.
 > (single hunks can't be staged then), and show the unchanged lines
 > between hunks one gap at a time or all at once. Mark a file viewed to
 > collapse it and track progress; it opens again if it changes.
-> Uncommitted changes appear as a row above the current commit; open it the same way to
-> review them, with each file marked staged, partly staged or untracked.
-> Stage or unstage whole files or single hunks there (staged hunks are
-> marked and listed first) and commit them with a message (⌘↵), or
-> amend the last commit, with a warning when it is already pushed. Commits
+> Uncommitted changes appear as a row above the current commit. Selecting
+> it shows them beside the history as unstaged and staged files, listed
+> by path or as a tree: stage, unstage or discard a file (or all of them),
+> then commit with a summary and a description (⌘↵), amend the previous
+> commit (with a warning when it is already pushed), skip the hooks or add
+> a sign-off, or stash everything from the Stash tab. Clicking a file shows
+> the diff of the changes in place of the graph, where single hunks can be
+> staged, unstaged or discarded (staged hunks are marked and listed first). Commits
 > run your own `git`, so hooks and signing work as in the terminal, and a
 > hook that rejects the commit shows its output. Changes made in an
 > editor, a terminal or another git client show up as they happen, in the
-> open review too. **New local PR** creates a local pull request for a
+> open diff too. **New local PR** creates a local pull request for a
 > branch against its base (`main` by default); the sidebar lists them,
 > and opening one shows the branch's changes since it left the base,
 > with the files marked viewed kept between sessions. Hover a line and

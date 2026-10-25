@@ -16,6 +16,8 @@ icon_assets!(
         ArrowLeft,
         ArrowRight,
         ArrowRightToLine,
+        ArrowUpAZ,
+        ArrowUpZA,
         Bot,
         Check,
         Cherry,
@@ -28,12 +30,14 @@ icon_assets!(
         File,
         FolderOpen,
         GitBranch,
+        GitCommitHorizontal,
         GitCommitVertical,
         GitFork,
         GitGraph,
         GitMerge,
         GitPullRequestArrow,
         GripVertical,
+        List,
         ListTree,
         LoaderCircle,
         Move,
@@ -45,6 +49,7 @@ icon_assets!(
         Square,
         Tag,
         Terminal,
+        Trash,
         TriangleAlert
     ]
 );

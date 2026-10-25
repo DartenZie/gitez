@@ -2,8 +2,8 @@ use std::path::Path;
 use std::process::Command;
 
 use gitez_command::{
-    Error, Git, PullMethod, PullOutcome, PushRejection, RefUpdate, ResetMode, RevertOutcome,
-    UnstashOutcome, not_fast_forward, not_merged,
+    CommitOptions, Error, Git, PullMethod, PullOutcome, PushRejection, RefUpdate, ResetMode,
+    RevertOutcome, UnstashOutcome, not_fast_forward, not_merged,
 };
 
 /// `git <args>` in `dir`, returning its trimmed output.
@@ -111,6 +111,36 @@ fn a_rejected_commit_reports_the_hook_output() {
         other => panic!("expected the hook to reject the commit, got {other:?}"),
     }
     assert_eq!(status(dir.path()), "A  a.txt");
+}
+
+#[test]
+fn skips_the_hooks_and_signs_off_when_asked() {
+    let dir = repository();
+    let hook = dir.path().join(".git/hooks/pre-commit");
+    std::fs::write(&hook, "#!/bin/sh\nexit 1\n").expect("write hook");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
+            .expect("make the hook executable");
+    }
+    std::fs::write(dir.path().join("a.txt"), "a\n").expect("write");
+    let git_ = Git::new(dir.path());
+    git_.stage_all().expect("stage all");
+
+    let options = CommitOptions {
+        no_verify: true,
+        sign_off: true,
+        ..CommitOptions::default()
+    };
+    git_.commit_with("Add a", options).expect("commit");
+
+    let message = git(dir.path(), &["log", "-1", "--format=%B"]);
+    assert!(
+        message.starts_with("Add a\n\nSigned-off-by: "),
+        "{message:?}"
+    );
+    assert_eq!(status(dir.path()), "");
 }
 
 #[test]

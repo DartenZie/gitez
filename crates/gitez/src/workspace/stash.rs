@@ -20,6 +20,7 @@ pub enum StashFormEvent {
 }
 
 /// What a filled-in form asks for.
+#[derive(Debug, Clone)]
 pub struct StashRequest {
     /// `None` for git's own "WIP on …".
     pub message: Option<String>,
@@ -234,6 +235,16 @@ impl Workspace {
         };
         let request = form.read(cx).submit(cx);
         window.close_dialog(cx);
+        self.stash(request, window, cx);
+    }
+
+    /// Stashes the uncommitted changes as `request` says.
+    pub(super) fn stash(
+        &mut self,
+        request: StashRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.run_git(
             Some("Stash changes".to_owned()),
             move |git| git.stash(request.message.as_deref(), request.untracked),
