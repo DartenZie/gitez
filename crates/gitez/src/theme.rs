@@ -4,6 +4,12 @@
 //! writing hex literals. [`init`] projects the same tokens onto the gpui-kit
 //! theme so that its widgets (buttons, lists, scrollbars, menus) match.
 
+use std::sync::Arc;
+
+use gitez_highlight::TokenKind;
+use gpui_kit::component::highlighter::{
+    FontStyle as SyntaxFontStyle, FontWeightContent, SyntaxColors, ThemeStyle,
+};
 use gpui_kit::component::theme::{Theme, ThemeColor, ThemeMode};
 use gpui_kit::*;
 
@@ -157,6 +163,26 @@ pub mod color {
     /// The selected file in a review's file list.
     pub const FILE_ACTIVE: u32 = BUTTON;
 
+    /// Syntax colours of code on the dark diff card, for its text only:
+    /// a diff's added and removed tints stay behind them. Built from the
+    /// branch colours and the accent, with strings in a sage green and
+    /// numbers in a soft orange that neither diff tint uses.
+    pub const SYNTAX_KEYWORD: u32 = BRANCH_VIOLET;
+    pub const SYNTAX_FUNCTION: u32 = BRANCH_BLUE;
+    pub const SYNTAX_TYPE: u32 = BRANCH_TEAL;
+    pub const SYNTAX_STRING: u32 = 0xb8_cf_8b;
+    pub const SYNTAX_ESCAPE: u32 = ACCENT_HOVER;
+    /// Numbers and named constants.
+    pub const SYNTAX_NUMBER: u32 = 0xe8_9a_6c;
+    /// Comments, dimmer than any code; operators and punctuation keep the
+    /// code's text colour, so nothing else is this grey.
+    pub const SYNTAX_COMMENT: u32 = TEXT_FAINT;
+    /// Fields and keys, a lighter tint of the functions' blue.
+    pub const SYNTAX_PROPERTY: u32 = 0xa9_cf_f7;
+    /// Attributes, preprocessor directives and markup headings.
+    pub const SYNTAX_ATTRIBUTE: u32 = ACCENT;
+    pub const SYNTAX_TAG: u32 = BRANCH_BLUE;
+
     /// The uncommitted-changes row of the history.
     pub const WORKING_TREE_TEXT: u32 = REMOTE_LABEL_TEXT;
     /// Text on the small HEAD badge, which takes the branch colour.
@@ -229,10 +255,99 @@ pub fn init(cx: &mut App) {
         if let Some(family) = mono_font {
             theme.mono_font_family = family.into();
         }
+        // The code editor's highlighting, in the same colours as diffs.
+        let mut highlight = (*theme.highlight_theme).clone();
+        highlight.style.syntax = syntax_colors();
+        theme.highlight_theme = Arc::new(highlight);
         theme.radius = RADIUS;
         theme.radius_lg = px(8.);
         theme.shadow = false;
     });
+}
+
+/// The colour (and slant or weight) of a token of `kind` in code views.
+/// Variables, operators and punctuation keep the text colour.
+pub fn syntax_style(kind: TokenKind) -> HighlightStyle {
+    let (hex, style) = syntax(kind);
+    HighlightStyle {
+        color: hex.map(|hex| rgb(hex).into()),
+        font_style: (style == Some(SyntaxFontStyle::Italic)).then_some(FontStyle::Italic),
+        font_weight: (kind == TokenKind::Heading).then_some(FontWeight::SEMIBOLD),
+        underline: (style == Some(SyntaxFontStyle::Underline)).then(|| UnderlineStyle {
+            thickness: px(1.),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// The colour and font style of each token kind, shared by the diff views
+/// and the code editor.
+fn syntax(kind: TokenKind) -> (Option<u32>, Option<SyntaxFontStyle>) {
+    use color::*;
+    match kind {
+        TokenKind::Comment => (Some(SYNTAX_COMMENT), Some(SyntaxFontStyle::Italic)),
+        TokenKind::Keyword => (Some(SYNTAX_KEYWORD), None),
+        TokenKind::Preprocessor | TokenKind::Attribute | TokenKind::Heading => {
+            (Some(SYNTAX_ATTRIBUTE), None)
+        }
+        TokenKind::String => (Some(SYNTAX_STRING), None),
+        TokenKind::Escape => (Some(SYNTAX_ESCAPE), None),
+        TokenKind::Number | TokenKind::Constant => (Some(SYNTAX_NUMBER), None),
+        TokenKind::Type => (Some(SYNTAX_TYPE), None),
+        TokenKind::Function => (Some(SYNTAX_FUNCTION), None),
+        TokenKind::Variable | TokenKind::Operator | TokenKind::Punctuation => (None, None),
+        TokenKind::Property => (Some(SYNTAX_PROPERTY), None),
+        TokenKind::Tag => (Some(SYNTAX_TAG), None),
+        TokenKind::Link => (Some(SYNTAX_FUNCTION), Some(SyntaxFontStyle::Underline)),
+    }
+}
+
+/// The token colours as gpui-kit's code editor reads them.
+fn syntax_colors() -> SyntaxColors {
+    // A kind without a colour keeps the editor's text colour.
+    let style = |kind: TokenKind| {
+        let (hex, font_style) = syntax(kind);
+        Some(ThemeStyle {
+            color: Some(rgb(hex?).into()),
+            font_style,
+            font_weight: (kind == TokenKind::Heading).then_some(FontWeightContent::Semibold),
+        })
+    };
+    SyntaxColors {
+        attribute: style(TokenKind::Attribute),
+        boolean: style(TokenKind::Constant),
+        comment: style(TokenKind::Comment),
+        comment_doc: style(TokenKind::Comment),
+        constant: style(TokenKind::Constant),
+        constructor: style(TokenKind::Type),
+        enum_: style(TokenKind::Type),
+        function: style(TokenKind::Function),
+        keyword: style(TokenKind::Keyword),
+        label: style(TokenKind::Attribute),
+        link_text: style(TokenKind::Link),
+        link_uri: style(TokenKind::Link),
+        number: style(TokenKind::Number),
+        operator: style(TokenKind::Operator),
+        preproc: style(TokenKind::Preprocessor),
+        property: style(TokenKind::Property),
+        punctuation: style(TokenKind::Punctuation),
+        punctuation_bracket: style(TokenKind::Punctuation),
+        punctuation_delimiter: style(TokenKind::Punctuation),
+        punctuation_list_marker: style(TokenKind::Punctuation),
+        punctuation_special: style(TokenKind::Punctuation),
+        string: style(TokenKind::String),
+        string_escape: style(TokenKind::Escape),
+        string_regex: style(TokenKind::String),
+        string_special: style(TokenKind::String),
+        string_special_symbol: style(TokenKind::Constant),
+        tag: style(TokenKind::Tag),
+        title: style(TokenKind::Heading),
+        type_: style(TokenKind::Type),
+        variable: style(TokenKind::Variable),
+        variant: style(TokenKind::Constant),
+        ..SyntaxColors::default()
+    }
 }
 
 /// Maps the GitEZ tokens onto the gpui-kit colour slots its widgets read.

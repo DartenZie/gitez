@@ -4,6 +4,7 @@
 mod branch;
 mod changes;
 mod cherry_pick;
+mod code;
 mod conflicts;
 mod detail;
 mod graph;

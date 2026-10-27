@@ -107,6 +107,10 @@ pub struct Hunk {
     /// The file the hunk's new lines are from, to show the unchanged lines
     /// around it; `None` when there is none, as for a deleted file.
     pub new_side: Option<NewSide>,
+    /// The file the hunk's old lines are from, to highlight them whole;
+    /// `None` when there is none, as for an added file, a symlink or a
+    /// submodule.
+    pub old_side: Option<LineSource>,
 }
 
 /// The new version of a file a hunk is from.
@@ -402,7 +406,14 @@ impl Repository {
                     (id, old_kind, old_path),
                     (null, worktree_kind, &file.path),
                 )?;
-                prepared_content(&mut worktree_cache, &mut budget, options, on_disk)?
+                let head_blob = blob_source(head);
+                prepared_content(
+                    &mut worktree_cache,
+                    &mut budget,
+                    options,
+                    head_blob,
+                    on_disk,
+                )?
             } else {
                 let staged = match &file.staged {
                     Some(_) => {
@@ -414,11 +425,13 @@ impl Repository {
                             (old_id, old_kind, old_path),
                             (new_id, new_kind, &file.path),
                         )?;
-                        let staged_blob = indexed
-                            .filter(|&(_, kind)| kind != EntryKind::Link)
-                            .map(|(id, _)| LineSource::Blob(id));
-                        let content =
-                            prepared_content(&mut staged_cache, &mut budget, options, staged_blob)?;
+                        let content = prepared_content(
+                            &mut staged_cache,
+                            &mut budget,
+                            options,
+                            blob_source(head),
+                            blob_source(indexed),
+                        )?;
                         let patchable = head.is_some() && indexed.is_some();
                         Some(with_staging(content, Some(Staging::Staged), patchable))
                     }
@@ -437,6 +450,7 @@ impl Repository {
                             &mut worktree_cache,
                             &mut budget,
                             options,
+                            blob_source(indexed),
                             on_disk.clone(),
                         )?;
                         let patchable = indexed.is_some() && metadata.is_some();
@@ -461,18 +475,30 @@ impl Repository {
     /// The lines of the file stored at `source`, without line endings, as
     /// numbered in a diff.
     pub fn lines(&self, source: &LineSource) -> Result<Vec<String>> {
-        let data = match source {
-            LineSource::Blob(id) => self.local().find_object(*id)?.detach().data,
-            LineSource::WorkingTree(path) => {
-                let path = self.work_dir().unwrap_or(self.git_dir()).join(path);
-                std::fs::read(&path).map_err(|source| Error::ReadFile { path, source })?
-            }
-        };
+        let data = self.source_bytes(source)?;
         Ok(data
             .lines()
             .map(|line| line.to_str_lossy().into_owned())
             .collect())
     }
+
+    /// The contents of the file stored at `source`, as they are.
+    pub fn source_bytes(&self, source: &LineSource) -> Result<Vec<u8>> {
+        Ok(match source {
+            LineSource::Blob(id) => self.local().find_object(*id)?.detach().data,
+            LineSource::WorkingTree(path) => {
+                let path = self.work_dir().unwrap_or(self.git_dir()).join(path);
+                std::fs::read(&path).map_err(|source| Error::ReadFile { path, source })?
+            }
+        })
+    }
+}
+
+/// Where an index or tree entry's file is stored, unless it is a symlink.
+fn blob_source(entry: Option<(Oid, EntryKind)>) -> Option<LineSource> {
+    entry
+        .filter(|&(_, kind)| kind != EntryKind::Link)
+        .map(|(id, _)| LineSource::Blob(id))
 }
 
 /// Sets the old and new side of the next diff in `cache`: object id, kind
@@ -567,20 +593,37 @@ fn content(
         return Ok(DiffContent::Unchanged);
     }
     change.diff(cache)?;
-    let source = match change {
+    let new_source = match change {
         Change::Deletion { .. } => None,
         _ if change.entry_mode().is_link() => None,
         _ => Some(LineSource::Blob(change.id().detach())),
     };
-    prepared_content(cache, budget, options, source)
+    let old_source = match change {
+        Change::Addition { .. } => None,
+        Change::Deletion { id, entry_mode, .. } => entry_mode.is_blob().then(|| id.detach()),
+        Change::Modification {
+            previous_id,
+            previous_entry_mode,
+            ..
+        } => previous_entry_mode.is_blob().then(|| previous_id.detach()),
+        Change::Rewrite {
+            source_id,
+            source_entry_mode,
+            ..
+        } => source_entry_mode.is_blob().then(|| source_id.detach()),
+    }
+    .map(LineSource::Blob);
+    prepared_content(cache, budget, options, old_source, new_source)
 }
 
 /// The diff of the two resources set in `cache`, using at most `budget`
-/// lines. The new resource is stored at `new_source`, if anywhere.
+/// lines. The old and new resources are stored at `old_source` and
+/// `new_source`, if anywhere.
 fn prepared_content(
     cache: &mut gix::diff::blob::Platform,
     budget: &mut usize,
     options: DiffOptions,
+    old_source: Option<LineSource>,
     new_source: Option<LineSource>,
 ) -> Result<DiffContent> {
     cache.options.skip_internal_diff_if_external_is_configured = false;
@@ -624,6 +667,7 @@ fn prepared_content(
                         source,
                         lines: input.after.len() as u32,
                     });
+                    hunk.old_side = old_source.clone();
                     hunk
                 })
                 .collect::<Vec<_>>();
@@ -730,6 +774,7 @@ impl ConsumeHunk for Hunks {
             // Set for uncommitted changes, where it matters.
             patchable: exact,
             new_side: None,
+            old_side: None,
         });
         Ok(())
     }

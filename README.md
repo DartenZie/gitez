@@ -73,6 +73,12 @@ tree, so it cannot be committed or pushed by accident. Linked worktrees share it
   pull, push, fetch, set upstreams, revert and reset.
 - **Undo and redo** for most actions: commits, checkouts, merges, rebases,
   resets, stashes, discarded changes and more.
+- **Syntax highlighting** in diffs, the conflict editor and the file editor,
+  for about 200 languages (bat's grammars on syntect). Whole files are
+  highlighted, so multi-line strings and comments are coloured right; in a
+  diff of a file over 1 MB, each hunk is highlighted on its own. In diffs and
+  the conflict editor, binary files and lines over 2,000 bytes stay plain, and
+  a conflicted file over 1 MB is not highlighted.
 - **Command palette** (`⌘K`): find actions, commits, branches and files, or
   run any `git` command and see its output stream in.
 - **Clone or create** a repository from the start screen, the File menu or the palette.
@@ -213,6 +219,7 @@ cargo run --release -p gitez-git --example history -- <path-to-repository>
 | `crates/gitez-command` | Changes made with the user's `git` binary: staging, committing, merging, cherry-picking, rebasing, remotes, cloning |
 | `crates/gitez-review` | Local pull requests, comment threads and agent transcripts in `.git/gitez/reviews` |
 | `crates/gitez-agent` | Coding agents: Claude Code run as `claude -p` with its streamed events parsed, and test command detection |
+| `crates/gitez-highlight` | Syntax highlighting without GPUI: language detection and per-line token spans from syntect and bat's grammars |
 
 The UI uses [gpui-kit](https://gpui-kit.com), which pins the matching GPUI
 release. [CLAUDE.md](CLAUDE.md) describes the architecture decisions, the

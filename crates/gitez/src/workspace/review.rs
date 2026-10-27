@@ -15,6 +15,7 @@ use gitez_git::{
     Followed, Hunk, LineKind, LineSource, Oid, RefKind, RefLabel, Repository, Staging,
     WorkingTreeStatus, WorktreeChange,
 };
+use gitez_highlight::{Highlights, Language, Outcome, Span};
 use gitez_review::{FileUpdate, LineChange, PullRequest, State, Store, Timestamp};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::*;
@@ -32,7 +33,7 @@ pub(crate) use merge::{MergeDialog, MergeEvent, MergedPullRequest, Merging, reco
 mod prompt;
 mod threads;
 
-use super::labels;
+use super::{code, labels};
 use crate::theme::{self, color};
 use crate::undo::{self, Discard, Recorded, Recorder};
 
@@ -89,8 +90,6 @@ const LINE_HEIGHT: Pixels = px(21.);
 const CARD_GAP: Pixels = px(18.);
 /// Rows rendered beyond the visible ones, so fast scrolling stays smooth.
 const OVERDRAW: Pixels = px(600.);
-/// Spaces a tab is shown as.
-const TAB: &str = "    ";
 
 /// A row of the diff list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,10 +343,34 @@ pub struct Review {
     sources: HashMap<LineSource, Arc<Vec<String>>>,
     /// Why reading the lines of a file failed.
     sources_error: Option<SharedString>,
+    /// Syntax highlighting of the versions of files shown, by where each
+    /// is stored and then by the path it is shown at, which picks the
+    /// language; `None` for a version that stays plain. Filled in the
+    /// background, the files nearest the one shown first.
+    highlights: HashMap<LineSource, HashMap<String, Option<Arc<Highlights>>>>,
     /// The file to scroll to once the diff is read.
     pending_file: Option<String>,
     _load: Task<()>,
     _load_sources: Task<()>,
+    _highlight: Task<()>,
+}
+
+/// Which version of a file a hunk's lines are from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Version {
+    /// The removed lines'.
+    Old,
+    /// The added and unchanged lines'.
+    New,
+}
+
+/// A version of a file to highlight.
+struct HighlightJob {
+    /// The index of the file in the diff.
+    file: usize,
+    /// Its path in that version, which picks the language.
+    path: String,
+    source: LineSource,
 }
 
 impl EventEmitter<ReviewEvent> for Review {}
@@ -629,9 +652,11 @@ impl Review {
             expanded: HashMap::new(),
             sources: HashMap::new(),
             sources_error: None,
+            highlights: HashMap::new(),
             pending_file: None,
             _load: load,
             _load_sources: Task::ready(()),
+            _highlight: Task::ready(()),
         }
     }
 
@@ -684,6 +709,7 @@ impl Review {
                     .retain(|source, _| matches!(source, LineSource::Blob(_)));
                 self.rebuild_rows(anchor, cx);
                 self.load_sources(cx);
+                self.load_highlights(cx);
                 if let Some(path) = self.pending_file.take() {
                     self.show_file(path, cx);
                 }
@@ -888,6 +914,127 @@ impl Review {
             })
             .ok();
         });
+    }
+
+    /// Highlights, in the background, the versions of the files shown that
+    /// are not highlighted yet, then shows them coloured. Files in the
+    /// working tree are highlighted again, since they may have changed;
+    /// until then their old colours stay, on the lines still as long.
+    fn load_highlights(&mut self, cx: &mut Context<Self>) {
+        let Some(Ok(files)) = &self.files else {
+            return;
+        };
+        let files = files.clone();
+        let mut jobs = Vec::new();
+        let mut shown = HashSet::new();
+        for (index, file) in files.iter().enumerate() {
+            let DiffContent::Text(hunks) = &file.content else {
+                continue;
+            };
+            for hunk in hunks {
+                let sides = [
+                    (hunk.old_side.as_ref(), old_path(file)),
+                    (
+                        hunk.new_side.as_ref().map(|side| &side.source),
+                        file.path.as_str(),
+                    ),
+                ];
+                for (source, path) in sides {
+                    let Some(source) = source else {
+                        continue;
+                    };
+                    let stale = matches!(source, LineSource::WorkingTree(_))
+                        || !self
+                            .highlights
+                            .get(source)
+                            .is_some_and(|paths| paths.contains_key(path));
+                    if shown.insert((source.clone(), path.to_owned())) && stale {
+                        jobs.push(HighlightJob {
+                            file: index,
+                            path: path.to_owned(),
+                            source: source.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        // Files no longer in the diff; blobs cannot change, so they stay
+        // in case they come back.
+        self.highlights.retain(|source, paths| {
+            if !matches!(source, LineSource::Blob(_)) {
+                paths.retain(|path, _| shown.contains(&(source.clone(), path.clone())));
+            }
+            !paths.is_empty()
+        });
+        if jobs.is_empty() {
+            // A run still going is for files no longer shown.
+            self._highlight = Task::ready(());
+            return;
+        }
+        let repository = self.repository.clone();
+        self._highlight = cx.spawn(async move |this, cx| {
+            let parallel = std::thread::available_parallelism()
+                .map_or(1, |threads| threads.get())
+                .min(4);
+            while !jobs.is_empty() {
+                let Ok(current) = this.update(cx, |this, _| this.current_file) else {
+                    return;
+                };
+                // The nearest files last, to be taken first.
+                jobs.sort_by_key(|job| std::cmp::Reverse(job.file.abs_diff(current)));
+                let batch = jobs.split_off(jobs.len().saturating_sub(parallel));
+                let tasks: Vec<_> = batch
+                    .into_iter()
+                    .map(|job| {
+                        let (repository, files) = (repository.clone(), files.clone());
+                        cx.background_executor().spawn(async move {
+                            let highlights = highlight(&repository, &files, &job);
+                            (job.source, job.path, highlights)
+                        })
+                    })
+                    .collect();
+                let done = futures::future::join_all(tasks).await;
+                let updated = this.update(cx, |this, cx| {
+                    for (source, path, highlights) in done {
+                        this.highlights
+                            .entry(source)
+                            .or_default()
+                            .insert(path, highlights);
+                    }
+                    cx.notify();
+                });
+                if updated.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// The syntax spans of `line` of `hunk` of `file`: a removed line's
+    /// from the old file, the others' from the new one.
+    fn line_spans(&self, file: &FileDiff, hunk: &Hunk, line: &DiffLine) -> Option<&[Span]> {
+        let (source, number, version) = line_source(hunk, line)?;
+        let path = match version {
+            Version::Old => old_path(file),
+            Version::New => &file.path,
+        };
+        self.source_spans(source, path, number, &line.text)
+    }
+
+    /// The syntax spans of line `number` of the file at `source`, shown at
+    /// `path`, which reads `text`.
+    fn source_spans(
+        &self,
+        source: &LineSource,
+        path: &str,
+        number: u32,
+        text: &str,
+    ) -> Option<&[Span]> {
+        self.highlights
+            .get(source)?
+            .get(path)?
+            .as_ref()?
+            .line(number, text)
     }
 
     /// Whether this reviews a local pull request, whose files can be
@@ -1489,19 +1636,19 @@ impl Review {
                 let DiffContent::Text(hunks) = &files[file].content else {
                     return div().into_any_element();
                 };
-                diff_line(&hunks[hunk].lines[line], mono).into_any_element()
+                let (hunk, line) = (&hunks[hunk], &hunks[hunk].lines[line]);
+                diff_line(line, self.line_spans(&files[file], hunk, line), mono).into_any_element()
             }
             Some(Row::Pair(file, hunk, old, new)) => {
                 let DiffContent::Text(hunks) = &files[file].content else {
                     return div().into_any_element();
                 };
-                let lines = &hunks[hunk].lines;
-                split_line(
-                    old.and_then(|old| lines.get(old)),
-                    new.and_then(|new| lines.get(new)),
-                    mono,
-                )
-                .into_any_element()
+                let hunk = &hunks[hunk];
+                let side = |index: Option<usize>| {
+                    let line = hunk.lines.get(index?)?;
+                    Some((line, self.line_spans(&files[file], hunk, line)))
+                };
+                split_line(side(old), side(new), mono).into_any_element()
             }
             Some(Row::Gap(file, at)) => {
                 let DiffContent::Text(hunks) = &files[file].content else {
@@ -1553,6 +1700,7 @@ impl Review {
                     .and_then(|lines| lines.get(new as usize - 1))
                     .cloned()
                     .unwrap_or_default();
+                let spans = self.source_spans(&side.source, &files[file].path, new, &text);
                 let line = DiffLine {
                     kind: LineKind::Context,
                     old: Some(gap.old + line),
@@ -1562,9 +1710,10 @@ impl Review {
                     no_newline: false,
                 };
                 match ReviewSettings::get(cx).layout {
-                    DiffLayout::Unified => diff_line(&line, mono).into_any_element(),
+                    DiffLayout::Unified => diff_line(&line, spans, mono).into_any_element(),
                     DiffLayout::Split => {
-                        split_line(Some(&line), Some(&line), mono).into_any_element()
+                        split_line(Some((&line, spans)), Some((&line, spans)), mono)
+                            .into_any_element()
                     }
                 }
             }
@@ -2598,8 +2747,106 @@ fn file_header(
         })
 }
 
-/// One line of a diff: old and new line numbers, `+` or `−`, and the text.
-fn diff_line(line: &DiffLine, mono: SharedString) -> impl IntoElement {
+/// The version of a file `line` of `hunk` is highlighted in, its number
+/// there, and which version that is: a removed line's is the old file, the
+/// others' the new one.
+fn line_source<'a>(hunk: &'a Hunk, line: &DiffLine) -> Option<(&'a LineSource, u32, Version)> {
+    let new = hunk.new_side.as_ref().map(|side| &side.source);
+    let old = (hunk.old_side.as_ref(), line.old, Version::Old);
+    let (source, number, version) = match line.kind {
+        LineKind::Removed => old,
+        LineKind::Added => (new, line.new, Version::New),
+        // A context line is the same in both; the new file is the one gaps
+        // are filled from.
+        LineKind::Context => match new {
+            Some(new) => (Some(new), line.new, Version::New),
+            None => old,
+        },
+    };
+    Some((source?, number?, version))
+}
+
+/// The path of `file` before the change, which differs from its path for a
+/// renamed or copied file.
+fn old_path(file: &FileDiff) -> &str {
+    match &file.kind {
+        ChangeKind::Renamed { from } | ChangeKind::Copied { from } => from,
+        _ => &file.path,
+    }
+}
+
+/// The syntax highlighting of `job`'s version of a file: of the whole file,
+/// or when it is too large or cannot be read, of the lines its hunks show
+/// of it, as the old side of some and the new side of others. `None` when
+/// it stays plain. Blocks; run it in the background.
+fn highlight(
+    repository: &Repository,
+    files: &[FileDiff],
+    job: &HighlightJob,
+) -> Option<Arc<Highlights>> {
+    if let Ok(bytes) = repository.source_bytes(&job.source) {
+        // Bytes skipped as binary may still diff as text, decoded by a
+        // filter, so those fall back to the hunks' lines too.
+        match gitez_highlight::highlight_file(&job.path, &bytes) {
+            Outcome::Highlighted(highlights) => return Some(highlights),
+            Outcome::Plain => return None,
+            Outcome::Skipped => {}
+        }
+    }
+    let DiffContent::Text(hunks) = &files.get(job.file)?.content else {
+        return None;
+    };
+    // The file's lines by number; a line two hunks show is taken once.
+    let mut lines = std::collections::BTreeMap::<u32, &str>::new();
+    for hunk in hunks {
+        let sides = [
+            (hunk.old_side.as_ref(), Version::Old),
+            (
+                hunk.new_side.as_ref().map(|side| &side.source),
+                Version::New,
+            ),
+        ];
+        for (source, version) in sides {
+            if source != Some(&job.source) {
+                continue;
+            }
+            for line in &hunk.lines {
+                let number = match version {
+                    Version::Old => line.old,
+                    Version::New => line.new,
+                };
+                if let Some(number) = number {
+                    lines.entry(number).or_insert(&line.text);
+                }
+            }
+        }
+    }
+    // Consecutive numbers make one run.
+    let mut runs: Vec<(u32, Vec<&str>)> = Vec::new();
+    for (number, text) in lines {
+        match runs.last_mut() {
+            Some((first, run))
+                if u32::try_from(run.len())
+                    .is_ok_and(|len| first.checked_add(len) == Some(number)) =>
+            {
+                run.push(text);
+            }
+            _ => runs.push((number, vec![text])),
+        }
+    }
+    // Only a run from the top of the file has its first line.
+    let first_line = runs
+        .first()
+        .filter(|(first, _)| *first == 1)
+        .and_then(|(_, lines)| lines.first().copied())
+        .unwrap_or_default();
+    let language = Language::detect(&job.path, first_line)?;
+    Some(Arc::new(gitez_highlight::highlight_runs(language, runs)))
+}
+
+/// One line of a diff: old and new line numbers, `+` or `−`, and the text,
+/// coloured by its syntax `spans` if it has them.
+fn diff_line(line: &DiffLine, spans: Option<&[Span]>, mono: SharedString) -> impl IntoElement {
     let (sign, tint) = line_style(line.kind);
     card_row()
         .h(LINE_HEIGHT)
@@ -2609,15 +2856,15 @@ fn diff_line(line: &DiffLine, mono: SharedString) -> impl IntoElement {
         .child(line_number(line.old, tint))
         .child(line_number(line.new, tint))
         .child(line_sign(sign, tint))
-        .child(line_text(line))
+        .child(line_text(line, spans))
         .when(line.no_newline, |this| this.child(no_newline_note()))
 }
 
 /// A row of the split layout: the `old` side of a line on the left, the
-/// `new` side of a line on the right.
+/// `new` side of a line on the right, each with its syntax spans.
 fn split_line(
-    old: Option<&DiffLine>,
-    new: Option<&DiffLine>,
+    old: Option<(&DiffLine, Option<&[Span]>)>,
+    new: Option<(&DiffLine, Option<&[Span]>)>,
     mono: SharedString,
 ) -> impl IntoElement {
     card_row()
@@ -2636,16 +2883,19 @@ fn split_line(
 }
 
 /// One side of a split row, numbered by `number`; blank without a line.
-fn split_half(line: Option<&DiffLine>, number: fn(&DiffLine) -> Option<u32>) -> Div {
+fn split_half(
+    line: Option<(&DiffLine, Option<&[Span]>)>,
+    number: fn(&DiffLine) -> Option<u32>,
+) -> Div {
     let half = div().h_flex().flex_1().min_w_0().h_full();
-    let Some(line) = line else {
+    let Some((line, spans)) = line else {
         return half.bg(rgb(color::DIFF_FILE_HEADER));
     };
     let (sign, tint) = line_style(line.kind);
     half.when_some(tint, |this, tint| this.bg(theme::with_alpha(tint, 0.10)))
         .child(line_number(number(line), tint))
         .child(line_sign(sign, tint))
-        .child(line_text(line))
+        .child(line_text(line, spans))
         .when(line.no_newline, |this| this.child(no_newline_note()))
 }
 
@@ -2679,7 +2929,7 @@ fn line_sign(sign: &'static str, tint: Option<u32>) -> Div {
         .child(sign)
 }
 
-fn line_text(line: &DiffLine) -> Div {
+fn line_text(line: &DiffLine, spans: Option<&[Span]>) -> Div {
     div()
         .flex_1()
         .min_w_0()
@@ -2690,7 +2940,7 @@ fn line_text(line: &DiffLine) -> Div {
         .text_color(rgb(color::DIFF_TEXT))
         // A carriage return is shown only as part of the text when no
         // newline follows it.
-        .child(line.text.trim_end_matches('\r').replace('\t', TAB))
+        .child(code::styled_code(&line.text, spans))
 }
 
 fn no_newline_note() -> Div {
@@ -2797,7 +3047,9 @@ mod tests {
         ChangeKind, DiffContent, DiffLine, FileDiff, Hunk, LineKind, LineSource, NewSide, Staging,
     };
 
-    use super::{DiffLayout, Gap, GapAt, Row, fingerprint, gap, rows, split_pairs};
+    use super::{
+        DiffLayout, Gap, GapAt, Row, Version, fingerprint, gap, line_source, rows, split_pairs,
+    };
 
     fn line(kind: LineKind, text: &str) -> DiffLine {
         DiffLine {
@@ -2820,6 +3072,7 @@ mod tests {
             staging: Some(staging),
             patchable: true,
             new_side: None,
+            old_side: None,
         }
     }
 
@@ -2847,7 +3100,121 @@ mod tests {
                 source: LineSource::WorkingTree(format!("{staged}")),
                 lines,
             }),
+            old_side: None,
         }
+    }
+
+    #[test]
+    fn removed_lines_are_highlighted_in_the_old_file_and_others_in_the_new() {
+        let old = LineSource::Blob(
+            gitez_git::Oid::from_hex(b"1111111111111111111111111111111111111111").expect("an id"),
+        );
+        let new = LineSource::WorkingTree("a.rs".to_owned());
+        let hunk = Hunk {
+            old_side: Some(old.clone()),
+            ..ranged((3, 2), (3, 2), false, 9)
+        };
+        let hunk = Hunk {
+            new_side: hunk.new_side.map(|side| NewSide {
+                source: new.clone(),
+                ..side
+            }),
+            ..hunk
+        };
+        let numbered = |kind, old, new| DiffLine {
+            old,
+            new,
+            ..line(kind, "x")
+        };
+        assert_eq!(
+            line_source(&hunk, &numbered(LineKind::Removed, Some(3), None)),
+            Some((&old, 3, Version::Old))
+        );
+        assert_eq!(
+            line_source(&hunk, &numbered(LineKind::Added, None, Some(4))),
+            Some((&new, 4, Version::New))
+        );
+        assert_eq!(
+            line_source(&hunk, &numbered(LineKind::Context, Some(5), Some(6))),
+            Some((&new, 6, Version::New))
+        );
+        // A deleted file has only its old version.
+        let deleted = Hunk {
+            new_side: None,
+            ..hunk.clone()
+        };
+        assert_eq!(
+            line_source(&deleted, &numbered(LineKind::Context, Some(5), None)),
+            Some((&old, 5, Version::Old))
+        );
+        assert_eq!(
+            line_source(&deleted, &numbered(LineKind::Added, None, Some(4))),
+            None
+        );
+    }
+
+    #[gpui_kit::test]
+    fn changed_files_are_highlighted_in_the_background(cx: &mut gpui_kit::TestAppContext) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("run git");
+            assert!(output.status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("a.rs"), "fn old() {}\n/* a\n   b */\n").expect("write");
+        git(&["add", "."]);
+        git(&["commit", "-qm", "start"]);
+        std::fs::write(root.join("a.rs"), "fn new() {}\n/* a\n   b */\n").expect("write");
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+        });
+        let repository = gitez_git::Repository::open(root).expect("open repository");
+        let status = std::sync::Arc::new(repository.status().expect("status"));
+        let window = cx.open_window(
+            gpui_kit::size(gpui_kit::px(1000.), gpui_kit::px(800.)),
+            |_, cx| super::Review::working_tree(&repository, status, None, cx),
+        );
+        let review = window
+            .update(cx, |_, _, cx| cx.entity())
+            .expect("window open");
+        let cx = gpui_kit::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+
+        review.read_with(&cx, |review, _| {
+            let Some(Ok(files)) = &review.files else {
+                panic!("the diff is read");
+            };
+            let DiffContent::Text(hunks) = &files[0].content else {
+                panic!("a text diff");
+            };
+            let hunk = &hunks[0];
+            let kinds = |line: &DiffLine| {
+                review
+                    .line_spans(&files[0], hunk, line)
+                    .map(|spans| spans.iter().map(|span| span.kind).collect::<Vec<_>>())
+            };
+            // `fn` is a keyword in both versions, and the comment's second
+            // line, unchanged, is a comment because the whole file is read.
+            for line in &hunk.lines {
+                let kinds = kinds(line).expect("every line is highlighted");
+                match line.text.as_str() {
+                    "fn old() {}" | "fn new() {}" => {
+                        assert_eq!(kinds.first(), Some(&gitez_highlight::TokenKind::Keyword))
+                    }
+                    "   b */" => assert_eq!(kinds, [gitez_highlight::TokenKind::Comment]),
+                    _ => {}
+                }
+            }
+            assert!(hunk.lines.iter().any(|line| line.kind == LineKind::Removed));
+        });
     }
 
     #[test]

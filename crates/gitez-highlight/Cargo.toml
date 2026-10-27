@@ -1,0 +1,17 @@
+[package]
+name = "gitez-highlight"
+description = "Syntax highlighting for GitEZ's code views: language detection and per-line token spans from syntect and bat's grammars, without GPUI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+syntect.workspace = true
+two-face.workspace = true
+
+[lints]
+workspace = true

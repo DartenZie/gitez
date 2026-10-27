@@ -57,16 +57,36 @@ impl FileEditForm {
             }
         });
         let file = git.work_dir().join(&path);
+        let detect_path = path.clone();
         let load = cx.spawn_in(window, async move |this, cx| {
+            // The grammar is picked here too, off the UI thread. The editor
+            // has its own copy of the grammars, which gpui-kit keeps private
+            // and loads on the UI thread when `set_highlighter` first runs:
+            // a one-off pause of tens of milliseconds it gives no way to
+            // move off it.
             let read = cx
                 .background_executor()
-                .spawn(async move { std::fs::read(&file) })
+                .spawn(async move {
+                    let bytes = std::fs::read(&file)?;
+                    let first_line = bytes
+                        .split(|&byte| byte == b'\n')
+                        .next()
+                        .unwrap_or_default();
+                    let language = gitez_highlight::Language::detect(
+                        &detect_path,
+                        &String::from_utf8_lossy(first_line),
+                    );
+                    std::io::Result::Ok((bytes, language))
+                })
                 .await;
             this.update_in(cx, |this, window, cx| {
                 this.loaded = Some(match read {
-                    Ok(bytes) => match String::from_utf8(bytes) {
+                    Ok((bytes, language)) => match String::from_utf8(bytes) {
                         Ok(text) => {
                             this.editor.update(cx, |editor, cx| {
+                                if let Some(language) = language {
+                                    editor.set_highlighter(language.editor_token(), cx);
+                                }
                                 editor.set_value(text, window, cx);
                                 editor.focus(window, cx);
                             });

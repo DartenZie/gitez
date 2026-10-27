@@ -3,10 +3,12 @@
 //! conflict with our and their lines side by side, ticking lines into the
 //! result or editing it, then committing the merge or giving it up.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use gitez_command::{Git, ResetMode, Side};
 use gitez_git::{Conflict, ConflictFile, MergeInProgress, Repository, Segment, WorktreeChange};
+use gitez_highlight::{Highlights, Span};
 use gitez_review::{PullRequest, State, Store};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::*;
@@ -17,6 +19,7 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::code;
 use crate::theme::{self, color};
 use crate::undo::{self, Recorder};
 
@@ -67,20 +70,22 @@ impl Resolution {
         }
     }
 
-    /// The conflict's lines in the result, and where each comes from.
-    fn lines(&self, conflict: &Conflict) -> Vec<(String, Source)> {
+    /// The conflict's lines in the result, where each comes from, and its
+    /// index in that side's lines of the conflict; typed lines have none.
+    fn lines(&self, conflict: &Conflict) -> Vec<(String, Source, Option<usize>)> {
         if let Some(edited) = &self.edited {
             return edited
                 .iter()
-                .map(|line| (line.clone(), Source::Both))
+                .map(|line| (line.clone(), Source::Both, None))
                 .collect();
         }
         let pick = |lines: &[String], picked: &[bool], source| {
             lines
                 .iter()
                 .zip(picked)
-                .filter(|(_, picked)| **picked)
-                .map(|(line, _)| (line.clone(), source))
+                .enumerate()
+                .filter(|(_, (_, picked))| **picked)
+                .map(|(index, (line, _))| (line.clone(), source, Some(index)))
                 .collect::<Vec<_>>()
         };
         let ours = pick(&conflict.ours, &self.ours, Source::Ours);
@@ -123,6 +128,62 @@ impl ConflictedFile {
     }
 }
 
+/// Syntax highlighting of a conflicted file's versions, each numbered as
+/// [`starts`] numbers it; `None` for a version that stays plain.
+struct ConflictHighlights {
+    /// The clean lines and our side of every conflict.
+    ours: Option<Arc<Highlights>>,
+    /// The clean lines and their side.
+    theirs: Option<Arc<Highlights>>,
+    /// The clean lines and the common ancestor's, or ours where git did
+    /// not write it.
+    base: Option<Arc<Highlights>>,
+    /// Where each segment's lines start in the base, numbering from 1.
+    base_starts: Vec<usize>,
+}
+
+impl ConflictHighlights {
+    /// Highlights each version of `content`, at `path`. Blocks; run it in
+    /// the background.
+    fn new(path: &str, content: &ConflictFile) -> Self {
+        let version = |side: fn(&Conflict) -> &[String]| {
+            let mut text = String::new();
+            let mut starts = Vec::with_capacity(content.segments.len());
+            let mut next = 1;
+            for segment in &content.segments {
+                starts.push(next);
+                let lines: &[String] = match segment {
+                    Segment::Clean(lines) => lines,
+                    Segment::Conflict(conflict) => side(conflict),
+                };
+                next += lines.len();
+                for line in lines {
+                    text.push_str(line);
+                    text.push('\n');
+                }
+            }
+            let highlights = gitez_highlight::highlight_file(path, text.as_bytes());
+            (highlights.highlights().cloned(), starts)
+        };
+        let (ours, _) = version(|conflict| &conflict.ours);
+        let (theirs, _) = version(|conflict| &conflict.theirs);
+        let (base, base_starts) =
+            version(|conflict| conflict.base.as_deref().unwrap_or(&conflict.ours));
+        Self {
+            ours,
+            theirs,
+            base,
+            base_starts,
+        }
+    }
+}
+
+/// The syntax spans of line `number` (from 1) of a version highlighted as
+/// `highlights`, which reads `text`.
+fn spans<'a>(highlights: Option<&'a Highlights>, number: usize, text: &str) -> Option<&'a [Span]> {
+    highlights?.line(u32::try_from(number).ok()?, text)
+}
+
 /// What reading the merge found.
 struct Loaded {
     merge: MergeInProgress,
@@ -149,7 +210,11 @@ pub struct Conflicts {
     running: Option<Task<()>>,
     /// Why the last command failed.
     error: Option<SharedString>,
+    /// Syntax highlighting of the conflicted files, by path. Filled in the
+    /// background after each read.
+    highlights: HashMap<String, Arc<ConflictHighlights>>,
     _load: Task<()>,
+    _highlight: Task<()>,
 }
 
 impl EventEmitter<ConflictsEvent> for Conflicts {}
@@ -180,7 +245,9 @@ impl Conflicts {
             editing: None,
             running: None,
             error: None,
+            highlights: HashMap::new(),
             _load: Task::ready(()),
+            _highlight: Task::ready(()),
         };
         this.load(cx);
         this
@@ -199,6 +266,47 @@ impl Conflicts {
                 this.current_file = 0;
                 this.current_conflict = 0;
                 this.editing = None;
+                this.load_highlights(cx);
+                cx.notify();
+            })
+            .ok();
+        });
+    }
+
+    /// Highlights the conflicted files just read in the background, then
+    /// shows them coloured. Until then, the colours of the last read stay
+    /// on the lines that did not change.
+    fn load_highlights(&mut self, cx: &mut Context<Self>) {
+        let files: Vec<(String, ConflictFile)> = match &self.loaded {
+            Some(Ok(Some(loaded))) => loaded
+                .files
+                .iter()
+                .filter_map(|file| Some((file.path.clone(), file.content.clone()?)))
+                .collect(),
+            _ => Vec::new(),
+        };
+        self.highlights
+            .retain(|path, _| files.iter().any(|(shown, _)| shown == path));
+        if files.is_empty() {
+            // A run still going is for files that are gone.
+            self._highlight = Task::ready(());
+            return;
+        }
+        self._highlight = cx.spawn(async move |this, cx| {
+            let highlighted = cx
+                .background_executor()
+                .spawn(async move {
+                    files
+                        .into_iter()
+                        .map(|(path, content)| {
+                            let highlights = ConflictHighlights::new(&path, &content);
+                            (path, Arc::new(highlights))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.highlights.extend(highlighted);
                 cx.notify();
             })
             .ok();
@@ -276,7 +384,7 @@ impl Conflicts {
         let lines: Vec<String> = resolution
             .lines(conflict)
             .into_iter()
-            .map(|(line, _)| line)
+            .map(|(line, _, _)| line)
             .collect();
         let row = line
             .unwrap_or(usize::MAX)
@@ -346,7 +454,7 @@ impl Conflicts {
             file.resolutions[n]
                 .lines(conflicts[n])
                 .into_iter()
-                .map(|(line, _)| line)
+                .map(|(line, _, _)| line)
                 .collect()
         });
         let path = file.path.clone();
@@ -448,6 +556,7 @@ impl Conflicts {
                     loaded.map_err(|error| format!("Could not read the merge: {error:#}").into()),
                 );
                 this.editing = None;
+                this.load_highlights(cx);
                 cx.notify();
             })
             .ok();
@@ -690,8 +799,13 @@ fn pane_header() -> Div {
 }
 
 /// A line of code: a key column (a tick box or a tag), its number, its
-/// text.
-fn code_line(key: Option<AnyElement>, number: Option<usize>, text: &str) -> Div {
+/// text, coloured by its syntax `spans` if it has them.
+fn code_line(
+    key: Option<AnyElement>,
+    number: Option<usize>,
+    text: &str,
+    spans: Option<&[Span]>,
+) -> Div {
     div()
         .h_flex()
         .h(LINE_HEIGHT)
@@ -721,12 +835,7 @@ fn code_line(key: Option<AnyElement>, number: Option<usize>, text: &str) -> Div 
                 .whitespace_nowrap()
                 .text_ellipsis()
                 .text_color(rgb(color::DIFF_TEXT))
-                // An empty line keeps its height.
-                .child(if text.is_empty() {
-                    " ".to_owned()
-                } else {
-                    text.replace('\t', "    ")
-                }),
+                .child(code::styled_code(text, spans)),
         )
 }
 
@@ -1074,11 +1183,27 @@ impl Conflicts {
             Some(Segment::Clean(lines)) => &lines[..lines.len().min(CONTEXT)],
             _ => &[],
         };
-        let context_lines = |start: usize, lines: &[String]| {
+        let highlights = self.highlights.get(&file.path);
+        let ours_highlights = highlights.and_then(|highlights| highlights.ours.as_deref());
+        let theirs_highlights = highlights.and_then(|highlights| highlights.theirs.as_deref());
+        let base_highlights = highlights.and_then(|highlights| highlights.base.as_deref());
+        let base_start = highlights
+            .and_then(|highlights| highlights.base_starts.get(segment_index))
+            .copied()
+            .unwrap_or(0);
+        // Clean lines are the same on both sides, numbered on each.
+        let context_lines = |start: usize, lines: &[String], highlights: Option<&Highlights>| {
             lines
                 .iter()
                 .enumerate()
-                .map(|(i, line)| code_line(None, Some(start + i), line))
+                .map(|(i, line)| {
+                    code_line(
+                        None,
+                        Some(start + i),
+                        line,
+                        spans(highlights, start + i, line),
+                    )
+                })
                 .collect::<Vec<_>>()
         };
 
@@ -1096,6 +1221,10 @@ impl Conflicts {
                     color::BRANCH_TEAL,
                     color::HEAD_BADGE_TEXT,
                 ),
+            };
+            let highlights = match side {
+                Side::Ours => ours_highlights,
+                Side::Theirs => theirs_highlights,
             };
             lines
                 .iter()
@@ -1127,8 +1256,13 @@ impl Conflicts {
                             }
                         })
                         .on_click(cx.listener(move |this, _, _, cx| this.toggle_line(side, i, cx)));
-                    code_line(Some(tick_box.into_any_element()), Some(start + i), line)
-                        .bg(rgba(if on { strong } else { faint }))
+                    code_line(
+                        Some(tick_box.into_any_element()),
+                        Some(start + i),
+                        line,
+                        spans(highlights, start + i, line),
+                    )
+                    .bg(rgba(if on { strong } else { faint }))
                 })
                 .collect::<Vec<_>>()
         };
@@ -1154,7 +1288,11 @@ impl Conflicts {
                     .py(px(6.))
                     .font_family(mono.clone())
                     .text_size(px(12.))
-                    .children(context_lines(ours_start - before.len(), before))
+                    .children(context_lines(
+                        ours_start - before.len(),
+                        before,
+                        ours_highlights,
+                    ))
                     .children(side_lines(
                         Side::Ours,
                         &conflict.ours,
@@ -1164,7 +1302,11 @@ impl Conflicts {
                     .when(conflict.ours.is_empty(), |this| {
                         this.child(empty_side("Nothing here on this side"))
                     })
-                    .children(context_lines(ours_start + conflict.ours.len(), after)),
+                    .children(context_lines(
+                        ours_start + conflict.ours.len(),
+                        after,
+                        ours_highlights,
+                    )),
             );
         let theirs_pane = pane()
             .child(
@@ -1185,7 +1327,11 @@ impl Conflicts {
                     .py(px(6.))
                     .font_family(mono.clone())
                     .text_size(px(12.))
-                    .children(context_lines(theirs_start - before.len(), before))
+                    .children(context_lines(
+                        theirs_start - before.len(),
+                        before,
+                        theirs_highlights,
+                    ))
                     .children(side_lines(
                         Side::Theirs,
                         &conflict.theirs,
@@ -1195,7 +1341,11 @@ impl Conflicts {
                     .when(conflict.theirs.is_empty(), |this| {
                         this.child(empty_side("Nothing here on this side"))
                     })
-                    .children(context_lines(theirs_start + conflict.theirs.len(), after)),
+                    .children(context_lines(
+                        theirs_start + conflict.theirs.len(),
+                        after,
+                        theirs_highlights,
+                    )),
             );
         let base_pane = conflict.base.as_ref().filter(|_| show_base).map(|base| {
             pane()
@@ -1212,7 +1362,14 @@ impl Conflicts {
                         .py(px(6.))
                         .font_family(mono.clone())
                         .text_size(px(12.))
-                        .children(base.iter().map(|line| code_line(None, None, line)))
+                        .children(base.iter().enumerate().map(|(i, line)| {
+                            code_line(
+                                None,
+                                None,
+                                line,
+                                spans(base_highlights, base_start + i, line),
+                            )
+                        }))
                         .when(base.is_empty(), |this| {
                             this.child(empty_side("Nothing here before"))
                         }),
@@ -1222,11 +1379,11 @@ impl Conflicts {
         let result_lines = resolution.lines(conflict);
         let from_ours = result_lines
             .iter()
-            .filter(|(_, s)| *s == Source::Ours)
+            .filter(|(_, s, _)| *s == Source::Ours)
             .count();
         let from_theirs = result_lines
             .iter()
-            .filter(|(_, s)| *s == Source::Theirs)
+            .filter(|(_, s, _)| *s == Source::Theirs)
             .count();
         let state = if resolution.resolved {
             ("RESOLVED", color::DIFF_ADDED_TEXT)
@@ -1310,10 +1467,12 @@ impl Conflicts {
                     .font_family(mono.clone())
                     .text_size(px(12.))
                     .children(before.iter().enumerate().map(|(i, line)| {
+                        let ours = ours_start - before.len() + i;
                         code_line(
                             Some(tagged(Source::Both).into_any_element()),
                             Some(result_start - before.len() + i),
                             line,
+                            spans(ours_highlights, ours, line),
                         )
                     }))
                     .child(
@@ -1333,27 +1492,42 @@ impl Conflicts {
                                 .child(Textarea::new(input).font_family(mono.clone())),
                         ),
                         None => this
-                            .children(result_lines.iter().enumerate().map(|(i, (line, source))| {
-                                code_line(
-                                    Some(tagged(*source).into_any_element()),
-                                    Some(result_start + i),
-                                    line,
-                                )
-                                .id(("result-line", i))
-                                .debug_selector(move || format!("conflict-result-line-{i}"))
-                                .cursor_text()
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.edit(Some(i), window, cx)
-                                }))
-                                .bg(rgba(
-                                    match (resolution.resolved, source) {
-                                        (true, _) => color::CONFLICT_RESOLVED,
-                                        (false, Source::Ours) => color::CONFLICT_OURS_PICKED,
-                                        (false, Source::Theirs) => color::CONFLICT_THEIRS_PICKED,
-                                        (false, Source::Both) => color::CONFLICT_RESOLVED,
-                                    },
-                                ))
-                            }))
+                            .children(result_lines.iter().enumerate().map(
+                                |(i, (line, source, origin))| {
+                                    // A picked line is coloured as on its side.
+                                    let line_spans = match (source, origin) {
+                                        (Source::Ours, Some(index)) => {
+                                            spans(ours_highlights, ours_start + index, line)
+                                        }
+                                        (Source::Theirs, Some(index)) => {
+                                            spans(theirs_highlights, theirs_start + index, line)
+                                        }
+                                        _ => None,
+                                    };
+                                    code_line(
+                                        Some(tagged(*source).into_any_element()),
+                                        Some(result_start + i),
+                                        line,
+                                        line_spans,
+                                    )
+                                    .id(("result-line", i))
+                                    .debug_selector(move || format!("conflict-result-line-{i}"))
+                                    .cursor_text()
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.edit(Some(i), window, cx)
+                                    }))
+                                    .bg(rgba(
+                                        match (resolution.resolved, source) {
+                                            (true, _) => color::CONFLICT_RESOLVED,
+                                            (false, Source::Ours) => color::CONFLICT_OURS_PICKED,
+                                            (false, Source::Theirs) => {
+                                                color::CONFLICT_THEIRS_PICKED
+                                            }
+                                            (false, Source::Both) => color::CONFLICT_RESOLVED,
+                                        },
+                                    ))
+                                },
+                            ))
                             .when(result_lines.is_empty(), |this| {
                                 this.child(
                                     empty_side("Nothing yet: the conflict's lines are removed")
@@ -1366,10 +1540,12 @@ impl Conflicts {
                             }),
                     })
                     .children(after.iter().enumerate().map(|(i, line)| {
+                        let ours = ours_start + conflict.ours.len() + i;
                         code_line(
                             Some(tagged(Source::Both).into_any_element()),
                             Some(result_start + result_lines.len() + i),
                             line,
+                            spans(ours_highlights, ours, line),
                         )
                     })),
             )
@@ -1639,6 +1815,8 @@ mod tests {
         VisualTestContext, point, px, size,
     };
 
+    use gitez_highlight::{Highlights, TokenKind};
+
     use super::Conflicts;
 
     fn git(dir: &Path, args: &[&str]) {
@@ -1704,6 +1882,59 @@ mod tests {
             .debug_bounds("conflict-result-footer")
             .expect("result footer drawn");
         f32::from(bounds.top())
+    }
+
+    #[gpui_kit::test]
+    fn conflicted_files_are_highlighted(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("a.rs"), "/* base */\nfn f() {}\n").expect("write");
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "base"]);
+        git(root, &["checkout", "-qb", "theirs"]);
+        std::fs::write(root.join("a.rs"), "/* base */\nfn g() {}\n").expect("write");
+        git(root, &["commit", "-qam", "theirs"]);
+        git(root, &["checkout", "-q", "main"]);
+        std::fs::write(root.join("a.rs"), "/* base */\nfn h() {}\n").expect("write");
+        git(root, &["commit", "-qam", "ours"]);
+        git(root, &["merge", "-q", "theirs"]);
+
+        let (view, cx) = open(root, cx);
+        view.read_with(&cx, |view, _| {
+            let highlights = view.highlights.get("a.rs").expect("a.rs is highlighted");
+            let first_kind = |highlights: Option<&Highlights>, number, text| {
+                super::spans(highlights, number, text).map(|spans| spans[0].kind)
+            };
+            let ours = highlights.ours.as_deref();
+            let theirs = highlights.theirs.as_deref();
+            assert_eq!(first_kind(ours, 1, "/* base */"), Some(TokenKind::Comment));
+            assert_eq!(first_kind(ours, 2, "fn h() {}"), Some(TokenKind::Keyword));
+            assert_eq!(first_kind(theirs, 2, "fn g() {}"), Some(TokenKind::Keyword));
+        });
+    }
+
+    #[test]
+    fn result_lines_know_which_line_of_their_side_they_are() {
+        let conflict = gitez_git::Conflict {
+            ours: vec!["a".into(), "b".into()],
+            base: None,
+            theirs: vec!["c".into(), "d".into()],
+        };
+        let resolution = super::Resolution {
+            ours: vec![false, true],
+            theirs: vec![true, true],
+            theirs_first: true,
+            ..super::Resolution::default()
+        };
+        assert_eq!(
+            resolution.lines(&conflict),
+            [
+                ("c".to_owned(), super::Source::Theirs, Some(0)),
+                ("d".to_owned(), super::Source::Theirs, Some(1)),
+                ("b".to_owned(), super::Source::Ours, Some(1)),
+            ]
+        );
     }
 
     #[gpui_kit::test]

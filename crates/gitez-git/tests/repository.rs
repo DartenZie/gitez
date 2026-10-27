@@ -789,6 +789,8 @@ fn diff_numbers_lines_and_keeps_three_lines_of_context() {
                 source: LineSource::Blob(fixture.rev("HEAD:new.txt")),
                 lines: 2,
             }),
+            // An added file has no old version.
+            old_side: None,
         }])
     );
 
@@ -831,6 +833,66 @@ fn diff_numbers_lines_and_keeps_three_lines_of_context() {
     assert_eq!(
         fixture.open().lines(&new_side.source).expect("lines"),
         changed
+    );
+    // And the whole old file, for highlighting the removed lines.
+    assert_eq!(
+        hunk.old_side,
+        Some(LineSource::Blob(fixture.rev("HEAD~:text.txt")))
+    );
+}
+
+#[test]
+fn diff_hunks_know_the_old_file_their_lines_are_from() {
+    let fixture = Fixture::new();
+    std::fs::write(fixture.root.join("edited.txt"), "a\nb\nc\n").expect("write");
+    std::fs::write(fixture.root.join("gone.txt"), "bye\n").expect("write");
+    std::fs::write(
+        fixture.root.join("moved.txt"),
+        "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n",
+    )
+    .expect("write");
+    fixture.git(&["add", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "first"]);
+    std::fs::write(fixture.root.join("edited.txt"), "a\nB\nc\n").expect("write");
+    std::fs::remove_file(fixture.root.join("gone.txt")).expect("remove");
+    fixture.git(&["mv", "moved.txt", "renamed.txt"]);
+    std::fs::write(
+        fixture.root.join("renamed.txt"),
+        "1\n2\n3\n4\n5\n6\n7\n8\n9\nten\n",
+    )
+    .expect("write");
+    std::fs::write(fixture.root.join("new.txt"), "hi\n").expect("write");
+    fixture.git(&["add", "-A"]);
+    fixture.git(&["commit", "--quiet", "-m", "second"]);
+
+    let repository = fixture.open();
+    let diffs = repository
+        .commit_diff(fixture.rev("HEAD"), DiffOptions::default())
+        .expect("diff");
+    let old_side = |path: &str| {
+        let diff = diffs
+            .iter()
+            .find(|diff| diff.path == path)
+            .unwrap_or_else(|| panic!("{path} changed"));
+        match &diff.content {
+            DiffContent::Text(hunks) => hunks[0].old_side.clone(),
+            other => panic!("{path} has a text diff: {other:?}"),
+        }
+    };
+    let edited = LineSource::Blob(fixture.rev("HEAD~:edited.txt"));
+    assert_eq!(old_side("edited.txt"), Some(edited.clone()));
+    assert_eq!(
+        old_side("gone.txt"),
+        Some(LineSource::Blob(fixture.rev("HEAD~:gone.txt")))
+    );
+    assert_eq!(
+        old_side("renamed.txt"),
+        Some(LineSource::Blob(fixture.rev("HEAD~:moved.txt")))
+    );
+    assert_eq!(old_side("new.txt"), None);
+    assert_eq!(
+        repository.source_bytes(&edited).expect("bytes"),
+        b"a\nb\nc\n"
     );
 }
 
@@ -876,6 +938,29 @@ fn uncommitted_hunks_know_the_file_their_lines_are_from() {
             vec![Some(staged.clone()), Some(on_disk.clone())],
             vec![None]
         ]
+    );
+    // The staged hunk's old lines are from `HEAD`, the unstaged one's from
+    // the index; a deleted file's from `HEAD`.
+    let old_sides: Vec<Vec<Option<LineSource>>> = diffs
+        .iter()
+        .map(|diff| match &diff.content {
+            DiffContent::Text(hunks) => hunks.iter().map(|hunk| hunk.old_side.clone()).collect(),
+            other => panic!("a text diff: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        old_sides,
+        [
+            vec![
+                Some(LineSource::Blob(fixture.rev("HEAD:a.txt"))),
+                Some(staged.source.clone()),
+            ],
+            vec![Some(LineSource::Blob(fixture.rev("HEAD:gone.txt")))]
+        ]
+    );
+    assert_eq!(
+        repository.source_bytes(&on_disk.source).expect("bytes"),
+        b"one\n2\n3\n4\n5\n6\n7\n8\nnine\r\nten\n"
     );
     assert_eq!(repository.lines(&staged.source).expect("lines")[0], "one");
     assert_eq!(

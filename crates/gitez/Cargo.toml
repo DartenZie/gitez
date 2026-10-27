@@ -14,7 +14,10 @@ name = "gitez"
 path = "src/main.rs"
 
 [dependencies]
-gpui-kit.workspace = true
+# `syntect` highlights code in gpui-kit's editor with the same grammars as
+# gitez-highlight. Never `tree-sitter`: it replaces that highlighter.
+gpui-kit = { workspace = true, features = ["syntect"] }
+gitez-highlight.workspace = true
 gitez-git.workspace = true
 gitez-command.workspace = true
 gitez-review.workspace = true
