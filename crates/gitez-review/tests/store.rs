@@ -429,3 +429,55 @@ fn a_failed_read_stops_the_move() {
     assert_eq!(result, Err("no such commit"));
     assert_eq!(pull_request, before);
 }
+
+#[test]
+fn comments_can_be_edited_and_deleted() {
+    let (_dir, store) = store();
+    let mut pull_request: PullRequest = store
+        .create(new_pull_request("Edits"), time("2026-10-24T13:00:00Z"))
+        .expect("create");
+    let thread = pull_request.add_thread(
+        anchor((3, 4)),
+        "Rename it.".to_owned(),
+        time("2026-10-24T13:01:00Z"),
+    );
+    let reply = pull_request
+        .reply(
+            thread,
+            "And test it.".to_owned(),
+            time("2026-10-24T13:02:00Z"),
+        )
+        .expect("reply");
+    let other = pull_request.add_thread(
+        anchor((9, 9)),
+        "Drop this.".to_owned(),
+        time("2026-10-24T13:03:00Z"),
+    );
+
+    let edited_at = time("2026-10-24T13:05:00Z");
+    pull_request
+        .edit_comment(thread, 1, "Rename it to `anchor`.".to_owned(), edited_at)
+        .expect("edit");
+    // Deleting a reply keeps the thread; deleting the first comment does not.
+    let thread_gone = pull_request
+        .delete_comment(thread, reply, time("2026-10-24T13:06:00Z"))
+        .expect("delete reply");
+    assert!(!thread_gone);
+    let other_first = pull_request.thread(other).expect("other thread").comments[0].id;
+    let thread_gone = pull_request
+        .delete_comment(other, other_first, time("2026-10-24T13:07:00Z"))
+        .expect("delete thread");
+    assert!(thread_gone);
+    assert!(matches!(
+        pull_request.edit_comment(thread, 99, String::new(), edited_at),
+        Err(Error::NoComment { comment: 99, .. })
+    ));
+    store.save(&pull_request).expect("save");
+
+    let read = store.load(pull_request.number).expect("load");
+    assert_eq!(read.threads.len(), 1);
+    let comments = &read.threads[0].comments;
+    assert_eq!(comments.len(), 1);
+    assert_eq!(comments[0].body, "Rename it to `anchor`.");
+    assert_eq!(comments[0].edited, Some(edited_at));
+}

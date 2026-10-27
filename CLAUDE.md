@@ -89,7 +89,8 @@ Decided 2026-10-23; change only with the owner's agreement.
   - A thread has an id, an anchor (commit, path, `old` or `new` side, first
     and last line, and a copy of those lines), whether it is in the agent
     prompt, its resolution (`null`, or by `auto` or `you` with commit and
-    time) and its comments (id, body, time). When the head moves, a thread
+    time) and its comments (id, body, time, and the time of the last edit
+    if it was edited). When the head moves, a thread
     whose lines changed resolves itself; the others are re-anchored to the
     new commit.
   - A transcript starts with a GitEZ header line (time, agent, prompt), then

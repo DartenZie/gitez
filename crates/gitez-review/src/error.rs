@@ -26,6 +26,12 @@ pub enum Error {
     NotFound(u32),
     #[error("there is no thread {thread} in local pull request #{number}")]
     NoThread { number: u32, thread: u32 },
+    #[error("there is no comment {comment} in thread {thread} of local pull request #{number}")]
+    NoComment {
+        number: u32,
+        thread: u32,
+        comment: u32,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

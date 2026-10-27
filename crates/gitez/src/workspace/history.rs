@@ -1,15 +1,15 @@
 //! The commit history: every commit reachable from a ref, newest first, with
 //! its graph, labels, author and date, in a virtual list. Uncommitted changes
-//! get a row of their own right above the commit `HEAD` points at. A local
-//! branch's label can be dragged onto another branch to merge it there, as
-//! in the `Merge.dc.html` artboard. ⌘-click and ⇧-click pick several
+//! get a row of their own at the top, joined to the commit `HEAD` points at
+//! by a dashed line. A local branch's label can be dragged onto another
+//! branch to merge it there, as in the `Merge.dc.html` artboard. ⌘-click and ⇧-click pick several
 //! commits, to cherry-pick them, as in the `CherryPick.dc.html` artboard.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
-use gitez_git::graph::{GraphLayout, Row};
+use gitez_git::graph::{GraphLayout, Row, Segment};
 use gitez_git::{Commit, Oid, Order, RefKind, RefLabel, Repository, WorkingTreeStatus};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::*;
@@ -156,6 +156,9 @@ pub struct History {
     head: Option<Oid>,
     /// Index of the `HEAD` commit in `commits`, once read.
     head_index: Option<usize>,
+    /// The lane of the dashed line from the uncommitted-changes row down to
+    /// the `HEAD` commit: one that no row above `HEAD` uses.
+    working_tree_lane: usize,
     /// Uncommitted changes; the list shows their row while not clean.
     working_tree: Option<Arc<WorkingTreeStatus>>,
     /// The commit summary typed in the uncommitted-changes row, shared with
@@ -195,6 +198,7 @@ impl History {
             labels: HashMap::new(),
             head: None,
             head_index: None,
+            working_tree_lane: 0,
             working_tree: None,
             summary: None,
             selected: None,
@@ -323,6 +327,9 @@ impl History {
         self.head_index = head.and_then(|head| commits.iter().position(|commit| commit.id == head));
         self.commits = commits;
         self.rows = rows;
+        self.working_tree_lane = self
+            .head_index
+            .map_or(0, |head| working_tree_lane(&self.rows, head));
         self.labels = labels;
         // Its rows may have moved.
         if let Some(drag) = &mut self.drag {
@@ -359,6 +366,7 @@ impl History {
 
     /// Adds a batch of commits; returns whether more may follow.
     fn append(&mut self, commits: Vec<Commit>, rows: Vec<Row>, cx: &mut Context<Self>) -> bool {
+        let commits_len = commits.len();
         if commits.is_empty() {
             self.complete = true;
             self._load = None;
@@ -374,13 +382,14 @@ impl History {
             && let Some(offset) = commits.iter().position(|commit| commit.id == head)
         {
             self.head_index = Some(self.commits.len() + offset);
-            // The uncommitted-changes row moves from the top to above `HEAD`.
-            if self.working_tree_index().is_some() {
-                self.scroll_to_selection();
-            }
         }
         self.commits.extend(commits);
         self.rows.extend(rows);
+        if let Some(head) = self.head_index
+            && head >= self.rows.len() - commits_len
+        {
+            self.working_tree_lane = working_tree_lane(&self.rows, head);
+        }
         cx.notify();
         true
     }
@@ -507,11 +516,9 @@ impl History {
         true
     }
 
-    /// Where the uncommitted-changes row is, if shown: right above the `HEAD`
-    /// commit, or at the top until that commit has been read.
+    /// Where the uncommitted-changes row is, if shown: always at the top.
     fn working_tree_index(&self) -> Option<usize> {
-        self.working_tree.as_ref()?;
-        Some(self.head_index.unwrap_or(0))
+        self.working_tree.as_ref().map(|_| 0)
     }
 
     /// Number of rows in the list.
@@ -535,11 +542,30 @@ impl History {
         }
     }
 
-    /// The graph row of an entry; the uncommitted changes take `HEAD`'s.
-    fn graph_row(&self, entry: Entry) -> Option<&Row> {
+    /// The lane of an entry's node in the graph.
+    fn graph_lane(&self, entry: Entry) -> Option<usize> {
         match entry {
-            Entry::WorkingTree => self.rows.get(self.head_index?),
-            Entry::Commit(index) => self.rows.get(index),
+            Entry::WorkingTree => Some(self.working_tree_line()?.0),
+            Entry::Commit(index) => self.rows.get(index).map(|row| row.lane),
+        }
+    }
+
+    /// The lane and colour of the uncommitted-changes row's node and its
+    /// dashed line, while that row is shown. Lane 0 until `HEAD` is read.
+    fn working_tree_line(&self) -> Option<(usize, usize)> {
+        self.working_tree.as_ref()?;
+        let color = self
+            .head_index
+            .and_then(|index| self.rows.get(index))
+            .map_or(0, |row| row.color);
+        Some((self.working_tree_lane, color))
+    }
+
+    /// Lanes the graph column must show.
+    fn graph_lanes(&self) -> usize {
+        match self.working_tree_line() {
+            Some((lane, _)) => self.lanes.max(lane + 1),
+            None => self.lanes,
         }
     }
 
@@ -564,7 +590,7 @@ impl History {
         if let Some(index) = self.index_of(entry) {
             self.scroll.scroll_to_item(index, ScrollStrategy::Nearest);
         }
-        if let Some(lane) = self.graph_row(entry).map(|row| row.lane) {
+        if let Some(lane) = self.graph_lane(entry) {
             let scroll = graph::scroll_to_lane(lane, self.graph_scroll, self.graph_width());
             self.set_graph_scroll(scroll);
         }
@@ -595,12 +621,12 @@ impl History {
     }
 
     fn graph_width(&self) -> Pixels {
-        graph::column_width(self.lanes, columns::GRAPH_MIN, columns::GRAPH_MAX)
+        graph::column_width(self.graph_lanes(), columns::GRAPH_MIN, columns::GRAPH_MAX)
     }
 
     /// How far the graph can scroll: zero when it fits its column.
     fn max_graph_scroll(&self) -> Pixels {
-        (graph::content_width(self.lanes) - self.graph_width()).max(px(0.))
+        (graph::content_width(self.graph_lanes()) - self.graph_width()).max(px(0.))
     }
 
     fn set_graph_scroll(&mut self, scroll: Pixels) -> bool {
@@ -1080,9 +1106,14 @@ impl History {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let status = self.working_tree.as_ref()?;
-        let head_row = self.head_index.and_then(|index| self.rows.get(index));
-        let cell =
-            graph::working_tree_cell(head_row.cloned(), self.graph_width(), self.graph_scroll);
+        let (lane, color) = self.working_tree_line()?;
+        let cell = graph::working_tree_cell(
+            lane,
+            color,
+            self.head_index.is_some(),
+            self.graph_width(),
+            self.graph_scroll,
+        );
         Some(
             row.when(self.drag_role(None).is_some(), |this| this.opacity(0.45))
                 .child(self.graph_column(cell, cx))
@@ -1143,16 +1174,22 @@ impl History {
         let commit = self.commits.get(index)?;
         let graph_row = self.rows.get(index)?;
         let labels = self.labels.get(&commit.id);
+        let working_tree = self
+            .working_tree_line()
+            .filter(|_| self.head_index.is_some_and(|head| index <= head));
         let head = if self.head != Some(commit.id) {
             graph::Head::No
-        } else if self.working_tree.is_some() && self.head_index == Some(index) {
-            graph::Head::BelowWorkingTree
+        } else if let Some((lane, _)) = working_tree {
+            graph::Head::BelowWorkingTree { lane }
         } else {
             graph::Head::Yes
         };
+        // The dashed line passes the rows between the two.
+        let through = working_tree.filter(|_| self.head_index != Some(index));
         let cell = graph::cell(
             graph_row.clone(),
             head,
+            through,
             self.graph_width(),
             self.graph_scroll,
         );
@@ -1235,7 +1272,7 @@ impl History {
     /// when the graph is wider than its column.
     fn render_graph_heading(&self) -> impl IntoElement {
         let width = self.graph_width();
-        let content = graph::content_width(self.lanes);
+        let content = graph::content_width(self.graph_lanes());
         div()
             .relative()
             .h_full()
@@ -1494,9 +1531,72 @@ fn format_count(count: usize) -> String {
     formatted
 }
 
+/// A lane for the dashed line from the uncommitted-changes row at the top
+/// down to the `HEAD` commit at `rows[head]`: `HEAD`'s own lane when no row
+/// above uses it, so the line drops straight onto the node, or else the
+/// leftmost lane free in every row above.
+fn working_tree_lane(rows: &[Row], head: usize) -> usize {
+    let Some(head_lane) = rows.get(head).map(|row| row.lane) else {
+        return 0;
+    };
+    let mut used = Vec::new();
+    for row in &rows[..head] {
+        let lanes = row.segments.iter().map(|segment| match *segment {
+            Segment::Through { lane, .. }
+            | Segment::In { lane, .. }
+            | Segment::Out { lane, .. } => lane,
+        });
+        for lane in lanes.chain([row.lane]) {
+            if lane >= used.len() {
+                used.resize(lane + 1, false);
+            }
+            used[lane] = true;
+        }
+    }
+    if !used.get(head_lane).copied().unwrap_or(false) {
+        return head_lane;
+    }
+    used.iter().position(|used| !used).unwrap_or(used.len())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::format_count;
+    use super::{format_count, working_tree_lane};
+    use gitez_git::Oid;
+    use gitez_git::graph::GraphLayout;
+
+    fn oid(n: u8) -> Oid {
+        Oid::from_bytes_or_panic(&[n; 20])
+    }
+
+    #[test]
+    fn working_tree_line_takes_a_free_lane_when_heads_lane_is_used_above() {
+        // Two branch tips, 1 and 2, fork from HEAD (3) and sit above it.
+        let mut layout = GraphLayout::new();
+        let rows = vec![
+            layout.push(oid(1), &[oid(3)]),
+            layout.push(oid(2), &[oid(3)]),
+            layout.push(oid(3), &[]),
+        ];
+        // Both tips above HEAD use lanes 0 and 1; HEAD sits in lane 0.
+        assert_eq!(rows[2].lane, 0);
+        assert_eq!(working_tree_lane(&rows, 2), 2);
+        // HEAD at the top keeps its own lane.
+        assert_eq!(working_tree_lane(&rows, 0), rows[0].lane);
+    }
+
+    #[test]
+    fn working_tree_line_keeps_heads_lane_when_rows_above_leave_it_free() {
+        // 1 is another branch's tip in lane 0; HEAD (2) is a tip of its own.
+        let mut layout = GraphLayout::new();
+        let rows = vec![
+            layout.push(oid(1), &[oid(3)]),
+            layout.push(oid(2), &[oid(3)]),
+            layout.push(oid(3), &[]),
+        ];
+        assert_eq!(rows[1].lane, 1);
+        assert_eq!(working_tree_lane(&rows, 1), 1);
+    }
 
     #[test]
     fn counts_have_thousands_separators() {

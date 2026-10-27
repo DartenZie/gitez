@@ -305,6 +305,17 @@ impl Git {
         self.commit_with(message, CommitOptions::default())
     }
 
+    /// Commits the working-tree content of `paths`, which git must already
+    /// track, with `message`, like `git commit --only`; other staged changes
+    /// stay staged and out of the commit.
+    pub fn commit_only(&self, message: &str, paths: &[String]) -> Result<()> {
+        let args = ["commit", "--quiet", "--file=-", "--only", "--"]
+            .into_iter()
+            .map(str::to_owned)
+            .chain(paths.iter().cloned());
+        self.run(args, Some(message.as_bytes())).map(drop)
+    }
+
     /// Commits the staged changes with `message` as `options` say. Hooks
     /// run unless skipped; when one rejects the commit, its output is the
     /// error.

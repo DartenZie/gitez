@@ -25,6 +25,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 mod edit;
+mod edit_file;
 mod merge;
 
 pub(crate) use merge::{MergeDialog, MergeEvent, MergedPullRequest, Merging, record_merge};
@@ -77,6 +78,9 @@ pub enum ReviewEvent {
         message: SharedString,
         step: Option<u64>,
     },
+    /// A file of the head branch was edited, and committed when
+    /// `committed`; `step` is the undo step of the commit.
+    FileEdited { committed: bool, step: Option<u64> },
 }
 
 /// Height of one diff line.
@@ -313,6 +317,8 @@ struct PullRequestSubject {
     merge_dialog: Option<Subscription>,
     /// Set while the edit dialog is open.
     edit_dialog: Option<Subscription>,
+    /// Set while the dialog editing a file of the head branch is open.
+    file_edit_dialog: Option<Subscription>,
 }
 
 pub struct Review {
@@ -439,6 +445,7 @@ impl Review {
             checking_out: None,
             merge_dialog: None,
             edit_dialog: None,
+            file_edit_dialog: None,
         }));
         let mut review = Self::with_subject(repository, subject, load, cx);
         review.find_run(cx);
@@ -885,6 +892,40 @@ impl Review {
 
     /// Whether this reviews a local pull request, whose files can be
     /// marked viewed.
+    /// The button that edits `file` of a local pull request, for a file
+    /// still there on its head branch. It needs the branch checked out.
+    fn edit_file_button(&self, file: &FileDiff, cx: &mut Context<Self>) -> Option<Button> {
+        let Subject::PullRequest(subject) = &self.subject else {
+            return None;
+        };
+        if matches!(file.kind, ChangeKind::Deleted) || self.repository.work_dir().is_none() {
+            return None;
+        }
+        let checked_out = subject.tips.checked_out;
+        let path = file.path.clone();
+        let tooltip: SharedString = if checked_out {
+            "Edit this file on the branch".into()
+        } else {
+            format!(
+                "Check out {} to edit its files",
+                subject.pull_request.head.branch
+            )
+            .into()
+        };
+        Some(
+            Button::new(SharedString::from(format!("edit-file-{path}")))
+                .ghost()
+                .xsmall()
+                .icon(IconName::Pencil)
+                .label("Edit")
+                .tooltip(tooltip)
+                .disabled(!checked_out)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_file_edit(path.clone(), window, cx)
+                })),
+        )
+    }
+
     fn is_pull_request(&self) -> bool {
         matches!(self.subject, Subject::PullRequest(_))
     }
@@ -1403,6 +1444,9 @@ impl Review {
                             .gap(px(10.))
                             .when_some(status, |this, status| {
                                 this.child(self.staging_buttons(index, status, cx))
+                            })
+                            .when_some(self.edit_file_button(file, cx), |this, button| {
+                                this.child(button)
                             })
                             .when(self.is_pull_request(), |this| {
                                 this.child(

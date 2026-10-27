@@ -143,6 +143,9 @@ pub struct Comment {
     pub id: u32,
     pub body: String,
     pub created: Timestamp,
+    /// When the body was last changed, if it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edited: Option<Timestamp>,
 }
 
 impl PullRequest {
@@ -175,6 +178,48 @@ impl PullRequest {
         self.thread_mut(thread)?.comments.push(comment);
         self.updated = at;
         Ok(id)
+    }
+
+    /// Replaces the body of comment `comment` in thread `thread`.
+    pub fn edit_comment(
+        &mut self,
+        thread: u32,
+        comment: u32,
+        body: String,
+        at: Timestamp,
+    ) -> Result<()> {
+        let comment = self.comment_mut(thread, comment)?;
+        if comment.body != body {
+            comment.body = body;
+            comment.edited = Some(at);
+            self.updated = at;
+        }
+        Ok(())
+    }
+
+    /// Deletes comment `comment` from thread `thread`. Deleting the first
+    /// comment deletes the whole thread, since the replies answer it.
+    /// Returns whether the thread went too.
+    pub fn delete_comment(&mut self, thread: u32, comment: u32, at: Timestamp) -> Result<bool> {
+        self.comment_mut(thread, comment)?;
+        let index = self
+            .threads
+            .iter()
+            .position(|candidate| candidate.id == thread)
+            .expect("comment_mut found the thread");
+        let first = self.threads[index]
+            .comments
+            .first()
+            .is_some_and(|first| first.id == comment);
+        if first {
+            self.threads.remove(index);
+        } else {
+            self.threads[index]
+                .comments
+                .retain(|candidate| candidate.id != comment);
+        }
+        self.updated = at;
+        Ok(first)
     }
 
     /// Resolves thread `thread`, or reopens it with `None`.
@@ -212,6 +257,19 @@ impl PullRequest {
             .ok_or(Error::NoThread { number, thread })
     }
 
+    fn comment_mut(&mut self, thread: u32, comment: u32) -> Result<&mut Comment> {
+        let number = self.number;
+        self.thread_mut(thread)?
+            .comments
+            .iter_mut()
+            .find(|candidate| candidate.id == comment)
+            .ok_or(Error::NoComment {
+                number,
+                thread,
+                comment,
+            })
+    }
+
     fn new_comment(&self, body: String, at: Timestamp) -> Comment {
         let id = self
             .threads
@@ -225,6 +283,7 @@ impl PullRequest {
             id,
             body,
             created: at,
+            edited: None,
         }
     }
 }

@@ -11,7 +11,7 @@ use gitez_review::{PullRequest, State, Store};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::*;
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::input::{InputEvent, Position, Textarea, TextareaState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -259,8 +259,10 @@ impl Conflicts {
         });
     }
 
-    /// Starts typing the current conflict's result, from what it is now.
-    fn edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Starts typing the current conflict's result, from what it is now,
+    /// with the cursor at the end of result line `line` (the last line when
+    /// `None`).
+    fn edit(&mut self, line: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
         let (file, n) = (self.current_file, self.current_conflict);
         let Some(Ok(Some(loaded))) = &self.loaded else {
             return;
@@ -271,15 +273,20 @@ impl Conflicts {
         let (Some(conflict), Some(resolution)) = (file.conflict(n), file.resolutions.get(n)) else {
             return;
         };
-        let text = resolution
+        let lines: Vec<String> = resolution
             .lines(conflict)
             .into_iter()
             .map(|(line, _)| line)
-            .collect::<Vec<_>>()
-            .join("\n");
+            .collect();
+        let row = line
+            .unwrap_or(usize::MAX)
+            .min(lines.len().saturating_sub(1));
+        let column = lines.get(row).map_or(0, |line| line.encode_utf16().count());
+        let text = lines.join("\n");
         let input = cx.new(|cx| {
             let mut input = TextareaState::new(window, cx).auto_grow(3, 24);
             input.set_value(text, window, cx);
+            input.set_cursor_position(Position::new(row as u32, column as u32), window, cx);
             input
         });
         let subscription = cx.subscribe(&input, |this, input, event: &InputEvent, cx| {
@@ -862,6 +869,7 @@ impl Conflicts {
     fn render_files(&self, loaded: &Loaded, cx: &mut Context<Self>) -> impl IntoElement {
         let heading = |text: &'static str| {
             div()
+                .flex_none()
                 .px(px(10.))
                 .pt(px(14.))
                 .pb(px(8.))
@@ -880,6 +888,7 @@ impl Conflicts {
             div()
                 .id(("conflicted-file", index))
                 .h_flex()
+                .flex_none()
                 .gap(px(8.))
                 .h(px(32.))
                 .px(px(10.))
@@ -923,6 +932,7 @@ impl Conflicts {
         let merged = loaded.merged.iter().map(|path| {
             div()
                 .h_flex()
+                .flex_none()
                 .gap(px(8.))
                 .h(px(32.))
                 .px(px(10.))
@@ -1249,8 +1259,20 @@ impl Conflicts {
                         div()
                             .text_size(px(12.))
                             .text_color(rgb(color::TEXT_MUTED))
-                            .child("Tick lines above or edit it."),
+                            .child("Tick lines above, or click a line to edit it."),
                     )
+                    .when(editing.is_none(), |this| {
+                        this.child(
+                            Button::new("result-edit-header")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Pencil)
+                                .label("Edit")
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.edit(None, window, cx)),
+                                ),
+                        )
+                    })
                     .child(
                         div()
                             .ml_auto()
@@ -1317,6 +1339,12 @@ impl Conflicts {
                                     Some(result_start + i),
                                     line,
                                 )
+                                .id(("result-line", i))
+                                .debug_selector(move || format!("conflict-result-line-{i}"))
+                                .cursor_text()
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.edit(Some(i), window, cx)
+                                }))
                                 .bg(rgba(
                                     match (resolution.resolved, source) {
                                         (true, _) => color::CONFLICT_RESOLVED,
@@ -1327,9 +1355,14 @@ impl Conflicts {
                                 ))
                             }))
                             .when(result_lines.is_empty(), |this| {
-                                this.child(empty_side(
-                                    "Nothing yet: the conflict's lines are removed",
-                                ))
+                                this.child(
+                                    empty_side("Nothing yet: the conflict's lines are removed")
+                                        .id("result-empty")
+                                        .cursor_text()
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.edit(None, window, cx)
+                                        })),
+                                )
                             }),
                     })
                     .children(after.iter().enumerate().map(|(i, line)| {
@@ -1350,6 +1383,7 @@ impl Conflicts {
                     .border_t_1()
                     .border_color(rgb(color::DIFF_CARD_BORDER))
                     .bg(rgb(color::RESULT_FOOTER))
+                    .debug_selector(|| "conflict-result-footer".into())
                     .child(
                         div()
                             .text_size(px(12.5))
@@ -1374,9 +1408,9 @@ impl Conflicts {
                                     .ghost()
                                     .icon(IconName::Pencil)
                                     .label("Edit")
-                                    .on_click(
-                                        cx.listener(|this, _, window, cx| this.edit(window, cx)),
-                                    )
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.edit(None, window, cx)
+                                    }))
                             })
                             .child(
                                 Button::new("result-resolved")
@@ -1403,9 +1437,12 @@ impl Conflicts {
             .overflow_y_scroll()
             .gap(px(12.))
             .pb(px(24.))
+            // Children keep their height and the column scrolls, rather than
+            // squeezing them into the window.
             .child(
                 div()
                     .h_flex()
+                    .flex_none()
                     .flex_wrap()
                     .gap(px(8.))
                     .child(title)
@@ -1489,6 +1526,7 @@ impl Conflicts {
             )
             .child(
                 div()
+                    .flex_none()
                     .grid()
                     .grid_cols(if base_pane.is_some() { 3 } else { 2 })
                     .gap(px(12.))
@@ -1496,10 +1534,11 @@ impl Conflicts {
                     .children(base_pane)
                     .child(theirs_pane),
             )
-            .child(result_pane)
+            .child(result_pane.flex_none())
             .when_some(self.error.clone(), |this, error| {
                 this.child(
                     div()
+                        .flex_none()
                         .px(px(12.))
                         .py(px(8.))
                         .rounded(theme::RADIUS)
@@ -1575,8 +1614,8 @@ impl Render for Conflicts {
         let file = self.render_file(loaded, window, cx);
         root.child(header).child(
             div()
-                .h_flex()
-                .items_start()
+                .flex()
+                .flex_row()
                 .flex_1()
                 .min_h_0()
                 .gap(px(16.))
@@ -1585,5 +1624,143 @@ impl Render for Conflicts {
                 .child(files)
                 .child(file),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::process::Command;
+
+    use gitez_git::Repository;
+    use gitez_review::Store;
+    use gpui_kit::{
+        Entity, Modifiers, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase,
+        VisualTestContext, point, px, size,
+    };
+
+    use super::Conflicts;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("run git");
+        assert!(
+            status.status.success() || args[0] == "merge",
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+    }
+
+    /// A repository stopped in a merge whose one conflict has `lines` lines
+    /// on each side.
+    fn conflicted_repository(lines: usize) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path();
+        let text = |side: &str| {
+            (0..lines)
+                .map(|n| format!("{side} line {n}\n"))
+                .collect::<String>()
+        };
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("file.txt"), "base\n").expect("write");
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "base"]);
+        git(root, &["checkout", "-qb", "theirs"]);
+        std::fs::write(root.join("file.txt"), text("theirs")).expect("write");
+        git(root, &["commit", "-qam", "theirs"]);
+        git(root, &["checkout", "-q", "main"]);
+        std::fs::write(root.join("file.txt"), text("ours")).expect("write");
+        git(root, &["commit", "-qam", "ours"]);
+        git(root, &["merge", "-q", "theirs"]);
+        dir
+    }
+
+    fn open(dir: &Path, cx: &mut TestAppContext) -> (Entity<Conflicts>, VisualTestContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+        });
+        let repository = Repository::open(dir).expect("open repository");
+        let reviews = Store::new(&repository.common_dir());
+        let window = cx.open_window(size(px(1000.), px(500.)), |_, cx| {
+            Conflicts::new(repository, reviews, Default::default(), cx)
+        });
+        let view = window
+            .update(cx, |_, _, cx| cx.entity())
+            .expect("window open");
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        // Reading the merge happens in the background.
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        (view, cx)
+    }
+
+    fn scroll_offset(cx: &mut VisualTestContext) -> f32 {
+        let bounds = cx
+            .debug_bounds("conflict-result-footer")
+            .expect("result footer drawn");
+        f32::from(bounds.top())
+    }
+
+    #[gpui_kit::test]
+    fn a_long_conflict_scrolls_to_its_result(cx: &mut TestAppContext) {
+        let dir = conflicted_repository(40);
+        let (_, mut cx) = open(dir.path(), cx);
+        let before = scroll_offset(&mut cx);
+        assert!(
+            before > 500.,
+            "the footer starts below the window: {before}"
+        );
+        for _ in 0..40 {
+            cx.simulate_event(ScrollWheelEvent {
+                position: point(px(600.), px(300.)),
+                delta: ScrollDelta::Pixels(point(px(0.), px(-200.))),
+                touch_phase: TouchPhase::Moved,
+                modifiers: Modifiers::default(),
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        let after = scroll_offset(&mut cx);
+        assert!(
+            after < 500.,
+            "scrolling brings the footer into view: {after}"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn clicking_a_result_line_edits_it(cx: &mut TestAppContext) {
+        let dir = conflicted_repository(3);
+        let (view, mut cx) = open(dir.path(), cx);
+        // Take our side, so the result has lines to click.
+        view.update_in(&mut cx, |view, _, cx| view.take(true, false, false, cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let line = cx
+            .debug_bounds("conflict-result-line-1")
+            .expect("result line drawn");
+        cx.simulate_click(line.center(), Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let editing = view.read_with(&cx, |view, _| {
+            view.editing.as_ref().map(|(input, _)| input.clone())
+        });
+        let input = editing.expect("clicking a result line starts editing");
+        cx.simulate_input("!");
+        let value = input.read_with(&cx, |input, _| input.value().to_string());
+        assert_eq!(value, "ours line 0\nours line 1!\nours line 2");
+        let edited = view.read_with(&cx, |view, _| match &view.loaded {
+            Some(Ok(Some(loaded))) => loaded.files[0].resolutions[0].edited.clone(),
+            _ => None,
+        });
+        assert_eq!(
+            edited,
+            Some(vec![
+                "ours line 0".into(),
+                "ours line 1!".into(),
+                "ours line 2".into()
+            ])
+        );
     }
 }

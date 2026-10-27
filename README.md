@@ -34,6 +34,10 @@ prompt, or send it straight to [Claude Code](https://docs.claude.com/en/docs/cla
   file opens again when it changes.
 - Comment on one line or a range of lines. Threads support replies and
   **Resolve**, and a thread resolves itself when a new commit changes its lines.
+  Hover a comment to edit or delete it.
+- Fix small things yourself: **Edit** on a file opens it in an editor. **Save**
+  writes it to the working tree, and **Save and commit** commits that file
+  alone on the branch. The pull request's head branch must be checked out.
 - Build an **agent prompt** from the threads you include. Choose a template
   (fix the comments, or explain without changing anything) and whether to
   quote code and run tests. GitEZ guesses the test command (`cargo test`,
@@ -54,12 +58,13 @@ tree, so it cannot be committed or pushed by accident. Linked worktrees share it
   beside it.
 - **Working tree**: stage, unstage or discard files and single hunks. Commit,
   amend, sign off or skip hooks; type the commit summary in the panel or right
-  in the uncommitted-changes row of the graph. Changes made in other tools
-  appear as they happen.
+  in the uncommitted-changes row, which is always at the top of the graph.
+  Changes made in other tools appear as they happen.
 - **Drag-and-drop merge**: drag a branch label onto another branch to merge,
   squash, rebase, fast-forward, or open the two branches as a local PR.
 - **Conflict editor**: see our and their lines side by side (with the base if
-  you want it), and tick lines into the result or type it by hand.
+  you want it), and tick lines into the result, or click a result line to
+  edit it by hand.
 - **Cherry-pick**: select commits and pick them onto any branch. GitEZ does a
   trial run against each branch first.
 - **Rewrite history**: reword, edit, squash, fixup, drop and reorder commits,
@@ -81,7 +86,9 @@ tree, so it cannot be committed or pushed by accident. Linked worktrees share it
 
 - [Rust](https://rustup.rs), installed with rustup. The `rust-toolchain.toml`
   file selects the correct toolchain automatically.
-- `git` on the `PATH`.
+- `git` on the `PATH`. When GitEZ starts from Finder or a desktop launcher, it
+  takes the `PATH` from your login shell, so git filters and helpers such as
+  `git-crypt` and `git-lfs` are found as they are in the terminal.
 - Optional: [Claude Code](https://docs.claude.com/en/docs/claude-code), to send
   prompts to an agent. GitEZ looks for `claude` on the `PATH` and in the
   installers' default locations, such as `~/.local/bin`.

@@ -23,6 +23,8 @@ anyhow.workspace = true
 futures.workspace = true
 
 [dev-dependencies]
+# GPUI's test platform, to lay out and drive views in tests.
+gpui-kit = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 
 [lints]

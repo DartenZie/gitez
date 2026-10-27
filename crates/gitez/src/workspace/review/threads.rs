@@ -34,6 +34,8 @@ pub(super) struct Comments {
     pub composer: Option<Composer>,
     /// Replies being written, by thread id.
     pub replies: HashMap<u32, Draft>,
+    /// The comment being edited: its thread, its id, and the new text.
+    pub editing: Option<(u32, u32, Draft)>,
     /// Resolved threads shown in full, by id.
     pub shown_resolved: HashSet<u32>,
 }
@@ -610,8 +612,10 @@ impl Review {
         let Some(comments) = self.comments_mut() else {
             return false;
         };
-        let open = comments.composer.is_some() || !comments.replies.is_empty();
-        if comments.composer.take().is_none() {
+        let open = comments.composer.is_some()
+            || !comments.replies.is_empty()
+            || comments.editing.is_some();
+        if comments.composer.take().is_none() && comments.editing.take().is_none() {
             comments.replies.clear();
         }
         if open {
@@ -655,6 +659,88 @@ impl Review {
             comments.replies.remove(&thread);
         }
         self.rebuild_keeping_scroll(cx);
+    }
+
+    /// Starts editing comment `comment` of thread `thread`.
+    fn start_editing(
+        &mut self,
+        thread: u32,
+        comment: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(body) = (match &self.subject {
+            Subject::PullRequest(subject) => subject
+                .pull_request
+                .thread(thread)
+                .and_then(|thread| thread.comments.iter().find(|c| c.id == comment))
+                .map(|comment| comment.body.clone()),
+            _ => None,
+        }) else {
+            return;
+        };
+        let draft = self.draft("Comment".to_owned(), window, cx, move |this, window, cx| {
+            this.submit_edit(window, cx)
+        });
+        draft
+            .input
+            .update(cx, |input, cx| input.set_value(body, window, cx));
+        window.focus(&draft.input.focus_handle(cx), cx);
+        if let Some(comments) = self.comments_mut() {
+            comments.editing = Some((thread, comment, draft));
+        }
+        self.rebuild_keeping_scroll(cx);
+    }
+
+    /// Saves the comment being edited.
+    fn submit_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((thread, comment, draft)) = self
+            .comments()
+            .and_then(|comments| comments.editing.as_ref())
+        else {
+            return;
+        };
+        let (thread, comment) = (*thread, *comment);
+        let body = draft.input.read(cx).value().trim().to_owned();
+        if body.is_empty() {
+            return;
+        }
+        self.change_threads(cx, |pull_request, comments| {
+            // The comment exists: it is shown.
+            pull_request
+                .edit_comment(thread, comment, body, Timestamp::now())
+                .ok();
+            comments.editing = None;
+        });
+        window.focus(&self.focus_handle, cx);
+    }
+
+    fn cancel_edit(&mut self, cx: &mut Context<Self>) {
+        if let Some(comments) = self.comments_mut() {
+            comments.editing = None;
+        }
+        self.rebuild_keeping_scroll(cx);
+    }
+
+    /// Deletes comment `comment` of thread `thread`, and the thread with
+    /// its first comment.
+    fn delete_comment(&mut self, thread: u32, comment: u32, cx: &mut Context<Self>) {
+        self.change_threads(cx, |pull_request, comments| {
+            let gone = pull_request
+                .delete_comment(thread, comment, Timestamp::now())
+                .unwrap_or(false);
+            if comments
+                .editing
+                .as_ref()
+                .is_some_and(|(t, c, _)| *t == thread && (*c == comment || gone))
+            {
+                comments.editing = None;
+            }
+            if gone {
+                comments.replies.remove(&thread);
+                comments.shown_resolved.remove(&thread);
+            }
+        });
     }
 
     fn set_resolved(&mut self, thread: u32, resolved: bool, cx: &mut Context<Self>) {
@@ -846,17 +932,99 @@ impl Review {
         let reply = comments.replies.get(&id);
         let mut card = thread_card();
         for (index, comment) in thread.comments.iter().enumerate() {
+            let edited = if comment.edited.is_some() {
+                " · edited"
+            } else {
+                ""
+            };
             let detail = if index == 0 {
                 let lines = describe_lines(thread.anchor.side, thread.anchor.lines);
                 let outdated = if outdated { " · outdated" } else { "" };
-                format!("on {lines} · {}{outdated}", ago(comment.created))
+                format!("on {lines} · {}{edited}{outdated}", ago(comment.created))
             } else {
-                ago(comment.created)
+                format!("{}{edited}", ago(comment.created))
+            };
+            let comment_id = comment.id;
+            let editing = comments
+                .editing
+                .as_ref()
+                .filter(|(thread, comment, _)| *thread == id && *comment == comment_id)
+                .map(|(_, _, draft)| draft);
+            let group: SharedString = format!("comment-{comment_id}").into();
+            let tools = div()
+                .h_flex()
+                .gap(px(2.))
+                .opacity(0.)
+                .group_hover(group.clone(), |style| style.opacity(1.))
+                .child(
+                    Button::new(("comment-edit", comment_id as usize))
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Pencil)
+                        .tooltip("Edit")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.start_editing(id, comment_id, window, cx)
+                        })),
+                )
+                .child(
+                    Button::new(("comment-delete", comment_id as usize))
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Delete)
+                        .tooltip(if index == 0 {
+                            "Delete the thread"
+                        } else {
+                            "Delete"
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.delete_comment(id, comment_id, cx)
+                        })),
+                );
+            let body = match editing {
+                Some(draft) => {
+                    let empty = draft.input.read(cx).value().trim().is_empty();
+                    div()
+                        .v_flex()
+                        .gap(px(8.))
+                        .child(Textarea::new(&draft.input).bg(rgb(color::BACKGROUND)))
+                        .child(
+                            div().h_flex().gap(px(6.)).child(muted("⌘↵ to save")).child(
+                                div()
+                                    .h_flex()
+                                    .ml_auto()
+                                    .gap(px(6.))
+                                    .child(
+                                        Button::new("comment-edit-cancel")
+                                            .ghost()
+                                            .h(px(30.))
+                                            .label("Cancel")
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| this.cancel_edit(cx)),
+                                            ),
+                                    )
+                                    .child(
+                                        Button::new("comment-edit-save")
+                                            .primary()
+                                            .h(px(30.))
+                                            .label("Save")
+                                            .disabled(empty)
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.submit_edit(window, cx)
+                                            })),
+                                    ),
+                            ),
+                        )
+                }
+                None => div()
+                    .line_height(relative(1.55))
+                    .text_color(rgb(color::TEXT))
+                    .child(comment.body.clone()),
             };
             card = card.child(
                 div()
                     .h_flex()
                     .items_start()
+                    .group(group)
                     .gap(px(10.))
                     .px(px(14.))
                     .py(px(12.))
@@ -877,16 +1045,19 @@ impl Review {
                                     .text_size(px(12.))
                                     .child(div().font_weight(FontWeight::SEMIBOLD).child("You"))
                                     .child(muted(detail))
-                                    .when_some(number.filter(|_| index == 0), |this, number| {
-                                        this.child(div().ml_auto().child(chip(number.to_string())))
-                                    }),
+                                    .child(
+                                        div()
+                                            .h_flex()
+                                            .ml_auto()
+                                            .gap(px(6.))
+                                            .when(editing.is_none(), |this| this.child(tools))
+                                            .when_some(
+                                                number.filter(|_| index == 0),
+                                                |this, number| this.child(chip(number.to_string())),
+                                            ),
+                                    ),
                             )
-                            .child(
-                                div()
-                                    .line_height(relative(1.55))
-                                    .text_color(rgb(color::TEXT))
-                                    .child(comment.body.clone()),
-                            ),
+                            .child(body),
                     ),
             );
         }

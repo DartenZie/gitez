@@ -428,21 +428,25 @@ impl Workspace {
         let workspace = cx.entity().downgrade();
         let action = std::rc::Rc::new(action);
         window.push_notification(
-            notification.action(move |_, _, cx| {
-                let notification = cx.entity().downgrade();
-                let (workspace, action) = (workspace.clone(), action.clone());
-                Button::new("notification-action")
-                    .small()
-                    .label(label)
-                    .on_click(move |_, window, cx| {
-                        workspace
-                            .update(cx, |this, cx| action(this, window, cx))
-                            .ok();
-                        notification
-                            .update(cx, |notification, cx| notification.dismiss(window, cx))
-                            .ok();
-                    })
-            }),
+            notification
+                .action(move |_, _, cx| {
+                    let notification = cx.entity().downgrade();
+                    let (workspace, action) = (workspace.clone(), action.clone());
+                    Button::new("notification-action")
+                        .small()
+                        .label(label)
+                        .on_click(move |_, window, cx| {
+                            workspace
+                                .update(cx, |this, cx| action(this, window, cx))
+                                .ok();
+                            notification
+                                .update(cx, |notification, cx| notification.dismiss(window, cx))
+                                .ok();
+                        })
+                })
+                // An action turns autohide off; turn it back on so
+                // notifications never pile up. Undo stays on ⌘Z after it goes.
+                .autohide(true),
             cx,
         );
     }

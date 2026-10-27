@@ -114,6 +114,33 @@ fn a_rejected_commit_reports_the_hook_output() {
 }
 
 #[test]
+fn commits_only_the_paths_asked_for() {
+    let dir = repository();
+    std::fs::write(dir.path().join("a.txt"), "a\n").expect("write");
+    std::fs::write(dir.path().join("b.txt"), "b\n").expect("write");
+    let git_ = Git::new(dir.path());
+    git_.stage_all().expect("stage all");
+    git_.commit("Add a and b").expect("commit");
+
+    std::fs::write(dir.path().join("a.txt"), "a, edited\n").expect("write");
+    std::fs::write(dir.path().join("b.txt"), "b, staged\n").expect("write");
+    git_.stage(&["b.txt".to_owned()]).expect("stage b");
+    git_.commit_only("Edit a", &["a.txt".to_owned()])
+        .expect("commit a only");
+
+    assert_eq!(
+        git(dir.path(), &["log", "-1", "--format=%s"]).trim(),
+        "Edit a"
+    );
+    assert_eq!(
+        git(dir.path(), &["show", "--name-only", "--format="]).trim(),
+        "a.txt"
+    );
+    // b's staged change is still staged, not committed.
+    assert_eq!(status(dir.path()), "M  b.txt");
+}
+
+#[test]
 fn skips_the_hooks_and_signs_off_when_asked() {
     let dir = repository();
     let hook = dir.path().join(".git/hooks/pre-commit");

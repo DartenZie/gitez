@@ -5,6 +5,7 @@
 
 mod assets;
 mod repository;
+mod shell_path;
 mod theme;
 mod time;
 mod undo;
@@ -19,6 +20,10 @@ use workspace::{CloneRepository, InitRepository, OpenRepository, Workspace};
 actions!(gitez, [Quit]);
 
 fn main() {
+    // Before anything else: it changes the environment, and git needs the
+    // user's PATH to find filters such as git-crypt.
+    shell_path::init();
+
     let path = std::env::args_os()
         .nth(1)
         .map(|arg| std::path::absolute(PathBuf::from(&arg)).unwrap_or_else(|_| arg.into()));

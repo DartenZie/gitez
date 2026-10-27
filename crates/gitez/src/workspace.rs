@@ -709,6 +709,20 @@ impl Workspace {
                     this.refresh_status(window, cx);
                     return;
                 }
+                ReviewEvent::FileEdited { committed, step } => {
+                    if *committed {
+                        let message = "Committed your edit";
+                        this.notify_done(Notification::success(message), *step, window, cx);
+                        this.reload(window, cx);
+                    } else {
+                        window.push_notification(
+                            Notification::success("Saved; commit it from the history"),
+                            cx,
+                        );
+                    }
+                    this.refresh_status(window, cx);
+                    return;
+                }
                 ReviewEvent::CheckedOut => {
                     this.reload(window, cx);
                     this.refresh_status(window, cx);

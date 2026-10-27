@@ -58,19 +58,37 @@ pub enum Head {
     No,
     /// `HEAD` points at this commit.
     Yes,
-    /// `HEAD` points at this commit and the uncommitted-changes row sits
-    /// right above it, joined to it by a dashed line.
-    BelowWorkingTree,
+    /// `HEAD` points at this commit, and the dashed line from the
+    /// uncommitted-changes row comes in at the top of the row in `lane`.
+    BelowWorkingTree {
+        lane: usize,
+    },
 }
 
 /// An element that paints `row` across its bounds, with the graph moved
-/// `scroll` to the left.
-pub fn cell(row: Row, head: Head, width: Pixels, scroll: Pixels) -> impl IntoElement {
+/// `scroll` to the left. `working_tree` is the lane and colour of the dashed
+/// line from the uncommitted-changes row, when it passes through this row on
+/// its way down to `HEAD`.
+pub fn cell(
+    row: Row,
+    head: Head,
+    working_tree: Option<(usize, usize)>,
+    width: Pixels,
+    scroll: Pixels,
+) -> impl IntoElement {
     canvas(
         |_, _, _| {},
         move |bounds, _, window, _| {
             window.with_content_mask(Some(ContentMask { bounds }), |window| {
                 paint_row(&row, head, bounds, scroll, window);
+                if let Some((lane, color)) = working_tree {
+                    let x = lane_x(bounds, scroll, lane);
+                    if let Some(path) =
+                        dashed_line(point(x, bounds.top()), point(x, bounds.bottom()))
+                    {
+                        window.paint_path(path, lane_color(color));
+                    }
+                }
             });
         },
     )
@@ -79,16 +97,22 @@ pub fn cell(row: Row, head: Head, width: Pixels, scroll: Pixels) -> impl IntoEle
     .flex_none()
 }
 
-/// An element that paints the uncommitted-changes row, which sits right
-/// above `head_row`, the row of the commit `HEAD` points at. Lines entering
-/// `head_row` from above pass through; with no `head_row` (an unborn branch,
-/// or `HEAD` not read yet) only the node is drawn, in the first lane.
-pub fn working_tree_cell(head_row: Option<Row>, width: Pixels, scroll: Pixels) -> impl IntoElement {
+/// An element that paints the uncommitted-changes row, the first row of the
+/// history: its node in `lane`, and with `has_head` a dashed line going down
+/// towards the commit `HEAD` points at. Without `has_head` (an unborn branch,
+/// or `HEAD` not read yet) only the node is drawn.
+pub fn working_tree_cell(
+    lane: usize,
+    color: usize,
+    has_head: bool,
+    width: Pixels,
+    scroll: Pixels,
+) -> impl IntoElement {
     canvas(
         |_, _, _| {},
         move |bounds, _, window, _| {
             window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                paint_working_tree(head_row.as_ref(), bounds, scroll, window);
+                paint_working_tree(lane, color, has_head, bounds, scroll, window);
             });
         },
     )
@@ -103,28 +127,16 @@ fn lane_x(bounds: Bounds<Pixels>, scroll: Pixels, lane: usize) -> Pixels {
 }
 
 fn paint_working_tree(
-    head_row: Option<&Row>,
+    lane: usize,
+    color: usize,
+    has_head: bool,
     bounds: Bounds<Pixels>,
     scroll: Pixels,
     window: &mut Window,
 ) {
-    let (lane, color) = head_row.map_or((0, 0), |row| (row.lane, row.color));
     let node = point(lane_x(bounds, scroll, lane), bounds.center().y);
-    if let Some(row) = head_row {
-        // Every line at the top of the `HEAD` row crosses this row whole.
-        for segment in &row.segments {
-            if let Segment::Through { lane, color } | Segment::In { lane, color } = *segment {
-                let x = lane_x(bounds, scroll, lane);
-                let path = line(point(x, bounds.top()), point(x, bounds.bottom()));
-                if let Some(path) = path {
-                    window.paint_path(path, lane_color(color));
-                }
-            }
-        }
-        let path = dashed_line(node, point(node.x, bounds.bottom()));
-        if let Some(path) = path {
-            window.paint_path(path, lane_color(color));
-        }
+    if has_head && let Some(path) = dashed_line(node, point(node.x, bounds.bottom())) {
+        window.paint_path(path, lane_color(color));
     }
     window.paint_quad(quad(
         circle_bounds(node, WORKING_TREE_RADIUS),
@@ -157,8 +169,8 @@ fn paint_row(row: &Row, head: Head, bounds: Bounds<Pixels>, scroll: Pixels, wind
     }
 
     let color = lane_color(row.color);
-    if head == Head::BelowWorkingTree
-        && let Some(path) = dashed_line(point(node.x, top), node)
+    if let Head::BelowWorkingTree { lane } = head
+        && let Some(path) = dashed_curve(point(x(lane), top), node)
     {
         window.paint_path(path, color);
     }
@@ -203,8 +215,27 @@ fn curve(from: Point<Pixels>, to: Point<Pixels>) -> Option<Path<Pixels>> {
     if from.x == to.x {
         return line(from, to);
     }
+    s_curve(PathBuilder::stroke(LINE_WIDTH), from, to)
+}
+
+/// [`curve`], dashed.
+fn dashed_curve(from: Point<Pixels>, to: Point<Pixels>) -> Option<Path<Pixels>> {
+    if from.x == to.x {
+        return dashed_line(from, to);
+    }
+    s_curve(
+        PathBuilder::stroke(LINE_WIDTH).dash_array(&DASHES),
+        from,
+        to,
+    )
+}
+
+fn s_curve(
+    mut builder: PathBuilder,
+    from: Point<Pixels>,
+    to: Point<Pixels>,
+) -> Option<Path<Pixels>> {
     let bend = (from.y + to.y) / 2.;
-    let mut builder = PathBuilder::stroke(LINE_WIDTH);
     builder.move_to(from);
     builder.cubic_bezier_to(to, point(from.x, bend), point(to.x, bend));
     builder.build().ok()
