@@ -1,9 +1,12 @@
 //! GitEZ entry point: installs the theme, menus and key bindings, and opens
 //! the main window.
 //!
-//! `gitez [path]` opens the repository containing `path` straight away.
+//! `gitez [path]` opens the repository containing `path` straight away;
+//! without one, GitEZ opens the repository that was open when it last quit.
 
 mod assets;
+mod menus;
+mod recent;
 mod repository;
 mod shell_path;
 mod theme;
@@ -15,9 +18,7 @@ use std::path::PathBuf;
 
 use gpui_kit::*;
 
-use workspace::{CloneRepository, InitRepository, OpenRepository, Workspace};
-
-actions!(gitez, [Quit]);
+use workspace::Workspace;
 
 fn main() {
     // Before anything else: it changes the environment, and git needs the
@@ -35,28 +36,9 @@ fn main() {
             gpui_kit::init(cx);
             theme::init(cx);
 
-            cx.on_action(|_: &Quit, cx| cx.quit());
-            cx.bind_keys([
-                KeyBinding::new("secondary-o", OpenRepository, None),
-                KeyBinding::new("secondary-q", Quit, None),
-            ]);
+            recent::init(cx);
+            menus::init(cx);
             cx.bind_keys(workspace::key_bindings());
-            cx.set_menus([
-                Menu {
-                    name: "GitEZ".into(),
-                    items: vec![MenuItem::action("Quit GitEZ", Quit)],
-                    disabled: false,
-                },
-                Menu {
-                    name: "File".into(),
-                    items: vec![
-                        MenuItem::action("Open Repository…", OpenRepository),
-                        MenuItem::action("Clone Repository…", CloneRepository),
-                        MenuItem::action("New Repository…", InitRepository),
-                    ],
-                    disabled: false,
-                },
-            ]);
             // One window per process for now, so closing it ends the app.
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
@@ -65,6 +47,7 @@ fn main() {
             })
             .detach();
 
+            let path = path.or_else(|| recent::last(cx));
             let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
             let options = WindowOptions {
                 titlebar: Some(TitlebarOptions {

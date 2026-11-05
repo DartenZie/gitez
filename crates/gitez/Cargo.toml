@@ -24,6 +24,9 @@ gitez-review.workspace = true
 gitez-agent.workspace = true
 anyhow.workspace = true
 futures.workspace = true
+dirs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 # GPUI's test platform, to lay out and drive views in tests.

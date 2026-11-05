@@ -2174,6 +2174,7 @@ name = "gitez"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dirs 6.0.0",
  "futures",
  "gitez-agent",
  "gitez-command",
@@ -2181,6 +2182,8 @@ dependencies = [
  "gitez-highlight",
  "gitez-review",
  "gpui-kit",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 

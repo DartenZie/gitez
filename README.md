@@ -82,6 +82,7 @@ tree, so it cannot be committed or pushed by accident. Linked worktrees share it
 - **Command palette** (`⌘K`): find actions, commits, branches and files, or
   run any `git` command and see its output stream in.
 - **Clone or create** a repository from the start screen, the File menu or the palette.
+- **Reopen where you left off**: GitEZ opens the repository that was open when it last quit, and the start screen and File > Open Recent list the last ten. File also has Reveal in Finder, Close Repository and Close Window.
 
 > [!NOTE]
 > GitEZ reads the repository with [gitoxide](https://github.com/GitoxideLabs/gitoxide),
@@ -151,7 +152,7 @@ You need a Vulkan-capable GPU driver. Wayland and X11 are both supported.
 ```sh
 git clone https://github.com/miroslavpasek/gitez.git
 cd gitez
-cargo run                          # open, clone or create a repository from the start screen
+cargo run                          # reopen the last repository, or start from the start screen
 cargo run -- <path-to-repository>  # open a repository directly
 ```
 
@@ -185,6 +186,7 @@ On Linux, use `Ctrl` instead of `⌘`.
 | Shortcut | Action |
 | --- | --- |
 | `⌘O` | Open a repository |
+| `⌘W` | Close the window |
 | `⌘K` | Open the command palette |
 | `⌘Z` / `⇧⌘Z` | Undo / redo |
 | `↑` `↓` or `k` `j` | Move through the history |

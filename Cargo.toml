@@ -31,6 +31,9 @@ futures = "0.3"
 
 tempfile = "3"
 
+# The folders GitEZ keeps its own data in, such as the recent repositories.
+dirs = "6"
+
 # Local pull requests: stored as JSON, with RFC 3339 times.
 jiff = { version = "0.2", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }

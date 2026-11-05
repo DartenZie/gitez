@@ -73,6 +73,8 @@ actions!(
         OpenRepository,
         CloneRepository,
         InitRepository,
+        CloseRepository,
+        RevealRepository,
         ReviewSelected,
         NewPullRequest,
         OpenPalette,
@@ -87,6 +89,13 @@ actions!(
         RedoStep
     ]
 );
+
+/// Opens a repository from File > Open Recent.
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = workspace, no_json)]
+pub struct OpenRecent {
+    pub path: PathBuf,
+}
 
 /// Key bindings of the views inside the workspace.
 pub fn key_bindings() -> Vec<KeyBinding> {
@@ -291,6 +300,8 @@ impl Workspace {
             // Files change outside GitEZ; read the status again on return.
             // The toolbar names the next undo and redo steps.
             cx.observe_global::<UndoLog>(|_, cx| cx.notify()),
+            // The start screen lists the recent repositories.
+            cx.observe_global::<crate::recent::Recent>(|_, cx| cx.notify()),
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
                     this.refresh_status(window, cx);
@@ -386,6 +397,47 @@ impl Workspace {
         .detach();
     }
 
+    fn open_recent(&mut self, action: &OpenRecent, window: &mut Window, cx: &mut Context<Self>) {
+        self.open(action.path.clone(), window, cx);
+    }
+
+    /// Shows the open repository in Finder or the file manager.
+    fn reveal_repository(&mut self, _: &RevealRepository, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(snapshot) = &self.snapshot {
+            cx.reveal_path(&snapshot.path);
+        }
+    }
+
+    /// Closes the open repository, back to the start screen, unless a git
+    /// command is still running in it.
+    fn close_repository(
+        &mut self,
+        _: &CloseRepository,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let busy = self.remote_op.is_some()
+            || self.git_command.is_some()
+            || self.stepping.is_some()
+            || self.rewrite_command.is_some()
+            || self._create.is_some()
+            || self.cloning.is_some();
+        if busy {
+            window.push_notification(
+                Notification::warning(
+                    "Wait for the running git command to finish, then close the repository.",
+                ),
+                cx,
+            );
+            return;
+        }
+        crate::recent::closed(cx);
+        window.set_window_title("GitEZ");
+        // A fresh workspace drops every view, task and watcher of the old one.
+        *self = Self::new(None, window, cx);
+        cx.notify();
+    }
+
     /// Opens the repository containing `path` on a background thread. The
     /// current repository stays on screen until the new one has loaded.
     pub fn open(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
@@ -398,7 +450,10 @@ impl Workspace {
             this.update_in(cx, |this, window, cx| {
                 this.loading = None;
                 match result {
-                    Ok(snapshot) => this.show(Arc::new(snapshot), window, cx),
+                    Ok(snapshot) => {
+                        crate::recent::opened(&snapshot.path, cx);
+                        this.show(Arc::new(snapshot), window, cx)
+                    }
                     Err(error) => this.show_error(error, window, cx),
                 }
             })
@@ -1613,6 +1668,14 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::prompt_for_repository))
             .on_action(cx.listener(Self::clone_repository))
             .on_action(cx.listener(Self::init_repository))
+            .on_action(cx.listener(Self::open_recent))
+            // Without a repository the menu items are disabled.
+            .when(snapshot.is_some() || self.loading.is_some(), |this| {
+                this.on_action(cx.listener(Self::close_repository))
+            })
+            .when(snapshot.is_some(), |this| {
+                this.on_action(cx.listener(Self::reveal_repository))
+            })
             .on_action(cx.listener(Self::review_selected))
             .on_action(cx.listener(Self::new_pull_request))
             .on_action(cx.listener(Self::open_palette))
@@ -1695,7 +1758,7 @@ impl Render for Workspace {
                         )
                         .child(resizable_panel().child(match selection_review {
                             Some(review) => review.into_any_element(),
-                            None => self.render_history(),
+                            None => self.render_history(cx),
                         }))
                         .child(
                             resizable_panel()
@@ -1762,7 +1825,7 @@ impl Render for Workspace {
 
 impl Workspace {
     /// The history list, or what to show while no repository is open.
-    fn render_history(&self) -> AnyElement {
+    fn render_history(&self, cx: &App) -> AnyElement {
         if self.snapshot.is_some() {
             return self.history.clone().into_any_element();
         }
@@ -1786,17 +1849,76 @@ impl Workspace {
             return empty_state(
                 "Could not open the repository",
                 error.clone(),
-                Some(start_buttons("Open another…")),
+                Some(start_actions("Open another…", cx)),
             )
             .into_any_element();
         }
         empty_state(
             "No repository open",
             "Open a repository to see its history, clone one, or create a new one.",
-            Some(start_buttons("Open repository…")),
+            Some(start_actions("Open repository…", cx)),
         )
         .into_any_element()
     }
+}
+
+/// The start buttons, and the recent repositories below them.
+fn start_actions(open: &'static str, cx: &App) -> impl IntoElement {
+    let recent = crate::recent::paths(cx);
+    div()
+        .v_flex()
+        .items_center()
+        .gap(px(24.))
+        .child(start_buttons(open))
+        .when(!recent.is_empty(), |this| this.child(recent_list(recent)))
+}
+
+/// The recent repositories, each opening on click.
+fn recent_list(paths: &[PathBuf]) -> impl IntoElement {
+    div()
+        .v_flex()
+        .w(px(420.))
+        .child(
+            div()
+                .px(px(10.))
+                .pb(px(6.))
+                .text_size(px(11.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(color::TEXT_FAINT))
+                .child("RECENT"),
+        )
+        .children(paths.iter().enumerate().map(|(index, path)| {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            let action = OpenRecent { path: path.clone() };
+            div()
+                .id(("recent-repository", index))
+                .h_flex()
+                .gap(px(10.))
+                .h(px(32.))
+                .px(px(10.))
+                .rounded(px(6.))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(color::ROW_HOVER)))
+                .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
+                .child(
+                    Icon::new(IconName::Folder)
+                        .size(px(14.))
+                        .text_color(rgb(color::TEXT_MUTED)),
+                )
+                .child(div().flex_none().child(name))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_right()
+                        .text_color(rgb(color::TEXT_FAINT))
+                        .child(crate::recent::display(path)),
+                )
+        }))
 }
 
 /// Opening, cloning or creating a repository; `open` labels the first.
