@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use gitez_command::Git;
 use gpui_kit::component::button::*;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::notification::Notification;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -302,11 +301,11 @@ impl Workspace {
                             .file_name()
                             .map_or_else(|| url.clone(), |name| name.to_string_lossy().into());
                         window
-                            .push_notification(Notification::success(format!("Cloned {name}")), cx);
+                            .push_notification(crate::toast::success(format!("Cloned {name}")), cx);
                         this.open(git.work_dir().to_path_buf(), window, cx);
                     }
                     Err(error) => window.push_notification(
-                        Notification::error(format!("Could not clone: {error}")),
+                        crate::toast::error(format!("Could not clone: {error}")),
                         cx,
                     ),
                 }
@@ -368,15 +367,15 @@ impl Workspace {
                 match result {
                     Ok(created) => {
                         let notification = if created {
-                            Notification::success(format!("Created a repository in {name}"))
+                            crate::toast::success(format!("Created a repository in {name}"))
                         } else {
-                            Notification::info(format!("{name} is a repository already"))
+                            crate::toast::info(format!("{name} is a repository already"))
                         };
                         window.push_notification(notification, cx);
                         this.open(dir, window, cx);
                     }
                     Err(error) => window.push_notification(
-                        Notification::error(format!(
+                        crate::toast::error(format!(
                             "Could not create a repository in {name}: {error}"
                         )),
                         cx,

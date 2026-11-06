@@ -3,7 +3,6 @@
 use gitez_git::{Head, Oid, tag_name_problem};
 use gpui_kit::component::button::*;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::notification::Notification;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -268,9 +267,9 @@ impl Workspace {
             move |git| git.create_tag(&tag, &commit.to_string(), message.as_deref()),
             move |this, result, step, window, cx| {
                 let notification = match result {
-                    Ok(()) => Notification::success(format!("Created tag {name}")),
+                    Ok(()) => crate::toast::success(format!("Created tag {name}")),
                     Err(error) => {
-                        Notification::error(format!("Could not create tag {name}: {error}"))
+                        crate::toast::error(format!("Could not create tag {name}: {error}"))
                     }
                 };
                 this.notify_done(notification, step, window, cx);
@@ -288,9 +287,9 @@ impl Workspace {
             move |git| git.delete_tag(&tag),
             move |this, result, step, window, cx| {
                 let notification = match result {
-                    Ok(()) => Notification::success(format!("Deleted tag {name}")),
+                    Ok(()) => crate::toast::success(format!("Deleted tag {name}")),
                     Err(error) => {
-                        Notification::error(format!("Could not delete tag {name}: {error}"))
+                        crate::toast::error(format!("Could not delete tag {name}: {error}"))
                     }
                 };
                 this.notify_done(notification, step, window, cx);
@@ -313,7 +312,7 @@ impl Workspace {
     /// Sends tag `name` to the remote.
     pub(super) fn push_tag(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(remote) = self.tag_remote() else {
-            window.push_notification(Notification::info("There is no remote to push to."), cx);
+            window.push_notification(crate::toast::info("There is no remote to push to."), cx);
             return;
         };
         let (to, tag) = (remote.clone(), name.clone());
@@ -322,9 +321,9 @@ impl Workspace {
             move |git| git.push_tag(&to, &tag),
             move |_, result, _, window, cx| {
                 let notification = match result {
-                    Ok(()) => Notification::success(format!("Pushed tag {name} to {remote}")),
+                    Ok(()) => crate::toast::success(format!("Pushed tag {name} to {remote}")),
                     Err(error) => {
-                        Notification::error(format!("Could not push tag {name}: {error}"))
+                        crate::toast::error(format!("Could not push tag {name}: {error}"))
                     }
                 };
                 window.push_notification(notification, cx);
@@ -348,7 +347,7 @@ impl Workspace {
         if !confirmed {
             let again = name.clone();
             self.notify_with_action(
-                Notification::warning(format!(
+                crate::toast::warning(format!(
                     "Delete tag {name} from {remote}? Everyone who fetches from {remote} loses \
                      it, and GitEZ cannot undo this."
                 )),
@@ -365,8 +364,8 @@ impl Workspace {
             move |git| git.delete_remote_tag(&on, &tag),
             move |_, result, _, window, cx| {
                 let notification = match result {
-                    Ok(()) => Notification::success(format!("Deleted tag {name} from {remote}")),
-                    Err(error) => Notification::error(format!(
+                    Ok(()) => crate::toast::success(format!("Deleted tag {name} from {remote}")),
+                    Err(error) => crate::toast::error(format!(
                         "Could not delete tag {name} from {remote}: {error}"
                     )),
                 };

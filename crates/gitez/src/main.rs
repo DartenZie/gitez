@@ -11,6 +11,7 @@ mod repository;
 mod shell_path;
 mod theme;
 mod time;
+mod toast;
 mod undo;
 mod workspace;
 

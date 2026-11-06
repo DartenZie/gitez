@@ -3,7 +3,6 @@
 use gitez_command::{Git, ResetMode, RevertOutcome};
 use gitez_git::{Head, Oid};
 use gpui_kit::component::button::*;
-use gpui_kit::component::notification::Notification;
 use gpui_kit::component::radio::{Radio, RadioGroup};
 use gpui_kit::component::*;
 use gpui_kit::*;
@@ -104,7 +103,7 @@ impl Workspace {
     /// `id` changed.
     pub(super) fn revert_commit(&mut self, id: Oid, window: &mut Window, cx: &mut Context<Self>) {
         let Some(branch) = self.checked_out_branch() else {
-            window.push_notification(Notification::info("Check out a branch to revert on."), cx);
+            window.push_notification(crate::toast::info("Check out a branch to revert on."), cx);
             return;
         };
         let commit = self
@@ -127,20 +126,20 @@ impl Workspace {
             move |git| git.revert(&id.to_string(), mainline),
             move |this, result, step, window, cx| match result {
                 Ok(RevertOutcome::Reverted) => this.notify_done(
-                    Notification::success(format!("Reverted {short} on {branch}")),
+                    crate::toast::success(format!("Reverted {short} on {branch}")),
                     step,
                     window,
                     cx,
                 ),
                 Ok(RevertOutcome::Conflicts) => window.push_notification(
-                    Notification::warning(format!(
+                    crate::toast::warning(format!(
                         "Reverting {short} conflicts with later changes on {branch}, so \
                          nothing was changed."
                     )),
                     cx,
                 ),
                 Err(error) => window.push_notification(
-                    Notification::error(format!("Could not revert {short}: {error}")),
+                    crate::toast::error(format!("Could not revert {short}: {error}")),
                     cx,
                 ),
             },
@@ -152,7 +151,7 @@ impl Workspace {
     /// Asks how to reset the branch checked out to commit `target`.
     pub(super) fn reset_to(&mut self, target: Oid, window: &mut Window, cx: &mut Context<Self>) {
         let Some(branch) = self.checked_out_branch() else {
-            window.push_notification(Notification::info("Check out a branch to reset."), cx);
+            window.push_notification(crate::toast::info("Check out a branch to reset."), cx);
             return;
         };
         let on = self.describe_commit(target, cx);
@@ -241,14 +240,14 @@ impl Workspace {
                     Ok(recorded) => {
                         let step = undo::record(cx, recorded, label);
                         this.notify_done(
-                            Notification::success(format!("Reset {branch} to {short}")),
+                            crate::toast::success(format!("Reset {branch} to {short}")),
                             step,
                             window,
                             cx,
                         );
                     }
                     Err(error) => window.push_notification(
-                        Notification::error(format!("Could not reset {branch}: {error}")),
+                        crate::toast::error(format!("Could not reset {branch}: {error}")),
                         cx,
                     ),
                 }

@@ -5,7 +5,6 @@ use gitez_git::{Head, WorkingTreeStatus, WorktreeChange};
 use gpui_kit::component::button::*;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::notification::Notification;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -169,7 +168,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(status) = self.status.clone().filter(|status| !status.is_clean()) else {
-            window.push_notification(Notification::info("There are no changes to stash."), cx);
+            window.push_notification(crate::toast::info("There are no changes to stash."), cx);
             return;
         };
         let branch = match self
@@ -250,15 +249,15 @@ impl Workspace {
             move |git| git.stash(request.message.as_deref(), request.untracked),
             |this, result, step, window, cx| match result {
                 Ok(true) => this.notify_done(
-                    Notification::success("Stashed your changes"),
+                    crate::toast::success("Stashed your changes"),
                     step,
                     window,
                     cx,
                 ),
                 Ok(false) => window
-                    .push_notification(Notification::info("There were no changes to stash."), cx),
+                    .push_notification(crate::toast::info("There were no changes to stash."), cx),
                 Err(error) => window.push_notification(
-                    Notification::error(format!("Could not stash: {error}")),
+                    crate::toast::error(format!("Could not stash: {error}")),
                     cx,
                 ),
             },
@@ -282,17 +281,17 @@ impl Workspace {
             move |_, result, _, window, cx| {
                 let notification = match result {
                     Ok(UnstashOutcome::Applied) if pop => {
-                        Notification::success("Popped the stash into the working tree")
+                        crate::toast::success("Popped the stash into the working tree")
                     }
                     Ok(UnstashOutcome::Applied) => {
-                        Notification::success("Applied the stash to the working tree; it is kept")
+                        crate::toast::success("Applied the stash to the working tree; it is kept")
                     }
-                    Ok(UnstashOutcome::Conflicts) => Notification::warning(
+                    Ok(UnstashOutcome::Conflicts) => crate::toast::warning(
                         "The stash conflicts with your files. The conflicts are marked in \
                          them, and the stash is kept until you drop it.",
                     ),
                     Err(error) => {
-                        Notification::error(format!("Could not apply the stash: {error}"))
+                        crate::toast::error(format!("Could not apply the stash: {error}"))
                     }
                 };
                 window.push_notification(notification, cx);
@@ -319,10 +318,10 @@ impl Workspace {
             move |git| git.drop_stash(index),
             |this, result, step, window, cx| match result {
                 Ok(()) => {
-                    this.notify_done(Notification::success("Dropped the stash"), step, window, cx)
+                    this.notify_done(crate::toast::success("Dropped the stash"), step, window, cx)
                 }
                 Err(error) => window.push_notification(
-                    Notification::error(format!("Could not drop the stash: {error}")),
+                    crate::toast::error(format!("Could not drop the stash: {error}")),
                     cx,
                 ),
             },

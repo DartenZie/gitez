@@ -4,7 +4,6 @@
 use gitez_git::remote_name_problem;
 use gpui_kit::component::button::*;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::notification::Notification;
 use gpui_kit::component::select::{SearchableVec, Select, SelectState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -386,13 +385,13 @@ impl Workspace {
                     move |_, result, _, window, cx| {
                         let notification = match result {
                             Ok(None) => {
-                                Notification::success(format!("Added {name} and fetched it"))
+                                crate::toast::success(format!("Added {name} and fetched it"))
                             }
-                            Ok(Some(error)) => Notification::warning(format!(
+                            Ok(Some(error)) => crate::toast::warning(format!(
                                 "Added {name}, but could not fetch it: {error}"
                             )),
                             Err(error) => {
-                                Notification::error(format!("Could not add {name}: {error}"))
+                                crate::toast::error(format!("Could not add {name}: {error}"))
                             }
                         };
                         window.push_notification(notification, cx);
@@ -425,11 +424,11 @@ impl Workspace {
                     move |_, result, _, window, cx| {
                         let notification = match result {
                             Ok(()) if from != to => {
-                                Notification::success(format!("Renamed {from} to {to}"))
+                                crate::toast::success(format!("Renamed {from} to {to}"))
                             }
-                            Ok(()) => Notification::success(format!("Changed the URL of {to}")),
+                            Ok(()) => crate::toast::success(format!("Changed the URL of {to}")),
                             Err(error) => {
-                                Notification::error(format!("Could not change {from}: {error}"))
+                                crate::toast::error(format!("Could not change {from}: {error}"))
                             }
                         };
                         window.push_notification(notification, cx);
@@ -454,8 +453,8 @@ impl Workspace {
             move |git| git.fetch_remote(&remote),
             move |_, result, _, window, cx| {
                 let notification = match result {
-                    Ok(()) => Notification::success(format!("Fetched {name}")),
-                    Err(error) => Notification::error(format!("Could not fetch {name}: {error}")),
+                    Ok(()) => crate::toast::success(format!("Fetched {name}")),
+                    Err(error) => crate::toast::error(format!("Could not fetch {name}: {error}")),
                 };
                 window.push_notification(notification, cx);
             },
@@ -475,7 +474,7 @@ impl Workspace {
         if !confirmed {
             let again = name.clone();
             self.notify_with_action(
-                Notification::warning(format!(
+                crate::toast::warning(format!(
                     "Remove {name}? Its remote-tracking branches go, and branches that track \
                      it no longer have an upstream. GitEZ cannot undo this; adding it again \
                      and fetching brings the branches back."
@@ -493,8 +492,8 @@ impl Workspace {
             move |git| git.remove_remote(&remote),
             move |_, result, _, window, cx| {
                 let notification = match result {
-                    Ok(()) => Notification::success(format!("Removed {name}")),
-                    Err(error) => Notification::error(format!("Could not remove {name}: {error}")),
+                    Ok(()) => crate::toast::success(format!("Removed {name}")),
+                    Err(error) => crate::toast::error(format!("Could not remove {name}: {error}")),
                 };
                 window.push_notification(notification, cx);
             },
@@ -521,7 +520,7 @@ impl Workspace {
             .collect();
         if remote_branches.is_empty() {
             window.push_notification(
-                Notification::info("There are no remote branches to track; fetch a remote first."),
+                crate::toast::info("There are no remote branches to track; fetch a remote first."),
                 cx,
             );
             return;
@@ -585,12 +584,12 @@ impl Workspace {
             move |_, result, _, window, cx| {
                 let notification = match (result, upstream) {
                     (Ok(()), Some(upstream)) => {
-                        Notification::success(format!("{branch} now tracks {upstream}"))
+                        crate::toast::success(format!("{branch} now tracks {upstream}"))
                     }
                     (Ok(()), None) => {
-                        Notification::success(format!("{branch} no longer has an upstream"))
+                        crate::toast::success(format!("{branch} no longer has an upstream"))
                     }
-                    (Err(error), _) => Notification::error(format!(
+                    (Err(error), _) => crate::toast::error(format!(
                         "Could not set the upstream of {branch}: {error}"
                     )),
                 };

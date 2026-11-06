@@ -53,7 +53,7 @@ impl Workspace {
         };
         if only.is_some_and(|id| id != next.id) {
             window.push_notification(
-                Notification::info(format!(
+                crate::toast::info(format!(
                     "Undo “{}” and the steps after it first.",
                     next.label
                 )),
@@ -77,28 +77,28 @@ impl Workspace {
                 undo::put_back(cx, &key, direction, entry, result.is_ok());
                 match (result, direction) {
                     (Ok(()), Direction::Undo) => this.notify_with_action(
-                        Notification::success(format!("Undone: {label}")),
+                        crate::toast::success(format!("Undone: {label}")),
                         "Redo",
                         move |this, window, cx| this.step(Direction::Redo, Some(id), window, cx),
                         window,
                         cx,
                     ),
                     (Ok(()), Direction::Redo) => this.notify_with_action(
-                        Notification::success(format!("Redone: {label}")),
+                        crate::toast::success(format!("Redone: {label}")),
                         "Undo",
                         move |this, window, cx| this.step(Direction::Undo, Some(id), window, cx),
                         window,
                         cx,
                     ),
                     (Err(error), Direction::Undo) => window.push_notification(
-                        Notification::error(format!(
+                        crate::toast::error(format!(
                             "Could not undo {}: {error:#}",
                             lowercase_first(&label)
                         )),
                         cx,
                     ),
                     (Err(error), Direction::Redo) => window.push_notification(
-                        Notification::error(format!(
+                        crate::toast::error(format!(
                             "Could not redo {}: {error:#}",
                             lowercase_first(&label)
                         )),

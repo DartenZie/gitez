@@ -20,7 +20,6 @@ use gitez_review::{FileUpdate, LineChange, PullRequest, State, Store, Timestamp}
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::*;
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::notification::Notification;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -589,7 +588,7 @@ impl Review {
                         cx.emit(ReviewEvent::CheckedOut);
                     }
                     Err(error) => window.push_notification(
-                        Notification::error(format!("{:#}", anyhow::Error::from(error)))
+                        crate::toast::error(format!("{:#}", anyhow::Error::from(error)))
                             .title("Could not check out the branch"),
                         cx,
                     ),
@@ -1405,7 +1404,7 @@ impl Review {
                 match result {
                     Ok(value) => done(this, value, window, cx),
                     Err(error) => window.push_notification(
-                        Notification::error(format!("{:#}", anyhow::Error::from(error))),
+                        crate::toast::error(format!("{:#}", anyhow::Error::from(error))),
                         cx,
                     ),
                 }

@@ -157,8 +157,8 @@ impl Workspace {
             move |_, result, _, window, cx| {
                 let notification = match result {
                     // "Fetch from origin" becomes "Fetched from origin".
-                    Ok(()) => Notification::success(description.replacen("Fetch", "Fetched", 1)),
-                    Err(error) => Notification::error(format!("Could not fetch: {error}")),
+                    Ok(()) => crate::toast::success(description.replacen("Fetch", "Fetched", 1)),
+                    Err(error) => crate::toast::error(format!("Could not fetch: {error}")),
                 };
                 window.push_notification(notification, cx);
             },
@@ -185,16 +185,16 @@ impl Workspace {
             move |git| git.pull(method),
             |this, result, step, window, cx| match result {
                 Ok(PullOutcome::Pulled) => {
-                    this.notify_done(Notification::success("Pulled"), step, window, cx)
+                    this.notify_done(crate::toast::success("Pulled"), step, window, cx)
                 }
                 Ok(PullOutcome::Conflicts) => window.push_notification(
-                    Notification::warning(
+                    crate::toast::warning(
                         "The pull stopped on conflicts. Resolve them to finish it, or abort it.",
                     ),
                     cx,
                 ),
                 Err(error) if needs_pull_method(&error) => this.notify_with_action(
-                    Notification::warning(
+                    crate::toast::warning(
                         "The branch and its upstream have diverged, and git is not set to \
                          merge or rebase them (pull.rebase).",
                     ),
@@ -204,7 +204,7 @@ impl Workspace {
                     cx,
                 ),
                 Err(error) => window
-                    .push_notification(Notification::error(format!("Could not pull: {error}")), cx),
+                    .push_notification(crate::toast::error(format!("Could not pull: {error}")), cx),
             },
             window,
             cx,
@@ -242,11 +242,11 @@ impl Workspace {
             move |git| git.pull_branch(&name),
             move |this, result, _, window, cx| match result {
                 Ok(()) => window.push_notification(
-                    Notification::success(format!("Pulled {upstream} into {branch}")),
+                    crate::toast::success(format!("Pulled {upstream} into {branch}")),
                     cx,
                 ),
                 Err(error) if not_fast_forward(&error) => this.notify_with_action(
-                    Notification::warning(format!(
+                    crate::toast::warning(format!(
                         "{branch} has commits {upstream} does not. Check it out to merge or \
                          rebase them."
                     )),
@@ -256,7 +256,7 @@ impl Workspace {
                     cx,
                 ),
                 Err(error) => window
-                    .push_notification(Notification::error(format!("Could not pull: {error}")), cx),
+                    .push_notification(crate::toast::error(format!("Could not pull: {error}")), cx),
             },
             window,
             cx,
@@ -323,11 +323,11 @@ impl Workspace {
                     } else {
                         format!("Pushed {} to {}", plan.branch, plan.to)
                     };
-                    window.push_notification(Notification::success(done), cx)
+                    window.push_notification(crate::toast::success(done), cx)
                 }
                 Err(error) => match PushRejection::of(&error) {
                     Some(PushRejection::NotFetched) => this.notify_with_action(
-                        Notification::warning(format!(
+                        crate::toast::warning(format!(
                             "{} has commits not fetched yet. Pull them in, then push.",
                             plan.to
                         )),
@@ -340,7 +340,7 @@ impl Workspace {
                         cx,
                     ),
                     Some(PushRejection::Diverged) if !force => this.notify_with_action(
-                        Notification::warning(format!(
+                        crate::toast::warning(format!(
                             "{} has commits {} does not. Pull them in, or force push to \
                              replace them.",
                             plan.to, plan.branch
@@ -356,7 +356,7 @@ impl Workspace {
                         cx,
                     ),
                     _ => window.push_notification(
-                        Notification::error(format!("Could not push: {error}")),
+                        crate::toast::error(format!("Could not push: {error}")),
                         cx,
                     ),
                 },

@@ -6,7 +6,6 @@ use gitez_review::State;
 use gpui_kit::component::button::*;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState, SelectAll};
-use gpui_kit::component::notification::Notification;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -286,7 +285,7 @@ impl Workspace {
     ) {
         if let Some(number) = self.pull_request_on(&branch) {
             window.push_notification(
-                Notification::info(format!(
+                crate::toast::info(format!(
                     "{branch} is a branch of local pull request #{number}; close or merge it first."
                 )),
                 cx,
@@ -308,7 +307,7 @@ impl Workspace {
     ) {
         if let Some(number) = self.pull_request_on(&branch) {
             window.push_notification(
-                Notification::info(format!(
+                crate::toast::info(format!(
                     "{branch} is a branch of local pull request #{number}; close or merge it first."
                 )),
                 cx,
@@ -330,7 +329,7 @@ impl Workspace {
                 Ok(()) => {
                     let short = tip.to_hex_with_len(7).to_string();
                     this.notify_done(
-                        Notification::success(format!("Deleted {branch} (was {short})")),
+                        crate::toast::success(format!("Deleted {branch} (was {short})")),
                         step,
                         window,
                         cx,
@@ -339,7 +338,7 @@ impl Workspace {
                 Err(error) if not_merged(&error) => {
                     let again = branch.clone();
                     this.notify_with_action(
-                        Notification::warning(format!(
+                        crate::toast::warning(format!(
                             "{branch} has commits that are not on the branch checked out or its \
                              upstream. Deleting it leaves them on no branch."
                         )),
@@ -350,7 +349,7 @@ impl Workspace {
                     );
                 }
                 Err(error) => window.push_notification(
-                    Notification::error(format!("Could not delete {branch}: {error}")),
+                    crate::toast::error(format!("Could not delete {branch}: {error}")),
                     cx,
                 ),
             },
@@ -384,7 +383,7 @@ impl Workspace {
                 .is_some_and(|tracking| tracking.upstream == upstream);
             if !tracks {
                 window.push_notification(
-                    Notification::info(format!(
+                    crate::toast::info(format!(
                         "A local branch {name} already exists and does not track {upstream}."
                     )),
                     cx,
@@ -400,13 +399,13 @@ impl Workspace {
             move |git| git.track(&track_remote, &track_name),
             move |this, result, step, window, cx| match result {
                 Ok(()) => this.notify_done(
-                    Notification::success(format!("Checked out {name}, tracking {upstream}")),
+                    crate::toast::success(format!("Checked out {name}, tracking {upstream}")),
                     step,
                     window,
                     cx,
                 ),
                 Err(error) => window.push_notification(
-                    Notification::error(format!("Could not check out {upstream}: {error}")),
+                    crate::toast::error(format!("Could not check out {upstream}: {error}")),
                     cx,
                 ),
             },
@@ -428,7 +427,7 @@ impl Workspace {
         if !confirmed {
             let (again_remote, again_name) = (remote.clone(), name.clone());
             self.notify_with_action(
-                Notification::warning(format!(
+                crate::toast::warning(format!(
                     "Delete {name} from {remote}? Everyone who fetches from {remote} loses \
                      it, and GitEZ cannot undo this."
                 )),
@@ -453,8 +452,8 @@ impl Workspace {
             move |git| git.delete_remote_branch(&on, &branch),
             move |_, result, _, window, cx| {
                 let notification = match result {
-                    Ok(()) => Notification::success(format!("Deleted {name} from {remote}")),
-                    Err(error) => Notification::error(format!(
+                    Ok(()) => crate::toast::success(format!("Deleted {name} from {remote}")),
+                    Err(error) => crate::toast::error(format!(
                         "Could not delete {name} from {remote}: {error}"
                     )),
                 };
@@ -572,11 +571,11 @@ impl Workspace {
                     move |this, result, step, window, cx| {
                         let notification = match result {
                             Ok(()) if checkout => {
-                                Notification::success(format!("Created and checked out {name}"))
+                                crate::toast::success(format!("Created and checked out {name}"))
                             }
-                            Ok(()) => Notification::success(format!("Created {name}")),
+                            Ok(()) => crate::toast::success(format!("Created {name}")),
                             Err(error) => {
-                                Notification::error(format!("Could not create {name}: {error}"))
+                                crate::toast::error(format!("Could not create {name}: {error}"))
                             }
                         };
                         this.notify_done(notification, step, window, cx);
@@ -592,9 +591,9 @@ impl Workspace {
                     move |git| git.rename_branch(&old, &new),
                     move |this, result, step, window, cx| {
                         let notification = match result {
-                            Ok(()) => Notification::success(format!("Renamed {from} to {to}")),
+                            Ok(()) => crate::toast::success(format!("Renamed {from} to {to}")),
                             Err(error) => {
-                                Notification::error(format!("Could not rename {from}: {error}"))
+                                crate::toast::error(format!("Could not rename {from}: {error}"))
                             }
                         };
                         this.notify_done(notification, step, window, cx);

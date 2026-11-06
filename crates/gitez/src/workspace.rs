@@ -393,7 +393,7 @@ impl Workspace {
                 Ok(Err(error)) => {
                     this.update_in(cx, |_, window, cx| {
                         window.push_notification(
-                            Notification::error(format!(
+                            crate::toast::error(format!(
                                 "Could not show the folder picker: {error:#}"
                             )),
                             cx,
@@ -438,7 +438,7 @@ impl Workspace {
             || self.cloning.is_some();
         if busy {
             window.push_notification(
-                Notification::warning(
+                crate::toast::warning(
                     "Wait for the running git command to finish, then close the repository.",
                 ),
                 cx,
@@ -489,7 +489,7 @@ impl Workspace {
         self.history
             .update(cx, |history, cx| history.load(&snapshot, cx));
         if let Some(error) = &snapshot.pull_requests_error {
-            window.push_notification(Notification::warning(error.clone()), cx);
+            window.push_notification(crate::toast::warning(error.clone()), cx);
         }
         window.focus(&self.history.focus_handle(cx), cx);
         self.snapshot = Some(snapshot);
@@ -523,7 +523,7 @@ impl Workspace {
                 Err(error) => {
                     this.update_in(cx, |_, window, cx| {
                         window.push_notification(
-                            Notification::warning(format!(
+                            crate::toast::warning(format!(
                                 "Changes made outside GitEZ appear only when its window is focused again: {:#}",
                                 anyhow::Error::from(error)
                             )),
@@ -658,7 +658,7 @@ impl Workspace {
                             anyhow::Error::from(error)
                         );
                         if this.status_error.as_ref() != Some(&message) {
-                            window.push_notification(Notification::error(message.clone()), cx);
+                            window.push_notification(crate::toast::error(message.clone()), cx);
                             this.status_error = Some(message);
                         }
                     }
@@ -769,12 +769,12 @@ impl Workspace {
                     return;
                 }
                 ReviewEvent::Discarded { message, step } => {
-                    this.notify_done(Notification::success(message.clone()), *step, window, cx);
+                    this.notify_done(crate::toast::success(message.clone()), *step, window, cx);
                     this.refresh_status(window, cx);
                     return;
                 }
                 ReviewEvent::Merged { message, step } => {
-                    this.notify_done(Notification::success(message.clone()), *step, window, cx);
+                    this.notify_done(crate::toast::success(message.clone()), *step, window, cx);
                     this.reload(window, cx);
                     this.refresh_status(window, cx);
                     return;
@@ -782,11 +782,11 @@ impl Workspace {
                 ReviewEvent::FileEdited { committed, step } => {
                     if *committed {
                         let message = "Committed your edit";
-                        this.notify_done(Notification::success(message), *step, window, cx);
+                        this.notify_done(crate::toast::success(message), *step, window, cx);
                         this.reload(window, cx);
                     } else {
                         window.push_notification(
-                            Notification::success("Saved; commit it from the history"),
+                            crate::toast::success("Saved; commit it from the history"),
                             cx,
                         );
                     }
@@ -860,7 +860,7 @@ impl Workspace {
         };
         if snapshot.refs.branches.len() < 2 {
             window.push_notification(
-                Notification::info(
+                crate::toast::info(
                     "A local pull request reviews one branch against another; this repository has fewer than two branches.",
                 ),
                 cx,
@@ -959,7 +959,7 @@ impl Workspace {
                         }
                     }
                     Err(error) => window.push_notification(
-                        Notification::error(format!(
+                        crate::toast::error(format!(
                             "Could not create the local pull request: {:#}",
                             anyhow::Error::from(error)
                         )),
@@ -1053,7 +1053,7 @@ impl Workspace {
                     return;
                 }
             };
-            this.notify_done(Notification::success(done), step, window, cx);
+            this.notify_done(crate::toast::success(done), step, window, cx);
             this.reload(window, cx);
             this.refresh_status(window, cx);
         });
@@ -1086,7 +1086,7 @@ impl Workspace {
         let subscription = cx.subscribe_in(&panel, window, |this, _, event, window, cx| {
             this.cherry_pick = None;
             if let CherryPickEvent::Done { message, step } = event {
-                this.notify_done(Notification::success(message.clone()), *step, window, cx);
+                this.notify_done(crate::toast::success(message.clone()), *step, window, cx);
                 this.history
                     .update(cx, |history, cx| history.clear_picked(cx));
                 this.reload(window, cx);
@@ -1120,12 +1120,12 @@ impl Workspace {
             None
         };
         if let Some(refusal) = refusal {
-            window.push_notification(Notification::warning(refusal), cx);
+            window.push_notification(crate::toast::warning(refusal), cx);
             return;
         }
         let Some(Head::Branch { name, target }) = snapshot.refs.head.clone() else {
             window.push_notification(
-                Notification::warning("Check out a branch to rewrite its history."),
+                crate::toast::warning("Check out a branch to rewrite its history."),
                 cx,
             );
             return;
@@ -1148,10 +1148,10 @@ impl Workspace {
             match event {
                 RewriteEvent::Close => {}
                 RewriteEvent::Done { message, step } => {
-                    this.notify_done(Notification::success(message.clone()), *step, window, cx);
+                    this.notify_done(crate::toast::success(message.clone()), *step, window, cx);
                 }
                 RewriteEvent::Stopped(message) => {
-                    window.push_notification(Notification::info(message.clone()), cx);
+                    window.push_notification(crate::toast::info(message.clone()), cx);
                 }
             }
             this.rewrite = None;
@@ -1201,11 +1201,11 @@ impl Workspace {
         self.run_rewrite_command(
             |git| git.continue_rebase(),
             |result| match result {
-                Ok(RewriteOutcome::Done) => Notification::success("Rewrite finished"),
+                Ok(RewriteOutcome::Done) => crate::toast::success("Rewrite finished"),
                 Ok(RewriteOutcome::Stopped) => {
-                    Notification::info("Stopped at the next commit to change")
+                    crate::toast::info("Stopped at the next commit to change")
                 }
-                Err(error) => Notification::error(format!("Could not continue: {error}")),
+                Err(error) => crate::toast::error(format!("Could not continue: {error}")),
             },
             window,
             cx,
@@ -1216,8 +1216,8 @@ impl Workspace {
         self.run_rewrite_command(
             |git| git.abort_rebase(),
             |result| match result {
-                Ok(()) => Notification::success("Rewrite aborted; everything is as it was before"),
-                Err(error) => Notification::error(format!("Could not abort: {error}")),
+                Ok(()) => crate::toast::success("Rewrite aborted; everything is as it was before"),
+                Err(error) => crate::toast::error(format!("Could not abort: {error}")),
             },
             window,
             cx,
@@ -1254,7 +1254,7 @@ impl Workspace {
                 }
                 ChangesEvent::Staged => this.refresh_status(window, cx),
                 ChangesEvent::Discarded { message, step } => {
-                    this.notify_done(Notification::success(message.clone()), *step, window, cx);
+                    this.notify_done(crate::toast::success(message.clone()), *step, window, cx);
                     this.refresh_status(window, cx);
                 }
                 ChangesEvent::Committed => {
@@ -1287,9 +1287,9 @@ impl Workspace {
                     if !this.palette_open {
                         window.push_notification(
                             if *ok {
-                                Notification::success(format!("{command} finished"))
+                                crate::toast::success(format!("{command} finished"))
                             } else {
-                                Notification::error(format!(
+                                crate::toast::error(format!(
                                     "{command} failed; ⌘K shows what it wrote"
                                 ))
                             },
@@ -1447,7 +1447,7 @@ impl Workspace {
             .update(cx, |history, cx| history.select_commit(id, cx));
         if !found {
             window.push_notification(
-                Notification::info("That commit is not in the history shown."),
+                crate::toast::info("That commit is not in the history shown."),
                 cx,
             );
         }
@@ -1525,13 +1525,13 @@ impl Workspace {
             this.update_in(cx, |this, window, cx| match found {
                 Ok(Some(from)) => this.open_rewrite(from, None, autosquash, window, cx),
                 Ok(None) => window.push_notification(
-                    Notification::warning(format!(
+                    crate::toast::warning(format!(
                         "{base} is not a commit before the tip of the branch checked out."
                     )),
                     cx,
                 ),
                 Err(error) => window.push_notification(
-                    Notification::error(format!(
+                    crate::toast::error(format!(
                         "Could not find {base}: {:#}",
                         anyhow::Error::from(error)
                     )),
@@ -1551,9 +1551,9 @@ impl Workspace {
             move |git| git.switch(&name),
             move |_, switched, _, window, cx| match switched {
                 Ok(()) => window
-                    .push_notification(Notification::success(format!("Checked out {branch}")), cx),
+                    .push_notification(crate::toast::success(format!("Checked out {branch}")), cx),
                 Err(error) => window.push_notification(
-                    Notification::error(format!("Could not check out {branch}: {error}")),
+                    crate::toast::error(format!("Could not check out {branch}: {error}")),
                     cx,
                 ),
             },
@@ -1584,7 +1584,7 @@ impl Workspace {
                     } else {
                         "Merge aborted; everything is as it was before"
                     };
-                    this.notify_done(Notification::success(message), *step, window, cx);
+                    this.notify_done(crate::toast::success(message), *step, window, cx);
                     this.close_conflicts(window, cx);
                     // A merged pull request shows as merged.
                     this.close_review(window, cx);
@@ -1662,7 +1662,7 @@ impl Workspace {
     fn show_error(&mut self, error: anyhow::Error, window: &mut Window, cx: &mut Context<Self>) {
         let message: SharedString = format!("{error:#}").into();
         if self.snapshot.is_some() {
-            window.push_notification(Notification::error(message), cx);
+            window.push_notification(crate::toast::error(message), cx);
         } else {
             self.error = Some(message);
         }
