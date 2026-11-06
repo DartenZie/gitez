@@ -3,6 +3,7 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::*;
 use gpui_kit::component::kbd::Kbd;
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -10,10 +11,12 @@ use gpui_kit::*;
 use super::palette::lowercase_first;
 use super::remote::{RemoteActions, RemoteOp};
 use super::{
-    Fetch, NewBranch, NewPullRequest, OpenPalette, OpenRepository, Pull, Push, RedoStep,
-    StashChanges, UndoStep,
+    Fetch, NewBranch, NewPullRequest, OpenPalette, OpenRecent, OpenRepository, Pull, Push,
+    RedoStep, StashChanges, UndoStep,
 };
 use crate::theme::{self, color};
+
+use std::path::{Path, PathBuf};
 
 /// Height of toolbar buttons in the design.
 const BUTTON_HEIGHT: Pixels = px(30.);
@@ -25,6 +28,10 @@ const BUTTON_HEIGHT: Pixels = px(30.);
 pub struct Toolbar {
     /// Name of the open repository.
     pub repository_name: Option<SharedString>,
+    /// Folder of the open repository, ticked in the repository menu.
+    pub repository_path: Option<PathBuf>,
+    /// Where the repository menu sends its actions: the workspace.
+    pub focus: FocusHandle,
     /// Whether a repository is being opened.
     pub loading: bool,
     /// What fetch, pull and push would do; `None` without a repository.
@@ -63,9 +70,12 @@ impl RenderOnce for Toolbar {
                         .font_weight(FontWeight::SEMIBOLD)
                         .label(repository_label)
                         .loading(self.loading)
-                        .tooltip("Open a repository")
-                        .on_click(|_, window, cx| {
-                            window.dispatch_action(Box::new(OpenRepository), cx)
+                        .dropdown_caret(true)
+                        .tooltip("Switch repository")
+                        .dropdown_menu({
+                            let (focus, current) =
+                                (self.focus.clone(), self.repository_path.clone());
+                            move |menu, _, cx| repository_menu(menu, current.as_deref(), &focus, cx)
                         }),
                 ),
             )
@@ -206,6 +216,56 @@ impl Toolbar {
             .on_click(|_, window, cx| window.dispatch_action(Box::new(Push), cx)),
         ]
     }
+}
+
+/// The recent repositories, the open one ticked, then "Open repository…".
+fn repository_menu(
+    menu: PopupMenu,
+    current: Option<&Path>,
+    focus: &FocusHandle,
+    cx: &App,
+) -> PopupMenu {
+    let recent = crate::recent::paths(cx);
+    let mut menu = menu
+        .action_context(focus.clone())
+        .min_w(px(260.))
+        .max_w(px(420.));
+    if !recent.is_empty() {
+        menu = menu.label("Recent repositories");
+    }
+    for path in recent {
+        let name: SharedString = path
+            .file_name()
+            .map_or_else(
+                || path.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            )
+            .into();
+        let location: SharedString = crate::recent::display(path).into();
+        menu = menu.menu_element_with_check(
+            current == Some(path.as_path()),
+            Box::new(OpenRecent { path: path.clone() }),
+            move |_, _| {
+                div().v_flex().min_w_0().child(name.clone()).child(
+                    div()
+                        .text_size(px(11.5))
+                        .text_color(rgb(color::TEXT_MUTED))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(location.clone()),
+                )
+            },
+        );
+    }
+    if !recent.is_empty() {
+        menu = menu.separator();
+    }
+    menu.menu_with_icon(
+        "Open repository…",
+        IconName::FolderOpen,
+        Box::new(OpenRepository),
+    )
 }
 
 /// The amber "G" badge.
