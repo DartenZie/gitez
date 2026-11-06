@@ -222,6 +222,20 @@ impl Workspace {
                 SidebarEvent::DeleteBranch(branch) => {
                     this.delete_branch(branch.clone(), false, window, cx)
                 }
+                SidebarEvent::MergeBranch {
+                    head,
+                    head_tip,
+                    base,
+                    base_tip,
+                } => {
+                    let dropped = BranchDropped {
+                        head: head.clone(),
+                        head_tip: *head_tip,
+                        base: base.clone(),
+                        base_tip: *base_tip,
+                    };
+                    this.open_branch_merge(&dropped, window, cx)
+                }
                 SidebarEvent::CheckOutRemote { remote, name } => {
                     this.check_out_remote(remote.clone(), name.clone(), window, cx)
                 }
@@ -958,7 +972,7 @@ impl Workspace {
     }
 
     /// Offers the ways to bring branch `head` into `base`, dropped on it in
-    /// the history.
+    /// the history or the sidebar.
     fn open_branch_merge(
         &mut self,
         dropped: &BranchDropped,

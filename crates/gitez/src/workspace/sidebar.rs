@@ -13,6 +13,7 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::history::{DraggedBranch, DraggedLabel};
 use crate::repository::{Snapshot, Tracking};
 use crate::theme::{self, color};
 use crate::time;
@@ -44,6 +45,13 @@ pub enum SidebarEvent {
     NewBranchFrom(Oid),
     RenameBranch(String),
     DeleteBranch(String),
+    /// Branch `head` was dropped on branch `base`, to merge it there.
+    MergeBranch {
+        head: String,
+        head_tip: Oid,
+        base: String,
+        base_tip: Oid,
+    },
     /// Check out remote branch `remote`/`name` as a local branch tracking
     /// it.
     CheckOutRemote {
@@ -89,6 +97,8 @@ pub struct Sidebar {
     collapsed: HashSet<Section>,
     /// Remotes whose branches are listed.
     expanded_remotes: HashSet<String>,
+    /// The local branch being dragged, here or in the history.
+    dragging: Option<SharedString>,
 }
 
 impl Sidebar {
@@ -98,6 +108,7 @@ impl Sidebar {
             changed_files: None,
             collapsed: HashSet::new(),
             expanded_remotes: HashSet::new(),
+            dragging: None,
         }
     }
 
@@ -214,10 +225,24 @@ impl EventEmitter<SidebarEvent> for Sidebar {}
 
 impl Render for Sidebar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Dropped, or released away from any branch.
+        if self.dragging.is_some() && !cx.has_active_drag() {
+            self.dragging = None;
+        }
         let snapshot = self.snapshot.clone();
+        let dragging = self.dragging.clone();
 
         div()
             .id("sidebar")
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<DraggedBranch>, _, cx| {
+                    let name = event.drag(cx).name();
+                    if this.dragging.as_ref() != Some(name) {
+                        this.dragging = Some(name.clone());
+                        cx.notify();
+                    }
+                }),
+            )
             .v_flex()
             .size_full()
             .bg(rgb(color::SIDEBAR))
@@ -296,7 +321,8 @@ impl Render for Sidebar {
                     .branches
                     .iter()
                     .map(|branch| {
-                        branch_row(branch, snapshot.tracking.get(&branch.name), cx)
+                        let lifted = dragging.as_deref() == Some(branch.name.as_str());
+                        branch_row(branch, snapshot.tracking.get(&branch.name), lifted, cx)
                             .into_any_element()
                     })
                     .collect::<Vec<_>>();
@@ -415,10 +441,12 @@ fn trailing(text: impl Into<SharedString>) -> Div {
 }
 
 /// A local branch: double-click checks it out, right-click shows what else
-/// can be done with it.
+/// can be done with it. It can be dragged onto another branch, here or in the
+/// history, to merge it there; `lifted` while it is.
 fn branch_row(
     branch: &Branch,
     tracking: Option<&Tracking>,
+    lifted: bool,
     cx: &mut Context<Sidebar>,
 ) -> impl IntoElement {
     let branch_color = rgb(theme::branch_color(&branch.name));
@@ -460,6 +488,35 @@ fn branch_row(
             this.child(trailing(text).font_weight(FontWeight::NORMAL))
         })
         .id(SharedString::from(format!("branch-{}", branch.name)))
+        .when(lifted, |this| this.opacity(0.35))
+        .on_drag(
+            DraggedBranch::new(branch.name.clone(), branch.target),
+            |dragged, _, _, cx| cx.new(|_| DraggedLabel(dragged.name().clone())),
+        )
+        .can_drop({
+            let name = branch.name.clone();
+            move |dragged, _, _| {
+                dragged
+                    .downcast_ref::<DraggedBranch>()
+                    .is_some_and(|dragged| *dragged.name() != name)
+            }
+        })
+        .drag_over::<DraggedBranch>(|style, _, _, _| {
+            style
+                .bg(rgba(color::TARGET_ROW))
+                .text_color(rgb(color::ACCENT))
+        })
+        .on_drop({
+            let (base, base_tip) = (branch.name.clone(), branch.target);
+            cx.listener(move |_, dragged: &DraggedBranch, _, cx| {
+                cx.emit(SidebarEvent::MergeBranch {
+                    head: dragged.name().to_string(),
+                    head_tip: dragged.tip(),
+                    base: base.clone(),
+                    base_tip,
+                });
+            })
+        })
         .on_click({
             let (name, is_head) = (branch.name.clone(), branch.is_head);
             cx.listener(move |_, event: &ClickEvent, _, cx| {

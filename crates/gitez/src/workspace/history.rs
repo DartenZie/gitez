@@ -1,8 +1,9 @@
 //! The commit history: every commit reachable from a ref, newest first, with
 //! its graph, labels, author and date, in a virtual list. Uncommitted changes
 //! get a row of their own at the top, joined to the commit `HEAD` points at
-//! by a dashed line. A local branch's label can be dragged onto another
-//! branch to merge it there, as in the `Merge.dc.html` artboard. ⌘-click and ⇧-click pick several
+//! by a dashed line. A local branch's label, here or in the sidebar, can be
+//! dragged onto another branch to merge it there, as in the `Merge.dc.html`
+//! artboard. ⌘-click and ⇧-click pick several
 //! commits, to cherry-pick them, as in the `CherryPick.dc.html` artboard.
 
 use std::collections::{HashMap, HashSet};
@@ -93,10 +94,28 @@ pub struct BranchDropped {
     pub base_tip: Oid,
 }
 
-/// A local branch being dragged.
+/// A local branch being dragged, from the history or the sidebar.
+#[derive(Clone)]
 pub struct DraggedBranch {
     name: SharedString,
     tip: Oid,
+}
+
+impl DraggedBranch {
+    pub fn new(name: impl Into<SharedString>, tip: Oid) -> Self {
+        Self {
+            name: name.into(),
+            tip,
+        }
+    }
+
+    pub fn name(&self) -> &SharedString {
+        &self.name
+    }
+
+    pub fn tip(&self) -> Oid {
+        self.tip
+    }
 }
 
 /// The branch being dragged and where it would land.
@@ -673,6 +692,20 @@ impl History {
         cx.notify();
     }
 
+    /// Starts showing the drag of `dragged` if it began outside the
+    /// history, in the sidebar.
+    fn follow_drag(
+        &mut self,
+        event: &DragMoveEvent<DraggedBranch>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.drag.is_none() {
+            let dragged = event.drag(cx).clone();
+            self.start_drag(&dragged, window, cx);
+        }
+    }
+
     /// The pointer moved, inside the row of commit `index` or not, while a
     /// branch is dragged.
     fn drag_over_commit(&mut self, index: usize, inside: bool, cx: &mut Context<Self>) {
@@ -1009,12 +1042,13 @@ impl History {
                     cx.new(|_| DraggedLabel(dragged.name.clone()))
                 },
             )
-            .on_drag_move(
-                cx.listener(move |this, event: &DragMoveEvent<DraggedBranch>, _, cx| {
+            .on_drag_move(cx.listener(
+                move |this, event: &DragMoveEvent<DraggedBranch>, window, cx| {
+                    this.follow_drag(event, window, cx);
                     let inside = event.bounds.contains(&event.event.position);
                     this.drag_over_label(&over, inside, cx);
-                }),
-            )
+                },
+            ))
             .into_any_element()
     }
 
@@ -1203,7 +1237,8 @@ impl History {
 
         Some(
             row.on_drag_move(cx.listener(
-                move |this, event: &DragMoveEvent<DraggedBranch>, _, cx| {
+                move |this, event: &DragMoveEvent<DraggedBranch>, window, cx| {
+                    this.follow_drag(event, window, cx);
                     let inside = event.bounds.contains(&event.event.position);
                     this.drag_over_commit(index, inside, cx);
                 },
@@ -1492,7 +1527,7 @@ fn pick_hint(cx: &App) -> impl IntoElement {
 }
 
 /// What follows the pointer while a branch is dragged: its label, lifted.
-struct DraggedLabel(SharedString);
+pub struct DraggedLabel(pub SharedString);
 
 impl Render for DraggedLabel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

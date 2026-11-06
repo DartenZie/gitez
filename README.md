@@ -60,8 +60,9 @@ tree, so it cannot be committed or pushed by accident. Linked worktrees share it
   amend, sign off or skip hooks; type the commit summary in the panel or right
   in the uncommitted-changes row, which is always at the top of the graph.
   Changes made in other tools appear as they happen.
-- **Drag-and-drop merge**: drag a branch label onto another branch to merge,
-  squash, rebase, fast-forward, or open the two branches as a local PR.
+- **Drag-and-drop merge**: drag a branch, from its label in the graph or its
+  row in the sidebar, onto another branch in either place to merge, squash,
+  rebase, fast-forward, or open the two branches as a local PR.
 - **Conflict editor**: see our and their lines side by side (with the base if
   you want it), and tick lines into the result, or a side's box to take all
   of it; the side you tick first goes first. Click a result line to edit it
