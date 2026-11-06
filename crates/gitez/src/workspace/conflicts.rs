@@ -4,16 +4,20 @@
 //! result or editing it, then committing the merge or giving it up.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gitez_command::{Git, ResetMode, Side};
-use gitez_git::{Conflict, ConflictFile, MergeInProgress, Repository, Segment, WorktreeChange};
+use gitez_git::{
+    Conflict, ConflictFile, MergeInProgress, Oid, Repository, Segment, WorktreeChange,
+};
 use gitez_highlight::{Highlights, Span};
 use gitez_review::{PullRequest, State, Store};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::*;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{InputEvent, Position, Textarea, TextareaState};
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -22,6 +26,8 @@ use gpui_kit::*;
 use super::code;
 use crate::theme::{self, color};
 use crate::undo::{self, Recorder};
+
+mod story;
 
 /// Lines of the file shown before and after a conflict.
 const CONTEXT: usize = 3;
@@ -37,6 +43,9 @@ pub enum ConflictsEvent {
     /// The merge was committed, or given up when `committed` is false.
     /// `step` is the undo step.
     Finished { committed: bool, step: Option<u64> },
+    /// Go back to the history with this commit selected; the merge stays
+    /// in progress.
+    ShowCommit(Oid),
 }
 
 /// How a conflict is resolved so far.
@@ -45,7 +54,8 @@ struct Resolution {
     /// Which of our lines go into the result.
     ours: Vec<bool>,
     theirs: Vec<bool>,
-    /// Their picked lines come before ours.
+    /// Their picked lines come before ours: their side got its first
+    /// tick while ours had none.
     theirs_first: bool,
     /// The result as typed, replacing the picked lines.
     edited: Option<Vec<String>>,
@@ -95,6 +105,34 @@ impl Resolution {
         } else {
             [ours, theirs].concat()
         }
+    }
+
+    fn picked(&self, side: Side) -> &[bool] {
+        match side {
+            Side::Ours => &self.ours,
+            Side::Theirs => &self.theirs,
+        }
+    }
+
+    /// Changes which lines of `side` are picked with `change`. A side that
+    /// gets its first tick while the other has none goes first; when the
+    /// other has some, it stays first.
+    fn pick(&mut self, side: Side, change: impl FnOnce(&mut Vec<bool>)) {
+        let other = match side {
+            Side::Ours => Side::Theirs,
+            Side::Theirs => Side::Ours,
+        };
+        let had = self.picked(side).contains(&true);
+        let other_has = self.picked(other).contains(&true);
+        change(match side {
+            Side::Ours => &mut self.ours,
+            Side::Theirs => &mut self.theirs,
+        });
+        if !had && self.picked(side).contains(&true) {
+            self.theirs_first = (side == Side::Theirs) != other_has;
+        }
+        self.edited = None;
+        self.resolved = false;
     }
 
     fn is_empty(&self) -> bool {
@@ -213,8 +251,17 @@ pub struct Conflicts {
     /// Syntax highlighting of the conflicted files, by path. Filled in the
     /// background after each read.
     highlights: HashMap<String, Arc<ConflictHighlights>>,
+    /// The commits behind each conflicted file's conflicts, by path. Read
+    /// in the background after each read.
+    histories: HashMap<String, Result<Arc<story::FileHistory>, SharedString>>,
+    /// The "Why these lines conflict" card is open.
+    story_open: bool,
+    /// The commit shown in that card: a side and an index into its
+    /// commits.
+    story_commit: Option<(Side, usize)>,
     _load: Task<()>,
     _highlight: Task<()>,
+    _history: Task<()>,
 }
 
 impl EventEmitter<ConflictsEvent> for Conflicts {}
@@ -246,8 +293,12 @@ impl Conflicts {
             running: None,
             error: None,
             highlights: HashMap::new(),
+            histories: HashMap::new(),
+            story_open: true,
+            story_commit: None,
             _load: Task::ready(()),
             _highlight: Task::ready(()),
+            _history: Task::ready(()),
         };
         this.load(cx);
         this
@@ -266,7 +317,9 @@ impl Conflicts {
                 this.current_file = 0;
                 this.current_conflict = 0;
                 this.editing = None;
+                this.story_commit = None;
                 this.load_highlights(cx);
+                this.load_histories(cx);
                 cx.notify();
             })
             .ok();
@@ -313,6 +366,48 @@ impl Conflicts {
         });
     }
 
+    /// Reads, in the background, which commits made the conflicts of the
+    /// files just read, then shows them.
+    fn load_histories(&mut self, cx: &mut Context<Self>) {
+        let Some(Ok(Some(loaded))) = &self.loaded else {
+            self._history = Task::ready(());
+            return;
+        };
+        let (ours, theirs) = (loaded.merge.ours, loaded.merge.theirs);
+        let files: Vec<(String, ConflictFile)> = loaded
+            .files
+            .iter()
+            .filter_map(|file| Some((file.path.clone(), file.content.clone()?)))
+            .collect();
+        self.histories
+            .retain(|path, _| files.iter().any(|(shown, _)| shown == path));
+        let repository = self.repository.clone();
+        self._history = cx.spawn(async move |this, cx| {
+            let read = cx
+                .background_executor()
+                .spawn(async move {
+                    files
+                        .into_iter()
+                        .map(|(path, content)| {
+                            let history = repository
+                                .conflict_history(&path, &content, ours, theirs)
+                                .map(|history| {
+                                    Arc::new(story::FileHistory::new(&path, &content, history))
+                                })
+                                .map_err(|error| SharedString::from(error.to_string()));
+                            (path, history)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.histories.extend(read);
+                cx.notify();
+            })
+            .ok();
+        });
+    }
+
     fn loaded_mut(&mut self) -> Option<&mut Loaded> {
         match &mut self.loaded {
             Some(Ok(Some(loaded))) => Some(loaded),
@@ -343,27 +438,21 @@ impl Conflicts {
         cx.notify();
     }
 
-    fn take(&mut self, ours: bool, theirs: bool, theirs_first: bool, cx: &mut Context<Self>) {
+    /// Ticks every line of `side` into the result, or none of them.
+    fn take_side(&mut self, side: Side, take: bool, cx: &mut Context<Self>) {
         self.editing = None;
-        self.change(cx, |resolution, conflict| {
-            resolution.ours = vec![ours; conflict.ours.len()];
-            resolution.theirs = vec![theirs; conflict.theirs.len()];
-            resolution.theirs_first = theirs_first;
-            resolution.edited = None;
+        self.change(cx, |resolution, _| {
+            resolution.pick(side, |picked| picked.fill(take));
         });
     }
 
     fn toggle_line(&mut self, side: Side, line: usize, cx: &mut Context<Self>) {
         self.change(cx, |resolution, _| {
-            let picked = match side {
-                Side::Ours => &mut resolution.ours,
-                Side::Theirs => &mut resolution.theirs,
-            };
-            if let Some(picked) = picked.get_mut(line) {
-                *picked = !*picked;
-            }
-            resolution.edited = None;
-            resolution.resolved = false;
+            resolution.pick(side, |picked| {
+                if let Some(picked) = picked.get_mut(line) {
+                    *picked = !*picked;
+                }
+            });
         });
     }
 
@@ -427,6 +516,7 @@ impl Conflicts {
         match next {
             Some(n) => {
                 self.current_conflict = n;
+                self.story_commit = None;
                 cx.notify();
             }
             None => self.save_file(cx),
@@ -556,7 +646,9 @@ impl Conflicts {
                     loaded.map_err(|error| format!("Could not read the merge: {error:#}").into()),
                 );
                 this.editing = None;
+                this.story_commit = None;
                 this.load_highlights(cx);
+                this.load_histories(cx);
                 cx.notify();
             })
             .ok();
@@ -577,6 +669,7 @@ impl Conflicts {
     fn select_file(&mut self, index: usize, cx: &mut Context<Self>) {
         self.current_file = index;
         self.editing = None;
+        self.story_commit = None;
         self.current_conflict = match &self.loaded {
             Some(Ok(Some(loaded))) => loaded
                 .files
@@ -600,6 +693,7 @@ impl Conflicts {
         if (0..count).contains(&next) {
             self.current_conflict = next as usize;
             self.editing = None;
+            self.story_commit = None;
             cx.notify();
         }
     }
@@ -773,6 +867,44 @@ fn source_tag(text: &'static str, source: Source) -> Div {
         .child(text)
 }
 
+/// How much of a side a tick box stands for.
+#[derive(Clone, Copy, PartialEq)]
+enum Tick {
+    None,
+    Some,
+    All,
+}
+
+/// A tick box in a side's colour: a tick when `All`, a dash when `Some`.
+fn tick_box(id: impl Into<ElementId>, side: Side, tick: Tick) -> Stateful<Div> {
+    let (fill, mark) = match side {
+        Side::Ours => (color::ACCENT, color::ON_ACCENT),
+        Side::Theirs => (color::BRANCH_TEAL, color::HEAD_BADGE_TEXT),
+    };
+    div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(px(16.))
+        .rounded(px(4.))
+        .border_1()
+        .cursor_pointer()
+        .map(|this| match tick {
+            Tick::None => this.border_color(rgb(color::PICK_BORDER)),
+            Tick::Some | Tick::All => this.bg(rgb(fill)).border_color(rgb(fill)).child(
+                Icon::new(if tick == Tick::All {
+                    IconName::Check
+                } else {
+                    IconName::Minus
+                })
+                .size(px(11.))
+                .text_color(rgb(mark)),
+            ),
+        })
+}
+
 /// A pane around code: a header strip and lines.
 fn pane() -> Div {
     div()
@@ -798,45 +930,187 @@ fn pane_header() -> Div {
         .text_size(px(12.5))
 }
 
-/// A line of code: a key column (a tick box or a tag), its number, its
-/// text, coloured by its syntax `spans` if it has them.
-fn code_line(
+/// What clicking a row does.
+type RowClick = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
+
+/// A row of a pane: a key (a tick box or a tag), its number, and its text,
+/// all on one background.
+struct CodeRow {
     key: Option<AnyElement>,
     number: Option<usize>,
-    text: &str,
-    spans: Option<&[Span]>,
-) -> Div {
+    text: AnyElement,
+    background: Option<Rgba>,
+    /// The commit that last changed the line, shown after the text.
+    credit: Option<AnyElement>,
+    /// An id for the row, and what clicking it does.
+    click: Option<(ElementId, RowClick)>,
+    /// The text cell's name for tests.
+    debug: Option<SharedString>,
+}
+
+impl CodeRow {
+    /// A line of code, coloured by its syntax `spans` if it has them.
+    fn code(
+        key: Option<AnyElement>,
+        number: Option<usize>,
+        text: &str,
+        spans: Option<&[Span]>,
+    ) -> Self {
+        Self {
+            key,
+            number,
+            text: code::styled_code(text, spans).into_any_element(),
+            background: None,
+            credit: None,
+            click: None,
+            debug: None,
+        }
+    }
+
+    /// A row that is not code, such as a note that a side is empty.
+    fn note(text: impl IntoElement) -> Self {
+        Self {
+            key: None,
+            number: None,
+            text: text.into_any_element(),
+            background: None,
+            credit: None,
+            click: None,
+            debug: None,
+        }
+    }
+
+    fn bg(mut self, background: impl Into<Rgba>) -> Self {
+        self.background = Some(background.into());
+        self
+    }
+
+    fn credit(mut self, credit: Option<impl IntoElement>) -> Self {
+        self.credit = credit.map(IntoElement::into_any_element);
+        self
+    }
+
+    fn on_click(
+        mut self,
+        id: impl Into<ElementId>,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.click = Some((id.into(), Rc::new(handler)));
+        self
+    }
+
+    fn debug(mut self, name: impl Into<SharedString>) -> Self {
+        self.debug = Some(name.into());
+        self
+    }
+}
+
+/// A pane's rows: the keys and numbers stay put while the text scrolls
+/// sideways, so long lines can be read whole; the scroller keeps each swipe
+/// to one direction, so an upright one scrolls the page. `id` names the
+/// scrolling part.
+fn code_rows(id: impl Into<ElementId>, rows: Vec<CodeRow>, mono: &SharedString) -> Div {
+    let has_credit = rows.iter().any(|row| row.credit.is_some());
+    let height = rows.len() as f32;
+    // Rows without numbers, such as a side's lines on their own, leave out
+    // the number column.
+    let numbered = rows.iter().any(|row| row.number.is_some());
+    let mut keys = Vec::with_capacity(rows.len());
+    let mut texts = Vec::with_capacity(rows.len());
+    let mut credits = Vec::new();
+    for row in rows {
+        let background = row.background;
+        let line = || {
+            div()
+                .h_flex()
+                .h(LINE_HEIGHT)
+                .when_some(background, |this, background| this.bg(background))
+        };
+        let key = line()
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .w(px(28.))
+                    .justify_center()
+                    .children(row.key),
+            )
+            .when(numbered, |this| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .w(px(40.))
+                        .pr(px(10.))
+                        .text_right()
+                        .text_color(rgb(color::DIFF_LINE_NUMBER))
+                        .children(row.number.map(|n| n.to_string())),
+                )
+            });
+        let text = line()
+            .pr(px(12.))
+            .whitespace_nowrap()
+            .text_color(rgb(color::DIFF_TEXT))
+            .when_some(row.debug, |this, name| {
+                this.debug_selector(move || name.to_string())
+            })
+            .child(row.text);
+        match row.click {
+            Some((id, handler)) => {
+                let on_key = handler.clone();
+                keys.push(
+                    key.id(id.clone())
+                        .cursor_text()
+                        .on_click(move |event, window, cx| on_key(event, window, cx))
+                        .into_any_element(),
+                );
+                texts.push(
+                    text.id(id)
+                        .cursor_text()
+                        .on_click(move |event, window, cx| handler(event, window, cx))
+                        .into_any_element(),
+                );
+            }
+            None => {
+                keys.push(key.into_any_element());
+                texts.push(text.into_any_element());
+            }
+        }
+        if has_credit {
+            credits.push(line().children(row.credit).into_any_element());
+        }
+    }
+    let id = id.into();
     div()
         .h_flex()
-        .h(LINE_HEIGHT)
+        .items_start()
+        .py(px(6.))
+        .font_family(mono.clone())
+        .text_size(px(12.))
         .child(
             div()
-                .flex()
+                .id(ElementId::Name(format!("{id}-keys").into()))
+                .v_flex()
                 .flex_none()
-                .w(px(28.))
-                .justify_center()
-                .children(key),
+                .children(keys),
         )
         .child(
             div()
-                .flex_none()
-                .w(px(40.))
-                .pr(px(10.))
-                .text_right()
-                .text_color(rgb(color::DIFF_LINE_NUMBER))
-                .children(number.map(|n| n.to_string())),
-        )
-        .child(
-            div()
+                .id(id.clone())
                 .flex_1()
                 .min_w_0()
-                .pr(px(12.))
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_ellipsis()
-                .text_color(rgb(color::DIFF_TEXT))
-                .child(code::styled_code(text, spans)),
+                // The scroll area fills this height: without it, it has
+                // none, and no swipe reaches it.
+                .h(LINE_HEIGHT * height)
+                .h_flex()
+                .items_start()
+                .child(div().v_flex().flex_none().min_w_full().children(texts))
+                .overflow_x_scrollbar()
+                // Every pane is made here; each needs its own scroll position.
+                .id(ElementId::Name(format!("{id}-scroll").into())),
         )
+        .when(has_credit, |this| {
+            this.child(div().v_flex().flex_none().children(credits))
+        })
 }
 
 /// Where each segment's lines start in our file, their file and the
@@ -1197,7 +1471,7 @@ impl Conflicts {
                 .iter()
                 .enumerate()
                 .map(|(i, line)| {
-                    code_line(
+                    CodeRow::code(
                         None,
                         Some(start + i),
                         line,
@@ -1207,20 +1481,39 @@ impl Conflicts {
                 .collect::<Vec<_>>()
         };
 
+        let history = self.histories.get(&file.path);
+        // The commit that last changed line `i` of `side` in this conflict.
+        let credit =
+            |side: Side, i: usize| {
+                let Some(Ok(history)) = history else {
+                    return None;
+                };
+                let side_history = match side {
+                    Side::Ours => &history.history.ours,
+                    Side::Theirs => &history.history.theirs,
+                };
+                let index = (*side_history.conflicts.get(n)?.lines.get(i)?)?;
+                let commit = side_history.commits.get(index)?;
+                let summary: SharedString = commit.summary.clone().into();
+                let id = match side {
+                    Side::Ours => ("credit-ours", i),
+                    Side::Theirs => ("credit-theirs", i),
+                };
+                Some(
+                    story::line_credit(side, commit)
+                        .debug_selector(move || format!("conflict-{}-{}", id.0, id.1))
+                        .id(id)
+                        .cursor_pointer()
+                        .tooltip(move |window, cx| Tooltip::new(summary.clone()).build(window, cx))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.choose_story_commit(side, index, cx)
+                        })),
+                )
+            };
         let side_lines = |side: Side, lines: &[String], picked: &[bool], start: usize| {
-            let (faint, strong, tick, on_tick) = match side {
-                Side::Ours => (
-                    color::CONFLICT_OURS,
-                    color::CONFLICT_OURS_PICKED,
-                    color::ACCENT,
-                    color::ON_ACCENT,
-                ),
-                Side::Theirs => (
-                    color::CONFLICT_THEIRS,
-                    color::CONFLICT_THEIRS_PICKED,
-                    color::BRANCH_TEAL,
-                    color::HEAD_BADGE_TEXT,
-                ),
+            let (faint, strong) = match side {
+                Side::Ours => (color::CONFLICT_OURS, color::CONFLICT_OURS_PICKED),
+                Side::Theirs => (color::CONFLICT_THEIRS, color::CONFLICT_THEIRS_PICKED),
             };
             let highlights = match side {
                 Side::Ours => ours_highlights,
@@ -1235,43 +1528,72 @@ impl Conflicts {
                         Side::Ours => ("pick-ours", i),
                         Side::Theirs => ("pick-theirs", i),
                     };
-                    let tick_box = div()
-                        .id(id)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .size(px(16.))
-                        .rounded(px(4.))
-                        .border_1()
-                        .cursor_pointer()
-                        .map(|this| {
-                            if on {
-                                this.bg(rgb(tick)).border_color(rgb(tick)).child(
-                                    Icon::new(IconName::Check)
-                                        .size(px(11.))
-                                        .text_color(rgb(on_tick)),
-                                )
-                            } else {
-                                this.border_color(rgb(color::PICK_BORDER))
-                            }
-                        })
+                    let tick_box = tick_box(id, side, if on { Tick::All } else { Tick::None })
                         .on_click(cx.listener(move |this, _, _, cx| this.toggle_line(side, i, cx)));
-                    code_line(
+                    CodeRow::code(
                         Some(tick_box.into_any_element()),
                         Some(start + i),
                         line,
                         spans(highlights, start + i, line),
                     )
                     .bg(rgba(if on { strong } else { faint }))
+                    .credit(credit(side, i))
+                    .debug(match side {
+                        Side::Ours => format!("conflict-ours-line-{i}"),
+                        Side::Theirs => format!("conflict-theirs-line-{i}"),
+                    })
                 })
                 .collect::<Vec<_>>()
         };
 
         let show_base = self.show_base && conflict.base.is_some();
         let sha = |oid: &gitez_git::Oid| oid.to_hex_with_len(7).to_string();
+        // The tick box over a side's lines takes all of them, or none;
+        // with lines of both sides picked, the side ticked first goes first.
+        let both_picked = resolution.edited.is_none()
+            && resolution.ours.contains(&true)
+            && resolution.theirs.contains(&true);
+        let side_tick = |side: Side, name: &str| {
+            let picked = resolution.picked(side);
+            let tick = if picked.is_empty() || !picked.contains(&true) {
+                Tick::None
+            } else if picked.iter().all(|on| *on) {
+                Tick::All
+            } else {
+                Tick::Some
+            };
+            let take = tick != Tick::All;
+            let tooltip: SharedString = if take {
+                format!("Take every line of {name}").into()
+            } else {
+                format!("Take none of {name}").into()
+            };
+            let id = match side {
+                Side::Ours => "take-ours",
+                Side::Theirs => "take-theirs",
+            };
+            tick_box(id, side, tick)
+                .when(picked.is_empty(), |this| this.opacity(0.4).cursor_default())
+                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                .when(!picked.is_empty(), |this| {
+                    this.on_click(cx.listener(move |this, _, _, cx| this.take_side(side, take, cx)))
+                })
+        };
+        let order = |side: Side| {
+            let first = (side == Side::Theirs) == resolution.theirs_first;
+            div()
+                .ml_auto()
+                .flex_none()
+                .whitespace_nowrap()
+                .text_size(px(11.5))
+                .text_color(rgb(color::TEXT_MUTED))
+                .child(if first { "goes first" } else { "goes second" })
+        };
         let ours_pane = pane()
             .child(
                 pane_header()
+                    .pl(px(6.))
+                    .child(side_tick(Side::Ours, &ours_name))
                     .child(source_tag("OURS", Source::Ours))
                     .child(side_chip(ours_name.clone(), Side::Ours))
                     .child(
@@ -1280,37 +1602,32 @@ impl Conflicts {
                             .text_size(theme::SMALL_TEXT_SIZE)
                             .text_color(rgb(color::TEXT_MUTED))
                             .child(sha(&merge.ours)),
-                    ),
+                    )
+                    .when(both_picked, |this| this.child(order(Side::Ours))),
             )
-            .child(
-                div()
-                    .v_flex()
-                    .py(px(6.))
-                    .font_family(mono.clone())
-                    .text_size(px(12.))
-                    .children(context_lines(
-                        ours_start - before.len(),
-                        before,
-                        ours_highlights,
-                    ))
-                    .children(side_lines(
-                        Side::Ours,
-                        &conflict.ours,
-                        &resolution.ours,
-                        ours_start,
-                    ))
-                    .when(conflict.ours.is_empty(), |this| {
-                        this.child(empty_side("Nothing here on this side"))
-                    })
-                    .children(context_lines(
-                        ours_start + conflict.ours.len(),
-                        after,
-                        ours_highlights,
-                    )),
-            );
+            .child(code_rows(
+                "ours-lines",
+                [
+                    context_lines(ours_start - before.len(), before, ours_highlights),
+                    side_lines(Side::Ours, &conflict.ours, &resolution.ours, ours_start),
+                    conflict
+                        .ours
+                        .is_empty()
+                        .then(|| CodeRow::note(empty_note("Nothing here on this side")))
+                        .into_iter()
+                        .collect(),
+                    context_lines(ours_start + conflict.ours.len(), after, ours_highlights),
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
+                &mono,
+            ));
         let theirs_pane = pane()
             .child(
                 pane_header()
+                    .pl(px(6.))
+                    .child(side_tick(Side::Theirs, &theirs_name))
                     .child(source_tag("THEIRS", Source::Theirs))
                     .child(side_chip(theirs_name.clone(), Side::Theirs))
                     .child(
@@ -1319,34 +1636,36 @@ impl Conflicts {
                             .text_size(theme::SMALL_TEXT_SIZE)
                             .text_color(rgb(color::TEXT_MUTED))
                             .child(sha(&merge.theirs)),
-                    ),
+                    )
+                    .when(both_picked, |this| this.child(order(Side::Theirs))),
             )
-            .child(
-                div()
-                    .v_flex()
-                    .py(px(6.))
-                    .font_family(mono.clone())
-                    .text_size(px(12.))
-                    .children(context_lines(
-                        theirs_start - before.len(),
-                        before,
-                        theirs_highlights,
-                    ))
-                    .children(side_lines(
+            .child(code_rows(
+                "theirs-lines",
+                [
+                    context_lines(theirs_start - before.len(), before, theirs_highlights),
+                    side_lines(
                         Side::Theirs,
                         &conflict.theirs,
                         &resolution.theirs,
                         theirs_start,
-                    ))
-                    .when(conflict.theirs.is_empty(), |this| {
-                        this.child(empty_side("Nothing here on this side"))
-                    })
-                    .children(context_lines(
+                    ),
+                    conflict
+                        .theirs
+                        .is_empty()
+                        .then(|| CodeRow::note(empty_note("Nothing here on this side")))
+                        .into_iter()
+                        .collect(),
+                    context_lines(
                         theirs_start + conflict.theirs.len(),
                         after,
                         theirs_highlights,
-                    )),
-            );
+                    ),
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
+                &mono,
+            ));
         let base_pane = conflict.base.as_ref().filter(|_| show_base).map(|base| {
             pane()
                 .child(
@@ -1356,24 +1675,25 @@ impl Conflicts {
                             .child("Before either side changed it"),
                     ),
                 )
-                .child(
-                    div()
-                        .v_flex()
-                        .py(px(6.))
-                        .font_family(mono.clone())
-                        .text_size(px(12.))
-                        .children(base.iter().enumerate().map(|(i, line)| {
-                            code_line(
+                .child(code_rows(
+                    "base-lines",
+                    base.iter()
+                        .enumerate()
+                        .map(|(i, line)| {
+                            CodeRow::code(
                                 None,
                                 None,
                                 line,
                                 spans(base_highlights, base_start + i, line),
                             )
-                        }))
-                        .when(base.is_empty(), |this| {
-                            this.child(empty_side("Nothing here before"))
-                        }),
-                )
+                        })
+                        .chain(
+                            base.is_empty()
+                                .then(|| CodeRow::note(empty_note("Nothing here before"))),
+                        )
+                        .collect(),
+                    &mono,
+                ))
         });
 
         let result_lines = resolution.lines(conflict);
@@ -1393,7 +1713,8 @@ impl Conflicts {
         let built = if resolution.edited.is_some() {
             format!("Conflict {} is edited by hand.", n + 1)
         } else if resolution.is_empty() {
-            "Tick the lines to keep, take one side, or edit the result.".to_owned()
+            "Tick the lines to keep, or a side's box to take all of it, or edit the result."
+                .to_owned()
         } else {
             let parts: Vec<String> = [(from_ours, &ours_name), (from_theirs, &theirs_name)]
                 .into_iter()
@@ -1408,6 +1729,103 @@ impl Conflicts {
             Source::Both => source_tag("=", source),
         };
         let editing = self.editing.as_ref().map(|(input, _)| input.clone());
+        let before_rows = || {
+            before
+                .iter()
+                .enumerate()
+                .map(|(i, line)| {
+                    let ours = ours_start - before.len() + i;
+                    CodeRow::code(
+                        Some(tagged(Source::Both).into_any_element()),
+                        Some(result_start - before.len() + i),
+                        line,
+                        spans(ours_highlights, ours, line),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let after_rows = || {
+            after
+                .iter()
+                .enumerate()
+                .map(|(i, line)| {
+                    let ours = ours_start + conflict.ours.len() + i;
+                    CodeRow::code(
+                        Some(tagged(Source::Both).into_any_element()),
+                        Some(result_start + result_lines.len() + i),
+                        line,
+                        spans(ours_highlights, ours, line),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let label = div()
+            .text_size(px(10.5))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(state.1))
+            .child(format!("CONFLICT {} · {}", n + 1, state.0));
+        let result_body = match &editing {
+            Some(input) => div()
+                .v_flex()
+                .child(code_rows("result-before", before_rows(), &mono))
+                .child(div().px(px(12.)).child(label))
+                .child(
+                    div()
+                        .px(px(12.))
+                        .py(px(4.))
+                        .child(Textarea::new(input).font_family(mono.clone())),
+                )
+                .child(code_rows("result-after", after_rows(), &mono)),
+            None => {
+                let picked = result_lines
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (line, source, origin))| {
+                        // A picked line is coloured as on its side.
+                        let line_spans = match (source, origin) {
+                            (Source::Ours, Some(index)) => {
+                                spans(ours_highlights, ours_start + index, line)
+                            }
+                            (Source::Theirs, Some(index)) => {
+                                spans(theirs_highlights, theirs_start + index, line)
+                            }
+                            _ => None,
+                        };
+                        CodeRow::code(
+                            Some(tagged(*source).into_any_element()),
+                            Some(result_start + i),
+                            line,
+                            line_spans,
+                        )
+                        .on_click(
+                            ("result-line", i),
+                            cx.listener(move |this, _, window, cx| this.edit(Some(i), window, cx)),
+                        )
+                        .debug(format!("conflict-result-line-{i}"))
+                        .bg(rgba(match (resolution.resolved, source) {
+                            (true, _) => color::CONFLICT_RESOLVED,
+                            (false, Source::Ours) => color::CONFLICT_OURS_PICKED,
+                            (false, Source::Theirs) => color::CONFLICT_THEIRS_PICKED,
+                            (false, Source::Both) => color::CONFLICT_RESOLVED,
+                        }))
+                    });
+                let empty = result_lines.is_empty().then(|| {
+                    CodeRow::note(empty_note("Nothing yet: the conflict's lines are removed"))
+                        .on_click(
+                            "result-empty",
+                            cx.listener(|this, _, window, cx| this.edit(None, window, cx)),
+                        )
+                });
+                let rows = before_rows()
+                    .into_iter()
+                    .chain([CodeRow::note(label)])
+                    .chain(picked)
+                    .chain(empty)
+                    .chain(after_rows())
+                    .collect();
+                code_rows("result-lines", rows, &mono)
+            }
+        };
         let result_pane = pane()
             .child(
                 pane_header()
@@ -1460,95 +1878,7 @@ impl Conflicts {
                             ),
                     ),
             )
-            .child(
-                div()
-                    .v_flex()
-                    .py(px(6.))
-                    .font_family(mono.clone())
-                    .text_size(px(12.))
-                    .children(before.iter().enumerate().map(|(i, line)| {
-                        let ours = ours_start - before.len() + i;
-                        code_line(
-                            Some(tagged(Source::Both).into_any_element()),
-                            Some(result_start - before.len() + i),
-                            line,
-                            spans(ours_highlights, ours, line),
-                        )
-                    }))
-                    .child(
-                        div()
-                            .px(px(12.))
-                            .py(px(3.))
-                            .text_size(px(10.5))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(state.1))
-                            .child(format!("CONFLICT {} · {}", n + 1, state.0)),
-                    )
-                    .map(|this| match &editing {
-                        Some(input) => this.child(
-                            div()
-                                .px(px(12.))
-                                .py(px(4.))
-                                .child(Textarea::new(input).font_family(mono.clone())),
-                        ),
-                        None => this
-                            .children(result_lines.iter().enumerate().map(
-                                |(i, (line, source, origin))| {
-                                    // A picked line is coloured as on its side.
-                                    let line_spans = match (source, origin) {
-                                        (Source::Ours, Some(index)) => {
-                                            spans(ours_highlights, ours_start + index, line)
-                                        }
-                                        (Source::Theirs, Some(index)) => {
-                                            spans(theirs_highlights, theirs_start + index, line)
-                                        }
-                                        _ => None,
-                                    };
-                                    code_line(
-                                        Some(tagged(*source).into_any_element()),
-                                        Some(result_start + i),
-                                        line,
-                                        line_spans,
-                                    )
-                                    .id(("result-line", i))
-                                    .debug_selector(move || format!("conflict-result-line-{i}"))
-                                    .cursor_text()
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.edit(Some(i), window, cx)
-                                    }))
-                                    .bg(rgba(
-                                        match (resolution.resolved, source) {
-                                            (true, _) => color::CONFLICT_RESOLVED,
-                                            (false, Source::Ours) => color::CONFLICT_OURS_PICKED,
-                                            (false, Source::Theirs) => {
-                                                color::CONFLICT_THEIRS_PICKED
-                                            }
-                                            (false, Source::Both) => color::CONFLICT_RESOLVED,
-                                        },
-                                    ))
-                                },
-                            ))
-                            .when(result_lines.is_empty(), |this| {
-                                this.child(
-                                    empty_side("Nothing yet: the conflict's lines are removed")
-                                        .id("result-empty")
-                                        .cursor_text()
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.edit(None, window, cx)
-                                        })),
-                                )
-                            }),
-                    })
-                    .children(after.iter().enumerate().map(|(i, line)| {
-                        let ours = ours_start + conflict.ours.len() + i;
-                        code_line(
-                            Some(tagged(Source::Both).into_any_element()),
-                            Some(result_start + result_lines.len() + i),
-                            line,
-                            spans(ours_highlights, ours, line),
-                        )
-                    })),
-            )
+            .child(result_body)
             .child(
                 div()
                     .h_flex()
@@ -1604,6 +1934,25 @@ impl Conflicts {
             );
 
         let _ = window;
+        let story = self.render_story(
+            history,
+            (
+                story::SideView {
+                    name: &ours_name,
+                    highlights: ours_highlights,
+                    start: ours_start,
+                },
+                story::SideView {
+                    name: &theirs_name,
+                    highlights: theirs_highlights,
+                    start: theirs_start,
+                },
+            ),
+            n,
+            conflict,
+            &mono,
+            cx,
+        );
         div()
             .id("conflict-file")
             .v_flex()
@@ -1611,6 +1960,9 @@ impl Conflicts {
             .min_w_0()
             .h_full()
             .overflow_y_scroll()
+            // A sideways swipe over the history's lanes scrolls them, not
+            // the page.
+            .restrict_scroll_to_axis()
             .gap(px(12.))
             .pb(px(24.))
             // Children keep their height and the column scrolls, rather than
@@ -1647,59 +1999,22 @@ impl Conflicts {
                             .disabled(n + 1 >= file.conflict_count())
                             .on_click(cx.listener(|this, _, _, cx| this.step_conflict(1, cx))),
                     )
-                    .child(
-                        div()
-                            .ml_auto()
-                            .h_flex()
-                            .flex_wrap()
-                            .gap(px(6.))
-                            .child(
-                                Button::new("take-ours")
-                                    .small()
-                                    .label(format!("Take {ours_name}"))
-                                    .text_color(rgb(color::CHIP_TEXT))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.take(true, false, false, cx)
+                    .child(div().ml_auto().h_flex().flex_wrap().gap(px(6.)).when(
+                        conflict.base.is_some(),
+                        |this| {
+                            this.child(
+                                Checkbox::new("show-base")
+                                    .label("Show base")
+                                    .checked(self.show_base)
+                                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                        this.show_base = *checked;
+                                        cx.notify();
                                     })),
                             )
-                            .child(
-                                Button::new("take-theirs")
-                                    .small()
-                                    .label(format!("Take {theirs_name}"))
-                                    .text_color(rgb(color::PULL_REQUEST_OPEN_TEXT))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.take(false, true, false, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("take-both-ours-first")
-                                    .small()
-                                    .label(format!("Both, {ours_name} first"))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.take(true, true, false, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("take-both-theirs-first")
-                                    .small()
-                                    .label(format!("Both, {theirs_name} first"))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.take(true, true, true, cx)
-                                    })),
-                            )
-                            .when(conflict.base.is_some(), |this| {
-                                this.child(
-                                    Checkbox::new("show-base")
-                                        .label("Show base")
-                                        .checked(self.show_base)
-                                        .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                                            this.show_base = *checked;
-                                            cx.notify();
-                                        })),
-                                )
-                            }),
-                    ),
+                        },
+                    )),
             )
+            .child(story)
             .child(
                 div()
                     .flex_none()
@@ -1729,12 +2044,9 @@ impl Conflicts {
     }
 }
 
-fn empty_side(text: &'static str) -> Div {
+/// A note in place of lines, such as that a side has none.
+fn empty_note(text: &'static str) -> Div {
     div()
-        .px(px(12.))
-        .h(LINE_HEIGHT)
-        .flex()
-        .items_center()
         .text_size(px(12.))
         .text_color(rgb(color::TEXT_FAINT))
         .child(text)
@@ -1911,6 +2223,31 @@ mod tests {
             assert_eq!(first_kind(ours, 1, "/* base */"), Some(TokenKind::Comment));
             assert_eq!(first_kind(ours, 2, "fn h() {}"), Some(TokenKind::Keyword));
             assert_eq!(first_kind(theirs, 2, "fn g() {}"), Some(TokenKind::Keyword));
+
+            // What each side's commit did to the lines, under the history.
+            let Some(Ok(file)) = view.histories.get("a.rs") else {
+                panic!("the history is read");
+            };
+            let side = &file.history.theirs;
+            let (index, lines) = &side.conflicts[0].touched_by[0];
+            let change = file
+                .change(gitez_command::Side::Theirs, 0, *index)
+                .expect("the change is highlighted");
+            let kinds: Vec<(String, Option<TokenKind>)> = lines
+                .iter()
+                .map(|line| {
+                    let kind = change
+                        .spans(line)
+                        .and_then(|spans| spans.first())
+                        .map(|s| s.kind);
+                    (line.text.clone(), kind)
+                })
+                .collect();
+            assert!(
+                kinds.contains(&("fn f() {}".to_owned(), Some(TokenKind::Keyword)))
+                    && kinds.contains(&("fn g() {}".to_owned(), Some(TokenKind::Keyword))),
+                "{kinds:?}"
+            );
         });
     }
 
@@ -1935,6 +2272,38 @@ mod tests {
                 ("b".to_owned(), super::Source::Ours, Some(1)),
             ]
         );
+    }
+
+    #[test]
+    fn the_side_ticked_first_goes_first() {
+        use gitez_command::Side;
+        let conflict = gitez_git::Conflict {
+            ours: vec!["a".into(), "b".into()],
+            base: None,
+            theirs: vec!["c".into()],
+        };
+        let texts = |resolution: &super::Resolution| -> Vec<String> {
+            resolution
+                .lines(&conflict)
+                .into_iter()
+                .map(|(text, _, _)| text)
+                .collect()
+        };
+        let mut resolution = super::Resolution::new(&conflict);
+        // A line of theirs first, then all of ours: theirs stays first.
+        resolution.pick(Side::Theirs, |picked| picked[0] = true);
+        resolution.pick(Side::Ours, |picked| picked.fill(true));
+        assert_eq!(texts(&resolution), ["c", "a", "b"]);
+        // Dropping theirs and ticking it again puts it after ours.
+        resolution.pick(Side::Theirs, |picked| picked.fill(false));
+        resolution.pick(Side::Theirs, |picked| picked.fill(true));
+        assert_eq!(texts(&resolution), ["a", "b", "c"]);
+        // Starting over from nothing, ours line by line, then theirs.
+        let mut resolution = super::Resolution::new(&conflict);
+        resolution.pick(Side::Ours, |picked| picked[1] = true);
+        resolution.pick(Side::Theirs, |picked| picked.fill(true));
+        resolution.pick(Side::Ours, |picked| picked[0] = true);
+        assert_eq!(texts(&resolution), ["a", "b", "c"]);
     }
 
     #[gpui_kit::test]
@@ -1963,11 +2332,136 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn the_commits_behind_a_conflict_are_shown(cx: &mut TestAppContext) {
+        let dir = conflicted_repository(2);
+        let (view, mut cx) = open(dir.path(), cx);
+        let (ours, theirs) = view.read_with(&cx, |view, _| {
+            let Some(Ok(history)) = view.histories.get("file.txt") else {
+                panic!("the history is read");
+            };
+            let touched = |side: &gitez_git::SideHistory| -> Vec<String> {
+                side.conflicts[0]
+                    .touched_by
+                    .iter()
+                    .map(|(index, _)| side.commits[*index].summary.clone())
+                    .collect()
+            };
+            (
+                touched(&history.history.ours),
+                touched(&history.history.theirs),
+            )
+        });
+        assert_eq!(
+            (ours, theirs),
+            (vec!["ours".to_owned()], vec!["theirs".to_owned()])
+        );
+        // Each conflicting line names its commit; clicking it shows the commit.
+        let credit = cx
+            .debug_bounds("conflict-credit-theirs-1")
+            .expect("line credit drawn");
+        cx.simulate_click(credit.center(), Modifiers::default());
+        let chosen = view.read_with(&cx, |view, _| view.story_commit);
+        assert_eq!(chosen, Some((gitez_command::Side::Theirs, 0)));
+    }
+
+    #[gpui_kit::test]
+    fn a_sideways_swipe_does_not_scroll_the_page(cx: &mut TestAppContext) {
+        let dir = conflicted_repository(40);
+        let (_, mut cx) = open(dir.path(), cx);
+        let before = scroll_offset(&mut cx);
+        for _ in 0..10 {
+            cx.simulate_event(ScrollWheelEvent {
+                position: point(px(600.), px(300.)),
+                delta: ScrollDelta::Pixels(point(px(-200.), px(0.))),
+                touch_phase: TouchPhase::Moved,
+                modifiers: Modifiers::default(),
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        assert_eq!(scroll_offset(&mut cx), before);
+    }
+
+    #[gpui_kit::test]
+    fn a_long_line_scrolls_sideways(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("file.txt"), "base\n").expect("write");
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "base"]);
+        git(root, &["checkout", "-qb", "theirs"]);
+        std::fs::write(root.join("file.txt"), "theirs\n").expect("write");
+        git(root, &["commit", "-qam", "theirs"]);
+        git(root, &["checkout", "-q", "main"]);
+        let long = format!("{}\n", "ours ".repeat(80));
+        std::fs::write(root.join("file.txt"), long).expect("write");
+        git(root, &["commit", "-qam", "ours"]);
+        git(root, &["merge", "-q", "theirs"]);
+
+        let (view, mut cx) = open(root, cx);
+        let before = cx
+            .debug_bounds("conflict-ours-line-0")
+            .expect("our line drawn");
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(before.origin.x + px(50.), before.center().y),
+            delta: ScrollDelta::Pixels(point(px(-300.), px(0.))),
+            touch_phase: TouchPhase::Moved,
+            modifiers: Modifiers::default(),
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let after = cx
+            .debug_bounds("conflict-ours-line-0")
+            .expect("our line drawn");
+        assert!(
+            after.origin.x < before.origin.x,
+            "the line moves left: {before:?} -> {after:?}"
+        );
+
+        // So does what our commit did to the lines, under the history: its
+        // widest line, the long one it added.
+        const CHANGE_LINES: [&str; 4] = [
+            "story-change-line-0",
+            "story-change-line-1",
+            "story-change-line-2",
+            "story-change-line-3",
+        ];
+        view.update_in(&mut cx, |view, _, cx| {
+            view.choose_story_commit(gitez_command::Side::Ours, 0, cx)
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let added = CHANGE_LINES
+            .iter()
+            .filter_map(|name| cx.debug_bounds(name))
+            .max_by(|a, b| f32::from(a.size.width).total_cmp(&f32::from(b.size.width)))
+            .expect("the commit's change drawn");
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(added.origin.x + px(50.), added.center().y),
+            delta: ScrollDelta::Pixels(point(px(-300.), px(0.))),
+            touch_phase: TouchPhase::Moved,
+            modifiers: Modifiers::default(),
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let moved = CHANGE_LINES
+            .iter()
+            .filter_map(|name| cx.debug_bounds(name))
+            .max_by(|a, b| f32::from(a.size.width).total_cmp(&f32::from(b.size.width)))
+            .expect("the commit's change drawn");
+        assert!(
+            moved.origin.x < added.origin.x,
+            "the change moves left: {added:?} -> {moved:?}"
+        );
+    }
+
+    #[gpui_kit::test]
     fn clicking_a_result_line_edits_it(cx: &mut TestAppContext) {
         let dir = conflicted_repository(3);
         let (view, mut cx) = open(dir.path(), cx);
-        // Take our side, so the result has lines to click.
-        view.update_in(&mut cx, |view, _, cx| view.take(true, false, false, cx));
+        // Take our side, so the result has lines to click, and fold the
+        // history away so the result fits the window.
+        view.update_in(&mut cx, |view, _, cx| {
+            view.story_open = false;
+            view.take_side(gitez_command::Side::Ours, true, cx)
+        });
         cx.update(|window, cx| window.draw(cx).clear(cx));
         let line = cx
             .debug_bounds("conflict-result-line-1")

@@ -1739,3 +1739,77 @@ fn ref_state_reads_head_branches_tags_and_stashes() {
         Some(HeadPlace::Detached(first))
     );
 }
+
+#[test]
+fn conflict_history_finds_the_commits_that_changed_the_conflicting_lines() {
+    let fixture = Fixture::new();
+    let write = |text: &str, message: &str| {
+        std::fs::write(fixture.root.join("f.txt"), text).expect("write");
+        fixture.git(&["commit", "--quiet", "-am", message]);
+        fixture.rev("HEAD")
+    };
+    std::fs::write(fixture.root.join("f.txt"), "a\nb\nc\nd\ne\nf\ng\n").expect("write");
+    fixture.git(&["add", "f.txt"]);
+    fixture.git(&["commit", "--quiet", "-m", "base"]);
+    let base = fixture.rev("HEAD");
+
+    fixture.git(&["checkout", "--quiet", "-b", "feature"]);
+    // Two lines on top, which merge cleanly and shift the rest.
+    let shifts = write("0\n1\na\nb\nc\nd\ne\nf\ng\n", "feature adds a header");
+    let changes = write("0\n1\na\nb\nc\nD theirs\ne\nf\ng\n", "feature changes d");
+    fixture.git(&["checkout", "--quiet", "main"]);
+    let changes_ours = write("a\nb\nc\nD ours\ne\nf\ng\n", "main changes d");
+    let elsewhere = fixture.commit("other.txt", "main changes another file");
+
+    let merge = Command::new("git")
+        .arg("-C")
+        .arg(&fixture.root)
+        .args(["merge", "--quiet", "feature"])
+        .output()
+        .expect("git runs");
+    assert!(!merge.status.success(), "the merge conflicts");
+
+    let repo = fixture.open();
+    let file = repo
+        .conflict_file("f.txt")
+        .expect("read")
+        .expect("conflicts");
+    let history = repo
+        .conflict_history("f.txt", &file, fixture.rev("HEAD"), fixture.rev("feature"))
+        .expect("history");
+    assert_eq!(history.base.as_ref().map(|commit| commit.id), Some(base));
+
+    let ids = |side: &gitez_git::SideHistory| -> Vec<Oid> {
+        side.commits.iter().map(|commit| commit.id).collect()
+    };
+    assert_eq!(ids(&history.ours), [elsewhere, changes_ours]);
+    assert_eq!(ids(&history.theirs), [changes, shifts]);
+
+    let touched = |side: &gitez_git::SideHistory| -> Vec<Oid> {
+        side.conflicts[0]
+            .touched_by
+            .iter()
+            .map(|(index, _)| side.commits[*index].id)
+            .collect()
+    };
+    assert_eq!(touched(&history.ours), [changes_ours]);
+    assert_eq!(touched(&history.theirs), [changes]);
+    assert_eq!(history.ours.conflicts[0].lines, [Some(1)]);
+    assert_eq!(history.theirs.conflicts[0].lines, [Some(0)]);
+
+    let (_, change) = &history.theirs.conflicts[0].touched_by[0];
+    let shown: Vec<(LineKind, &str)> = change
+        .iter()
+        .map(|line| (line.kind, line.text.as_str()))
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            (LineKind::Context, "c"),
+            (LineKind::Removed, "d"),
+            (LineKind::Added, "D theirs"),
+            (LineKind::Context, "e"),
+        ]
+    );
+    assert_eq!(change[2].new, Some(6));
+}

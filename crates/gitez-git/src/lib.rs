@@ -10,6 +10,7 @@
 
 mod commits;
 mod conflict;
+mod conflict_history;
 mod details;
 mod diff;
 mod error;
@@ -26,6 +27,7 @@ mod watch;
 
 pub use commits::{Commit, CommitWalk, Order, Signature, Timestamp};
 pub use conflict::{Conflict, ConflictFile, Segment};
+pub use conflict_history::{ChangeLine, ConflictHistory, ConflictSide, HistoryCommit, SideHistory};
 pub use details::{ChangeKind, CommitDetails, FileChange, LineCounts};
 pub use diff::{
     BranchDiff, DiffContent, DiffLine, DiffOptions, FileDiff, Hunk, LineKind, LineSource, NewSide,

@@ -63,8 +63,12 @@ tree, so it cannot be committed or pushed by accident. Linked worktrees share it
 - **Drag-and-drop merge**: drag a branch label onto another branch to merge,
   squash, rebase, fast-forward, or open the two branches as a local PR.
 - **Conflict editor**: see our and their lines side by side (with the base if
-  you want it), and tick lines into the result, or click a result line to
-  edit it by hand.
+  you want it), and tick lines into the result, or a side's box to take all
+  of it; the side you tick first goes first. Click a result line to edit it
+  by hand. "Why these lines conflict" shows the commits each branch
+  made since the two split, picks out those that changed the conflict's lines,
+  and labels each line with its commit. Click a commit to read its message
+  and see what it did to those lines.
 - **Cherry-pick**: select commits and pick them onto any branch. GitEZ does a
   trial run against each branch first.
 - **Rewrite history**: reword, edit, squash, fixup, drop and reorder commits,

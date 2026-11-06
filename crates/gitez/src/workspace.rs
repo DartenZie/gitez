@@ -1559,6 +1559,10 @@ impl Workspace {
         let subscription = cx.subscribe_in(&conflicts, window, |this, _, event, window, cx| {
             match event {
                 ConflictsEvent::Close => this.close_conflicts(window, cx),
+                ConflictsEvent::ShowCommit(id) => {
+                    this.close_conflicts(window, cx);
+                    this.select_commit(*id, window, cx);
+                }
                 ConflictsEvent::Changed => this.refresh_status(window, cx),
                 ConflictsEvent::Finished { committed, step } => {
                     let message = if *committed {
