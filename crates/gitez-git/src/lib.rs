@@ -38,7 +38,7 @@ pub use follow::{ChangedLines, Followed};
 pub use merge::{MergeInProgress, MergePreview};
 pub use pick::PickTrial;
 pub use refs::{
-    Branch, Head, RefKind, RefLabel, Refs, RemoteBranch, Stash, Tag, branch_name_problem,
+    Branch, Head, RefGroup, RefKind, RefLabel, Refs, RemoteBranch, Stash, Tag, branch_name_problem,
     remote_name_problem, tag_name_problem,
 };
 pub use repository::Repository;

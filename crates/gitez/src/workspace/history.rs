@@ -11,11 +11,12 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use gitez_git::graph::{GraphLayout, Row, Segment};
-use gitez_git::{Commit, Oid, Order, RefKind, RefLabel, Repository, WorkingTreeStatus};
+use gitez_git::{Commit, Oid, Order, RefGroup, RefKind, RefLabel, Repository, WorkingTreeStatus};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::*;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::kbd::Kbd;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -58,8 +59,8 @@ const FIRST_BATCH: usize = 200;
 const BATCH: usize = 5_000;
 
 pub const ROW_HEIGHT: Pixels = px(36.);
-/// Room kept for a commit's summary beside its ref labels.
-const SUMMARY_MIN_WIDTH: Pixels = px(160.);
+/// The shortest line from a branch label to the edge of the graph column.
+const LABEL_LINE: Pixels = px(6.);
 /// The most commits highlighted as coming in with a dragged branch.
 const MAX_INCOMING: usize = 2_000;
 
@@ -67,6 +68,10 @@ const MAX_INCOMING: usize = 2_000;
 mod columns {
     use gpui_kit::{Pixels, px};
 
+    /// The branch and tag labels, left of the graph.
+    /// Narrow, so a short branch name keeps its line to the graph short;
+    /// longer names are cut short.
+    pub const REFS: Pixels = px(140.);
     pub const GRAPH_MIN: Pixels = px(112.);
     /// About ten lanes; wider graphs scroll sideways.
     pub const GRAPH_MAX: Pixels = px(240.);
@@ -172,6 +177,8 @@ pub struct History {
     /// How far the graph is scrolled to the left, when wider than its column.
     graph_scroll: Pixels,
     labels: HashMap<Oid, Vec<RefLabel>>,
+    /// The labels of the branch column, by commit.
+    groups: HashMap<Oid, Vec<RefGroup>>,
     head: Option<Oid>,
     /// Index of the `HEAD` commit in `commits`, once read.
     head_index: Option<usize>,
@@ -215,6 +222,7 @@ impl History {
             lanes: 1,
             graph_scroll: px(0.),
             labels: HashMap::new(),
+            groups: HashMap::new(),
             head: None,
             head_index: None,
             working_tree_lane: 0,
@@ -241,6 +249,7 @@ impl History {
             summary: self.summary.take(),
             repository: Some(snapshot.repository.clone()),
             labels: snapshot.refs.labels_by_commit(),
+            groups: snapshot.refs.groups_by_commit(),
             head: snapshot.refs.head.as_ref().and_then(|head| head.target()),
             ..Self::new(cx)
         };
@@ -306,6 +315,7 @@ impl History {
         let repository = snapshot.repository.clone();
         let tips = snapshot.refs.tips(true);
         let labels = snapshot.refs.labels_by_commit();
+        let groups = snapshot.refs.groups_by_commit();
         let head = snapshot.refs.head.as_ref().and_then(|head| head.target());
         self._load = Some(cx.spawn(async move |this, cx| {
             let history = cx
@@ -323,7 +333,7 @@ impl History {
                 })
                 .await;
             this.update(cx, |this, cx| match history {
-                Ok((commits, rows)) => this.replace(commits, rows, labels, head, cx),
+                Ok((commits, rows)) => this.replace(commits, rows, labels, groups, head, cx),
                 Err(error) => this.fail(error, cx),
             })
             .ok();
@@ -335,6 +345,7 @@ impl History {
         commits: Vec<Commit>,
         rows: Vec<Row>,
         labels: HashMap<Oid, Vec<RefLabel>>,
+        groups: HashMap<Oid, Vec<RefGroup>>,
         head: Option<Oid>,
         cx: &mut Context<Self>,
     ) {
@@ -350,6 +361,7 @@ impl History {
             .head_index
             .map_or(0, |head| working_tree_lane(&self.rows, head));
         self.labels = labels;
+        self.groups = groups;
         // Its rows may have moved.
         if let Some(drag) = &mut self.drag {
             drag.over_commit = None;
@@ -1005,10 +1017,23 @@ impl History {
         })
     }
 
-    /// The label of `label`, on commit `index`; a local branch's can be
-    /// dragged onto another branch.
-    fn render_label(&self, label: &RefLabel, index: usize, cx: &mut Context<Self>) -> AnyElement {
-        let chip = labels::ref_label(label);
+    /// The label of `group`, in `color`, on commit `index`; a local
+    /// branch's can be dragged onto another branch.
+    fn render_group(
+        &self,
+        group: &RefGroup,
+        color: u32,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let label = &group.label;
+        let description: SharedString = labels::group_description(group).into();
+        let chip = labels::group_label(group, color)
+            .id(SharedString::from(format!(
+                "ref-{:?}-{}",
+                label.kind, label.name
+            )))
+            .tooltip(move |window, cx| Tooltip::new(description.clone()).build(window, cx));
         let Some(tip) = self.commits.get(index).map(|commit| commit.id) else {
             return chip.into_any_element();
         };
@@ -1023,8 +1048,7 @@ impl History {
             .is_some_and(|(target, at)| *target == name && *at == index);
         let history = cx.weak_entity();
         let over = name.clone();
-        chip.id(SharedString::from(format!("branch-{name}")))
-            .cursor_grab()
+        chip.cursor_grab()
             .when(lifted, |this| this.opacity(0.35))
             .when(target, |this| {
                 this.bg(rgb(color::ACCENT))
@@ -1125,13 +1149,64 @@ impl History {
             }))
     }
 
-    /// The graph column of a row: scrolls the graph sideways.
-    fn graph_column(&self, cell: impl IntoElement, cx: &mut Context<Self>) -> Div {
-        div()
+    /// The branch and graph columns of a row, side by side with no gap, so
+    /// the line from a branch label runs on into the graph: `refs` holds
+    /// the labels, `cell` paints the graph and scrolls it sideways.
+    fn graph_column(&self, refs: Div, cell: impl IntoElement, cx: &mut Context<Self>) -> Div {
+        div().h_flex().h_full().flex_none().child(refs).child(
+            div()
+                .h_full()
+                .flex_none()
+                .on_scroll_wheel(cx.listener(Self::scroll_graph))
+                .child(cell),
+        )
+    }
+
+    /// The branch column of commit `index`, drawn in `color`: its first
+    /// label, a count of the others, whose names show on hover, and a line
+    /// on to the graph. Empty when the commit has no labels.
+    fn refs_cell(&self, index: usize, color: u32, cx: &mut Context<Self>) -> Div {
+        let cell = div()
+            .h_flex()
             .h_full()
+            .w(columns::REFS)
             .flex_none()
-            .on_scroll_wheel(cx.listener(Self::scroll_graph))
-            .child(cell)
+            .pl(px(10.));
+        let Some(groups) = self
+            .commits
+            .get(index)
+            .and_then(|commit| self.groups.get(&commit.id))
+            .filter(|groups| !groups.is_empty())
+        else {
+            return cell;
+        };
+        let more = &groups[1..];
+        cell.child(self.render_group(&groups[0], color, index, cx))
+            .when(!more.is_empty(), |this| {
+                let names: SharedString = more
+                    .iter()
+                    .map(labels::group_description)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .into();
+                this.child(
+                    div()
+                        .id(SharedString::from(format!("more-refs-{index}")))
+                        .flex_none()
+                        .ml(px(4.))
+                        .h(px(20.))
+                        .px(px(5.))
+                        .h_flex()
+                        .rounded(px(4.))
+                        .bg(theme::with_alpha(color, 0.16))
+                        .text_color(rgb(color))
+                        .text_size(theme::SMALL_TEXT_SIZE)
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(format!("+{}", more.len()))
+                        .tooltip(move |window, cx| Tooltip::new(names.clone()).build(window, cx)),
+                )
+            })
+            .child(div().flex_1().min_w(LABEL_LINE).h(px(2.)).bg(rgb(color)))
     }
 
     fn render_working_tree(
@@ -1150,7 +1225,7 @@ impl History {
         );
         Some(
             row.when(self.drag_role(None).is_some(), |this| this.opacity(0.45))
-                .child(self.graph_column(cell, cx))
+                .child(self.graph_column(div().w(columns::REFS), cell, cx))
                 .children(self.pick_cell(None))
                 .child(match &self.summary {
                     Some((input, _)) => div()
@@ -1207,7 +1282,6 @@ impl History {
     ) -> Option<AnyElement> {
         let commit = self.commits.get(index)?;
         let graph_row = self.rows.get(index)?;
-        let labels = self.labels.get(&commit.id);
         let working_tree = self
             .working_tree_line()
             .filter(|_| self.head_index.is_some_and(|head| index <= head));
@@ -1220,13 +1294,19 @@ impl History {
         };
         // The dashed line passes the rows between the two.
         let through = working_tree.filter(|_| self.head_index != Some(index));
+        let labelled = self
+            .groups
+            .get(&commit.id)
+            .is_some_and(|groups| !groups.is_empty());
         let cell = graph::cell(
             graph_row.clone(),
             head,
             through,
+            labelled,
             self.graph_width(),
             self.graph_scroll,
         );
+        let refs = self.refs_cell(index, theme::graph_color(graph_row.color), cx);
 
         let row = match self.drag_role(Some(index)) {
             Some(DragRole::Target) => row.bg(rgba(color::TARGET_ROW)),
@@ -1244,32 +1324,16 @@ impl History {
                 },
             ))
             .on_drop(cx.listener(|this, _: &DraggedBranch, _, cx| this.drop_branch(cx)))
-            .child(self.graph_column(cell, cx))
+            .child(self.graph_column(refs, cell, cx))
             .children(self.pick_cell(Some(index)))
             .child(
                 div()
-                    .h_flex()
                     .flex_1()
                     .min_w_0()
-                    .gap(px(6.))
                     .overflow_hidden()
-                    .when_some(labels, |this, labels| {
-                        this.children(
-                            labels
-                                .iter()
-                                .map(|label| self.render_label(label, index, cx)),
-                        )
-                    })
-                    .child(
-                        div()
-                            // Labels shrink before the summary goes below
-                            // this.
-                            .min_w(SUMMARY_MIN_WIDTH)
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .child(commit.summary.clone()),
-                    ),
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(commit.summary.clone()),
             )
             .child(
                 div()
@@ -1442,7 +1506,20 @@ impl Render for History {
                     .text_size(px(11.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(color::TEXT_FAINT))
-                    .child(self.render_graph_heading())
+                    .child(
+                        div()
+                            .h_flex()
+                            .h_full()
+                            .flex_none()
+                            .child(
+                                div()
+                                    .w(columns::REFS)
+                                    .flex_none()
+                                    .pl(px(14.))
+                                    .child("BRANCH / TAG"),
+                            )
+                            .child(self.render_graph_heading()),
+                    )
                     .when(!self.picked.is_empty(), |this| {
                         this.child(div().w(px(22.)).flex_none())
                     })

@@ -115,6 +115,29 @@ pub struct RefLabel {
     pub is_head: bool,
 }
 
+/// One label of the history's branch column: a local branch together with
+/// the remote-tracking branches of the same name, or its upstream, that
+/// point at the same commit; otherwise a single ref.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefGroup {
+    pub label: RefLabel,
+    /// Short names, such as `origin/main`, of the remote-tracking branches
+    /// folded into a local branch's label.
+    pub remotes: Vec<String>,
+}
+
+impl RefGroup {
+    /// Whether the group holds a local branch.
+    pub fn is_local(&self) -> bool {
+        self.label.kind == RefKind::Branch
+    }
+
+    /// Whether the group holds a remote-tracking branch.
+    pub fn is_remote(&self) -> bool {
+        self.label.kind == RefKind::RemoteBranch || !self.remotes.is_empty()
+    }
+}
+
 impl Refs {
     /// Commits to start a history walk from: `HEAD`, every branch and tag,
     /// and remote-tracking branches when `include_remotes` is set. Stashes are
@@ -164,6 +187,79 @@ impl Refs {
             add(tag.target, RefKind::Tag, tag.name.clone(), false);
         }
         labels
+    }
+
+    /// Labels for the history's branch column, keyed by commit. A local
+    /// branch absorbs the remote-tracking branches of the same name, and its
+    /// upstream, at the same commit. Labels for one commit come in this
+    /// order: `HEAD` (the detached `HEAD` or the current branch), branches,
+    /// remote-tracking branches left on their own, tags.
+    pub fn groups_by_commit(&self) -> HashMap<Oid, Vec<RefGroup>> {
+        let mut groups: HashMap<Oid, Vec<RefGroup>> = HashMap::new();
+        let mut add = |target: Oid, kind, name: String, is_head, remotes| {
+            let group = RefGroup {
+                label: RefLabel {
+                    kind,
+                    name,
+                    is_head,
+                },
+                remotes,
+            };
+            let list = groups.entry(target).or_default();
+            if is_head {
+                list.insert(0, group);
+            } else {
+                list.push(group);
+            }
+        };
+        if let Some(Head::Detached { target }) = &self.head {
+            add(*target, RefKind::Head, "HEAD".to_owned(), true, Vec::new());
+        }
+        let mut folded = vec![false; self.remote_branches.len()];
+        for branch in &self.branches {
+            let mut remotes = Vec::new();
+            for (remote, folded) in self.remote_branches.iter().zip(&mut folded) {
+                let short_name = remote.short_name();
+                if remote.target == branch.target
+                    && (remote.name == branch.name
+                        || branch.upstream.as_deref() == Some(short_name.as_str()))
+                {
+                    *folded = true;
+                    remotes.push(short_name);
+                }
+            }
+            add(
+                branch.target,
+                RefKind::Branch,
+                branch.name.clone(),
+                branch.is_head,
+                remotes,
+            );
+        }
+        for (remote, _) in self
+            .remote_branches
+            .iter()
+            .zip(&folded)
+            .filter(|(_, folded)| !**folded)
+        {
+            add(
+                remote.target,
+                RefKind::RemoteBranch,
+                remote.short_name(),
+                false,
+                Vec::new(),
+            );
+        }
+        for tag in &self.tags {
+            add(
+                tag.target,
+                RefKind::Tag,
+                tag.name.clone(),
+                false,
+                Vec::new(),
+            );
+        }
+        groups
     }
 }
 
@@ -410,6 +506,67 @@ mod tests {
             parse_stash_message("custom".into()),
             (None, "custom".into())
         );
+    }
+
+    #[test]
+    fn groups_fold_remotes_into_local_branches_at_the_same_commit() {
+        let a = Oid::from_hex(b"1111111111111111111111111111111111111111").expect("valid hex");
+        let b = Oid::from_hex(b"2222222222222222222222222222222222222222").expect("valid hex");
+        let branch = |name: &str, target, upstream: Option<&str>, is_head| Branch {
+            name: name.into(),
+            target,
+            upstream: upstream.map(Into::into),
+            is_head,
+        };
+        let remote = |remote: &str, name: &str, target| RemoteBranch {
+            remote: remote.into(),
+            name: name.into(),
+            target,
+        };
+        let refs = Refs {
+            head: Some(Head::Branch {
+                name: "main".into(),
+                target: a,
+            }),
+            branches: vec![
+                branch("feature", b, Some("origin/feature"), false),
+                branch("main", a, Some("origin/main"), true),
+                branch("work", a, Some("fork/topic"), false),
+            ],
+            remote_branches: vec![
+                remote("fork", "topic", a),
+                remote("origin", "feature", a),
+                remote("origin", "main", a),
+                remote("upstream", "main", a),
+            ],
+            tags: vec![Tag {
+                name: "v1".into(),
+                target: a,
+                id: a,
+                annotated: false,
+            }],
+            stashes: Vec::new(),
+        };
+        let groups = refs.groups_by_commit();
+        let summary = |id| {
+            groups[&id]
+                .iter()
+                .map(|group| (group.label.name.as_str(), group.remotes.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            summary(a),
+            vec![
+                ("main", vec!["origin/main".into(), "upstream/main".into()]),
+                ("work", vec!["fork/topic".into()]),
+                ("origin/feature", vec![]),
+                ("v1", vec![]),
+            ]
+        );
+        assert_eq!(summary(b), vec![("feature", vec![])]);
+        assert!(groups[&a][0].label.is_head);
+        assert!(groups[&a][0].is_local() && groups[&a][0].is_remote());
+        assert!(!groups[&a][2].is_local() && groups[&a][2].is_remote());
     }
 
     #[test]

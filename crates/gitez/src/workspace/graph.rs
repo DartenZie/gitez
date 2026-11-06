@@ -26,7 +26,11 @@ const HEAD_RING_WIDTH: Pixels = px(2.);
 /// line joining it to the `HEAD` commit.
 const WORKING_TREE_RADIUS: Pixels = px(5.5);
 const WORKING_TREE_BORDER: Pixels = px(1.6);
-const DASHES: [Pixels; 2] = [px(3.), px(4.)];
+/// Dash and gap of the dashed line. Each row paints its piece of the line
+/// separately and the pattern restarts at every piece, so the period (6px)
+/// must divide half the row height (18px), the piece from the node to the
+/// row's edge, for the dashes to stay evenly spaced across rows.
+const DASHES: [Pixels; 2] = [px(3.), px(3.)];
 
 /// Width needed to show a graph `lanes` lanes wide in full.
 pub fn content_width(lanes: usize) -> Pixels {
@@ -68,11 +72,13 @@ pub enum Head {
 /// An element that paints `row` across its bounds, with the graph moved
 /// `scroll` to the left. `working_tree` is the lane and colour of the dashed
 /// line from the uncommitted-changes row, when it passes through this row on
-/// its way down to `HEAD`.
+/// its way down to `HEAD`. With `labelled`, a line in the commit's colour
+/// joins the left edge, where the row's branch label ends, to the node.
 pub fn cell(
     row: Row,
     head: Head,
     working_tree: Option<(usize, usize)>,
+    labelled: bool,
     width: Pixels,
     scroll: Pixels,
 ) -> impl IntoElement {
@@ -80,6 +86,13 @@ pub fn cell(
         |_, _, _| {},
         move |bounds, _, window, _| {
             window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                if labelled {
+                    let y = bounds.center().y;
+                    let node = lane_x(bounds, scroll, row.lane);
+                    if let Some(path) = line(point(bounds.left(), y), point(node, y)) {
+                        window.paint_path(path, lane_color(row.color));
+                    }
+                }
                 paint_row(&row, head, bounds, scroll, window);
                 if let Some((lane, color)) = working_tree {
                     let x = lane_x(bounds, scroll, lane);
@@ -188,7 +201,7 @@ fn paint_row(row: &Row, head: Head, bounds: Bounds<Pixels>, scroll: Pixels, wind
 }
 
 fn lane_color(color: usize) -> Rgba {
-    rgb(theme::GRAPH_COLORS[color % theme::GRAPH_COLORS.len()])
+    rgb(theme::graph_color(color))
 }
 
 fn circle_bounds(center: Point<Pixels>, radius: Pixels) -> Bounds<Pixels> {

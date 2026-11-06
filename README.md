@@ -56,7 +56,10 @@ tree, so it cannot be committed or pushed by accident. Linked worktrees share it
 
 - **History**: a virtualised commit graph, with branches, remotes, tags,
   stashes and local PRs in the sidebar, and commit details and full diffs
-  beside it.
+  beside it. Branch and tag labels sit in their own column left of the graph,
+  joined to their commit by a line; a laptop marks a local branch and a cloud
+  a branch on a remote, so `main` and `origin/main` at the same commit share
+  one label.
 - **Working tree**: stage, unstage or discard files and single hunks. Commit,
   amend, sign off or skip hooks; type the commit summary in the panel or right
   in the uncommitted-changes row, which is always at the top of the graph.

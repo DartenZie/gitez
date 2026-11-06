@@ -1,8 +1,9 @@
 //! Small pieces shared by the views: ref labels, keycaps,
 //! author avatars and the summary of uncommitted changes.
 
-use gitez_git::{ChangeKind, RefKind, RefLabel, WorkingTreeStatus};
-use gpui_kit::component::{ActiveTheme as _, StyledExt as _};
+use gitez_git::{ChangeKind, RefGroup, RefKind, RefLabel, WorkingTreeStatus};
+use gpui_kit::assets::IconName;
+use gpui_kit::component::{ActiveTheme as _, Icon, StyledExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -67,6 +68,83 @@ pub fn ref_label(label: &RefLabel) -> Div {
             .child(head_badge(color::BRANCH_BLUE))
             .text_color(rgb(color::BRANCH_BLUE))
             .child("detached"),
+    }
+}
+
+/// Size of the icons in a [`group_label`].
+const GROUP_ICON_SIZE: Pixels = px(12.);
+
+/// A label of the history's branch column, in `color`, the colour of the
+/// commit's lane: a check mark on the current branch, the name, then a
+/// laptop when the branch is local and a cloud when it is on a remote.
+/// Shrinks, cutting the name short, when the column is narrow.
+pub fn group_label(group: &RefGroup, color: u32) -> Div {
+    let icon = |name: IconName| {
+        Icon::new(name)
+            .size(GROUP_ICON_SIZE)
+            .flex_none()
+            .into_any_element()
+    };
+    let label = &group.label;
+    let chip = div()
+        .h_flex()
+        .min_w_0()
+        .h(px(20.))
+        .px(px(7.))
+        .gap(px(5.))
+        .rounded(px(4.))
+        .text_size(theme::SMALL_TEXT_SIZE)
+        .font_weight(FontWeight::MEDIUM)
+        .whitespace_nowrap()
+        .border_1();
+    let chip = match label.kind {
+        RefKind::Tag => chip
+            .border_dashed()
+            .border_color(rgb(color::TAG_LABEL_BORDER))
+            .text_color(rgb(color::TEXT_SECONDARY))
+            .child(icon(IconName::Tag)),
+        RefKind::RemoteBranch => chip
+            .border_color(theme::with_alpha(color, 0.45))
+            .text_color(rgb(color)),
+        RefKind::Branch | RefKind::Head => chip
+            .border_color(theme::with_alpha(color, 0.45))
+            .bg(theme::with_alpha(color, 0.16))
+            .text_color(rgb(color)),
+    };
+    chip.when(label.is_head, |this| this.child(icon(IconName::Check)))
+        .child(
+            div()
+                .min_w_0()
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(match label.kind {
+                    RefKind::Head => "detached HEAD".to_owned(),
+                    _ => label.name.clone(),
+                }),
+        )
+        .when(group.is_local(), |this| this.child(icon(IconName::Laptop)))
+        .when(group.is_remote(), |this| this.child(icon(IconName::Cloud)))
+}
+
+/// What a [`group_label`] stands for, for its tooltip: "main — local,
+/// origin/main".
+pub fn group_description(group: &RefGroup) -> String {
+    let label = &group.label;
+    match label.kind {
+        RefKind::Head => "Detached HEAD".to_owned(),
+        RefKind::Tag => format!("Tag {}", label.name),
+        RefKind::RemoteBranch => format!("{} — remote", label.name),
+        RefKind::Branch => {
+            let mut description = format!("{} — local", label.name);
+            for remote in &group.remotes {
+                description.push_str(", ");
+                description.push_str(remote);
+            }
+            if label.is_head {
+                description.push_str(" (checked out)");
+            }
+            description
+        }
     }
 }
 

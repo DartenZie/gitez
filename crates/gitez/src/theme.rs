@@ -198,6 +198,11 @@ pub const GRAPH_COLORS: [u32; 4] = [
     color::BRANCH_TEAL,
 ];
 
+/// The colour of graph colour identity `index`.
+pub fn graph_color(index: usize) -> u32 {
+    GRAPH_COLORS[index % GRAPH_COLORS.len()]
+}
+
 /// `hex` (`0xRRGGBB`) at `alpha` opacity, for tinted backgrounds.
 pub fn with_alpha(hex: u32, alpha: f32) -> Rgba {
     let mut color = rgb(hex);

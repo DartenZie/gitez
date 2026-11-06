@@ -37,6 +37,7 @@ icon_assets!(
         GitMerge,
         GitPullRequestArrow,
         GripVertical,
+        Laptop,
         List,
         ListTree,
         LoaderCircle,
