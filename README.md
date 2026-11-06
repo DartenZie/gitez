@@ -31,7 +31,8 @@ prompt, or send it straight to [Claude Code](https://docs.claude.com/en/docs/cla
 
 - Open any local branch as a pull request against its base branch (`main` by default).
 - Read the diff in unified or split view, and mark files as viewed. A viewed
-  file opens again when it changes.
+  file opens again when it changes. Swipe sideways, or hold Shift and scroll,
+  to read long lines.
 - Comment on one line or a range of lines. Threads support replies and
   **Resolve**, and a thread resolves itself when a new commit changes its lines.
   Hover a comment to edit or delete it.

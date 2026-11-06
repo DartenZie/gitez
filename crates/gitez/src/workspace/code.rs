@@ -54,6 +54,15 @@ pub(crate) fn display_runs(text: &str, spans: &[Span]) -> (String, Vec<(Range<us
     (shown, runs)
 }
 
+/// How many characters wide `text` is as a line of code shows it, a tab
+/// counting as the spaces it is shown as.
+pub(crate) fn display_columns(text: &str) -> usize {
+    text.trim_end_matches('\r')
+        .chars()
+        .map(|c| if c == '\t' { TAB.len() } else { 1 })
+        .sum()
+}
+
 /// A line of code coloured by `spans`, or plain without them.
 pub(crate) fn styled_code(text: &str, spans: Option<&[Span]>) -> StyledText {
     let (shown, runs) = display_runs(text, spans.unwrap_or_default());

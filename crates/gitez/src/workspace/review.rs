@@ -90,6 +90,12 @@ const LINE_HEIGHT: Pixels = px(21.);
 const CARD_GAP: Pixels = px(18.);
 /// Rows rendered beyond the visible ones, so fast scrolling stays smooth.
 const OVERDRAW: Pixels = px(600.);
+/// Width of a column of line numbers.
+const LINE_NUMBER_WIDTH: Pixels = px(48.);
+/// Width of the column of `+` and `−` signs.
+const LINE_SIGN_WIDTH: Pixels = px(20.);
+/// Space after the text of a line.
+const LINE_TEXT_PADDING: Pixels = px(12.);
 
 /// A row of the diff list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -350,6 +356,15 @@ pub struct Review {
     highlights: HashMap<LineSource, HashMap<String, Option<Arc<Highlights>>>>,
     /// The file to scroll to once the diff is read.
     pending_file: Option<String>,
+    /// How far each file's lines are scrolled sideways, by path.
+    scroll_x: HashMap<String, Pixels>,
+    /// The widest line of each file, in characters as shown.
+    widest: Vec<usize>,
+    /// The width of a character of the code font.
+    char_width: Pixels,
+    /// The width of the list when it was last laid out. Kept here because
+    /// the list's state cannot be read while it renders its rows.
+    list_width: Pixels,
     _load: Task<()>,
     _load_sources: Task<()>,
     _highlight: Task<()>,
@@ -654,6 +669,10 @@ impl Review {
             sources_error: None,
             highlights: HashMap::new(),
             pending_file: None,
+            scroll_x: HashMap::new(),
+            widest: Vec::new(),
+            char_width: px(7.),
+            list_width: px(0.),
             _load: load,
             _load_sources: Task::ready(()),
             _highlight: Task::ready(()),
@@ -747,6 +766,13 @@ impl Review {
                 |file| self.is_viewed(&files[file]),
             );
         }
+        self.widest = vec![0; files.len()];
+        for &row in &self.rows {
+            if let Some(file) = row.file() {
+                let columns = self.row_columns(&files, row);
+                self.widest[file] = self.widest[file].max(columns);
+            }
+        }
         self.list.reset(self.rows.len());
         if let Some(Anchor {
             path,
@@ -776,6 +802,107 @@ impl Review {
             self.current_file = file;
         } else {
             self.current_file = 0;
+        }
+    }
+
+    /// How many characters wide the widest line of `row` is.
+    fn row_columns(&self, files: &[FileDiff], row: Row) -> usize {
+        let hunks = row.file().and_then(|file| match &files.get(file)?.content {
+            DiffContent::Text(hunks) => Some(hunks),
+            _ => None,
+        });
+        let Some(hunks) = hunks else {
+            return 0;
+        };
+        let line = |hunk: usize, line: Option<usize>| {
+            hunks
+                .get(hunk)
+                .and_then(|hunk| hunk.lines.get(line?))
+                .map_or(0, |line| code::display_columns(&line.text))
+        };
+        match row {
+            Row::Line(_, hunk, index) => line(hunk, Some(index)),
+            Row::Pair(_, hunk, old, new) => line(hunk, old).max(line(hunk, new)),
+            Row::Context(_, at, index) => self
+                .context_text(hunks, at, index)
+                .map_or(0, code::display_columns),
+            _ => 0,
+        }
+    }
+
+    /// Line `line` of the unchanged lines left out at `at`, once read.
+    fn context_text(&self, hunks: &[Hunk], at: GapAt, line: u32) -> Option<&str> {
+        let (GapAt::Before(index) | GapAt::After(index)) = at;
+        let gap = gap(hunks, at)?;
+        let side = hunks.get(index)?.new_side.as_ref()?;
+        let new = (gap.new + line) as usize;
+        self.sources
+            .get(&side.source)?
+            .get(new.checked_sub(1)?)
+            .map(String::as_str)
+    }
+
+    /// The width the text of a line has in the list as it is laid out now.
+    fn text_width(&self, cx: &App) -> Pixels {
+        // The card's side borders.
+        let width = self.list_width - px(2.);
+        let text = match ReviewSettings::get(cx).layout {
+            DiffLayout::Unified => width - LINE_NUMBER_WIDTH * 2. - LINE_SIGN_WIDTH,
+            // Halves split by a 1px line.
+            DiffLayout::Split => (width - px(1.)) / 2. - LINE_NUMBER_WIDTH - LINE_SIGN_WIDTH,
+        };
+        text - LINE_TEXT_PADDING
+    }
+
+    /// How far the lines of file `file` are scrolled sideways, kept within
+    /// how far they can be: zero when they all fit.
+    fn scroll_x(&self, file: usize, cx: &App) -> Pixels {
+        let Some(Ok(files)) = &self.files else {
+            return px(0.);
+        };
+        let Some(scroll) = files
+            .get(file)
+            .and_then(|file| self.scroll_x.get(&file.path))
+        else {
+            return px(0.);
+        };
+        let widest = self.widest.get(file).copied().unwrap_or(0);
+        let max = (self.char_width * widest as f32 - self.text_width(cx)).max(px(0.));
+        (*scroll).min(max)
+    }
+
+    /// Scrolls the lines of file `file` sideways on a horizontal scroll, or
+    /// a vertical one with Shift held. Other scrolls go to the list.
+    fn scroll_sideways(
+        &mut self,
+        file: usize,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let delta = event.delta.pixel_delta(window.line_height());
+        let sideways = if event.modifiers.shift && delta.x == px(0.) {
+            delta.y
+        } else if delta.x.abs() > delta.y.abs() {
+            delta.x
+        } else {
+            return;
+        };
+        cx.stop_propagation();
+        let Some(Ok(files)) = &self.files else {
+            return;
+        };
+        let Some(path) = files.get(file).map(|file| file.path.clone()) else {
+            return;
+        };
+        let before = self.scroll_x(file, cx);
+        // Stored unclamped, then read back held to the end of the lines.
+        self.scroll_x
+            .insert(path.clone(), (before - sideways).max(px(0.)));
+        let after = self.scroll_x(file, cx);
+        self.scroll_x.insert(path, after);
+        if after != before {
+            cx.notify();
         }
     }
 
@@ -1551,14 +1678,23 @@ impl Review {
 
     fn render_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
         let element = self.render_plain_row(index, cx);
-        match self.rows.get(index).copied() {
-            Some(row @ (Row::Line(..) | Row::Pair(..) | Row::Context(..)))
-                if self.is_pull_request() =>
-            {
-                self.commentable(element, index, row, cx)
-            }
-            _ => element,
-        }
+        let Some(row @ (Row::Line(file, ..) | Row::Pair(file, ..) | Row::Context(file, ..))) =
+            self.rows.get(index).copied()
+        else {
+            return element;
+        };
+        let element = if self.is_pull_request() {
+            self.commentable(element, index, row, cx)
+        } else {
+            element
+        };
+        div()
+            .w_full()
+            .on_scroll_wheel(cx.listener(move |this, event, window, cx| {
+                this.scroll_sideways(file, event, window, cx)
+            }))
+            .child(element)
+            .into_any_element()
     }
 
     fn render_plain_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -1637,7 +1773,8 @@ impl Review {
                     return div().into_any_element();
                 };
                 let (hunk, line) = (&hunks[hunk], &hunks[hunk].lines[line]);
-                diff_line(line, self.line_spans(&files[file], hunk, line), mono).into_any_element()
+                let spans = self.line_spans(&files[file], hunk, line);
+                diff_line(line, spans, mono, self.scroll_x(file, cx)).into_any_element()
             }
             Some(Row::Pair(file, hunk, old, new)) => {
                 let DiffContent::Text(hunks) = &files[file].content else {
@@ -1648,7 +1785,7 @@ impl Review {
                     let line = hunk.lines.get(index?)?;
                     Some((line, self.line_spans(&files[file], hunk, line)))
                 };
-                split_line(side(old), side(new), mono).into_any_element()
+                split_line(side(old), side(new), mono, self.scroll_x(file, cx)).into_any_element()
             }
             Some(Row::Gap(file, at)) => {
                 let DiffContent::Text(hunks) = &files[file].content else {
@@ -1709,10 +1846,11 @@ impl Review {
                     crlf: false,
                     no_newline: false,
                 };
+                let scroll = self.scroll_x(file, cx);
                 match ReviewSettings::get(cx).layout {
-                    DiffLayout::Unified => diff_line(&line, spans, mono).into_any_element(),
+                    DiffLayout::Unified => diff_line(&line, spans, mono, scroll).into_any_element(),
                     DiffLayout::Split => {
-                        split_line(Some((&line, spans)), Some((&line, spans)), mono)
+                        split_line(Some((&line, spans)), Some((&line, spans)), mono, scroll)
                             .into_any_element()
                     }
                 }
@@ -2330,7 +2468,13 @@ impl Focusable for Review {
 }
 
 impl Render for Review {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let text_system = window.text_system();
+        let font_id = text_system.resolve_font(&font(cx.theme().mono_font_family.clone()));
+        if let Ok(width) = text_system.ch_advance(font_id, theme::MONO_TEXT_SIZE) {
+            self.char_width = width;
+        }
+        self.list_width = self.list.viewport_bounds().size.width;
         let body = match &self.files {
             None => message("Reading changes…").into_any_element(),
             Some(Err(error)) => message(error.clone()).into_any_element(),
@@ -2846,7 +2990,12 @@ fn highlight(
 
 /// One line of a diff: old and new line numbers, `+` or `−`, and the text,
 /// coloured by its syntax `spans` if it has them.
-fn diff_line(line: &DiffLine, spans: Option<&[Span]>, mono: SharedString) -> impl IntoElement {
+fn diff_line(
+    line: &DiffLine,
+    spans: Option<&[Span]>,
+    mono: SharedString,
+    scroll: Pixels,
+) -> impl IntoElement {
     let (sign, tint) = line_style(line.kind);
     card_row()
         .h(LINE_HEIGHT)
@@ -2856,7 +3005,7 @@ fn diff_line(line: &DiffLine, spans: Option<&[Span]>, mono: SharedString) -> imp
         .child(line_number(line.old, tint))
         .child(line_number(line.new, tint))
         .child(line_sign(sign, tint))
-        .child(line_text(line, spans))
+        .child(line_text(line, spans, scroll))
         .when(line.no_newline, |this| this.child(no_newline_note()))
 }
 
@@ -2866,12 +3015,13 @@ fn split_line(
     old: Option<(&DiffLine, Option<&[Span]>)>,
     new: Option<(&DiffLine, Option<&[Span]>)>,
     mono: SharedString,
+    scroll: Pixels,
 ) -> impl IntoElement {
     card_row()
         .h(LINE_HEIGHT)
         .font_family(mono)
         .text_size(theme::MONO_TEXT_SIZE)
-        .child(split_half(old, |line| line.old))
+        .child(split_half(old, |line| line.old, scroll))
         .child(
             div()
                 .w(px(1.))
@@ -2879,13 +3029,14 @@ fn split_line(
                 .flex_none()
                 .bg(rgb(color::DIFF_CARD_BORDER)),
         )
-        .child(split_half(new, |line| line.new))
+        .child(split_half(new, |line| line.new, scroll))
 }
 
 /// One side of a split row, numbered by `number`; blank without a line.
 fn split_half(
     line: Option<(&DiffLine, Option<&[Span]>)>,
     number: fn(&DiffLine) -> Option<u32>,
+    scroll: Pixels,
 ) -> Div {
     let half = div().h_flex().flex_1().min_w_0().h_full();
     let Some((line, spans)) = line else {
@@ -2895,7 +3046,7 @@ fn split_half(
     half.when_some(tint, |this, tint| this.bg(theme::with_alpha(tint, 0.10)))
         .child(line_number(number(line), tint))
         .child(line_sign(sign, tint))
-        .child(line_text(line, spans))
+        .child(line_text(line, spans, scroll))
         .when(line.no_newline, |this| this.child(no_newline_note()))
 }
 
@@ -2910,7 +3061,7 @@ fn line_style(kind: LineKind) -> (&'static str, Option<u32>) {
 
 fn line_number(number: Option<u32>, tint: Option<u32>) -> Div {
     div()
-        .w(px(48.))
+        .w(LINE_NUMBER_WIDTH)
         .flex_none()
         .h_full()
         .pr(px(10.))
@@ -2922,25 +3073,33 @@ fn line_number(number: Option<u32>, tint: Option<u32>) -> Div {
 
 fn line_sign(sign: &'static str, tint: Option<u32>) -> Div {
     div()
-        .w(px(20.))
+        .w(LINE_SIGN_WIDTH)
         .flex_none()
         .text_center()
         .text_color(rgb(tint.unwrap_or(color::DIFF_LINE_NUMBER)))
         .child(sign)
 }
 
-fn line_text(line: &DiffLine, spans: Option<&[Span]>) -> Div {
+/// The text of `line`, moved `scroll` to the left; what does not fit is
+/// cut off.
+fn line_text(line: &DiffLine, spans: Option<&[Span]>, scroll: Pixels) -> Div {
     div()
+        .h_flex()
         .flex_1()
         .min_w_0()
-        .pr(px(12.))
+        .h_full()
+        .pr(LINE_TEXT_PADDING)
         .overflow_hidden()
         .whitespace_nowrap()
-        .text_ellipsis()
         .text_color(rgb(color::DIFF_TEXT))
-        // A carriage return is shown only as part of the text when no
-        // newline follows it.
-        .child(code::styled_code(&line.text, spans))
+        .child(
+            div()
+                .flex_none()
+                .ml(-scroll)
+                // A carriage return is shown only as part of the text when
+                // no newline follows it.
+                .child(code::styled_code(&line.text, spans)),
+        )
 }
 
 fn no_newline_note() -> Div {
@@ -3214,6 +3373,85 @@ mod tests {
                 }
             }
             assert!(hunk.lines.iter().any(|line| line.kind == LineKind::Removed));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn long_lines_scroll_sideways(cx: &mut gpui_kit::TestAppContext) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("run git");
+            assert!(output.status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("a.txt"), "short\n").expect("write");
+        git(&["add", "."]);
+        git(&["commit", "-qm", "start"]);
+        std::fs::write(root.join("a.txt"), format!("{}\n", "long ".repeat(400))).expect("write");
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+        });
+        let repository = gitez_git::Repository::open(root).expect("open repository");
+        let status = std::sync::Arc::new(repository.status().expect("status"));
+        let window = cx.open_window(
+            gpui_kit::size(gpui_kit::px(1000.), gpui_kit::px(800.)),
+            |_, cx| super::Review::working_tree(&repository, status, None, cx),
+        );
+        let review = window
+            .update(cx, |_, _, cx| cx.entity())
+            .expect("window open");
+        let mut cx = gpui_kit::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+
+        let line = review.read_with(&cx, |review, _| {
+            let row = review
+                .rows
+                .iter()
+                .position(|row| matches!(row, Row::Line(..)))
+                .expect("a line row");
+            review.list.bounds_for_item(row).expect("the line is shown")
+        });
+        for _ in 0..2 {
+            cx.simulate_event(gpui_kit::ScrollWheelEvent {
+                position: line.center(),
+                delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(
+                    gpui_kit::px(-100.),
+                    gpui_kit::px(0.),
+                )),
+                ..Default::default()
+            });
+            // Drawn again with the lines scrolled.
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+        }
+
+        review.read_with(&cx, |review, cx| {
+            assert_eq!(review.scroll_x(0, cx), gpui_kit::px(200.));
+        });
+
+        // No further than the end of the line.
+        cx.simulate_event(gpui_kit::ScrollWheelEvent {
+            position: line.center(),
+            delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(
+                gpui_kit::px(-1e6),
+                gpui_kit::px(0.),
+            )),
+            ..Default::default()
+        });
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        review.read_with(&cx, |review, cx| {
+            let end = review.char_width * 2000. - review.text_width(cx);
+            assert!(end > gpui_kit::px(0.));
+            assert_eq!(review.scroll_x(0, cx), end);
         });
     }
 
