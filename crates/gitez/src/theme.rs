@@ -142,6 +142,16 @@ pub mod color {
     /// Initials avatar behind an author name.
     pub const AVATAR: u32 = 0x2c2c32;
     pub const AVATAR_TEXT: u32 = TEXT_SECONDARY;
+    /// The mark in the avatar of a coding agent or bot.
+    pub const AGENT_MARK: u32 = 0xff_ff_ff;
+    /// Behind the marks of the agents and bots that have a brand colour.
+    /// Those whose colour is black use [`AVATAR`], which shows on the panel.
+    pub const AGENT_CLAUDE: u32 = 0xd9_77_57;
+    pub const AGENT_GEMINI: u32 = 0x8e_75_b2;
+    pub const AGENT_GITHUB_ACTIONS: u32 = 0x20_88_ff;
+    pub const AGENT_DEPENDABOT: u32 = 0x02_5e_8c;
+    pub const AGENT_RENOVATE: u32 = 0x30_8b_e3;
+    pub const AGENT_CODERABBIT: u32 = 0xff_57_0a;
     /// Author names in the history list.
     pub const AUTHOR_TEXT: u32 = 0xb8_b5_ac;
     /// Ref labels: remote-tracking branches are outlined, tags dashed.

@@ -1,6 +1,7 @@
 //! The main window: toolbar, repository sidebar, history, commit detail and
 //! status bar, laid out as in the `Main.dc.html` artboard.
 
+mod agents;
 mod branch;
 mod changes;
 mod cherry_pick;

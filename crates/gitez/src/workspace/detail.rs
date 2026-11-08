@@ -4,16 +4,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gitez_git::{
-    ChangeKind, Commit, CommitDetails, FileChange, LineCounts, Oid, RefLabel, Repository,
+    ChangeKind, CoAuthor, Commit, CommitDetails, FileChange, LineCounts, Oid, RefLabel, Repository,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::*;
 use gpui_kit::component::text::TextView;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::labels;
+use super::{agents, labels};
 use crate::theme::{self, color};
 use crate::time;
 
@@ -383,6 +384,10 @@ fn header(
                         }),
                 ),
         )
+        .when_some(
+            details.filter(|details| !details.co_authors.is_empty()),
+            |this, details| this.child(co_authors(&details.co_authors)),
+        )
         .when(!labels.is_empty(), |this| {
             this.child(
                 div()
@@ -392,6 +397,45 @@ fn header(
                     .children(labels.iter().map(labels::ref_label)),
             )
         })
+}
+
+/// The co-authors of a commit, each with an avatar and name and the email in
+/// a tooltip.
+fn co_authors(co_authors: &[CoAuthor]) -> impl IntoElement {
+    div()
+        .h_flex()
+        .flex_wrap()
+        .gap_x(px(10.))
+        .gap_y(px(6.))
+        .text_size(theme::SMALL_TEXT_SIZE)
+        .child(
+            div()
+                .text_color(rgb(color::TEXT_MUTED))
+                .child("Co-authors:"),
+        )
+        .children(co_authors.iter().enumerate().map(|(index, co_author)| {
+            let tooltip: SharedString = if co_author.email.is_empty() {
+                co_author.name.clone().into()
+            } else {
+                format!("{} <{}>", co_author.name, co_author.email).into()
+            };
+            div()
+                .id(("co-author", index))
+                .h_flex()
+                .gap(px(6.))
+                .max_w_full()
+                .min_w_0()
+                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                .child(agents::avatar(&co_author.name, &co_author.email, px(20.)))
+                .child(
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(co_author.name.clone()),
+                )
+        }))
 }
 
 /// "N files changed +A −R" and one row per file, with the one at `current`

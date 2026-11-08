@@ -3,6 +3,7 @@
 
 use gix::bstr::ByteSlice;
 use gix::object::tree::diff::Change;
+use gix::objs::commit::message::BodyRef;
 
 use crate::{Oid, Repository, Result, Signature};
 
@@ -18,6 +19,8 @@ pub struct CommitDetails {
     /// Empty when the message is a single line.
     pub body: String,
     pub committer: Signature,
+    /// The people credited in `Co-authored-by` trailers, in message order.
+    pub co_authors: Vec<CoAuthor>,
     /// Whether the commit carries a signature. It is not verified.
     pub signed: bool,
     /// Files changed relative to the first parent (or added, for a root
@@ -35,6 +38,15 @@ impl CommitDetails {
                 (added + lines.added, removed + lines.removed)
             })
     }
+}
+
+/// Someone credited on a commit with a `Co-authored-by` trailer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoAuthor {
+    /// The name as written, or the email if the trailer gives only that.
+    pub name: String,
+    /// Empty if the trailer gives no email.
+    pub email: String,
 }
 
 /// How a file changed.
@@ -89,10 +101,9 @@ impl Repository {
         let commit = repo.find_commit(id)?;
         let decoded = commit.decode()?;
 
-        let message = decoded
-            .message()
-            .body()
-            .map(|body| body.trim().to_str_lossy().into_owned());
+        let body = decoded.message().body();
+        let co_authors = body.as_ref().map(co_authors).unwrap_or_default();
+        let message = body.map(|body| body.trim().to_str_lossy().into_owned());
         let committer = decoded.committer()?.trim();
         let committer = Signature {
             name: committer.name.to_str_lossy().into_owned(),
@@ -142,10 +153,48 @@ impl Repository {
             id,
             body: message.unwrap_or_default(),
             committer,
+            co_authors,
             signed,
             files,
         })
     }
+}
+
+/// The co-authors in the trailers of `body`, each person once.
+fn co_authors(body: &BodyRef<'_>) -> Vec<CoAuthor> {
+    let mut co_authors: Vec<CoAuthor> = Vec::new();
+    for trailer in body.trailers() {
+        if !trailer.token.eq_ignore_ascii_case(b"co-authored-by") {
+            continue;
+        }
+        let Some(co_author) = parse_co_author(&trailer.value.to_str_lossy()) else {
+            continue;
+        };
+        let known = co_authors.iter().any(|other| {
+            if co_author.email.is_empty() {
+                other.name == co_author.name
+            } else {
+                other.email.eq_ignore_ascii_case(&co_author.email)
+            }
+        });
+        if !known {
+            co_authors.push(co_author);
+        }
+    }
+    co_authors
+}
+
+/// Reads the value of a trailer, normally `Name <email>`.
+fn parse_co_author(value: &str) -> Option<CoAuthor> {
+    let (name, email) = match value.rsplit_once('<') {
+        Some((name, email)) => (name.trim(), email.trim().trim_end_matches('>').trim()),
+        None => (value.trim(), ""),
+    };
+    let name = if name.is_empty() { email } else { name };
+    (!name.is_empty()).then(|| CoAuthor {
+        name: name.to_owned(),
+        email: email.to_owned(),
+    })
 }
 
 /// The trees commit `commit` compares: its first parent's and its own. A root
@@ -202,4 +251,71 @@ fn line_counts(
         added: stats.insertions as usize,
         removed: stats.removals as usize,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(body: &[u8]) -> Vec<(String, String)> {
+        co_authors(&BodyRef::from_bytes(body))
+            .into_iter()
+            .map(|co_author| (co_author.name, co_author.email))
+            .collect()
+    }
+
+    fn pair(name: &str, email: &str) -> (String, String) {
+        (name.to_owned(), email.to_owned())
+    }
+
+    #[test]
+    fn co_authors_are_read_from_the_trailers_in_any_case() {
+        assert_eq!(
+            names(
+                b"Explains why.\n\nCo-authored-by: Ada Lovelace <ada@example.com>\n\
+                  co-AUTHORED-by: Grace Hopper <grace@example.com>\n"
+            ),
+            [
+                pair("Ada Lovelace", "ada@example.com"),
+                pair("Grace Hopper", "grace@example.com")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_message_of_only_trailers_has_co_authors() {
+        assert_eq!(
+            names(b"Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n"),
+            [pair("Claude Opus 5.5", "noreply@anthropic.com")]
+        );
+    }
+
+    #[test]
+    fn a_person_credited_twice_is_listed_once() {
+        assert_eq!(
+            names(
+                b"Co-authored-by: Ada <ada@example.com>\n\
+                  Co-authored-by: Ada L. <ADA@example.com>\n"
+            ),
+            [pair("Ada", "ada@example.com")]
+        );
+    }
+
+    #[test]
+    fn other_trailers_and_prose_are_not_co_authors() {
+        assert_eq!(names(b"Signed-off-by: Ada <ada@example.com>\n"), []);
+        assert_eq!(
+            names(b"Thanks to Co-authored-by: nobody at all, really.\n"),
+            []
+        );
+    }
+
+    #[test]
+    fn a_co_author_can_lack_a_name_or_an_email() {
+        assert_eq!(names(b"Co-authored-by: Ada\n"), [pair("Ada", "")]);
+        assert_eq!(
+            names(b"Co-authored-by: <ada@example.com>\n"),
+            [pair("ada@example.com", "ada@example.com")]
+        );
+    }
 }

@@ -28,7 +28,7 @@ mod watch;
 pub use commits::{Commit, CommitWalk, Order, Signature, Timestamp};
 pub use conflict::{Conflict, ConflictFile, Segment};
 pub use conflict_history::{ChangeLine, ConflictHistory, ConflictSide, HistoryCommit, SideHistory};
-pub use details::{ChangeKind, CommitDetails, FileChange, LineCounts};
+pub use details::{ChangeKind, CoAuthor, CommitDetails, FileChange, LineCounts};
 pub use diff::{
     BranchDiff, DiffContent, DiffLine, DiffOptions, FileDiff, Hunk, LineKind, LineSource, NewSide,
     Staging,

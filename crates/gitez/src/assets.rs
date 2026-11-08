@@ -55,11 +55,42 @@ icon_assets!(
     ]
 );
 
-/// gpui-kit's default icons plus [`ExtraIcons`].
+/// Embeds the marks in `assets/agents`, by the path they are drawn from.
+macro_rules! agent_marks {
+    ($($name:literal),+ $(,)?) => {
+        [$((
+            concat!("agents/", $name, ".svg"),
+            include_bytes!(concat!("../assets/agents/", $name, ".svg")).as_slice(),
+        )),+]
+    };
+}
+
+/// The marks of the coding agents and bots credited on commits.
+const AGENT_MARKS: [(&str, &[u8]); 14] = agent_marks![
+    "claude",
+    "codex",
+    "coderabbit",
+    "copilot",
+    "cursor",
+    "dependabot",
+    "devin",
+    "gemini",
+    "github",
+    "github-actions",
+    "opencode",
+    "openhands",
+    "renovate",
+    "windsurf",
+];
+
+/// gpui-kit's default icons, [`ExtraIcons`] and the agents' marks.
 pub struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if let Some((_, bytes)) = AGENT_MARKS.iter().find(|(known, _)| *known == path) {
+            return Ok(Some(Cow::Borrowed(bytes)));
+        }
         if let Some(bytes) = ExtraIcons.load(path)? {
             return Ok(Some(bytes));
         }
@@ -69,6 +100,12 @@ impl AssetSource for Assets {
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         let mut paths = gpui_kit::assets::Assets.list(path)?;
         paths.extend(ExtraIcons.list(path)?);
+        paths.extend(
+            AGENT_MARKS
+                .iter()
+                .filter(|(known, _)| known.starts_with(path))
+                .map(|(known, _)| SharedString::from(*known)),
+        );
         paths.sort();
         paths.dedup();
         Ok(paths)
