@@ -15,7 +15,6 @@ use gitez_git::{Commit, Oid, Order, RefGroup, RefKind, RefLabel, Repository, Wor
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::*;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -1537,52 +1536,33 @@ impl Render for History {
 /// The strip saying which branch is being dragged, in place of the list's
 /// title.
 fn moving(branch: &SharedString) -> impl IntoElement {
-    let escape = Keystroke::parse("escape").expect("escape is a valid keystroke");
     div()
         .h_flex()
-        .flex_1()
         .min_w_0()
         .gap(px(8.))
+        .h(px(30.))
+        .px(px(12.))
+        .rounded(px(15.))
+        .bg(rgb(color::MOVING))
+        .text_color(rgb(color::MOVING_TEXT))
+        .text_size(px(12.5))
+        .child(Icon::new(IconName::Move).size(px(14.)))
         .child(
             div()
-                .h_flex()
                 .min_w_0()
-                .gap(px(8.))
-                .h(px(30.))
-                .px(px(12.))
-                .rounded(px(15.))
-                .bg(rgb(color::MOVING))
-                .text_color(rgb(color::MOVING_TEXT))
-                .text_size(px(12.5))
-                .child(Icon::new(IconName::Move).size(px(14.)))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
                 .child(
-                    div()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .child(
-                            StyledText::new(format!("Moving {branch} — drop it on any branch"))
-                                .with_highlights([(
-                                    "Moving ".len().."Moving ".len() + branch.len(),
-                                    HighlightStyle {
-                                        font_weight: Some(FontWeight::SEMIBOLD),
-                                        ..Default::default()
-                                    },
-                                )]),
-                        ),
+                    StyledText::new(format!("Moving {branch} — drop it on any branch"))
+                        .with_highlights([(
+                            "Moving ".len().."Moving ".len() + branch.len(),
+                            HighlightStyle {
+                                font_weight: Some(FontWeight::SEMIBOLD),
+                                ..Default::default()
+                            },
+                        )]),
                 ),
-        )
-        .child(
-            div()
-                .h_flex()
-                .ml_auto()
-                .flex_none()
-                .gap(px(6.))
-                .text_size(px(12.))
-                .text_color(rgb(color::TEXT_MUTED))
-                .child(Kbd::new(escape))
-                .child("cancel"),
         )
 }
 
