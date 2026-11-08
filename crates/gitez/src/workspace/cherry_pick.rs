@@ -640,10 +640,7 @@ impl Render for CherryPick {
                         Button::new("cherry-pick-run")
                             .primary()
                             .label(action)
-                            // Twice the width of Cancel.
-                            .flex_grow(2.)
-                            .flex_basis(px(0.))
-                            .h(px(36.))
+                            .flex_1()
                             .loading(self.running)
                             .disabled(self.ready().is_none())
                             .on_click(cx.listener(|this, _, _, cx| this.run(cx))),

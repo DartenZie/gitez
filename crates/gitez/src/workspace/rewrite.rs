@@ -1124,17 +1124,13 @@ impl Rewrite {
                         Button::new("rewrite-cancel")
                             .label("Cancel")
                             .flex_1()
-                            .h(px(36.))
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(RewriteEvent::Close))),
                     )
                     .child(
                         Button::new("rewrite-run")
                             .primary()
                             .label(action)
-                            // Twice the width of Cancel.
-                            .flex_grow(2.)
-                            .flex_basis(px(0.))
-                            .h(px(36.))
+                            .flex_1()
                             .loading(self.running)
                             .disabled(!can_run)
                             .on_click(cx.listener(|this, _, _, cx| this.run(cx))),
