@@ -210,9 +210,14 @@ fn actions(id: Oid, cx: &mut Context<DetailPane>) -> impl IntoElement {
     let action = |name: &'static str, icon: IconName, label: &'static str| {
         Button::new(name)
             .flex_1()
-            // Three to a row: six do not fit beside each other.
+            // Three to a row, or two when the pane is too narrow for three.
+            // The explicit minimum keeps every button the same width and
+            // wide enough for the longest label, which would otherwise be
+            // cut off with an ellipsis.
             .flex_basis(relative(0.3))
+            .min_w(px(104.))
             .h(px(30.))
+            .compact()
             .icon(Icon::new(icon).size(px(14.)))
             .label(label)
     };
@@ -225,7 +230,7 @@ fn actions(id: Oid, cx: &mut Context<DetailPane>) -> impl IntoElement {
         .border_b_1()
         .border_color(rgb(color::BORDER))
         .child(
-            action("commit-cherry-pick", IconName::Cherry, "Cherry-pick…")
+            action("commit-cherry-pick", IconName::Cherry, "Cherry-pick")
                 .on_click(cx.listener(move |_, _, _, cx| cx.emit(DetailEvent::CherryPick(id)))),
         )
         .child(
@@ -234,12 +239,12 @@ fn actions(id: Oid, cx: &mut Context<DetailPane>) -> impl IntoElement {
                 .on_click(cx.listener(move |_, _, _, cx| cx.emit(DetailEvent::Reword(id)))),
         )
         .child(
-            action("commit-branch", IconName::GitBranch, "Branch…")
+            action("commit-branch", IconName::GitBranch, "Branch")
                 .tooltip("New branch starting at this commit")
                 .on_click(cx.listener(move |_, _, _, cx| cx.emit(DetailEvent::NewBranch(id)))),
         )
         .child(
-            action("commit-tag", IconName::Tag, "Tag…")
+            action("commit-tag", IconName::Tag, "Tag")
                 .tooltip("New tag on this commit")
                 .on_click(cx.listener(move |_, _, _, cx| cx.emit(DetailEvent::NewTag(id)))),
         )
@@ -249,7 +254,7 @@ fn actions(id: Oid, cx: &mut Context<DetailPane>) -> impl IntoElement {
                 .on_click(cx.listener(move |_, _, _, cx| cx.emit(DetailEvent::Revert(id)))),
         )
         .child(
-            action("commit-reset", IconName::Rewind, "Reset…")
+            action("commit-reset", IconName::Rewind, "Reset")
                 .tooltip("Move the branch checked out to this commit")
                 .on_click(cx.listener(move |_, _, _, cx| cx.emit(DetailEvent::Reset(id)))),
         )
