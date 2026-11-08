@@ -17,9 +17,22 @@ use super::{
 use crate::theme::{self, color};
 
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 /// Height of toolbar buttons in the design.
 const BUTTON_HEIGHT: Pixels = px(30.);
+
+/// Width of the repository menu, whatever the length of the paths in it.
+const REPOSITORY_MENU_WIDTH: Pixels = px(420.);
+
+/// Width of a row in that menu, inside its padding and tick column.
+const RECENT_ROW_WIDTH: Pixels = px(380.);
+
+/// Width of the name and path in a row, beside the remove button.
+const RECENT_TEXT_WIDTH: Pixels = px(348.);
+
+/// Hover group of a row in the repository menu.
+const RECENT_ROW_GROUP: &str = "recent-repository-row";
 
 /// Repository switcher, undo and redo, remote operations, branch and stash,
 /// the command palette entry and "New local PR".
@@ -218,22 +231,23 @@ impl Toolbar {
     }
 }
 
-/// The recent repositories, the open one ticked, then "Open repository…".
+/// The recent repositories, the open one ticked and each with a remove
+/// button on hover, then "Open repository…".
 fn repository_menu(
     menu: PopupMenu,
     current: Option<&Path>,
     focus: &FocusHandle,
-    cx: &App,
+    cx: &Context<PopupMenu>,
 ) -> PopupMenu {
     let recent = crate::recent::paths(cx);
     let mut menu = menu
         .action_context(focus.clone())
-        .min_w(px(260.))
-        .max_w(px(420.));
+        .min_w(REPOSITORY_MENU_WIDTH)
+        .max_w(REPOSITORY_MENU_WIDTH);
     if !recent.is_empty() {
         menu = menu.label("Recent repositories");
     }
-    for path in recent {
+    for (index, path) in recent.iter().enumerate() {
         let name: SharedString = path
             .file_name()
             .map_or_else(
@@ -242,19 +256,74 @@ fn repository_menu(
             )
             .into();
         let location: SharedString = crate::recent::display(path).into();
+        // Takes the row out and rebuilds the menu, which stays open.
+        let remove = Rc::new({
+            let path = path.clone();
+            let current = current.map(Path::to_owned);
+            let focus = focus.clone();
+            let this = cx.weak_entity();
+            move |window: &mut Window, cx: &mut App| {
+                crate::recent::remove(&path, cx);
+                this.update(cx, |menu, cx| {
+                    menu.rebuild(window, cx, |menu, _, cx| {
+                        repository_menu(menu, current.as_deref(), &focus, cx)
+                    })
+                })
+                .ok();
+            }
+        });
         menu = menu.menu_element_with_check(
             current == Some(path.as_path()),
             Box::new(OpenRecent { path: path.clone() }),
             move |_, _| {
-                div().v_flex().min_w_0().child(name.clone()).child(
-                    div()
-                        .text_size(px(11.5))
-                        .text_color(rgb(color::TEXT_MUTED))
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .child(location.clone()),
-                )
+                let remove = remove.clone();
+                // Definite widths: the popup sizes itself from its content,
+                // and text measured without a width is not cut to fit.
+                div()
+                    .group(RECENT_ROW_GROUP)
+                    .h_flex()
+                    .justify_between()
+                    .w(RECENT_ROW_WIDTH)
+                    .child(
+                        div()
+                            .v_flex()
+                            .w(RECENT_TEXT_WIDTH)
+                            .child(
+                                div()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis_middle()
+                                    .child(name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .text_color(rgb(color::TEXT_MUTED))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis_middle()
+                                    .child(location.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .opacity(0.)
+                            .group_hover(RECENT_ROW_GROUP, |style| style.opacity(1.))
+                            .child(
+                                Button::new(("remove-recent", index))
+                                    .ghost()
+                                    .xsmall()
+                                    .cursor_pointer()
+                                    .icon(Icon::new(IconName::Close).size(px(13.)))
+                                    .accessibility_label("Remove from recent repositories")
+                                    .tooltip("Remove from recent repositories")
+                                    .on_click(move |_, window, cx| {
+                                        cx.stop_propagation();
+                                        remove(window, cx);
+                                    }),
+                            ),
+                    )
             },
         );
     }

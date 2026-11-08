@@ -90,6 +90,11 @@ pub fn closed(cx: &mut App) {
     update(cx, |data| data.last = None);
 }
 
+/// Takes `path` off the list. Its folder stays where it is.
+pub fn remove(path: &Path, cx: &mut App) {
+    update(cx, |data| data.recent.retain(|recent| recent != path));
+}
+
 /// Empties Open Recent.
 pub fn clear(cx: &mut App) {
     update(cx, |data| data.recent.clear());
