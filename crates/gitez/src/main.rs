@@ -6,6 +6,7 @@
 
 mod assets;
 mod menus;
+mod project_icon;
 mod recent;
 mod repository;
 mod shell_path;

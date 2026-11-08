@@ -95,6 +95,18 @@ impl Repository {
         i64::try_from(elapsed.as_secs()).ok()
     }
 
+    /// Calls `visit` with the path of every file in the index, relative to
+    /// the working tree. Paths that are not UTF-8 are left out.
+    pub fn visit_tracked_paths(&self, mut visit: impl FnMut(&str)) -> Result<()> {
+        let index = self.local().index_or_empty()?;
+        for entry in index.entries() {
+            if let Ok(path) = entry.path(&index).to_str() {
+                visit(path);
+            }
+        }
+        Ok(())
+    }
+
     /// A handle for use on the current thread.
     pub(crate) fn local(&self) -> gix::Repository {
         let mut repo = self.inner.to_thread_local();

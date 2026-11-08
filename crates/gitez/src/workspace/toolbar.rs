@@ -18,9 +18,13 @@ use crate::theme::{self, color};
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 /// Height of toolbar buttons in the design.
 const BUTTON_HEIGHT: Pixels = px(30.);
+
+/// Width and height of the repository's icon.
+const LOGO_SIZE: Pixels = px(22.);
 
 /// Width of the repository menu, whatever the length of the paths in it.
 const REPOSITORY_MENU_WIDTH: Pixels = px(420.);
@@ -41,6 +45,8 @@ const RECENT_ROW_GROUP: &str = "recent-repository-row";
 pub struct Toolbar {
     /// Name of the open repository.
     pub repository_name: Option<SharedString>,
+    /// The open repository's own icon, if it has one.
+    pub repository_icon: Option<Arc<Image>>,
     /// Folder of the open repository, ticked in the repository menu.
     pub repository_path: Option<PathBuf>,
     /// Where the repository menu sends its actions: the workspace.
@@ -76,21 +82,31 @@ impl RenderOnce for Toolbar {
             .border_b_1()
             .border_color(rgb(color::BORDER))
             .child(
-                div().h_flex().gap(px(2.)).pl(px(6.)).child(logo()).child(
-                    Button::new("repository")
-                        .ghost()
-                        .h(BUTTON_HEIGHT)
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .label(repository_label)
-                        .loading(self.loading)
-                        .dropdown_caret(true)
-                        .tooltip("Switch repository")
-                        .dropdown_menu({
-                            let (focus, current) =
-                                (self.focus.clone(), self.repository_path.clone());
-                            move |menu, _, cx| repository_menu(menu, current.as_deref(), &focus, cx)
-                        }),
-                ),
+                div()
+                    .h_flex()
+                    .gap(px(2.))
+                    .pl(px(6.))
+                    .child(logo(
+                        self.repository_icon.clone(),
+                        self.repository_name.as_deref(),
+                    ))
+                    .child(
+                        Button::new("repository")
+                            .ghost()
+                            .h(BUTTON_HEIGHT)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .label(repository_label)
+                            .loading(self.loading)
+                            .dropdown_caret(true)
+                            .tooltip("Switch repository")
+                            .dropdown_menu({
+                                let (focus, current) =
+                                    (self.focus.clone(), self.repository_path.clone());
+                                move |menu, _, cx| {
+                                    repository_menu(menu, current.as_deref(), &focus, cx)
+                                }
+                            }),
+                    ),
             )
             .child(
                 div()
@@ -337,19 +353,43 @@ fn repository_menu(
     )
 }
 
-/// The amber "G" badge.
-fn logo() -> impl IntoElement {
+/// The icon of the repository called `name`, or the badge with its initial
+/// if it has none or the icon cannot be decoded.
+fn logo(icon: Option<Arc<Image>>, name: Option<&str>) -> AnyElement {
+    let letter = initial(name);
+    match icon {
+        Some(icon) => img(icon)
+            .flex_none()
+            .size(LOGO_SIZE)
+            .rounded(theme::RADIUS)
+            .object_fit(ObjectFit::Contain)
+            .with_fallback(move || badge(letter.clone()).into_any_element())
+            .into_any_element(),
+        None => badge(letter).into_any_element(),
+    }
+}
+
+/// The amber badge with a letter in it.
+fn badge(letter: SharedString) -> impl IntoElement {
     div()
         .flex()
+        .flex_none()
         .items_center()
         .justify_center()
-        .size(px(22.))
+        .size(LOGO_SIZE)
         .rounded(theme::RADIUS)
         .bg(rgb(color::ACCENT))
         .text_color(rgb(color::ON_ACCENT))
         .text_size(px(12.))
         .font_weight(FontWeight::BOLD)
-        .child("G")
+        .child(letter)
+}
+
+/// The first letter or digit of `name` in upper case; GitEZ's own "G" with
+/// no repository open or nothing to take a letter from.
+fn initial(name: Option<&str>) -> SharedString {
+    name.and_then(|name| name.chars().find(|c| c.is_alphanumeric()))
+        .map_or("G".into(), |c| c.to_uppercase().collect::<String>().into())
 }
 
 fn separator() -> impl IntoElement {
@@ -406,4 +446,23 @@ fn palette_entry() -> impl IntoElement {
                 .child("Search commits or run any git command"),
         )
         .child(Kbd::new(shortcut))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::initial;
+
+    #[test]
+    fn the_initial_is_the_first_letter_or_digit_in_upper_case() {
+        assert_eq!(initial(Some("gitez")).as_ref(), "G");
+        assert_eq!(initial(Some(".dotfiles")).as_ref(), "D");
+        assert_eq!(initial(Some("7zip")).as_ref(), "7");
+        assert_eq!(initial(Some("čeština")).as_ref(), "Č");
+    }
+
+    #[test]
+    fn without_a_name_the_initial_is_gitez_own() {
+        assert_eq!(initial(None).as_ref(), "G");
+        assert_eq!(initial(Some("---")).as_ref(), "G");
+    }
 }

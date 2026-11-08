@@ -91,6 +91,7 @@ tree, so it cannot be committed or pushed by accident. Linked worktrees share it
 - **Command palette** (`⌘K`): find actions, commits, branches and files, or
   run any `git` command and see its output stream in.
 - **Clone or create** a repository from the start screen, the File menu or the palette.
+- **Project icon**: the top left of the window shows the open repository's favicon, app icon (`.icns` included) or logo if a tracked file looks like one, and otherwise a badge with the first letter of its name.
 - **Reopen where you left off**: GitEZ opens the repository that was open when it last quit, and the start screen, File > Open Recent and the repository name at the top left list the last ten; click the name to switch repository or open another, and hover a repository in that list to remove it with its × button. File also has Reveal in Finder, Close Repository and Close Window.
 
 > [!NOTE]

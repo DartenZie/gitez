@@ -1714,6 +1714,7 @@ impl Render for Workspace {
             .text_size(theme::TEXT_SIZE)
             .child(toolbar::Toolbar {
                 repository_name: snapshot.as_ref().map(|snapshot| snapshot.name.clone()),
+                repository_icon: snapshot.as_ref().and_then(|snapshot| snapshot.icon.clone()),
                 repository_path: snapshot.as_ref().map(|snapshot| snapshot.path.clone()),
                 focus: self.focus_handle.clone(),
                 loading: self.loading.is_some() || self.cloning.is_some(),

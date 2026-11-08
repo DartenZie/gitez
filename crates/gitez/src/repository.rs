@@ -3,11 +3,12 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Context as _;
 use gitez_git::{Refs, Repository};
 use gitez_review::{PullRequest, State, Store};
-use gpui_kit::SharedString;
+use gpui_kit::{Image, SharedString};
 
 /// What the window shows about a repository, read in one go on a background
 /// thread. Replaced wholesale when the repository changes.
@@ -16,6 +17,8 @@ pub struct Snapshot {
     /// Clone it for each background read.
     pub repository: Repository,
     pub name: SharedString,
+    /// The project's favicon, app icon or logo, if it has one.
+    pub icon: Option<Arc<Image>>,
     /// The working tree, or the git directory of a bare repository.
     pub path: PathBuf,
     /// Tags are sorted newest version first; everything else as read.
@@ -103,9 +106,12 @@ impl Snapshot {
             .filter_map(|name| Some((name.clone(), repository.remote_url(name)?)))
             .collect();
         let fetched = repository.last_fetch();
+        let name = repository.name();
+        let icon = crate::project_icon::find(&repository, &name).map(Arc::new);
 
         Ok(Self {
-            name: repository.name().into(),
+            name: name.into(),
+            icon,
             path: repository
                 .work_dir()
                 .unwrap_or_else(|| repository.git_dir())
