@@ -1,0 +1,17 @@
+[package]
+name = "gitez-secret"
+description = "Secret values for agent threads, kept in the OS keychain."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+keyring.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

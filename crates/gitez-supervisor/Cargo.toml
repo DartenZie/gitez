@@ -1,0 +1,37 @@
+[package]
+name = "gitez-supervisor"
+description = "The process that runs one agent thread: queue, worktree, sandbox, agent, commit and pull request."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "gitez-supervisor"
+path = "src/bin/gitez-supervisor.rs"
+
+[dependencies]
+gitez-agent.workspace = true
+gitez-sandbox.workspace = true
+gitez-secret.workspace = true
+gitez-settings.workspace = true
+gitez-agent-thread.workspace = true
+gitez-review.workspace = true
+gitez-git.workspace = true
+gitez-command.workspace = true
+jiff.workspace = true
+rustix.workspace = true
+signal-hook.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

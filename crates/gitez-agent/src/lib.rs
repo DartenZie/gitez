@@ -6,12 +6,14 @@
 //! Everything here blocks: run it off the UI thread.
 
 mod claude_code;
+mod command;
 mod session;
 mod test_command;
 
 use std::path::{Path, PathBuf};
 
 pub use claude_code::ClaudeCode;
+pub use command::CommandSpec;
 pub use session::{Outcome, Session, Stopper};
 pub use test_command::detect_test_command;
 

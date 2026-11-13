@@ -44,11 +44,28 @@ serde_json = "1"
 syntect = { version = "5.3", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy"] }
 two-face = { version = "0.4.5", default-features = false, features = ["syntect-fancy"] }
 
+# Secret values in the OS keychain: Keychain Services on macOS, the Secret
+# Service (pure-Rust zbus) on Linux. The default `v1` feature picks the store.
+keyring = "4.2.0"
+# Copy-on-write clones of cache folders (APFS clonefile, Linux FICLONE).
+reflink-copy = "0.1.32"
+# Process groups, signals and setsid without unsafe code.
+rustix = { version = "1.1.6", features = ["process"] }
+# SIGTERM to the supervisor ends the agent's turn cleanly.
+signal-hook = "0.4.6"
+# Claude Code session ids.
+uuid = { version = "1.29.2", features = ["v4"] }
+
 gitez-git = { path = "crates/gitez-git" }
 gitez-command = { path = "crates/gitez-command" }
 gitez-review = { path = "crates/gitez-review" }
 gitez-agent = { path = "crates/gitez-agent" }
 gitez-highlight = { path = "crates/gitez-highlight" }
+gitez-sandbox = { path = "crates/gitez-sandbox" }
+gitez-secret = { path = "crates/gitez-secret" }
+gitez-settings = { path = "crates/gitez-settings" }
+gitez-agent-thread = { path = "crates/gitez-agent-thread" }
+gitez-supervisor = { path = "crates/gitez-supervisor" }
 
 [workspace.lints.rust]
 unsafe_code = "warn"

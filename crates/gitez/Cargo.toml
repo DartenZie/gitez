@@ -22,7 +22,14 @@ gitez-git.workspace = true
 gitez-command.workspace = true
 gitez-review.workspace = true
 gitez-agent.workspace = true
+gitez-sandbox.workspace = true
+gitez-secret.workspace = true
+gitez-settings.workspace = true
+gitez-agent-thread.workspace = true
+gitez-supervisor.workspace = true
 anyhow.workspace = true
+# Claude Code session ids for review prompt runs.
+uuid.workspace = true
 futures.workspace = true
 dirs.workspace = true
 serde.workspace = true
