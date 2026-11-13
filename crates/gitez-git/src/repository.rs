@@ -107,6 +107,38 @@ impl Repository {
         Ok(())
     }
 
+    /// The linked worktree that has branch `branch` checked out, if one
+    /// has, as git records it (the folder may since have been deleted).
+    /// While it is, git refuses to check the branch out or rebase it in any
+    /// other worktree.
+    pub fn linked_worktree_of(&self, branch: &str) -> Result<Option<PathBuf>> {
+        let dir = self.common_dir().join("worktrees");
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(Error::ReadFile { path: dir, source }),
+        };
+        let wanted = format!("ref: refs/heads/{branch}");
+        for entry in entries.flatten() {
+            let git_dir = entry.path();
+            let Ok(head) = std::fs::read_to_string(git_dir.join("HEAD")) else {
+                continue;
+            };
+            if head.trim_end() != wanted {
+                continue;
+            }
+            // `gitdir` names the worktree's `.git` file.
+            let Ok(dot_git) = std::fs::read_to_string(git_dir.join("gitdir")) else {
+                continue;
+            };
+            let dot_git = git_dir.join(dot_git.trim_end());
+            if let Some(worktree) = dot_git.parent() {
+                return Ok(Some(worktree.to_owned()));
+            }
+        }
+        Ok(None)
+    }
+
     /// A handle for use on the current thread.
     pub(crate) fn local(&self) -> gix::Repository {
         let mut repo = self.inner.to_thread_local();

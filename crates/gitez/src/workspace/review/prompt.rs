@@ -2,6 +2,10 @@
 //! `LocalPR.dc.html` artboard: which comments go into the prompt, how it is
 //! put together, the prompt itself, and sending it to a coding agent whose
 //! work streams in below.
+//!
+//! A pull request that an agent thread created sends its prompt to that
+//! thread instead (E.11): the thread continues in its own worktree, so the
+//! head branch need not be checked out, and the panel follows the thread.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -13,6 +17,7 @@ use gitez_agent::{
     Agent, AgentConfig, AgentEvent, AgentProcess, ClaudeCode, Conversation, Outcome, Registry,
     RunSpec, Stopper,
 };
+use gitez_agent_thread::{AgentThread, Ending, State as ThreadState, TurnKind};
 use gitez_command::Git;
 use gitez_git::Repository;
 use gitez_review::{PromptContext, RunHeader, Side, Store, Template, Timestamp};
@@ -21,13 +26,19 @@ use gpui_kit::component::button::*;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
+use gpui_kit::component::text::TextView;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::{Review, Row, Subject, muted};
+use crate::agent_threads::{AgentThreadKey, AgentThreads, OpenAgentThread};
 use crate::theme::{self, color};
 use crate::time;
+use crate::workspace::agent_thread;
+
+#[cfg(all(test, target_os = "macos"))]
+mod loop_shots;
 
 /// Width of the panel beside the diff.
 pub(super) const PANEL_WIDTH: Pixels = px(380.);
@@ -69,9 +80,35 @@ pub(super) struct PromptPanel {
     /// Saving the test command, after a pause in typing.
     saving_test_command: Task<()>,
     test_command_error: Option<SharedString>,
+    /// The repository's common git directory, which names its agent
+    /// threads.
+    common_dir: PathBuf,
+    /// What the panel asked of the pull request's agent thread, while the
+    /// request is under way.
+    thread_busy: Option<(ThreadAction, Task<()>)>,
+    /// The thread's `updated` time when a prompt was sent to it: until the
+    /// thread changes, it counts as working.
+    sent_at: Option<gitez_agent_thread::Timestamp>,
+    /// Why the last request to the thread failed.
+    thread_error: Option<SharedString>,
+    /// The thread's `updated` time last seen, to redraw when it changes.
+    thread_seen: Option<gitez_agent_thread::Timestamp>,
+    /// Whether the thread's worktree folder is gone, as last checked, and
+    /// for which `updated` time of the thread.
+    worktree_gone: bool,
+    worktree_checked: Option<gitez_agent_thread::Timestamp>,
+    _check_worktree: Task<()>,
     _load_run: Task<()>,
     _detect: Task<()>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// What the panel can ask of a pull request's agent thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThreadAction {
+    Send,
+    Retry,
+    Stop,
 }
 
 impl PromptPanel {
@@ -137,7 +174,7 @@ impl PromptPanel {
             window,
             cx,
         );
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             cx.subscribe(&test_command, |this, _, event: &InputEvent, cx| {
                 if let InputEvent::Change = event {
                     this.save_test_command(cx);
@@ -160,6 +197,10 @@ impl PromptPanel {
                 }
             }),
         ];
+        // The pull request's agent thread, if one created it, as it runs.
+        if let Some(threads) = AgentThreads::try_global(cx) {
+            subscriptions.push(cx.observe(&threads, |this, _, cx| this.follow_agent_thread(cx)));
+        }
         Self {
             agent,
             template,
@@ -169,6 +210,14 @@ impl PromptPanel {
             detected_test_command: None,
             saving_test_command: Task::ready(()),
             test_command_error: None,
+            common_dir: repository.common_dir(),
+            thread_busy: None,
+            sent_at: None,
+            thread_error: None,
+            thread_seen: None,
+            worktree_gone: false,
+            worktree_checked: None,
+            _check_worktree: Task::ready(()),
             _load_run: Task::ready(()),
             _detect: detect,
             _subscriptions: subscriptions,
@@ -339,6 +388,26 @@ impl Review {
         if subject.pull_request.state != gitez_review::State::Open {
             return Some("This pull request is no longer open.".into());
         }
+        // The thread works in its own worktree, whatever is checked out.
+        if let Some(thread) = self.agent_thread_for_pull_request(cx) {
+            if panel.thread_busy.is_some() {
+                return Some("Sending to the thread…".into());
+            }
+            if thread.state == ThreadState::Waiting {
+                return Some(
+                    "The thread waits for the agent’s usage limit to reset. Send once it has \
+                     finished."
+                        .into(),
+                );
+            }
+            if thread.state.is_active() || panel.sent_at == Some(thread.updated) {
+                return Some("The agent is still working on this thread.".into());
+            }
+            if thread.session_id.is_none() {
+                return Some("Retry the thread first: the agent never started.".into());
+            }
+            return None;
+        }
         if !subject.tips.checked_out {
             return Some(format!(
                 "The agent commits to the branch that is checked out. Check out {} to send.",
@@ -355,7 +424,8 @@ impl Review {
         None
     }
 
-    /// Sends the prompt to the pull request's agent.
+    /// Sends the prompt to the pull request's agent, or to the agent
+    /// thread that created it.
     fn send_prompt(&mut self, cx: &mut Context<Self>) {
         if self.cannot_send(cx).is_some() {
             return;
@@ -363,6 +433,16 @@ impl Review {
         let (Some(prompt), Some(dir)) = (self.prompt_text(cx), self.repository.work_dir()) else {
             return;
         };
+        if let Some(thread) = self.agent_thread_for_pull_request(cx) {
+            let sent_at = thread.updated;
+            self.ask_thread(ThreadAction::Send, cx, move |model, key, cx| {
+                model.reply(key, TurnKind::Review, prompt, cx)
+            });
+            if let Subject::PullRequest(subject) = &mut self.subject {
+                subject.panel.sent_at = Some(sent_at);
+            }
+            return;
+        }
         let Subject::PullRequest(subject) = &self.subject else {
             return;
         };
@@ -375,6 +455,120 @@ impl Review {
         let run = cx.new(|cx| AgentRun::start(agent, prompt, dir, store, number, cx));
         cx.default_global::<AgentRuns>().0.insert(key, run.clone());
         self.show_run(run, cx);
+    }
+
+    /// The agent thread that created the pull request reviewed, unless it
+    /// is completed: a reopened pull request of a completed thread is
+    /// reviewed as any other.
+    pub(super) fn agent_thread_for_pull_request(&self, cx: &App) -> Option<Arc<AgentThread>> {
+        let (subject, panel) = self.panel()?;
+        let threads = AgentThreads::try_global(cx)?;
+        let thread = threads
+            .read(cx)
+            .for_pull_request(&panel.common_dir, subject.pull_request.number)?;
+        (thread.state != ThreadState::Completed).then(|| thread.clone())
+    }
+
+    /// Follows the pull request's agent thread: redraws when it changes,
+    /// and checks whether its worktree is still there.
+    pub(super) fn follow_agent_thread(&mut self, cx: &mut Context<Self>) {
+        let thread = self.agent_thread_for_pull_request(cx);
+        let Subject::PullRequest(subject) = &mut self.subject else {
+            return;
+        };
+        let panel = &mut subject.panel;
+        let updated = thread.as_ref().map(|thread| thread.updated);
+        // An active thread's elapsed time advances with the model's redraws.
+        let active = thread
+            .as_ref()
+            .is_some_and(|thread| thread.state.is_active());
+        if panel.thread_seen == updated && !active {
+            return;
+        }
+        panel.thread_seen = updated;
+        if let Some(thread) = thread
+            && panel.worktree_checked != Some(thread.updated)
+        {
+            panel.worktree_checked = Some(thread.updated);
+            let worktree = thread.worktree.clone();
+            panel._check_worktree = cx.spawn(async move |this, cx| {
+                let gone = cx
+                    .background_executor()
+                    .spawn(async move { std::fs::symlink_metadata(&worktree).is_err() })
+                    .await;
+                this.update(cx, |this, cx| {
+                    if let Subject::PullRequest(subject) = &mut this.subject {
+                        subject.panel.worktree_gone = gone;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            });
+        }
+        cx.notify();
+    }
+
+    /// Runs `action` on the pull request's agent thread, showing `what`
+    /// until it ends and its error if it fails.
+    fn ask_thread(
+        &mut self,
+        what: ThreadAction,
+        cx: &mut Context<Self>,
+        action: impl FnOnce(
+            &mut AgentThreads,
+            &AgentThreadKey,
+            &mut Context<AgentThreads>,
+        ) -> Task<anyhow::Result<()>>,
+    ) {
+        let (Some(thread), Some(threads)) = (
+            self.agent_thread_for_pull_request(cx),
+            AgentThreads::try_global(cx),
+        ) else {
+            return;
+        };
+        let Subject::PullRequest(subject) = &mut self.subject else {
+            return;
+        };
+        if subject.panel.thread_busy.is_some() {
+            return;
+        }
+        let key = AgentThreadKey {
+            common_dir: subject.panel.common_dir.clone(),
+            id: thread.id.clone(),
+        };
+        let task = threads.update(cx, |threads, cx| action(threads, &key, cx));
+        let task = cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                if let Subject::PullRequest(subject) = &mut this.subject {
+                    let panel = &mut subject.panel;
+                    panel.thread_busy = None;
+                    panel.thread_error = result.err().map(|error| format!("{error:#}").into());
+                    if panel.thread_error.is_some() {
+                        panel.sent_at = None;
+                    }
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
+        subject.panel.thread_busy = Some((what, task));
+        subject.panel.thread_error = None;
+        cx.notify();
+    }
+
+    fn retry_thread(&mut self, cx: &mut Context<Self>) {
+        let Some(thread) = self.agent_thread_for_pull_request(cx) else {
+            return;
+        };
+        let network = agent_thread::suggested_retry(&thread);
+        self.ask_thread(ThreadAction::Retry, cx, move |model, key, cx| {
+            model.retry(key, network, cx)
+        });
+    }
+
+    fn stop_thread(&mut self, cx: &mut Context<Self>) {
+        self.ask_thread(ThreadAction::Stop, cx, |model, key, cx| model.stop(key, cx));
     }
 
     fn stop_agent(&mut self, cx: &mut Context<Self>) {
@@ -410,6 +604,8 @@ impl Review {
         let agent = Registry::builtin().get(&pull_request.prompt.agent);
         let cannot_send = self.cannot_send(cx);
         let options = &pull_request.prompt;
+        let thread = self.agent_thread_for_pull_request(cx);
+        let sending = matches!(panel.thread_busy, Some((ThreadAction::Send, _)));
 
         let comments = open.iter().map(|thread| {
             let id = thread.id;
@@ -632,6 +828,7 @@ impl Review {
                                         .h(px(34.))
                                         .label(format!("Send to {}", agent.name()))
                                         .child(Icon::new(IconName::ArrowRight).size(px(14.)))
+                                        .loading(sending)
                                         .disabled(prompt.is_none() || cannot_send.is_some())
                                         .on_click(
                                             cx.listener(|this, _, _, cx| this.send_prompt(cx)),
@@ -639,20 +836,32 @@ impl Review {
                                 )
                             }),
                     )
-                    .when_some(cannot_send.filter(|_| agent.is_some()), |this, reason| {
-                        this.child(
+                    .map(|this| match (&cannot_send, &thread, &agent) {
+                        (_, _, None) => this,
+                        (Some(reason), _, Some(_)) => this.child(
                             div()
                                 .text_size(px(12.))
                                 .line_height(relative(1.5))
                                 .text_color(rgb(color::ACCENT))
-                                .child(reason),
-                        )
+                                .child(reason.clone()),
+                        ),
+                        (None, Some(_), Some(_)) => this.child(
+                            muted("Runs in the thread’s worktree; your working tree is not touched.")
+                                .text_size(px(12.))
+                                .line_height(relative(1.5)),
+                        ),
+                        (None, None, Some(_)) => this,
                     })
                     .child(
-                        muted(
+                        // Beside an agent thread, review threads are called
+                        // comments, to keep the two apart.
+                        muted(if thread.is_some() {
+                            "Comments resolve themselves when a new commit on this branch \
+                             changes the lines they point at. You can reopen any of them."
+                        } else {
                             "Threads resolve themselves when a new commit on this branch \
-                             changes the lines they point at. You can reopen any of them.",
-                        )
+                             changes the lines they point at. You can reopen any of them."
+                        })
                         .text_size(theme::SMALL_TEXT_SIZE)
                         .line_height(relative(1.5)),
                     ),
@@ -669,8 +878,11 @@ impl Review {
                 .overflow_y_scroll()
                 .pb(px(24.))
                 .child(card)
-                .when_some(panel.run.as_ref(), |this, (run, _)| {
-                    this.child(self.render_run(run.read(cx), cx))
+                .map(|this| match &thread {
+                    Some(thread) => this.child(self.render_agent_thread(thread, cx)),
+                    None => this.when_some(panel.run.as_ref(), |this, (run, _)| {
+                        this.child(self.render_run(run.read(cx), cx))
+                    }),
                 })
                 .into_any_element(),
         )
@@ -701,6 +913,252 @@ impl Review {
             });
             cx.notify();
         }
+    }
+
+    /// The pull request's agent thread: what it does now or how its last
+    /// turn ended, and what can be done with it.
+    fn render_agent_thread(&self, thread: &AgentThread, cx: &mut Context<Self>) -> Div {
+        let Some((_, panel)) = self.panel() else {
+            return div();
+        };
+        let mono = cx.theme().mono_font_family.clone();
+        let now = gitez_agent_thread::Timestamp::now();
+        let busy = panel.thread_busy.as_ref().map(|(what, _)| *what);
+        let reviewed = thread
+            .turns
+            .last()
+            .is_some_and(|turn| turn.kind == TurnKind::Review);
+        let text = |text: String| {
+            div()
+                .text_size(px(12.5))
+                .line_height(relative(1.5))
+                .text_color(rgb(color::TEXT))
+                .child(text)
+        };
+        let note = |text: String| {
+            muted(text)
+                .text_size(theme::SMALL_TEXT_SIZE)
+                .line_height(relative(1.5))
+        };
+        let failed = |text: String| {
+            div()
+                .text_size(px(12.5))
+                .line_height(relative(1.5))
+                .text_color(rgb(color::DIFF_REMOVED))
+                .child(text)
+        };
+        let mut body: Vec<AnyElement> = Vec::new();
+        match thread.state {
+            ThreadState::Queued => body.push(
+                text(if reviewed {
+                    "Your comments are sent. The thread waits for a free running slot.".into()
+                } else {
+                    "The thread waits for a free running slot.".into()
+                })
+                .into_any_element(),
+            ),
+            ThreadState::Preparing | ThreadState::Running => {
+                if let Some(activity) = &thread.activity {
+                    body.push(
+                        div()
+                            .h_flex()
+                            .gap(px(8.))
+                            .font_family(mono.clone())
+                            .text_size(theme::SMALL_TEXT_SIZE)
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_color(rgb(color::ACCENT))
+                                    .child(activity.tool.clone().unwrap_or_else(|| "Setup".into())),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_color(rgb(color::TEXT_MUTED))
+                                    .child(activity.detail.clone()),
+                            )
+                            .into_any_element(),
+                    );
+                } else {
+                    body.push(
+                        text(if thread.state == ThreadState::Preparing {
+                            "Preparing the worktree…".into()
+                        } else {
+                            "Working on your comments…".into()
+                        })
+                        .into_any_element(),
+                    );
+                }
+                body.push(note(agent_thread::summary(thread, now)).into_any_element());
+            }
+            ThreadState::Waiting => body.push(
+                text(match thread.waiting_until {
+                    Some(_) => format!(
+                        "The agent’s usage limit was reached; the thread is {}.",
+                        agent_thread::state_label(thread).to_lowercase()
+                    ),
+                    None => "The agent’s usage limit was reached; the thread waits for it to \
+                             reset."
+                        .into(),
+                })
+                .into_any_element(),
+            ),
+            ThreadState::Finished | ThreadState::Completed => {
+                match thread.ending {
+                    Some(Ending::Failed) => body.push(
+                        failed(
+                            thread
+                                .error
+                                .as_ref()
+                                .map(|error| error.message.clone())
+                                .unwrap_or_else(|| "The thread failed.".into()),
+                        )
+                        .into_any_element(),
+                    ),
+                    Some(Ending::Stopped) => body
+                        .push(text("Stopped before the agent finished.".into()).into_any_element()),
+                    _ => {
+                        if let Some(message) = thread
+                            .turns
+                            .last()
+                            .and_then(|turn| turn.result.as_ref())
+                            .map(|result| result.message.trim().to_owned())
+                            .filter(|message| !message.is_empty())
+                        {
+                            body.push(
+                                div()
+                                    .id("thread-message")
+                                    .max_h(px(260.))
+                                    .overflow_y_scroll()
+                                    .text_size(px(12.5))
+                                    .line_height(relative(1.5))
+                                    .text_color(rgb(color::TEXT))
+                                    .child(
+                                        TextView::markdown(
+                                            SharedString::from(format!(
+                                                "prompt-thread-message-{}",
+                                                thread.id
+                                            )),
+                                            message,
+                                        )
+                                        .selectable(true),
+                                    )
+                                    .into_any_element(),
+                            );
+                        }
+                    }
+                }
+                body.push(note(agent_thread::summary(thread, now)).into_any_element());
+                if panel.worktree_gone {
+                    body.push(
+                        note(format!(
+                            "The thread’s worktree folder is gone. Sending creates it again \
+                             from {}.",
+                            thread.branch
+                        ))
+                        .text_color(rgb(color::ACCENT))
+                        .into_any_element(),
+                    );
+                }
+            }
+        }
+        if let Some(error) = &panel.thread_error {
+            body.push(
+                div()
+                    .font_family(mono.clone())
+                    .text_size(theme::SMALL_TEXT_SIZE)
+                    .line_height(relative(1.5))
+                    .text_color(rgb(color::DIFF_REMOVED))
+                    .child(error.clone())
+                    .into_any_element(),
+            );
+        }
+
+        let retry = thread.state == ThreadState::Finished
+            && matches!(thread.ending, Some(Ending::Failed | Ending::Stopped));
+        let stop = thread.state.is_active();
+        let open = {
+            let action = OpenAgentThread {
+                common_dir: panel.common_dir.clone(),
+                id: thread.id.clone(),
+            };
+            Button::new("thread-open")
+                .small()
+                .label("Open thread")
+                .on_click(move |_, window, cx| window.dispatch_action(Box::new(action.clone()), cx))
+        };
+        div()
+            .debug_selector(|| "prompt-thread".into())
+            .v_flex()
+            .flex_none()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(rgb(color::DIFF_CARD_BORDER))
+            .bg(rgb(color::PANEL))
+            .child(
+                div()
+                    .h_flex()
+                    .gap(px(8.))
+                    .px(px(14.))
+                    .py(px(10.))
+                    .border_b_1()
+                    .border_color(rgb(color::DIFF_CARD_BORDER))
+                    .child(agent_thread::agent_mark(&thread.agent))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(px(13.))
+                            .child(thread.title.clone()),
+                    )
+                    .child(agent_thread::state_chip(thread)),
+            )
+            .child(
+                div()
+                    .v_flex()
+                    .gap(px(8.))
+                    .px(px(14.))
+                    .py(px(12.))
+                    .children(body),
+            )
+            .child(
+                div()
+                    .h_flex()
+                    .gap(px(8.))
+                    .px(px(14.))
+                    .pb(px(12.))
+                    .child(open)
+                    .when(retry, |this| {
+                        this.child(
+                            Button::new("thread-retry")
+                                .small()
+                                .icon(IconName::RefreshCw)
+                                .label("Retry")
+                                .loading(busy == Some(ThreadAction::Retry))
+                                .disabled(busy.is_some())
+                                .on_click(cx.listener(|this, _, _, cx| this.retry_thread(cx))),
+                        )
+                    })
+                    .when(stop, |this| {
+                        this.child(
+                            Button::new("thread-stop")
+                                .ml_auto()
+                                .small()
+                                .icon(IconName::Square)
+                                .label("Stop")
+                                .loading(busy == Some(ThreadAction::Stop))
+                                .disabled(busy.is_some())
+                                .on_click(cx.listener(|this, _, _, cx| this.stop_thread(cx))),
+                        )
+                    }),
+            )
     }
 
     /// The run's state and what the agent did, newest last.

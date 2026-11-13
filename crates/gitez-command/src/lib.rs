@@ -496,6 +496,19 @@ impl Git {
         merged.map(|()| MergeOutcome::Merged)
     }
 
+    /// Replays the commits of the branch checked out in this working tree
+    /// on top of branch `onto`, like `git rebase onto`; `onto` does not
+    /// move. For a branch checked out in a linked worktree, which no other
+    /// worktree may rebase. When git cannot finish, the rebase is given up
+    /// and nothing changes.
+    pub fn rebase_onto(&self, onto: &str) -> Result<()> {
+        let rebased = self.run(["rebase", "--quiet", onto], None);
+        if rebased.is_err() {
+            self.run(["rebase", "--abort"], None).ok();
+        }
+        rebased.map(drop)
+    }
+
     /// Replays the commits of branch `branch` on top of branch `onto`, like
     /// `git rebase onto branch`; `onto` does not move. When git cannot
     /// finish, the rebase is given up and nothing changes. Afterwards

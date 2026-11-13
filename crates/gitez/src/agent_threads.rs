@@ -19,8 +19,8 @@ use anyhow::{Context as _, bail};
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gitez_agent_thread::{
-    AgentThread, AgentThreadId, Ending, Index, IndexedRepository, NewAgentThread, Step, Store,
-    Timestamp, TurnKind,
+    AgentThread, AgentThreadId, Ending, Index, IndexedRepository, NewAgentThread, State, Step,
+    Store, Timestamp, TurnKind,
 };
 use gitez_sandbox::NetworkProfile;
 use gitez_secret::SecretStore;
@@ -160,6 +160,9 @@ pub struct AgentThreads {
     exe: Result<PathBuf, String>,
     repositories: Vec<RepositoryThreads>,
     current: Option<CurrentRepository>,
+    /// Threads being completed because their pull request was merged or
+    /// closed, so a burst of file events completes each once.
+    completing: HashSet<AgentThreadKey>,
     /// File events and reload requests, read in order by one task.
     changes: mpsc::UnboundedSender<Vec<PathBuf>>,
     watch: bool,
@@ -252,6 +255,7 @@ impl AgentThreads {
             exe: options.exe,
             repositories: Vec::new(),
             current: None,
+            completing: HashSet::new(),
             changes,
             watch: options.watch,
             watched: Vec::new(),
@@ -264,6 +268,13 @@ impl AgentThreads {
 
     pub fn global(cx: &App) -> Entity<AgentThreads> {
         cx.global::<AgentThreadsGlobal>().0.clone()
+    }
+
+    /// [`AgentThreads::global`], or `None` before [`init`] (in tests of
+    /// views that do not need it).
+    pub fn try_global(cx: &App) -> Option<Entity<AgentThreads>> {
+        cx.try_global::<AgentThreadsGlobal>()
+            .map(|global| global.0.clone())
     }
 
     pub fn data_dir(&self) -> Option<&Path> {
@@ -295,7 +306,6 @@ impl AgentThreads {
     }
 
     /// The agent thread that created local pull request `number`, if any.
-    #[allow(dead_code, reason = "for the agent thread screens still to come")]
     pub fn for_pull_request(&self, common_dir: &Path, number: u32) -> Option<&Arc<AgentThread>> {
         self.repository(common_dir)?
             .threads
@@ -660,6 +670,10 @@ impl AgentThreads {
     /// changed.
     fn apply(&mut self, loaded: Loaded, cx: &mut Context<Self>) {
         let mut changed = BTreeSet::new();
+        // Read again, so perhaps finished since their pull request was
+        // merged or closed: whole repositories, and single threads.
+        let mut reread: Vec<PathBuf> = loaded.reviews.iter().cloned().collect();
+        let mut reread_threads = Vec::new();
         if let Some(dir) = loaded.canonical_data_dir {
             self.canonical_data_dir = Some(dir);
         }
@@ -713,6 +727,7 @@ impl AgentThreads {
                 repository.threads = threads;
                 repository.error = error;
                 changed.insert(repository.common_dir.clone());
+                reread.push(repository.common_dir.clone());
             }
         }
         for (common_dir, id, read) in loaded.threads {
@@ -720,6 +735,12 @@ impl AgentThreads {
                 continue;
             };
             let position = repository.threads.iter().position(|thread| thread.id == id);
+            if read.is_ok() {
+                reread_threads.push(AgentThreadKey {
+                    common_dir: repository.common_dir.clone(),
+                    id: id.clone(),
+                });
+            }
             match (read, position) {
                 (Ok(thread), Some(position)) => {
                     if *repository.threads[position] == thread {
@@ -745,6 +766,7 @@ impl AgentThreads {
             }
             changed.insert(repository.common_dir.clone());
         }
+        self.complete_merged(&reread, &reread_threads, cx);
         for common_dir in changed {
             debug(|| format!("changed {}", common_dir.display()));
             cx.emit(AgentThreadsEvent::Changed { common_dir });
@@ -983,6 +1005,9 @@ struct Plan {
     repositories: BTreeSet<PathBuf>,
     threads: BTreeMap<PathBuf, BTreeSet<AgentThreadId>>,
     transcripts: Vec<AgentThreadKey>,
+    /// Repositories whose local pull requests changed: their threads may
+    /// complete (E.11).
+    reviews: BTreeSet<PathBuf>,
 }
 
 /// What [`Plan::load`] read.
@@ -1007,6 +1032,7 @@ struct Loaded {
         gitez_agent_thread::Result<AgentThread>,
     )>,
     transcripts: Vec<AgentThreadKey>,
+    reviews: BTreeSet<PathBuf>,
 }
 
 impl Plan {
@@ -1048,9 +1074,11 @@ impl Plan {
                     _ => {}
                 }
             }
-            // Local pull requests: completing the thread of one merged or
-            // closed (E.11) hooks in here.
-            ["reviews", ..] => {}
+            // A local pull request saved, perhaps merged or closed; not the
+            // review panel's own agent runs.
+            ["reviews"] | ["reviews", _] | ["reviews", _, "review.json"] => {
+                self.reviews.insert(common_dir.to_owned());
+            }
             _ => {}
         }
     }
@@ -1061,6 +1089,7 @@ impl Plan {
             && self.repositories.is_empty()
             && self.threads.is_empty()
             && self.transcripts.is_empty()
+            && self.reviews.is_empty()
     }
 
     /// Reads what the plan names. `known` are the repositories listed now.
@@ -1132,6 +1161,7 @@ impl Plan {
             repositories,
             threads,
             transcripts: self.transcripts,
+            reviews: self.reviews,
         }
     }
 }
@@ -1310,6 +1340,159 @@ fn resolve_secrets(
     (values, warnings)
 }
 
+// Completing an agent thread when its local pull request is merged or
+// closed (E.11). Checked whenever a pull request of a repository with
+// threads is saved and whenever threads are read, so it covers every way a
+// pull request is merged or closed: in this window, in another, or while
+// GitEZ was not running.
+
+impl AgentThreads {
+    /// Completes, in the background, the finished threads among those of
+    /// the repositories `repositories` and the threads `threads` whose pull
+    /// request is now merged or closed.
+    fn complete_merged(
+        &mut self,
+        repositories: &[PathBuf],
+        threads: &[AgentThreadKey],
+        cx: &mut Context<Self>,
+    ) {
+        let mut due = Vec::new();
+        for repository in &self.repositories {
+            let whole = repositories
+                .iter()
+                .any(|dir| *dir == repository.common_dir || *dir == repository.canonical);
+            for thread in &repository.threads {
+                let (State::Finished, Some(number)) = (thread.state, thread.pull_request) else {
+                    continue;
+                };
+                let key = AgentThreadKey {
+                    common_dir: repository.common_dir.clone(),
+                    id: thread.id.clone(),
+                };
+                let named = threads.iter().any(|named| {
+                    named.id == key.id
+                        && (named.common_dir == repository.common_dir
+                            || named.common_dir == repository.canonical)
+                });
+                if (whole || named) && !self.completing.contains(&key) {
+                    due.push((key, number, repository.work_dir.clone()));
+                }
+            }
+        }
+        if due.is_empty() {
+            return;
+        }
+        self.completing
+            .extend(due.iter().map(|(key, _, _)| key.clone()));
+        let changes = self.changes.clone();
+        let task = cx.background_executor().spawn(async move {
+            due.into_iter()
+                .map(|(key, number, work_dir)| {
+                    match complete_for_pull_request(&work_dir, &key, number, Timestamp::now()) {
+                        Ok(true) => {
+                            debug(|| format!("completed {}: #{number} merged or closed", key.id));
+                            changes.unbounded_send(vec![thread_file(&key)]).ok();
+                        }
+                        Ok(false) => {}
+                        Err(error) => eprintln!(
+                            "gitez: could not complete the thread {} of pull request #{number}: \
+                             {error:#}",
+                            key.id
+                        ),
+                    }
+                    key
+                })
+                .collect::<Vec<_>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let done = task.await;
+            this.update(cx, |this, _| {
+                for key in &done {
+                    this.completing.remove(key);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+}
+
+/// Whether `thread` completes when the pull request it created is in
+/// `state`: a finished thread does once the pull request is merged or
+/// closed. One still working completes when it finishes (it is checked
+/// again then); a completed one stays as it is, even when its pull request
+/// is reopened.
+fn completes_with(thread: &AgentThread, state: gitez_review::State) -> bool {
+    thread.state == State::Finished
+        && thread.pull_request.is_some()
+        && matches!(
+            state,
+            gitez_review::State::Merged | gitez_review::State::Closed
+        )
+}
+
+/// Completes the thread `key` if pull request `number`, which it created,
+/// is merged or closed: removes its worktree (and its branch when it has no
+/// commits of its own) and marks it completed. A worktree folder already
+/// gone, or one git cannot remove, does not keep the thread from
+/// completing; the thread says what happened. Returns whether it
+/// completed. Blocks.
+fn complete_for_pull_request(
+    work_dir: &Path,
+    key: &AgentThreadKey,
+    number: u32,
+    now: Timestamp,
+) -> anyhow::Result<bool> {
+    let pull_request = match gitez_review::Store::new(&key.common_dir).load(number) {
+        Ok(pull_request) => pull_request,
+        // A pull request whose file is gone or unreadable is left alone,
+        // like any other (F).
+        Err(error) => {
+            debug(|| format!("pull request #{number} of {}: {error}", key.id));
+            return Ok(false);
+        }
+    };
+    let store = Store::new(&key.common_dir);
+    let thread = store.load(&key.id)?;
+    if !completes_with(&thread, pull_request.state) {
+        return Ok(false);
+    }
+    let how = if pull_request.state == gitez_review::State::Merged {
+        "merged"
+    } else {
+        "closed"
+    };
+    let removed = gitez_agent_thread::complete(work_dir, &thread);
+    let warning = match &removed {
+        Ok(report) if !report.worktree_removed => Some(format!(
+            "The thread’s worktree folder was already gone when pull request #{number} was \
+             {how}."
+        )),
+        Ok(_) => None,
+        Err(error) => Some(format!(
+            "Pull request #{number} was {how}, but GitEZ could not remove the thread’s worktree \
+             at {}: {}. Remove the folder yourself.",
+            thread.worktree.display(),
+            anyhow::Error::from_ref(error)
+        )),
+    };
+    store
+        .update(&key.id, |thread| {
+            // Continued meanwhile: it completes when it finishes again.
+            if thread.state != State::Finished {
+                return Ok(false);
+            }
+            if let Some(warning) = warning
+                && !thread.warnings.contains(&warning)
+            {
+                thread.warnings.push(warning);
+            }
+            thread.mark_completed(now)?;
+            Ok(true)
+        })
+        .map_err(anyhow::Error::from)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -1323,7 +1506,9 @@ mod tests {
     use gitez_secret::SecretStore as _;
     use gitez_settings::{SecretEntry, SecretScope, Settings};
 
-    use super::{AgentThreadKey, Counts, Plan, resolve_secrets};
+    use super::{
+        AgentThreadKey, Counts, Plan, complete_for_pull_request, completes_with, resolve_secrets,
+    };
 
     /// An agent thread in `state` that ended with `ending`.
     fn thread(id: &str, state: State, ending: Option<Ending>) -> AgentThread {
@@ -1467,7 +1652,206 @@ mod tests {
             }]
         );
         assert!(plan.repositories.is_empty() && !plan.index && !plan.settings);
+        assert_eq!(plan.reviews, BTreeSet::from([common.to_owned()]));
         plan.add(common, Path::new("threads"));
         assert!(plan.repositories.contains(common));
+        // The review panel's own agent runs are not the pull request.
+        let mut runs = Plan::default();
+        runs.add(
+            common,
+            Path::new("reviews/3/runs/2026-11-13T09-41-31Z.jsonl"),
+        );
+        runs.add(common, Path::new("reviews/3/review.json.lock"));
+        assert!(runs.is_empty());
+    }
+
+    /// E.11: a finished thread completes once its pull request is merged
+    /// or closed; one working, completed, or with its pull request open
+    /// does not.
+    #[test]
+    fn a_finished_thread_completes_when_its_pull_request_is_merged_or_closed() {
+        use gitez_review::State as PullRequest;
+        let mut finished = thread("a", State::Finished, Some(Ending::PullRequest));
+        finished.pull_request = Some(3);
+        assert!(completes_with(&finished, PullRequest::Merged));
+        assert!(completes_with(&finished, PullRequest::Closed));
+        assert!(!completes_with(&finished, PullRequest::Open));
+        // A failed review turn leaves it finished too.
+        let mut failed = finished.clone();
+        failed.ending = Some(Ending::Failed);
+        assert!(completes_with(&failed, PullRequest::Merged));
+        for state in [
+            State::Queued,
+            State::Preparing,
+            State::Running,
+            State::Waiting,
+            State::Completed,
+        ] {
+            let mut other = finished.clone();
+            other.state = state;
+            assert!(!completes_with(&other, PullRequest::Merged), "{state:?}");
+            assert!(!completes_with(&other, PullRequest::Closed), "{state:?}");
+        }
+        let no_pull_request = thread("b", State::Finished, Some(Ending::Answer));
+        assert!(!completes_with(&no_pull_request, PullRequest::Merged));
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git runs");
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+        String::from_utf8(output.stdout)
+            .expect("utf-8")
+            .trim()
+            .to_owned()
+    }
+
+    /// A repository with a finished thread whose branch, checked out in its
+    /// worktree, has a commit, and the open pull request it created.
+    fn finished_thread(dir: &Path) -> (PathBuf, AgentThreadKey, u32) {
+        let main = dir.join("repo");
+        std::fs::create_dir_all(&main).expect("folder");
+        git(&main, &["init", "-q", "-b", "main"]);
+        git(&main, &["config", "user.name", "Ada Lovelace"]);
+        git(&main, &["config", "user.email", "ada@example.com"]);
+        git(&main, &["config", "commit.gpgsign", "false"]);
+        git(&main, &["commit", "-q", "--allow-empty", "-m", "First"]);
+        let start = git(&main, &["rev-parse", "HEAD"]);
+        let common_dir = gitez_git::Repository::open(&main)
+            .expect("open")
+            .common_dir();
+        let store = gitez_agent_thread::Store::new(&common_dir);
+        let created = store
+            .create(
+                gitez_agent_thread::NewAgentThread {
+                    prompt: "Add b.txt".into(),
+                    agent: "claude-code".into(),
+                    model: None,
+                    start: Start {
+                        branch: "main".into(),
+                        commit: start.clone(),
+                    },
+                    network: NetworkProfile::AgentOnly,
+                    secrets: Vec::new(),
+                },
+                &dir.join("data"),
+                "repo",
+                |_| false,
+                Timestamp::now(),
+            )
+            .expect("thread");
+        gitez_agent_thread::create_worktree(&main, &created.worktree, &created.branch, &start)
+            .expect("worktree");
+        std::fs::write(created.worktree.join("b.txt"), "b\n").expect("write");
+        git(&created.worktree, &["add", "."]);
+        git(&created.worktree, &["commit", "-qm", "Add b.txt"]);
+        let head = git(&created.worktree, &["rev-parse", "HEAD"]);
+        let pull_request = gitez_review::Store::new(&common_dir)
+            .create(
+                gitez_review::NewPullRequest {
+                    title: created.title.clone(),
+                    description: String::new(),
+                    base: gitez_review::Tip {
+                        branch: "main".into(),
+                        commit: start,
+                    },
+                    head: gitez_review::Tip {
+                        branch: created.branch.clone(),
+                        commit: head,
+                    },
+                },
+                Timestamp::now(),
+            )
+            .expect("pull request");
+        store
+            .update(&created.id, |thread| {
+                thread.state = State::Finished;
+                thread.ending = Some(Ending::PullRequest);
+                thread.session_id = Some("session".into());
+                thread.pull_request = Some(pull_request.number);
+                Ok(())
+            })
+            .expect("finish");
+        let key = AgentThreadKey {
+            common_dir,
+            id: created.id,
+        };
+        (main, key, pull_request.number)
+    }
+
+    fn set_state(key: &AgentThreadKey, number: u32, state: gitez_review::State) {
+        let store = gitez_review::Store::new(&key.common_dir);
+        let mut pull_request = store.load(number).expect("load");
+        pull_request.state = state;
+        store.save(&pull_request).expect("save");
+    }
+
+    #[test]
+    fn merging_its_pull_request_removes_the_worktree_and_completes_the_thread() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (main, key, number) = finished_thread(dir.path());
+        let store = gitez_agent_thread::Store::new(&key.common_dir);
+        let worktree = store.load(&key.id).expect("load").worktree;
+        let now = Timestamp::now();
+        // Open: nothing happens.
+        assert!(!complete_for_pull_request(&main, &key, number, now).expect("checked"));
+        assert!(worktree.exists());
+
+        set_state(&key, number, gitez_review::State::Merged);
+        assert!(complete_for_pull_request(&main, &key, number, now).expect("completed"));
+        let thread = store.load(&key.id).expect("load");
+        assert_eq!(thread.state, State::Completed);
+        assert_eq!(thread.completed, Some(now));
+        assert!(thread.warnings.is_empty(), "{:?}", thread.warnings);
+        assert!(!worktree.exists());
+        // The branch has a commit of its own, so it stays; git forgets the
+        // worktree.
+        git(&main, &["rev-parse", "--verify", &thread.branch]);
+        assert_eq!(git(&main, &["worktree", "list"]).lines().count(), 1);
+
+        // Reopened: the completed thread stays as it is.
+        set_state(&key, number, gitez_review::State::Open);
+        assert!(!complete_for_pull_request(&main, &key, number, now).expect("checked"));
+        set_state(&key, number, gitez_review::State::Closed);
+        assert!(!complete_for_pull_request(&main, &key, number, now).expect("checked"));
+        assert_eq!(store.load(&key.id).expect("load"), thread);
+    }
+
+    #[test]
+    fn a_thread_whose_worktree_is_gone_completes_and_says_so() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (main, key, number) = finished_thread(dir.path());
+        let store = gitez_agent_thread::Store::new(&key.common_dir);
+        std::fs::remove_dir_all(store.load(&key.id).expect("load").worktree)
+            .expect("deleted by hand");
+        set_state(&key, number, gitez_review::State::Closed);
+        assert!(complete_for_pull_request(&main, &key, number, Timestamp::now()).expect("done"));
+        let thread = store.load(&key.id).expect("load");
+        assert_eq!(thread.state, State::Completed);
+        assert_eq!(
+            thread.warnings,
+            [format!(
+                "The thread’s worktree folder was already gone when pull request #{number} was \
+                 closed."
+            )]
+        );
+        assert_eq!(git(&main, &["worktree", "list"]).lines().count(), 1);
+    }
+
+    #[test]
+    fn a_pull_request_whose_file_is_gone_leaves_its_thread_alone() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (main, key, number) = finished_thread(dir.path());
+        std::fs::remove_dir_all(key.common_dir.join("gitez/reviews")).expect("remove");
+        assert!(!complete_for_pull_request(&main, &key, number, Timestamp::now()).expect("ok"));
+        let thread = gitez_agent_thread::Store::new(&key.common_dir)
+            .load(&key.id)
+            .expect("load");
+        assert_eq!(thread.state, State::Finished);
     }
 }

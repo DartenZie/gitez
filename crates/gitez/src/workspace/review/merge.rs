@@ -13,7 +13,7 @@ use gpui_kit::*;
 
 use super::{Review, ReviewEvent, Subject, follow_head, muted};
 use crate::theme::{self, color};
-use crate::undo::{self, Recorder, ReviewChange, ReviewTips};
+use crate::undo::{self, Recorded, Recorder, ReviewChange, ReviewTips};
 use crate::workspace::labels;
 
 /// What the dialog asks of its owner.
@@ -163,33 +163,19 @@ impl MergeDialog {
             let done = cx
                 .background_executor()
                 .spawn(async move {
-                    let return_to = match repository.refs()?.head {
-                        Some(Head::Branch { name, .. }) => Some(name),
-                        _ => None,
-                    };
-                    let recorder = Recorder::start(git.work_dir());
-                    let (Some(how), Some(message)) = (how, message) else {
-                        git.rebase_branch(&head, &base, return_to.as_deref())?;
-                        return anyhow::Ok((Done::Rebased, recorder.finish(ResetMode::Keep)));
-                    };
-                    match git.merge_branch(&head, &base, how, &message, return_to.as_deref())? {
-                        MergeOutcome::Merged => {
-                            let merged = number
-                                .map(|number| {
-                                    record_merge(&repository, &store, number, base_before)
-                                })
-                                .transpose()?;
-                            let mut recorded = recorder.finish(ResetMode::Keep);
-                            let pull_request = merged.map(|(pull_request, review)| {
-                                recorded =
-                                    recorded.take().map(|recorded| recorded.with_review(review));
-                                Box::new(pull_request)
-                            });
-                            Ok((Done::Merged(pull_request), recorded))
-                        }
-                        // Recorded once the merge is committed.
-                        MergeOutcome::Conflicts => Ok((Done::Stopped, None)),
-                    }
+                    carry_out(
+                        &repository,
+                        &store,
+                        &git,
+                        Carry {
+                            how,
+                            message,
+                            head,
+                            base,
+                            number,
+                            base_before,
+                        },
+                    )
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -647,6 +633,83 @@ impl Review {
     }
 }
 
+/// A merge or rebase for [`carry_out`].
+struct Carry {
+    /// `None` rebases the head onto the base without merging.
+    how: Option<MergeMethod>,
+    message: Option<String>,
+    head: String,
+    base: String,
+    /// The pull request the merge marks merged.
+    number: Option<u32>,
+    base_before: Oid,
+}
+
+/// Merges or rebases as `carry` says with `git`, in the main working tree,
+/// and saves the pull request, if any, as merged. Blocks; run it on a
+/// background thread.
+fn carry_out(
+    repository: &Repository,
+    store: &Store,
+    git: &Git,
+    carry: Carry,
+) -> anyhow::Result<(Done, Option<Recorded>)> {
+    let Carry {
+        how,
+        message,
+        head,
+        base,
+        number,
+        base_before,
+    } = carry;
+    let return_to = match repository.refs()?.head {
+        Some(Head::Branch { name, .. }) => Some(name),
+        _ => None,
+    };
+    // A branch checked out in a linked worktree, such as an agent thread's,
+    // can be rebased only there: git refuses to check it out here.
+    let head_worktree = match repository.linked_worktree_of(&head)? {
+        Some(dir) if dir.exists() => Some(Git::new(dir)),
+        Some(_) => {
+            // Its folder was deleted: git holds the branch for it until
+            // pruned.
+            git.worktree_prune()?;
+            None
+        }
+        None => None,
+    };
+    let recorder = Recorder::start(git.work_dir());
+    let (Some(how), Some(message)) = (how, message) else {
+        match &head_worktree {
+            Some(worktree) => worktree.rebase_onto(&base)?,
+            None => git.rebase_branch(&head, &base, return_to.as_deref())?,
+        }
+        return Ok((Done::Rebased, recorder.finish(ResetMode::Keep)));
+    };
+    let how = match (how, &head_worktree) {
+        (MergeMethod::Rebase, Some(worktree)) => {
+            worktree.rebase_onto(&base)?;
+            MergeMethod::FastForward
+        }
+        (how, _) => how,
+    };
+    match git.merge_branch(&head, &base, how, &message, return_to.as_deref())? {
+        MergeOutcome::Merged => {
+            let merged = number
+                .map(|number| record_merge(repository, store, number, base_before))
+                .transpose()?;
+            let mut recorded = recorder.finish(ResetMode::Keep);
+            let pull_request = merged.map(|(pull_request, review)| {
+                recorded = recorded.take().map(|recorded| recorded.with_review(review));
+                Box::new(pull_request)
+            });
+            Ok((Done::Merged(pull_request), recorded))
+        }
+        // Recorded once the merge is committed.
+        MergeOutcome::Conflicts => Ok((Done::Stopped, None)),
+    }
+}
+
 /// Pull request `number` saved as merged into its base, which was on
 /// `base_before` until then, with what undoing that puts back. Its threads
 /// follow the head if a rebase moved it. Blocks; run it on a background
@@ -734,10 +797,173 @@ fn count(n: usize, one: &str, many: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use gitez_command::MergeMethod;
-    use gitez_git::Oid;
+    use std::path::Path;
 
-    use super::{MergedPullRequest, Merging, message};
+    use gitez_command::{Git, MergeMethod};
+    use gitez_git::{Oid, Repository};
+    use gitez_review::{NewPullRequest, State, Store, Timestamp, Tip};
+
+    use super::{Carry, Done, MergedPullRequest, Merging, carry_out, message};
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git runs");
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+        String::from_utf8(output.stdout)
+            .expect("utf-8")
+            .trim()
+            .to_owned()
+    }
+
+    /// A repository with `main` and `agent/fix` checked out in a linked
+    /// worktree, each a commit past where they split, and an open pull
+    /// request of `agent/fix` into `main`.
+    fn thread_repository(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf, u32) {
+        let main = dir.join("repo");
+        std::fs::create_dir_all(&main).expect("folder");
+        git(&main, &["init", "-q", "-b", "main"]);
+        for (key, value) in [
+            ("user.name", "Ada Lovelace"),
+            ("user.email", "ada@example.com"),
+            ("commit.gpgsign", "false"),
+            ("core.hooksPath", "/dev/null"),
+        ] {
+            git(&main, &["config", key, value]);
+        }
+        std::fs::write(main.join("a.txt"), "a\n").expect("write");
+        git(&main, &["add", "."]);
+        git(&main, &["commit", "-qm", "First"]);
+        let start = git(&main, &["rev-parse", "HEAD"]);
+        let worktree = dir.join("worktree");
+        git(&main, &["branch", "agent/fix"]);
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                worktree.to_str().expect("utf-8"),
+                "agent/fix",
+            ],
+        );
+        std::fs::write(worktree.join("b.txt"), "b\n").expect("write");
+        git(&worktree, &["add", "."]);
+        git(&worktree, &["commit", "-qm", "The agent's"]);
+        let head = git(&worktree, &["rev-parse", "HEAD"]);
+        std::fs::write(main.join("c.txt"), "c\n").expect("write");
+        git(&main, &["add", "."]);
+        git(&main, &["commit", "-qm", "Meanwhile on main"]);
+        let common_dir = Repository::open(&main).expect("open").common_dir();
+        let pull_request = Store::new(&common_dir)
+            .create(
+                NewPullRequest {
+                    title: "Fix it".into(),
+                    description: String::new(),
+                    base: Tip {
+                        branch: "main".into(),
+                        commit: start,
+                    },
+                    head: Tip {
+                        branch: "agent/fix".into(),
+                        commit: head,
+                    },
+                },
+                Timestamp::now(),
+            )
+            .expect("pull request");
+        (main, worktree, pull_request.number)
+    }
+
+    fn carry(main: &Path, how: Option<MergeMethod>, number: u32) -> Carry {
+        let base_before = Repository::open(main)
+            .expect("open")
+            .resolve_commit("refs/heads/main")
+            .expect("resolve")
+            .expect("main");
+        Carry {
+            how,
+            message: how.map(|_| String::new()),
+            head: "agent/fix".into(),
+            base: "main".into(),
+            number: Some(number),
+            base_before,
+        }
+    }
+
+    /// Rebasing a branch checked out in a linked worktree (an agent
+    /// thread's) happens in that worktree; git refuses it anywhere else.
+    #[test]
+    fn a_branch_of_a_linked_worktree_is_rebased_there_and_merged() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (main, worktree, number) = thread_repository(dir.path());
+        let repository = Repository::open(&main).expect("open");
+        assert_eq!(
+            repository
+                .linked_worktree_of("agent/fix")
+                .expect("read")
+                .map(|dir| dir.canonicalize().expect("canonical")),
+            Some(worktree.canonicalize().expect("canonical"))
+        );
+        let store = Store::new(&repository.common_dir());
+        let (done, _) = carry_out(
+            &repository,
+            &store,
+            &Git::new(&main),
+            carry(&main, Some(MergeMethod::Rebase), number),
+        )
+        .expect("rebased and merged");
+        assert!(matches!(done, Done::Merged(Some(_))));
+        assert_eq!(store.load(number).expect("load").state, State::Merged);
+        // main moved to the rebased branch, which the worktree still has.
+        let tip = git(&main, &["rev-parse", "main"]);
+        assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), tip);
+        assert_eq!(git(&main, &["rev-parse", "agent/fix"]), tip);
+        assert_eq!(git(&main, &["log", "--format=%s", "-3"]).lines().count(), 3);
+        assert_eq!(git(&main, &["branch", "--show-current"]), "main");
+        assert_eq!(git(&worktree, &["status", "--porcelain"]), "");
+    }
+
+    /// Rebasing alone (a branch dropped on another) too; and a worktree
+    /// whose folder was deleted no longer holds its branch.
+    #[test]
+    fn a_branch_of_a_deleted_worktree_is_rebased_here() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (main, worktree, number) = thread_repository(dir.path());
+        let repository = Repository::open(&main).expect("open");
+        let store = Store::new(&repository.common_dir());
+        carry_out(
+            &repository,
+            &store,
+            &Git::new(&main),
+            carry(&main, None, number),
+        )
+        .expect("rebased in the worktree");
+        let main_tip = git(&main, &["rev-parse", "main"]);
+        assert_eq!(git(&worktree, &["rev-parse", "HEAD~1"]), main_tip);
+
+        std::fs::remove_dir_all(&worktree).expect("delete the worktree");
+        std::fs::write(main.join("d.txt"), "d\n").expect("write");
+        git(&main, &["add", "."]);
+        git(&main, &["commit", "-qm", "More on main"]);
+        let (done, _) = carry_out(
+            &repository,
+            &store,
+            &Git::new(&main),
+            carry(&main, Some(MergeMethod::Rebase), number),
+        )
+        .expect("rebased here and merged");
+        assert!(matches!(done, Done::Merged(Some(_))));
+        assert_eq!(
+            repository.linked_worktree_of("agent/fix").expect("read"),
+            None
+        );
+        assert_eq!(git(&main, &["branch", "--show-current"]), "main");
+    }
 
     fn merging(description: &str) -> Merging {
         Merging {

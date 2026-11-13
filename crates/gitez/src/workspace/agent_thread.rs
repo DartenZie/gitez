@@ -66,6 +66,8 @@ struct RunEvents {
 struct Details {
     user_name: Option<String>,
     pull_request: Option<BranchStats>,
+    /// Whether the thread's pull request is open, merged or closed.
+    pull_request_state: Option<gitez_review::State>,
 }
 
 struct BranchStats {
@@ -343,18 +345,24 @@ impl ThreadView {
             .repository(&self.key.common_dir)
             .map(|repository| repository.work_dir.clone());
         let (base, branch) = (thread.start.commit.clone(), thread.branch.clone());
-        let with_branch = thread.pull_request.is_some();
+        let number = thread.pull_request;
+        let common_dir = self.key.common_dir.clone();
         let read = cx.background_executor().spawn(async move {
             let Some(repository) = work_dir.and_then(|dir| gitez_git::Repository::open(dir).ok())
             else {
                 return Details::default();
             };
-            let pull_request = with_branch
-                .then(|| branch_stats(&repository, &base, &branch))
-                .flatten();
+            let pull_request = number.and_then(|_| branch_stats(&repository, &base, &branch));
+            let pull_request_state = number.and_then(|number| {
+                gitez_review::Store::new(&common_dir)
+                    .load(number)
+                    .ok()
+                    .map(|pull_request| pull_request.state)
+            });
             Details {
                 user_name: repository.user_name(),
                 pull_request,
+                pull_request_state,
             }
         });
         self._details_task = Some(cx.spawn(async move |this, cx| {
@@ -666,7 +674,7 @@ fn cost(thread: &AgentThread) -> Option<f64> {
 
 /// "14 min · 31 steps · $0.92" while active; "Finished 1 h ago · 26 min run
 /// · $1.84" after.
-fn summary(thread: &AgentThread, now: Timestamp) -> String {
+pub fn summary(thread: &AgentThread, now: Timestamp) -> String {
     let run = duration(thread.run_time(now).as_secs());
     let cost = cost(thread).map(|cost| format!("${cost:.2}"));
     let steps = match thread.steps() {
@@ -1101,10 +1109,28 @@ impl ThreadView {
                 )
         });
         let common_dir = self.key.common_dir.clone();
+        let completed = thread.state == State::Completed;
+        // How the pull request ended, once read, for a completed thread.
+        let note = match (completed, self.details.pull_request_state) {
+            (false, _) => "Review comments go back to this thread and run in its worktree.".into(),
+            (true, Some(gitez_review::State::Merged)) => format!(
+                "Merged into {}. The thread is completed and its worktree removed.",
+                thread.start.branch
+            ),
+            (true, Some(gitez_review::State::Closed)) => {
+                "Closed without merging. The thread is completed and its worktree removed.".into()
+            }
+            (true, Some(gitez_review::State::Open)) => {
+                "Reopened after the thread was completed; it is reviewed like any other pull \
+                 request."
+                    .into()
+            }
+            (true, None) => "The thread is completed and its worktree removed.".into(),
+        };
         let button = Button::new("thread-open-pull-request")
             .h(px(34.))
             .px(px(14.))
-            .primary()
+            .when(!completed, |this| this.primary())
             .when(!self.wide, |this| this.w_full())
             .label(label)
             .icon(Icon::new(IconName::ArrowRight).size(px(14.)))
@@ -1174,12 +1200,10 @@ impl ThreadView {
                             .text_size(px(12.))
                             .line_height(relative(1.5))
                             .text_color(rgb(color::TEXT_MUTED))
-                            .child(
-                                "Review comments go back to this thread and run in its worktree.",
-                            ),
+                            .child(note),
                     ),
             )
-            .when(thread.state != State::Completed, |this| this.child(button))
+            .child(button)
     }
 
     fn render_prompt(&self, thread: &AgentThread) -> Option<Div> {

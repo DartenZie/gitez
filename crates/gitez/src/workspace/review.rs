@@ -486,6 +486,7 @@ impl Review {
         }));
         let mut review = Self::with_subject(repository, subject, load, cx);
         review.find_run(cx);
+        review.follow_agent_thread(cx);
         review
     }
 
@@ -2096,6 +2097,12 @@ impl Review {
         .filter(|(missing, _)| *missing)
         .map(|(_, name)| format!("{name} no longer exists"))
         .collect::<Vec<_>>();
+        // A pull request an agent thread created: the thread's worktree has
+        // the head branch.
+        let thread = self.agent_thread_for_pull_request(cx);
+        let thread_working = thread
+            .as_ref()
+            .is_some_and(|thread| thread.state.is_active());
         div()
             .h_flex()
             .items_start()
@@ -2200,8 +2207,14 @@ impl Review {
                                 "Checkout branch"
                             })
                             .loading(subject.checking_out.is_some())
+                            // Git keeps a branch checked out in one worktree
+                            // at a time: the thread's has it.
+                            .when(thread.is_some(), |this| {
+                                this.tooltip("Checked out in the thread’s worktree")
+                            })
                             .disabled(
                                 subject.tips.checked_out
+                                    || thread.is_some()
                                     || subject.tips.head.is_none()
                                     || self.repository.work_dir().is_none(),
                             )
@@ -2213,8 +2226,13 @@ impl Review {
                         Button::new("pull-request-merge")
                             .h(px(30.))
                             .label(format!("Merge into {}…", pull_request.base.branch))
+                            // Its commits would land after the merge.
+                            .when(thread_working, |this| {
+                                this.tooltip("The agent is still working on this branch")
+                            })
                             .disabled(
                                 pull_request.state != State::Open
+                                    || thread_working
                                     || subject.tips.head.is_none()
                                     || subject.tips.base.is_none()
                                     || self.repository.work_dir().is_none(),
