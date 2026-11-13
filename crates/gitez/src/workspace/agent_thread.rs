@@ -183,8 +183,11 @@ impl ThreadView {
             if self.activity_shown(&thread) {
                 self.read_transcripts(cx);
             }
-            // Commits land when a turn ends; nothing to read meanwhile.
-            if !thread.state.is_active() && self.details_read != Some(thread.updated) {
+            // The user's name is needed at once; commits land when a turn
+            // ends, so there is nothing new to read while one runs.
+            if self.details_read.is_none()
+                || (!thread.state.is_active() && self.details_read != Some(thread.updated))
+            {
                 self.read_details(&thread, cx);
             }
         }
@@ -675,11 +678,11 @@ fn agent_mark(agent: &str) -> Div {
         .child(mark)
 }
 
-/// A branch name in its colour.
+/// A branch name in its colour; cut with an ellipsis where space is short.
 fn branch_chip(name: &str, small: bool) -> Div {
     let branch_color = theme::branch_color(name);
     div()
-        .flex_none()
+        .flex_shrink(1.)
         .min_w_0()
         .overflow_hidden()
         .text_ellipsis()
@@ -693,6 +696,13 @@ fn branch_chip(name: &str, small: bool) -> Div {
         .font_weight(FontWeight::MEDIUM)
         .line_height(px(if small { 18. } else { 20. }))
         .child(name.to_owned())
+}
+
+/// A keycap on an amber button: dark, as the button's label.
+fn on_accent(key_cap: Div) -> Div {
+    key_cap
+        .border_color(theme::with_alpha(color::ON_ACCENT, 0.4))
+        .text_color(rgb(color::ON_ACCENT))
 }
 
 /// The heading over a message: who wrote it, and what it is.
@@ -732,8 +742,35 @@ impl ThreadView {
         let active = thread.state.is_active();
         let can_complete = thread.state == State::Finished && thread.pull_request.is_none();
         let has_transcript = self.newest_run(thread).is_some();
-        let summary = summary(thread, Timestamp::now());
-        div()
+        let summary = div()
+            .min_w_0()
+            .text_size(px(12.))
+            .text_color(rgb(color::TEXT_MUTED))
+            .child(summary(thread, Timestamp::now()));
+        let (inline, below) = if self.wide {
+            (Some(summary), None)
+        } else {
+            (None, Some(summary))
+        };
+        // The detail panel is too narrow for the summary and the buttons on
+        // one line: the summary goes under it, and the transcript button
+        // shows only its icon.
+        let transcript = Button::new("thread-transcript")
+            .ghost()
+            .h(px(28.))
+            .compact()
+            .text_color(rgb(color::TEXT_SECONDARY))
+            .on_click(cx.listener(|this, _, _, cx| this.open_transcript(cx)));
+        let transcript = if self.wide {
+            transcript
+                .label("Open transcript")
+                .tooltip("Show the agent's transcript in Finder")
+        } else {
+            transcript
+                .icon(Icon::new(IconName::File).size(px(13.)))
+                .tooltip("Open transcript: show it in Finder")
+        };
+        let row = div()
             .h_flex()
             .flex_wrap()
             .gap(px(8.))
@@ -745,17 +782,12 @@ impl ThreadView {
                     .child(agent_name),
             )
             .child(state_chip(thread))
-            .child(
-                div()
-                    .min_w_0()
-                    .text_color(rgb(color::TEXT_MUTED))
-                    .child(summary),
-            )
+            .children(inline)
             .child(
                 div()
                     .h_flex()
                     .ml_auto()
-                    .gap(px(6.))
+                    .gap(px(4.))
                     .when(active, |this| {
                         let label = if thread.state == State::Queued {
                             "Cancel"
@@ -789,18 +821,9 @@ impl ThreadView {
                                 ),
                         )
                     })
-                    .when(has_transcript, |this| {
-                        this.child(
-                            Button::new("thread-transcript")
-                                .h(px(28.))
-                                .compact()
-                                .label("Open transcript")
-                                .text_color(rgb(color::TEXT_SECONDARY))
-                                .tooltip("Show the agent's transcript in Finder")
-                                .on_click(cx.listener(|this, _, _, cx| this.open_transcript(cx))),
-                        )
-                    }),
-            )
+                    .when(has_transcript, |this| this.child(transcript)),
+            );
+        div().v_flex().gap(px(4.)).child(row).children(below)
     }
 
     fn render_facts(&self, thread: &AgentThread, cx: &mut Context<Self>) -> Div {
@@ -823,14 +846,16 @@ impl ThreadView {
         };
         let short_sha: String = thread.start.commit.chars().take(7).collect();
         let from = |this: Div| {
-            this.child(branch_chip(&thread.start.branch, false)).child(
-                div()
-                    .flex_none()
-                    .font_family(mono.clone())
-                    .text_size(px(11.))
-                    .text_color(rgb(color::TEXT_MUTED))
-                    .child(short_sha.clone()),
-            )
+            // The base branch is short as a rule; the thread's own gives way.
+            this.child(branch_chip(&thread.start.branch, false).flex_none())
+                .child(
+                    div()
+                        .flex_none()
+                        .font_family(mono.clone())
+                        .text_size(px(11.))
+                        .text_color(rgb(color::TEXT_MUTED))
+                        .child(short_sha.clone()),
+                )
         };
         let mut rows = div().v_flex().gap(px(8.));
         if self.wide
@@ -886,7 +911,12 @@ impl ThreadView {
                         .gap(px(6.))
                         .min_w_0()
                         .child(branch_chip(&thread.branch, false))
-                        .child(div().text_color(rgb(color::TEXT_MUTED)).child("from")),
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_color(rgb(color::TEXT_MUTED))
+                                .child("from"),
+                        ),
                 )
                 .into_any_element(),
             ));
@@ -941,8 +971,9 @@ impl ThreadView {
             .gap_x(px(14.))
             .gap_y(px(6.))
             .py(px(10.))
+            // In the panel, the section above draws the line over it.
             .when(!self.wide, |this| this.px(px(18.)))
-            .border_t_1()
+            .when(self.wide, |this| this.border_t_1())
             .border_b_1()
             .border_color(rgb(color::ROW_DIVIDER))
             .text_size(px(12.))
@@ -1033,7 +1064,8 @@ impl ThreadView {
         let button = Button::new("thread-open-pull-request")
             .h(px(34.))
             .px(px(14.))
-            .when(!self.wide, |this| this.primary().w_full())
+            .primary()
+            .when(!self.wide, |this| this.w_full())
             .label(label)
             .icon(Icon::new(IconName::ArrowRight).size(px(14.)))
             .on_click(cx.listener(move |_, _, _, cx| {
@@ -1074,7 +1106,13 @@ impl ThreadView {
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child(format!("Local pull request #{number}")),
                             )
-                            .child(div().ml_auto().child(state_chip(thread))),
+                            // In the panel the chip goes to the right edge;
+                            // wide, it follows the title.
+                            .child(
+                                div()
+                                    .when(!self.wide, |this| this.ml_auto())
+                                    .child(state_chip(thread)),
+                            ),
                     )
                     .child(
                         div()
@@ -1231,6 +1269,7 @@ impl ThreadView {
     ) -> AnyElement {
         let mono = cx.theme().mono_font_family.clone();
         match row {
+            // Agents write Markdown: `code` and **bold** in their steps too.
             Row::Text(text) => div()
                 .pl(px(60.))
                 .pr(px(12.))
@@ -1238,7 +1277,10 @@ impl ThreadView {
                 .text_size(px(12.5))
                 .line_height(relative(1.5))
                 .text_color(rgb(color::TEXT_SECONDARY))
-                .child(text.to_owned())
+                .child(TextView::markdown(
+                    SharedString::from(format!("thread-step-{index}")),
+                    text.to_owned(),
+                ))
                 .into_any_element(),
             Row::Tool {
                 name,
@@ -1554,17 +1596,33 @@ impl ThreadView {
         }
         let busy = self.busy.as_ref().map(|(busy, _)| *busy);
         let empty = self.reply.read(cx).value().trim().is_empty();
-        let continues = match thread.pull_request {
-            Some(number) => div()
-                .child("Continues on ")
-                .child(
-                    div()
-                        .text_color(rgb(theme::branch_color(&thread.branch)))
-                        .child(thread.branch.clone()),
+        let (continues, highlight) = match thread.pull_request {
+            Some(number) => {
+                let prefix = "Continues on ";
+                let branch = prefix.len()..prefix.len() + thread.branch.len();
+                let style = HighlightStyle {
+                    color: Some(rgb(theme::branch_color(&thread.branch)).into()),
+                    ..HighlightStyle::default()
+                };
+                (
+                    format!(
+                        "{prefix}{} · new commits update PR #{number}",
+                        thread.branch
+                    ),
+                    Some((branch, style)),
                 )
-                .child(format!(" · new commits update PR #{number}")),
-            None => div().child("Continues in this thread’s worktree"),
+            }
+            None => ("Continues in this thread’s worktree".to_owned(), None),
         };
+        let continues = div()
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_ellipsis()
+            .text_size(px(11.5))
+            .text_color(rgb(color::TEXT_MUTED))
+            .child(StyledText::new(continues).with_highlights(highlight));
         Some(
             footer.child(
                 inner.child(
@@ -1591,36 +1649,27 @@ impl ThreadView {
                                 .disabled(busy.is_some()),
                         )
                         .child(
-                            div()
-                                .h_flex()
-                                .gap(px(10.))
-                                .child(
-                                    continues
-                                        .h_flex()
-                                        .flex_wrap()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .text_size(px(11.5))
-                                        .text_color(rgb(color::TEXT_MUTED)),
-                                )
-                                .child(
-                                    Button::new("thread-send")
-                                        .primary()
-                                        .h(px(28.))
-                                        .label("Send")
-                                        .child(
-                                            div()
-                                                .h_flex()
-                                                .gap(px(2.))
-                                                .child(labels::key_cap(labels::SECONDARY_KEY, cx))
-                                                .child(labels::key_cap("↵", cx)),
-                                        )
-                                        .loading(busy == Some(Busy::Replying))
-                                        .disabled(empty || busy.is_some())
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.send_reply(window, cx)
-                                        })),
-                                ),
+                            div().h_flex().gap(px(10.)).child(continues).child(
+                                Button::new("thread-send")
+                                    .primary()
+                                    .h(px(28.))
+                                    .label("Send")
+                                    .child(
+                                        div()
+                                            .h_flex()
+                                            .gap(px(2.))
+                                            .child(on_accent(labels::key_cap(
+                                                labels::SECONDARY_KEY,
+                                                cx,
+                                            )))
+                                            .child(on_accent(labels::key_cap("↵", cx))),
+                                    )
+                                    .loading(busy == Some(Busy::Replying))
+                                    .disabled(empty || busy.is_some())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.send_reply(window, cx)
+                                    })),
+                            ),
                         ),
                 ),
             ),
@@ -1703,10 +1752,11 @@ impl Render for ThreadView {
                 .child(strip)
                 .child(body)
         } else {
+            // Sections divided by lines, as in the board: no gaps between
+            // them.
             div()
                 .v_flex()
                 .pb(px(24.))
-                .gap(px(16.))
                 .child(
                     div()
                         .px(px(18.))
@@ -1717,10 +1767,17 @@ impl Render for ThreadView {
                         .child(header),
                 )
                 .when_some(pull_request, |this, card| {
-                    this.child(div().px(px(18.)).child(card))
+                    this.child(
+                        div()
+                            .px(px(18.))
+                            .py(px(14.))
+                            .border_b_1()
+                            .border_color(rgb(color::ROW_DIVIDER))
+                            .child(card),
+                    )
                 })
                 .child(strip)
-                .child(body)
+                .child(body.pt(px(16.)))
         };
         let footer = self.render_footer(&thread, cx);
         pane.child(
@@ -1771,6 +1828,22 @@ mod tests {
     fn repository_with_thread(
         finish: impl FnOnce(&mut AgentThread),
     ) -> (tempfile::TempDir, PathBuf, AgentThreadId) {
+        repository_with(
+            "Explain the layout",
+            &[
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"a.txt"}}]}}"#,
+            ],
+            finish,
+        )
+    }
+
+    /// [`repository_with_thread`] with the thread's `prompt` and the lines of
+    /// its transcript.
+    fn repository_with(
+        prompt: &str,
+        transcript: &[&str],
+        finish: impl FnOnce(&mut AgentThread),
+    ) -> (tempfile::TempDir, PathBuf, AgentThreadId) {
         let dir = tempfile::tempdir().expect("temp dir");
         let work_dir = dir.path().join("repo");
         std::fs::create_dir(&work_dir).expect("mkdir");
@@ -1791,7 +1864,7 @@ mod tests {
         let thread = store
             .create(
                 NewAgentThread {
-                    prompt: "Explain the layout".into(),
+                    prompt: prompt.into(),
                     agent: gitez_agent::ClaudeCode::ID.into(),
                     model: None,
                     start: Start {
@@ -1813,7 +1886,7 @@ mod tests {
                 RunHeader {
                     started: at,
                     agent: gitez_agent::ClaudeCode::ID.into(),
-                    prompt: "Explain the layout".into(),
+                    prompt: prompt.into(),
                     kind: TurnKind::Start,
                     session_id: None,
                     resume: false,
@@ -1822,10 +1895,9 @@ mod tests {
                 },
             )
             .expect("run");
-        run.append(
-            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"a.txt"}}]}}"#,
-        )
-        .expect("append");
+        for line in transcript {
+            run.append(line).expect("append");
+        }
         let transcript = run.file_name();
         store
             .update(&thread.id, |thread| {
@@ -1948,6 +2020,220 @@ mod tests {
                     ..
                 })
             ));
+        });
+    }
+
+    /// Stream-JSON lines of a transcript: `("text", words)` for what the
+    /// agent wrote, `("fail", why)` for a tool that failed, and
+    /// `(tool, detail)` for a tool use.
+    fn transcript(steps: &[(&str, &str)]) -> Vec<String> {
+        steps
+            .iter()
+            .map(|(kind, value)| {
+                let block = match *kind {
+                    "text" => serde_json::json!({"type": "text", "text": value}),
+                    "fail" => {
+                        let result = serde_json::json!({"type": "tool_result", "is_error": true, "content": value});
+                        return serde_json::json!({"type": "user", "message": {"content": [result]}})
+                            .to_string();
+                    }
+                    tool => serde_json::json!({"type": "tool_use", "name": tool, "input": {"command": value}}),
+                };
+                serde_json::json!({"type": "assistant", "message": {"content": [block]}}).to_string()
+            })
+            .collect()
+    }
+
+    const PROMPT: &str = "Add a blame view to the commit detail: clicking a file in a commit \
+        shows who last changed each line, with the commit summary on hover. Reuse the diff \
+        virtual list. Add tests in gitez-git.";
+
+    const STEPS: &[(&str, &str)] = &[
+        (
+            "text",
+            "I’ll add a `blame` module to gitez-git first, then the view.",
+        ),
+        ("Read", "crates/gitez-git/src/diff.rs"),
+        ("Grep", "VirtualList"),
+        ("Read", "crates/gitez-git/src/lib.rs"),
+        ("Read", "crates/gitez/src/workspace/detail.rs"),
+        ("Write", "crates/gitez-git/src/blame.rs"),
+        ("Bash", "cargo check -p gitez-git"),
+        (
+            "fail",
+            "error[E0425]: cannot find value `line` in this scope\n  --> blame.rs:41",
+        ),
+        (
+            "text",
+            "The virtual list from the diff view fits; wiring it into the commit detail.",
+        ),
+        ("Edit", "crates/gitez/src/workspace/detail.rs"),
+        (
+            "Bash",
+            "cargo test -p gitez-git blame -- --nocapture --test-threads=1 2>&1 | tail -n 40",
+        ),
+    ];
+
+    const ANSWER: &str = "Done, in two commits on the thread's branch.\n\n\
+        - `blame.rs` reads who last changed each line with gix, in the background.\n\
+        - The commit detail shows it in the diff's virtual list; hovering a line shows the \
+        commit summary.\n\n\
+        The tests in `tests/blame.rs` cover renames and a file added in the first commit.";
+
+    /// Shoots the main window with the thread `finish` leaves open in the
+    /// detail panel, whole and the panel alone.
+    fn shoot(name: &str, pull_request: bool, finish: impl FnOnce(&mut AgentThread)) {
+        if !crate::screenshot::enabled() {
+            return;
+        }
+        let lines = transcript(STEPS);
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let (dir, common_dir, id) = repository_with(PROMPT, &lines, finish);
+        let work_dir = dir.path().join("repo");
+        git(&work_dir, &["config", "user.name", "Ada Lovelace"]);
+        if pull_request {
+            git(&work_dir, &["checkout", "-qb", &id.branch()]);
+            for (file, message) in [
+                ("blame.rs", "Read who last changed each line"),
+                ("detail.rs", "Show blame in the commit detail"),
+            ] {
+                std::fs::write(work_dir.join(file), "fn blame() {}\n".repeat(20)).expect("write");
+                git(&work_dir, &["add", "."]);
+                git(&work_dir, &["commit", "-qm", message]);
+            }
+            git(&work_dir, &["checkout", "-q", "main"]);
+        }
+        let store = Store::new(&common_dir);
+        let thread = store.load(&id).expect("the thread is read");
+        if thread.state != State::Completed {
+            std::fs::create_dir_all(&thread.worktree).expect("worktree folder");
+        }
+        let mut shots =
+            crate::screenshot::Shots::from_env(&dir.path().join("data")).expect("enabled");
+        let (window, _) = shots.open_workspace(&work_dir);
+        shots.dispatch(
+            window,
+            crate::agent_threads::OpenAgentThread {
+                common_dir: common_dir.clone(),
+                id: id.clone(),
+            },
+        );
+        shots.save(window, &format!("thread-{name}"));
+        // The detail panel, at its default width, in full resolution.
+        let panel = gpui_kit::Bounds {
+            origin: gpui_kit::point(px(1080.), px(48.)),
+            size: size(px(360.), px(824.)),
+        };
+        shots.save_region(window, panel, &format!("thread-{name}-panel"));
+        if name == "pull-request" {
+            // Type a reply, open the activity and scroll to the end.
+            shots.click(window, gpui_kit::point(px(1200.), px(781.)));
+            shots.type_text(window, "Also cover a file renamed twice.");
+            shots.click(window, gpui_kit::point(px(1200.), px(713.)));
+            shots.scroll(window, gpui_kit::point(px(1260.), px(400.)), 40.);
+            shots.save_region(window, panel, "thread-pull-request-activity-panel");
+            // The wide layout Home will use (`C-6-Thread`).
+            let key = AgentThreadKey {
+                common_dir: common_dir.clone(),
+                id: thread.id.clone(),
+            };
+            let (wide, _) = shots.open(crate::screenshot::window_size(), |window, cx| {
+                gpui_kit::AppContext::new(cx, |cx| ThreadView::new(key, true, window, cx))
+            });
+            shots.save(wide, "thread-pull-request-wide");
+        }
+    }
+
+    fn minutes_ago(minutes: i64) -> Timestamp {
+        Timestamp::now() - jiff::SignedDuration::from_mins(minutes)
+    }
+
+    #[test]
+    fn screenshot_thread_running() {
+        shoot("running", false, |thread| {
+            thread.state = State::Running;
+            thread.ending = None;
+            thread.session_id = Some("session".into());
+            thread.secrets = vec!["GITHUB_TOKEN".into(), "SENTRY_DSN".into()];
+            thread.network = NetworkProfile::Packages;
+            let turn = &mut thread.turns[0];
+            turn.started = Some(minutes_ago(14));
+            turn.ended = None;
+            thread.activity = Some(gitez_agent_thread::Activity {
+                tool: Some("Bash".into()),
+                detail: "cargo test -p gitez-git blame".into(),
+                steps: 9,
+                updated: Timestamp::now(),
+            });
+        });
+    }
+
+    #[test]
+    fn screenshot_thread_pull_request() {
+        shoot("pull-request", true, |thread| {
+            thread.state = State::Finished;
+            thread.ending = Some(Ending::PullRequest);
+            thread.pull_request = Some(12);
+            thread.session_id = Some("session".into());
+            thread.secrets = vec!["GITHUB_TOKEN".into()];
+            let turn = &mut thread.turns[0];
+            turn.started = Some(minutes_ago(86));
+            turn.ended = Some(minutes_ago(60));
+            let mut done = result(ANSWER, true);
+            done.steps = 9;
+            done.cost_usd = Some(1.84);
+            turn.result = Some(done);
+        });
+    }
+
+    #[test]
+    fn screenshot_thread_answer() {
+        shoot("answer", false, |thread| {
+            thread.state = State::Finished;
+            thread.ending = Some(Ending::Answer);
+            thread.session_id = Some("session".into());
+            let turn = &mut thread.turns[0];
+            turn.started = Some(minutes_ago(30));
+            turn.ended = Some(minutes_ago(27));
+            let mut done = result(ANSWER, true);
+            done.steps = 9;
+            turn.result = Some(done);
+        });
+    }
+
+    #[test]
+    fn screenshot_thread_failed() {
+        shoot("failed", false, |thread| {
+            let turn = &mut thread.turns[0];
+            turn.started = Some(minutes_ago(12));
+            turn.ended = None;
+            thread.fail(
+                Step::Agent,
+                "Claude Code exited with code 1: API Error: 529 Overloaded. The sandbox \
+                 refused a request to registry.npmjs.org.",
+                minutes_ago(5),
+            );
+            let mut failed = result("", false);
+            failed.steps = 9;
+            failed.exit_code = Some(1);
+            failed.blocked_hosts = vec!["registry.npmjs.org".into()];
+            thread.turns[0].result = Some(failed);
+        });
+    }
+
+    #[test]
+    fn screenshot_thread_completed() {
+        shoot("completed", false, |thread| {
+            thread.state = State::Completed;
+            thread.ending = Some(Ending::Answer);
+            thread.session_id = Some("session".into());
+            thread.completed = Some(Timestamp::now());
+            let turn = &mut thread.turns[0];
+            turn.started = Some(minutes_ago(60 * 26));
+            turn.ended = Some(minutes_ago(60 * 26 - 3));
+            let mut done = result(ANSWER, true);
+            done.steps = 9;
+            turn.result = Some(done);
         });
     }
 

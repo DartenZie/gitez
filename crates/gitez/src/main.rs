@@ -12,6 +12,9 @@ mod menus;
 mod project_icon;
 mod recent;
 mod repository;
+// Screenshots of real views for agents; see the module.
+#[cfg(all(test, target_os = "macos"))]
+mod screenshot;
 mod shell_path;
 mod theme;
 mod time;

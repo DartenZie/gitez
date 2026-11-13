@@ -44,5 +44,12 @@ serde_json.workspace = true
 gpui-kit = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 
+# Screenshot tests (`src/screenshot.rs`): Core Text for real fonts, and PNG
+# output. Both are already built for gpui-kit; keep `gpui-pre-apple` at the
+# `gpui-pre` version gpui-kit pins (see CLAUDE.md, "Updating GPUI").
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+gpui-pre-apple = { version = "=0.3.9", features = ["font-kit"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
 [lints]
 workspace = true

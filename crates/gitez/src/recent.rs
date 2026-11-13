@@ -60,6 +60,17 @@ pub fn init(cx: &mut App) {
     });
 }
 
+/// An empty list that is never saved, for tests that open a window
+/// without touching the user's data folder.
+#[cfg(test)]
+pub fn init_in_memory(cx: &mut App) {
+    cx.set_global(Recent {
+        file: None,
+        data: File::default(),
+        saving: None,
+    });
+}
+
 /// The repository to open at start, if the last one is still there.
 pub fn last(cx: &App) -> Option<PathBuf> {
     cx.global::<Recent>()

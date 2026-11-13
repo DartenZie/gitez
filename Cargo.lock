@@ -2259,6 +2259,8 @@ dependencies = [
  "gitez-settings",
  "gitez-supervisor",
  "gpui-kit",
+ "gpui-pre-apple",
+ "image",
  "jiff",
  "notify",
  "serde",
