@@ -71,7 +71,8 @@ use history::{
     AskAgent, BranchDropped, CherryPickRequested, History, LaneSelected, PickedChanged, Selection,
     SelectionChanged, StartRequested,
 };
-use home::{Home, HomeEvent, NewThread};
+pub use home::NewThread;
+use home::{Home, HomeEvent};
 use new_pull_request::{FormEvent, NewPullRequestForm};
 use palette::{Palette, PaletteCommand, PaletteContext, PaletteEvent};
 use remote::{RemoteActions, RemoteOp};
@@ -631,8 +632,14 @@ impl Workspace {
         self.history
             .update(cx, |history, cx| history.load(&snapshot, cx));
         // A new composer: nothing typed for another repository carries over.
-        let composer =
-            composer_mode(&snapshot).map(|mode| cx.new(|cx| Composer::new(mode, window, cx)));
+        let changed = self.status.as_ref().map(|status| status.files.len());
+        let composer = composer_mode(&snapshot).map(|mode| {
+            cx.new(|cx| {
+                let mut composer = Composer::new(mode, window, cx);
+                composer.set_uncommitted(changed, cx);
+                composer
+            })
+        });
         self.history
             .update(cx, |history, cx| history.set_composer(composer, window, cx));
         if let Some(error) = &snapshot.pull_requests_error {
@@ -836,6 +843,9 @@ impl Workspace {
         }
         self.status = status.clone();
         let changed = status.as_ref().map(|status| status.files.len());
+        if let Some(composer) = self.history.read(cx).composer().cloned() {
+            composer.update(cx, |composer, cx| composer.set_uncommitted(changed, cx));
+        }
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.set_changed_files(changed, cx));
         self.history.update(cx, |history, cx| {
@@ -1545,6 +1555,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         match command {
+            PaletteCommand::AskAgent => self.ask_agent(&AskAgent, window, cx),
+            PaletteCommand::ShowHome => self.show_home(&ShowHome, window, cx),
+            PaletteCommand::OpenSettings => crate::settings_sheet::open(window, cx),
             PaletteCommand::OpenRepository => {
                 self.prompt_for_repository(&OpenRepository, window, cx)
             }
@@ -2032,7 +2045,14 @@ impl Workspace {
                 composer.update(cx, |composer, cx| composer.set_mode(mode, cx));
                 Some(composer)
             }
-            (Some(mode), None) => Some(cx.new(|cx| Composer::new(mode, window, cx))),
+            (Some(mode), None) => {
+                let changed = self.status.as_ref().map(|status| status.files.len());
+                Some(cx.new(|cx| {
+                    let mut composer = Composer::new(mode, window, cx);
+                    composer.set_uncommitted(changed, cx);
+                    composer
+                }))
+            }
         };
         self.history
             .update(cx, |history, cx| history.set_composer(composer, window, cx));
@@ -2063,15 +2083,25 @@ impl Workspace {
     ) {
         let title = gitez_agent_thread::title_from_prompt(&request.prompt);
         let prompt = request.prompt.clone();
+        // Every slot taken: the thread waits in the queue, which the toast
+        // says rather than "Started".
+        let full = {
+            let threads = AgentThreads::global(cx).read(cx);
+            threads.running() >= threads.settings().threads.max_running as usize
+        };
         let start = AgentThreads::global(cx).update(cx, |threads, cx| threads.start(request, cx));
         cx.spawn_in(window, async move |this, cx| {
             let started = start.await;
             this.update_in(cx, |this, window, cx| match started {
                 Ok(key) => {
-                    window.push_notification(
-                        crate::toast::success(format!("Started \u{201c}{title}\u{201d}")),
-                        cx,
-                    );
+                    let toast = if full {
+                        crate::toast::info(format!(
+                            "Queued \u{201c}{title}\u{201d}: it starts when an agent is free"
+                        ))
+                    } else {
+                        crate::toast::success(format!("Started \u{201c}{title}\u{201d}"))
+                    };
+                    window.push_notification(toast, cx);
                     this.show_agent_thread(key, window, cx);
                 }
                 Err(error) => {
@@ -2158,7 +2188,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_agent_thread))
             .on_action(cx.listener(Self::open_agent_pull_request))
             .when(snapshot.is_some(), |this| {
+                // ⌘N in a repository window asks an agent there, as ⌘⇧A.
                 this.on_action(cx.listener(Self::ask_agent))
+                    .on_action(cx.listener(|this, _: &NewThread, window, cx| {
+                        this.ask_agent(&AskAgent, window, cx)
+                    }))
             })
             .on_action(cx.listener(Self::new_pull_request))
             .on_action(cx.listener(Self::open_palette))
@@ -2178,7 +2212,12 @@ impl Render for Workspace {
             .text_color(rgb(color::TEXT))
             .text_size(theme::TEXT_SIZE)
             .when_some(home.clone(), |this, home| {
-                this.on_action(cx.listener(Self::new_thread)).child(home)
+                // ⌘⇧A in Home is the launcher, as ⌘N.
+                this.on_action(cx.listener(Self::new_thread))
+                    .on_action(cx.listener(|this, _: &AskAgent, window, cx| {
+                        this.new_thread(&NewThread, window, cx)
+                    }))
+                    .child(home)
             })
             .when(home.is_none(), |this| {
                 this.child(toolbar::Toolbar {
@@ -2374,16 +2413,19 @@ enum Selected {
 /// from; `None` when it cannot start any: a bare repository, or one with no
 /// branch yet.
 fn composer_mode(snapshot: &Snapshot) -> Option<ComposerMode> {
-    let work_dir = snapshot.repository.work_dir()?.to_owned();
+    // A bare repository or one without a branch keeps the row: the
+    // composer says why nothing can start yet.
+    let bare = snapshot.repository.work_dir().is_none();
+    let work_dir = snapshot
+        .repository
+        .work_dir()
+        .map_or_else(|| snapshot.path.clone(), ToOwned::to_owned);
     let branches: Vec<(String, Oid)> = snapshot
         .refs
         .branches
         .iter()
         .map(|branch| (branch.name.clone(), branch.target))
         .collect();
-    if branches.is_empty() {
-        return None;
-    }
     let current = match &snapshot.refs.head {
         Some(Head::Branch { name, .. }) => Some(name.clone()),
         _ => None,
@@ -2394,6 +2436,7 @@ fn composer_mode(snapshot: &Snapshot) -> Option<ComposerMode> {
         name: snapshot.name.clone(),
         branches,
         current,
+        bare,
     })
 }
 

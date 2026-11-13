@@ -5,7 +5,8 @@ use gpui_kit::*;
 use crate::agent_threads::OpenSettings;
 use crate::recent;
 use crate::workspace::{
-    CloneRepository, CloseRepository, InitRepository, OpenRecent, OpenRepository, RevealRepository,
+    CloneRepository, CloseRepository, InitRepository, NewThread, OpenRecent, OpenRepository,
+    RevealRepository, ShowHome,
 };
 
 actions!(gitez, [Quit, CloseWindow, ClearRecent]);
@@ -74,6 +75,9 @@ pub fn set(cx: &mut App) {
                     disabled: false,
                 }),
                 MenuItem::action("Clone Repository…", CloneRepository),
+                MenuItem::separator(),
+                MenuItem::action("Ask an Agent…", NewThread),
+                MenuItem::action("Show All Agent Threads", ShowHome),
                 MenuItem::separator(),
                 MenuItem::action(reveal, RevealRepository),
                 MenuItem::separator(),

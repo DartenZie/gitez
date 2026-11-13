@@ -29,7 +29,7 @@ mod watch;
 mod worktree;
 
 pub use error::{Error, Result};
-pub use index::{Index, IndexedRepository};
+pub use index::{Index, IndexReport, IndexedRepository};
 pub use model::{
     Activity, AgentThread, AgentThreadId, CONTINUE_PROMPT, Ending, Failure, NewAgentThread,
     RetryPlan, Start, State, Step, SupervisorInfo, Turn, TurnKind, TurnResult, Uncommitted,

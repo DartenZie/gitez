@@ -39,6 +39,18 @@ pub struct IndexedRepository {
     pub name: String,
 }
 
+/// What [`Index::load_report`] found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IndexReport {
+    /// As [`Index::load`] returns them.
+    pub repositories: Vec<IndexedRepository>,
+    /// Listed, but their common dir is gone.
+    pub missing: Vec<IndexedRepository>,
+    /// The file's format version, when a newer GitEZ wrote it (and it
+    /// lists nothing for this one).
+    pub too_new: Option<u32>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct OnDisk {
     version: u32,
@@ -84,6 +96,58 @@ impl Index {
         })
     }
 
+    /// [`Index::load`], and what it leaves out, so a view can say why
+    /// threads are missing: the entries whose common dir is gone (moved or
+    /// deleted), and the format version of a file a newer GitEZ wrote.
+    pub fn load_report(&self) -> Result<IndexReport> {
+        Ok(match self.read()? {
+            Contents::Missing => IndexReport::default(),
+            Contents::TooNew(version) => IndexReport {
+                too_new: Some(version),
+                ..IndexReport::default()
+            },
+            Contents::Known(repositories) => {
+                let (repositories, missing) = repositories
+                    .into_iter()
+                    .partition(|repository| repository.common_dir.is_dir());
+                IndexReport {
+                    repositories,
+                    missing,
+                    too_new: None,
+                }
+            }
+        })
+    }
+
+    /// Removes the entry of `common_dir` (any spelling of it), if listed
+    /// (lock and rename): for a repository that was moved or deleted.
+    /// Refuses ([`Error::TooNew`]) to change a file a newer GitEZ wrote.
+    pub fn remove(&self, common_dir: &Path) -> Result<()> {
+        if !self.path.exists() {
+            return Ok(());
+        }
+        let lock = Lock::take(&self.path.with_file_name(LOCK_FILE))?;
+        let mut repositories = match self.read()? {
+            Contents::Missing => return Ok(()),
+            Contents::Known(repositories) => repositories,
+            Contents::TooNew(version) => {
+                return Err(Error::TooNew {
+                    path: self.path.clone(),
+                    version,
+                });
+            }
+        };
+        let key = same_dir_key(common_dir);
+        let before = repositories.len();
+        repositories.retain(|listed| {
+            listed.common_dir != common_dir && same_dir_key(&listed.common_dir) != key
+        });
+        if repositories.len() == before {
+            return Ok(());
+        }
+        self.write(lock, repositories)
+    }
+
     /// Adds `repository` unless its common dir is listed (lock and
     /// rename). Refuses ([`Error::TooNew`]) to overwrite a file a newer
     /// GitEZ wrote.
@@ -109,6 +173,11 @@ impl Index {
             return Ok(());
         }
         repositories.push(repository);
+        self.write(lock, repositories)
+    }
+
+    /// Writes `repositories` under `lock`, taken by the caller.
+    fn write(&self, lock: Lock, repositories: Vec<IndexedRepository>) -> Result<()> {
         let mut text = serde_json::to_string_pretty(&OnDisk {
             version: INDEX_VERSION,
             repositories,

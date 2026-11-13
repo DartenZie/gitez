@@ -52,6 +52,12 @@ pub enum PaletteEvent {
 /// Something the workspace does for the palette.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaletteCommand {
+    /// Open the composer to start an agent thread.
+    AskAgent,
+    /// Home: the agent threads of every repository.
+    ShowHome,
+    /// The settings sheet: agents, sandbox and secrets.
+    OpenSettings,
     OpenRepository,
     CloneRepository,
     InitRepository,
@@ -298,6 +304,24 @@ fn actions() -> Vec<Action> {
             icon: IconName::Redo2,
             keywords: &["redo", "again"],
             command: PaletteCommand::Redo,
+        },
+        Action {
+            title: "Ask an agent…",
+            icon: IconName::Terminal,
+            keywords: &["agent", "thread", "claude", "task", "ask"],
+            command: PaletteCommand::AskAgent,
+        },
+        Action {
+            title: "Show all agent threads in Home",
+            icon: IconName::House,
+            keywords: &["home", "threads", "agents", "all"],
+            command: PaletteCommand::ShowHome,
+        },
+        Action {
+            title: "Agents, sandbox and secrets settings…",
+            icon: IconName::Settings,
+            keywords: &["settings", "preferences", "sandbox", "secrets", "agents"],
+            command: PaletteCommand::OpenSettings,
         },
         Action {
             title: "New local pull request",

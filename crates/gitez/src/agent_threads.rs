@@ -10,7 +10,7 @@
 //! repositories that are not open are known too. Every read and write runs
 //! on the background executor.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -19,8 +19,8 @@ use anyhow::{Context as _, bail};
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gitez_agent_thread::{
-    AgentThread, AgentThreadId, Ending, IfUncommitted, Index, IndexedRepository, Kept,
-    NewAgentThread, State, Step, Store, Timestamp, TurnKind,
+    AgentThread, AgentThreadId, CompleteReport, Ending, IfUncommitted, Index, IndexReport,
+    IndexedRepository, Kept, NewAgentThread, State, Step, Store, Timestamp, TurnKind,
 };
 use gitez_sandbox::NetworkProfile;
 use gitez_secret::SecretStore;
@@ -63,10 +63,74 @@ pub struct RepositoryThreads {
     pub name: SharedString,
     /// Newest first.
     pub threads: Vec<Arc<AgentThread>>,
+    /// What else is known of each thread, read with it.
+    pub facts: HashMap<AgentThreadId, ThreadFacts>,
     /// Why some threads could not be read.
     pub error: Option<SharedString>,
     /// `common_dir` with symlinks resolved, as file events name it.
     canonical: PathBuf,
+}
+
+/// What GitEZ found out about a thread besides its `thread.json`, read
+/// with it in the background. Nothing here reads the worktree's files: its
+/// folder is only looked up, and its `.git` pointer checked as
+/// [`gitez_agent_thread::check_worktree`] does before GitEZ runs git there.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ThreadFacts {
+    /// Whether the thread's worktree folder is on disk.
+    pub worktree_present: bool,
+    /// Why GitEZ no longer trusts the worktree (its git files changed since
+    /// GitEZ made it), for a thread that is not running.
+    pub untrusted: Option<String>,
+    /// The state of the local pull request the thread created, once read.
+    pub pull_request: Option<gitez_review::State>,
+}
+
+impl ThreadFacts {
+    /// Reads them for `thread` of the repository at `common_dir`. Blocks.
+    fn read(common_dir: &Path, thread: &AgentThread) -> Self {
+        let worktree_present = std::fs::symlink_metadata(&thread.worktree).is_ok();
+        let untrusted = (worktree_present && !thread.state.is_active())
+            .then(|| {
+                match gitez_agent_thread::check_worktree(
+                    common_dir,
+                    &thread.worktree,
+                    thread.worktree_record.as_ref(),
+                ) {
+                    Err(gitez_agent_thread::Error::Tampered { problem, .. }) => Some(problem),
+                    _ => None,
+                }
+            })
+            .flatten();
+        Self {
+            worktree_present,
+            untrusted,
+            pull_request: pull_request_state(common_dir, thread.pull_request),
+        }
+    }
+}
+
+/// The state of local pull request `number` of the repository at
+/// `common_dir`, if it can be read. Blocks.
+fn pull_request_state(common_dir: &Path, number: Option<u32>) -> Option<gitez_review::State> {
+    let number = number?;
+    gitez_review::Store::new(common_dir)
+        .load(number)
+        .ok()
+        .map(|pull_request| pull_request.state)
+}
+
+/// Something about the threads the user should know: a repository or
+/// thread that could not be read, a watch that failed, a completion that
+/// went wrong. Shown in Home and the Agents popover.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    /// The repository it is about, if one.
+    pub common_dir: Option<PathBuf>,
+    pub text: SharedString,
+    /// A repository that was moved or deleted: the common dir to remove
+    /// from the list of repositories with threads.
+    pub forget: Option<PathBuf>,
 }
 
 /// How many agent threads are in each group.
@@ -76,10 +140,13 @@ pub struct Counts {
     pub active: usize,
     /// Queued, or waiting for the usage limit to reset.
     pub waiting: usize,
-    /// Finished with a pull request or an answer.
+    /// Finished with a pull request, an answer or uncommitted changes:
+    /// ready for review.
     pub ready: usize,
-    /// Finished after failing or being stopped.
+    /// Finished after failing.
     pub failed: usize,
+    /// Finished after the user stopped it.
+    pub stopped: usize,
     pub completed: usize,
 }
 
@@ -156,6 +223,16 @@ pub struct AgentThreads {
     /// The `gitez` program, started as `gitez supervise …`.
     exe: Result<PathBuf, String>,
     repositories: Vec<RepositoryThreads>,
+    /// Why the list of repositories with threads could not be read, or
+    /// that a newer GitEZ wrote it.
+    index_problem: Option<SharedString>,
+    /// Listed repositories whose git folder is gone (moved or deleted).
+    missing: Vec<IndexedRepository>,
+    /// What could not be watched: changes there show only after a restart.
+    watch_problems: Vec<SharedString>,
+    /// Why a thread whose pull request was merged or closed could not be
+    /// completed.
+    completion_problems: HashMap<AgentThreadKey, SharedString>,
     current: Option<CurrentRepository>,
     /// Threads being completed because their pull request was merged or
     /// closed, so a burst of file events completes each once.
@@ -251,6 +328,10 @@ impl AgentThreads {
             environment: 0,
             exe: options.exe,
             repositories: Vec::new(),
+            index_problem: None,
+            missing: Vec::new(),
+            watch_problems: Vec::new(),
+            completion_problems: HashMap::new(),
             current: None,
             completing: HashSet::new(),
             changes,
@@ -288,6 +369,19 @@ impl AgentThreads {
         })
     }
 
+    /// Replaces the threads read for the repository of `common_dir`, to
+    /// measure views with more threads than a test should write.
+    #[cfg(test)]
+    pub fn replace_threads(&mut self, common_dir: &Path, threads: Vec<Arc<AgentThread>>) {
+        if let Some(repository) = self
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.common_dir == common_dir)
+        {
+            repository.threads = threads;
+        }
+    }
+
     pub fn repository_by_work_dir(&self, work_dir: &Path) -> Option<&RepositoryThreads> {
         self.repositories
             .iter()
@@ -299,6 +393,116 @@ impl AgentThreads {
             .threads
             .iter()
             .find(|thread| thread.id == key.id)
+    }
+
+    /// What else is known of thread `key`; the defaults while not read.
+    pub fn facts(&self, key: &AgentThreadKey) -> ThreadFacts {
+        self.repository(&key.common_dir)
+            .and_then(|repository| repository.facts.get(&key.id))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// What the user should know about the threads of the repository at
+    /// `common_dir`, or of every repository with `None`: what could not be
+    /// read, watched or completed. Problems of no one repository are always
+    /// included.
+    pub fn notices(&self, common_dir: Option<&Path>) -> Vec<Notice> {
+        let wanted = |dir: &Path| {
+            common_dir.is_none_or(|wanted| {
+                dir == wanted
+                    || self
+                        .repository(wanted)
+                        .is_some_and(|known| known.common_dir == dir)
+            })
+        };
+        let mut notices: Vec<Notice> = self
+            .index_problem
+            .iter()
+            .chain(&self.watch_problems)
+            .map(|text| Notice {
+                common_dir: None,
+                text: text.clone(),
+                forget: None,
+            })
+            .collect();
+        for repository in &self.repositories {
+            if let Some(error) = &repository.error
+                && wanted(&repository.common_dir)
+            {
+                notices.push(Notice {
+                    common_dir: Some(repository.common_dir.clone()),
+                    text: format!("{}: {error}", repository.name).into(),
+                    forget: None,
+                });
+            }
+        }
+        let mut problems: Vec<(&AgentThreadKey, &SharedString)> = self
+            .completion_problems
+            .iter()
+            .filter(|(key, _)| wanted(&key.common_dir))
+            .collect();
+        problems.sort_by(|a, b| a.0.id.cmp(&b.0.id));
+        for (key, problem) in problems {
+            let title = self
+                .thread(key)
+                .map_or_else(|| key.id.to_string(), |thread| thread.title.clone());
+            notices.push(Notice {
+                common_dir: Some(key.common_dir.clone()),
+                text: format!("“{title}” could not be completed: {problem}").into(),
+                forget: None,
+            });
+        }
+        if common_dir.is_none() {
+            for repository in &self.missing {
+                notices.push(Notice {
+                    common_dir: Some(repository.common_dir.clone()),
+                    text: format!(
+                        "{} is no longer at {}: moved or deleted, so its threads are not \
+                         listed. Open it where it is now to list them again.",
+                        repository.name,
+                        crate::recent::display(&repository.work_dir)
+                    )
+                    .into(),
+                    forget: Some(repository.common_dir.clone()),
+                });
+            }
+        }
+        notices
+    }
+
+    /// Removes a repository that was moved or deleted from the list of
+    /// repositories with threads, in the background.
+    pub fn forget_repository(&mut self, common_dir: PathBuf, cx: &mut Context<Self>) {
+        let Some(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        self.missing
+            .retain(|repository| repository.common_dir != common_dir);
+        cx.notify();
+        let changes = self.changes.clone();
+        let removed = cx.background_executor().spawn(async move {
+            let index = Index::new(&data_dir);
+            let removed = index.remove(&common_dir);
+            changes.unbounded_send(vec![index.path().to_owned()]).ok();
+            removed
+        });
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = removed.await {
+                this.update(cx, |this, cx| {
+                    this.index_problem = Some(
+                        format!(
+                            "Could not change the list of repositories with threads: {:#}",
+                            anyhow::Error::from(error)
+                        )
+                        .into(),
+                    );
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     /// The agent thread that created local pull request `number`, if any.
@@ -562,31 +766,97 @@ impl AgentThreads {
 
     /// Completes a finished agent thread: removes its worktree (and its
     /// branch if it has no commits of its own), then marks it completed.
+    /// `uncommitted` says what to do with a worktree that has uncommitted
+    /// changes: [`IfUncommitted::Refuse`] fails with
+    /// [`gitez_agent_thread::Error::Uncommitted`] so the user can be asked.
+    /// A worktree GitEZ no longer trusts fails with
+    /// [`gitez_agent_thread::Error::Tampered`] unless kept. Holds the
+    /// thread's lock throughout, so it cannot be continued meanwhile.
     pub fn complete(
         &mut self,
         key: &AgentThreadKey,
+        uncommitted: IfUncommitted,
         cx: &mut Context<Self>,
-    ) -> Task<anyhow::Result<()>> {
+    ) -> Task<anyhow::Result<CompleteReport>> {
+        let task_key = key.clone();
         let key = key.clone();
         let work_dir = self
             .repository(&key.common_dir)
             .map(|repository| repository.work_dir.clone());
         let changes = self.changes.clone();
-        cx.background_executor().spawn(async move {
-            let store = Store::new(&key.common_dir);
-            let thread = store.load(&key.id)?;
-            // Refused unless it is finished; checked before anything is
-            // removed.
-            thread.clone().mark_completed(Timestamp::now())?;
+        let task = cx.background_executor().spawn(async move {
             let work_dir = work_dir.context("GitEZ does not know this thread’s repository")?;
-            // Refuse by default: an uncommitted worktree is never removed on
-            // one click. The GUI confirms, then calls again with Discard or
-            // Keep (see gitez_agent_thread::IfUncommitted). A tampered
-            // worktree is refused the same way.
-            gitez_agent_thread::complete(&work_dir, &thread, IfUncommitted::Refuse)?;
-            store.update(&key.id, |thread| thread.mark_completed(Timestamp::now()))?;
+            let store = Store::new(&key.common_dir);
+            let report = store.update(&key.id, |thread| {
+                // Refused unless it is finished; checked before anything is
+                // removed.
+                thread.clone().mark_completed(Timestamp::now())?;
+                let report = gitez_agent_thread::complete(&work_dir, thread, uncommitted)?;
+                thread.mark_completed(Timestamp::now())?;
+                Ok(report)
+            });
             changes.unbounded_send(vec![thread_file(&key)]).ok();
-            Ok(())
+            Ok(report?)
+        });
+        self.after_completing(task_key, task, cx)
+    }
+
+    /// Removes the worktree a completed thread kept (it had uncommitted
+    /// changes): the user agreed to discard them. Refuses a worktree GitEZ
+    /// no longer trusts ([`gitez_agent_thread::Error::Tampered`]).
+    pub fn remove_worktree(
+        &mut self,
+        key: &AgentThreadKey,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<CompleteReport>> {
+        let task_key = key.clone();
+        let key = key.clone();
+        let work_dir = self
+            .repository(&key.common_dir)
+            .map(|repository| repository.work_dir.clone());
+        let changes = self.changes.clone();
+        let task = cx.background_executor().spawn(async move {
+            let work_dir = work_dir.context("GitEZ does not know this thread’s repository")?;
+            let store = Store::new(&key.common_dir);
+            let report = store.update(&key.id, |thread| {
+                if thread.state != State::Completed {
+                    return Err(gitez_agent_thread::Error::Refused(
+                        "Only a completed thread’s kept worktree is removed this way.".into(),
+                    ));
+                }
+                let report =
+                    gitez_agent_thread::complete(&work_dir, thread, IfUncommitted::Discard)?;
+                // What was said about the kept worktree is no longer true.
+                let worktree = thread.worktree.display().to_string();
+                thread
+                    .warnings
+                    .retain(|warning| !warning.contains(&worktree));
+                Ok(report)
+            });
+            changes.unbounded_send(vec![thread_file(&key)]).ok();
+            Ok(report?)
+        });
+        self.after_completing(task_key, task, cx)
+    }
+
+    /// Forgets a completion problem of the thread once `task` succeeds.
+    fn after_completing(
+        &mut self,
+        key: AgentThreadKey,
+        task: Task<anyhow::Result<CompleteReport>>,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<CompleteReport>> {
+        cx.spawn(async move |this, cx| {
+            let report = task.await;
+            if report.is_ok() {
+                this.update(cx, |this, cx| {
+                    if this.completion_problems.remove(&key).is_some() {
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+            report
         })
     }
 
@@ -684,14 +954,14 @@ impl AgentThreads {
         }
         if let Some(index) = loaded.index {
             match index {
-                Ok(listed) => {
-                    let mut repositories = Vec::with_capacity(listed.len());
-                    for (repository, canonical) in listed {
-                        let threads = match self.repository(&repository.common_dir) {
-                            Some(known) => known.threads.clone(),
+                Ok((report, canonicals)) => {
+                    let mut repositories = Vec::with_capacity(report.repositories.len());
+                    for (repository, canonical) in report.repositories.into_iter().zip(canonicals) {
+                        let (threads, facts) = match self.repository(&repository.common_dir) {
+                            Some(known) => (known.threads.clone(), known.facts.clone()),
                             None => {
                                 changed.insert(repository.common_dir.clone());
-                                Vec::new()
+                                (Vec::new(), HashMap::new())
                             }
                         };
                         repositories.push(RepositoryThreads {
@@ -699,32 +969,53 @@ impl AgentThreads {
                             work_dir: repository.work_dir,
                             name: repository.name.into(),
                             threads,
+                            facts,
                             error: None,
                             canonical,
                         });
                     }
                     self.repositories = repositories;
+                    self.missing = report.missing;
+                    self.index_problem = report.too_new.map(|version| {
+                        format!(
+                            "A newer GitEZ wrote the list of repositories with threads (format \
+                             version {version}), so this one lists only the threads of open \
+                             repositories. Update GitEZ to see them all."
+                        )
+                        .into()
+                    });
                     self.rewatch(cx);
                 }
-                Err(error) => eprintln!(
-                    "gitez: could not read the repositories with threads: {:#}",
-                    anyhow::Error::from(error)
-                ),
+                Err(error) => {
+                    self.index_problem = Some(
+                        format!(
+                            "Could not read the list of repositories with threads, so only the \
+                             threads of open repositories are shown: {:#}",
+                            anyhow::Error::from(error)
+                        )
+                        .into(),
+                    );
+                }
             }
         }
         for (common_dir, read) in loaded.repositories {
             let Some(repository) = self.repository_mut(&common_dir) else {
                 continue;
             };
-            let (threads, error) = match read {
-                Ok((threads, errors)) => (
-                    threads.into_iter().map(Arc::new).collect::<Vec<_>>(),
-                    unreadable(&errors),
+            let (threads, facts, error) = match read {
+                Ok(read) => (
+                    read.threads.into_iter().map(Arc::new).collect::<Vec<_>>(),
+                    read.facts,
+                    unreadable(&read.errors),
                 ),
-                Err(error) => (Vec::new(), Some(error)),
+                Err(error) => (Vec::new(), HashMap::new(), Some(error)),
             };
-            if repository.threads != threads || repository.error != error {
+            if repository.threads != threads
+                || repository.error != error
+                || repository.facts != facts
+            {
                 repository.threads = threads;
+                repository.facts = facts;
                 repository.error = error;
                 changed.insert(repository.common_dir.clone());
                 reread.push(repository.common_dir.clone());
@@ -742,13 +1033,17 @@ impl AgentThreads {
                 });
             }
             match (read, position) {
-                (Ok(thread), Some(position)) => {
-                    if *repository.threads[position] == thread {
+                (Ok((thread, facts)), Some(position)) => {
+                    if *repository.threads[position] == thread
+                        && repository.facts.get(&id) == Some(&facts)
+                    {
                         continue;
                     }
                     repository.threads[position] = Arc::new(thread);
+                    repository.facts.insert(id, facts);
                 }
-                (Ok(thread), None) => {
+                (Ok((thread, facts)), None) => {
+                    repository.facts.insert(id, facts);
                     repository.threads.push(Arc::new(thread));
                     repository
                         .threads
@@ -756,6 +1051,7 @@ impl AgentThreads {
                 }
                 (Err(gitez_agent_thread::Error::NotFound(_)), Some(position)) => {
                     repository.threads.remove(position);
+                    repository.facts.remove(&id);
                 }
                 (Err(gitez_agent_thread::Error::NotFound(_)), None) => continue,
                 (Err(error), _) => {
@@ -789,7 +1085,11 @@ impl AgentThreads {
             Ok(gitez_settings::Loaded::Current(settings)) => {
                 self.can_save_settings = true;
                 self.settings_error = None;
-                self.settings = Arc::new(settings);
+                // The same settings keep their Arc, so views that compare it
+                // do not redo their work on every save.
+                if *self.settings != settings {
+                    self.settings = Arc::new(settings);
+                }
             }
             Ok(gitez_settings::Loaded::TooNew) => {
                 self.can_save_settings = false;
@@ -798,7 +1098,9 @@ impl AgentThreads {
                      and changes are not saved."
                         .into(),
                 );
-                self.settings = Arc::new(Settings::default());
+                if *self.settings != Settings::default() {
+                    self.settings = Arc::new(Settings::default());
+                }
             }
             Err(error) => {
                 self.can_save_settings = true;
@@ -835,9 +1137,15 @@ impl AgentThreads {
             .background_executor()
             .spawn(async move { Watchers::start(&dirs, data_dir.as_deref(), changes) });
         self._rewatch = cx.spawn(async move |this, cx| {
-            let watchers = start.await;
-            this.update(cx, |this, _| this._watchers = Some(watchers))
-                .ok();
+            let (watchers, problems) = start.await;
+            this.update(cx, |this, cx| {
+                this._watchers = Some(watchers);
+                if this.watch_problems != problems {
+                    this.watch_problems = problems;
+                    cx.notify();
+                }
+            })
+            .ok();
         });
     }
 }
@@ -853,7 +1161,8 @@ impl Counts {
                 State::Queued | State::Waiting => counts.waiting += 1,
                 State::Completed => counts.completed += 1,
                 State::Finished => match thread.ending {
-                    Some(Ending::Failed | Ending::Stopped) => counts.failed += 1,
+                    Some(Ending::Failed) => counts.failed += 1,
+                    Some(Ending::Stopped) => counts.stopped += 1,
                     Some(Ending::PullRequest | Ending::Answer) | None => counts.ready += 1,
                 },
             }
@@ -1014,25 +1323,27 @@ struct Plan {
 struct Loaded {
     canonical_data_dir: Option<PathBuf>,
     settings: Option<gitez_settings::Result<gitez_settings::Loaded>>,
-    index: Option<gitez_agent_thread::Result<Vec<(IndexedRepository, PathBuf)>>>,
-    #[allow(clippy::type_complexity)]
-    repositories: Vec<(
-        PathBuf,
-        Result<
-            (
-                Vec<AgentThread>,
-                Vec<(AgentThreadId, gitez_agent_thread::Error)>,
-            ),
-            SharedString,
-        >,
-    )>,
-    threads: Vec<(
-        PathBuf,
-        AgentThreadId,
-        gitez_agent_thread::Result<AgentThread>,
-    )>,
+    /// The index with each repository's canonical common dir.
+    index: Option<gitez_agent_thread::Result<(IndexReport, Vec<PathBuf>)>>,
+    repositories: Vec<(PathBuf, Result<ReadThreads, SharedString>)>,
+    threads: Vec<ReadThread>,
     transcripts: Vec<AgentThreadKey>,
     reviews: BTreeSet<PathBuf>,
+}
+
+/// One thread [`Plan::load`] read again: its repository, its id, and the
+/// thread with its facts.
+type ReadThread = (
+    PathBuf,
+    AgentThreadId,
+    gitez_agent_thread::Result<(AgentThread, ThreadFacts)>,
+);
+
+/// The threads of one repository as [`Plan::load`] read them.
+struct ReadThreads {
+    threads: Vec<AgentThread>,
+    facts: HashMap<AgentThreadId, ThreadFacts>,
+    errors: Vec<(AgentThreadId, gitez_agent_thread::Error)>,
 }
 
 impl Plan {
@@ -1104,26 +1415,34 @@ impl Plan {
             _ => None,
         };
         let index = match (&self.data_dir, self.index) {
-            (Some(dir), true) => Some(Index::new(dir).load().map(|repositories| {
-                repositories
-                    .into_iter()
+            (Some(dir), true) => Some(Index::new(dir).load_report().map(|report| {
+                let canonical = report
+                    .repositories
+                    .iter()
                     .map(|repository| {
-                        let canonical = std::fs::canonicalize(&repository.common_dir)
-                            .unwrap_or_else(|_| repository.common_dir.clone());
-                        (repository, canonical)
+                        std::fs::canonicalize(&repository.common_dir)
+                            .unwrap_or_else(|_| repository.common_dir.clone())
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                (report, canonical)
             })),
             _ => None,
         };
         let mut whole: Vec<PathBuf> = match &index {
-            Some(Ok(listed)) => listed
+            Some(Ok((report, _))) => report
+                .repositories
                 .iter()
-                .map(|(repository, _)| repository.common_dir.clone())
+                .map(|repository| repository.common_dir.clone())
                 .collect(),
             _ => Vec::new(),
         };
-        for common_dir in self.repositories {
+        // A pull request saved may be merged or closed now: what the
+        // threads show of it is read again.
+        for common_dir in self
+            .repositories
+            .into_iter()
+            .chain(self.reviews.iter().cloned())
+        {
             if !whole.contains(&common_dir) && known.contains(&common_dir) {
                 whole.push(common_dir);
             }
@@ -1133,7 +1452,20 @@ impl Plan {
             .map(|common_dir| {
                 let store = Store::new(common_dir);
                 let read = match store.ids() {
-                    Ok(_) => Ok(store.load_all()),
+                    Ok(_) => {
+                        let (threads, errors) = store.load_all();
+                        let facts = threads
+                            .iter()
+                            .map(|thread| {
+                                (thread.id.clone(), ThreadFacts::read(common_dir, thread))
+                            })
+                            .collect();
+                        Ok(ReadThreads {
+                            threads,
+                            facts,
+                            errors,
+                        })
+                    }
                     Err(error) => Err(format!(
                         "Could not list the threads: {:#}",
                         anyhow::Error::from(error)
@@ -1150,7 +1482,10 @@ impl Plan {
             }
             let store = Store::new(&common_dir);
             for id in ids {
-                let read = store.load(&id);
+                let read = store.load(&id).map(|thread| {
+                    let facts = ThreadFacts::read(&common_dir, &thread);
+                    (thread, facts)
+                });
                 threads.push((common_dir.clone(), id, read));
             }
         }
@@ -1174,12 +1509,14 @@ struct Watchers {
 }
 
 impl Watchers {
-    /// Starts watching; what cannot be watched is logged and left out.
+    /// Starts watching; what cannot be watched is left out, and said in
+    /// the problems returned.
     fn start(
         dirs: &[PathBuf],
         data_dir: Option<&Path>,
         changes: mpsc::UnboundedSender<Vec<PathBuf>>,
-    ) -> Self {
+    ) -> (Self, Vec<SharedString>) {
+        let mut problems = Vec::new();
         let send = {
             let changes = changes.clone();
             move |paths: Vec<PathBuf>| {
@@ -1189,9 +1526,13 @@ impl Watchers {
         let threads = match gitez_agent_thread::watch(dirs, send) {
             Ok(watcher) => Some(watcher),
             Err(error) => {
-                eprintln!(
-                    "gitez: changes to threads appear only after a restart: {:#}",
-                    anyhow::Error::from(error)
+                problems.push(
+                    format!(
+                        "GitEZ cannot follow the threads’ files, so changes to threads show \
+                         only after a restart: {:#}",
+                        anyhow::Error::from(error)
+                    )
+                    .into(),
                 );
                 None
             }
@@ -1220,17 +1561,24 @@ impl Watchers {
             match watcher {
                 Ok(watcher) => Some(watcher),
                 Err(error) => {
-                    eprintln!(
-                        "gitez: changes to the settings appear only after a restart: {error}"
+                    problems.push(
+                        format!(
+                            "GitEZ cannot follow its data folder, so new repositories with \
+                             threads and changed settings show only after a restart: {error}"
+                        )
+                        .into(),
                     );
                     None
                 }
             }
         });
-        Self {
-            _threads: threads,
-            _data_dir: data_dir,
-        }
+        (
+            Self {
+                _threads: threads,
+                _data_dir: data_dir,
+            },
+            problems,
+        )
     }
 }
 
@@ -1388,28 +1736,41 @@ impl AgentThreads {
         let task = cx.background_executor().spawn(async move {
             due.into_iter()
                 .map(|(key, number, work_dir)| {
-                    match complete_for_pull_request(&work_dir, &key, number, Timestamp::now()) {
+                    let problem = match complete_for_pull_request(
+                        &work_dir,
+                        &key,
+                        number,
+                        Timestamp::now(),
+                    ) {
                         Ok(true) => {
                             debug(|| format!("completed {}: #{number} merged or closed", key.id));
                             changes.unbounded_send(vec![thread_file(&key)]).ok();
+                            None
                         }
-                        Ok(false) => {}
-                        Err(error) => eprintln!(
-                            "gitez: could not complete the thread {} of pull request #{number}: \
-                             {error:#}",
-                            key.id
-                        ),
-                    }
-                    key
+                        Ok(false) => None,
+                        Err(error) => Some(SharedString::from(format!(
+                            "pull request #{number} was merged or closed: {error:#}"
+                        ))),
+                    };
+                    (key, problem)
                 })
                 .collect::<Vec<_>>()
         });
         cx.spawn(async move |this, cx| {
             let done = task.await;
-            this.update(cx, |this, _| {
-                for key in &done {
-                    this.completing.remove(key);
+            this.update(cx, |this, cx| {
+                for (key, problem) in done {
+                    this.completing.remove(&key);
+                    match problem {
+                        Some(problem) => {
+                            this.completion_problems.insert(key, problem);
+                        }
+                        None => {
+                            this.completion_problems.remove(&key);
+                        }
+                    }
                 }
+                cx.notify();
             })
             .ok();
         })
@@ -1452,21 +1813,43 @@ fn complete_for_pull_request(
             return Ok(false);
         }
     };
-    let store = Store::new(&key.common_dir);
-    let thread = store.load(&key.id)?;
-    if !completes_with(&thread, pull_request.state) {
-        return Ok(false);
-    }
     let how = if pull_request.state == gitez_review::State::Merged {
         "merged"
     } else {
         "closed"
     };
-    // Automatic completion after a merge or close keeps a worktree that has
-    // uncommitted changes (or that GitEZ no longer trusts) rather than
-    // destroying work: the user removes it later with an explicit Complete.
-    let removed = gitez_agent_thread::complete(work_dir, &thread, IfUncommitted::Keep);
-    let warning = match &removed {
+    // Under the thread's lock, so it cannot be continued between the check
+    // and the removal of its worktree.
+    Store::new(&key.common_dir)
+        .update(&key.id, |thread| {
+            if !completes_with(thread, pull_request.state) {
+                return Ok(false);
+            }
+            // Automatic completion after a merge or close keeps a worktree
+            // that has uncommitted changes (or that GitEZ no longer trusts)
+            // rather than destroying work: the user removes it later.
+            let removed = gitez_agent_thread::complete(work_dir, thread, IfUncommitted::Keep);
+            if let Some(warning) = completion_warning(&removed, thread, number, how)
+                && !thread.warnings.contains(&warning)
+            {
+                thread.warnings.push(warning);
+            }
+            thread.mark_completed(now)?;
+            Ok(true)
+        })
+        .map_err(anyhow::Error::from)
+}
+
+/// What the thread says after its pull request (`number`, `how`: merged or
+/// closed) completed it, if anything needs saying: a kept worktree, or one
+/// that was gone or could not be removed.
+fn completion_warning(
+    removed: &gitez_agent_thread::Result<CompleteReport>,
+    thread: &AgentThread,
+    number: u32,
+    how: &str,
+) -> Option<String> {
+    match removed {
         Ok(report) => match &report.kept {
             Some(Kept::Uncommitted { .. }) => Some(format!(
                 "Pull request #{number} was {how}; GitEZ completed the thread but kept its \
@@ -1491,22 +1874,7 @@ fn complete_for_pull_request(
             thread.worktree.display(),
             anyhow::Error::from_ref(error)
         )),
-    };
-    store
-        .update(&key.id, |thread| {
-            // Continued meanwhile: it completes when it finishes again.
-            if thread.state != State::Finished {
-                return Ok(false);
-            }
-            if let Some(warning) = warning
-                && !thread.warnings.contains(&warning)
-            {
-                thread.warnings.push(warning);
-            }
-            thread.mark_completed(now)?;
-            Ok(true)
-        })
-        .map_err(anyhow::Error::from)
+    }
 }
 
 #[cfg(test)]
@@ -1589,7 +1957,8 @@ mod tests {
                 active: 2,
                 waiting: 2,
                 ready: 2,
-                failed: 2,
+                failed: 1,
+                stopped: 1,
                 completed: 1,
             }
         );

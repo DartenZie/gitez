@@ -529,3 +529,102 @@ fn keychain_name() -> &'static str {
         "the keychain"
     }
 }
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::sync::Arc;
+
+    use gpui_kit::component::WindowExt as _;
+    use gpui_kit::{AppContext as _, Entity, TestAppContext, VisualTestContext, WindowOptions};
+
+    use super::SettingsSheet;
+    use crate::agent_threads::{AgentThreads, Options, init_with};
+
+    /// The sheet in a window of its own, with GitEZ's model on a scratch
+    /// data folder and secrets kept in memory.
+    pub(super) fn sheet(
+        cx: &mut TestAppContext,
+    ) -> (tempfile::TempDir, Entity<SettingsSheet>, VisualTestContext) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let data_dir = dir.path().join("data");
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+            crate::recent::init_in_memory(cx);
+            init_with(
+                Options {
+                    data_dir: Some(data_dir),
+                    sandbox: Arc::new(gitez_sandbox::Passthrough),
+                    // No agent: nothing runs a real `claude` to check it.
+                    agents: gitez_agent::Registry::with(Vec::new()),
+                    secrets: Arc::new(gitez_secret::Memory::default()),
+                    exe: Err("no supervisor in tests".into()),
+                    watch: false,
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let (window, sheet) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| SettingsSheet::new(window, cx))
+                })
+            })
+            .expect("window open");
+        let cx = VisualTestContext::from_window(window, cx);
+        (dir, sheet, cx)
+    }
+
+    fn settings(cx: &mut VisualTestContext) -> gitez_settings::Settings {
+        cx.update(|_, cx| (**AgentThreads::global(cx).read(cx).settings()).clone())
+    }
+
+    #[gpui_kit::test]
+    fn writable_folders_are_added_and_removed(cx: &mut TestAppContext) {
+        let (_dir, sheet, mut cx) = sheet(cx);
+        sheet.update(&mut cx, |sheet, cx| {
+            sheet.add_writable("/opt/gradle/caches/", cx)
+        });
+        assert_eq!(
+            settings(&mut cx).sandbox.writable_paths,
+            ["/opt/gradle/caches"]
+        );
+        // The whole disk is refused, and said why.
+        sheet.update(&mut cx, |sheet, cx| sheet.add_writable("/", cx));
+        assert_eq!(
+            settings(&mut cx).sandbox.writable_paths,
+            ["/opt/gradle/caches"]
+        );
+        sheet.read_with(&cx, |sheet, _| {
+            assert!(sheet.sandbox_write_error().is_some());
+        });
+        sheet.update(&mut cx, |sheet, cx| {
+            sheet.remove_writable("/opt/gradle/caches", cx)
+        });
+        assert!(settings(&mut cx).sandbox.writable_paths.is_empty());
+    }
+
+    #[gpui_kit::test]
+    fn unhiding_a_credential_folder_asks_first(cx: &mut TestAppContext) {
+        let (_dir, sheet, mut cx) = sheet(cx);
+        assert!(
+            settings(&mut cx)
+                .sandbox
+                .hidden_paths
+                .contains(&"~/.aws".to_owned())
+        );
+        sheet.update_in(&mut cx, |sheet, window, cx| {
+            sheet.ask_unhide_path("~/.aws", window, cx)
+        });
+        cx.run_until_parked();
+        // Nothing changes until the user agrees.
+        assert!(
+            settings(&mut cx)
+                .sandbox
+                .hidden_paths
+                .contains(&"~/.aws".to_owned())
+        );
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+    }
+}

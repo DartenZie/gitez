@@ -446,13 +446,13 @@ impl Review {
         let Subject::PullRequest(subject) = &self.subject else {
             return;
         };
-        let Some(agent) = Registry::builtin().get(&subject.pull_request.prompt.agent) else {
+        let Some(launch) = Launch::of(&subject.pull_request.prompt.agent, cx) else {
             return;
         };
         let number = subject.pull_request.number;
         let key = (self.repository.common_dir(), number);
         let (store, dir) = (subject.store.clone(), dir.to_owned());
-        let run = cx.new(|cx| AgentRun::start(agent, prompt, dir, store, number, cx));
+        let run = cx.new(|cx| AgentRun::start(launch, prompt, dir, store, number, cx));
         cx.default_global::<AgentRuns>().0.insert(key, run.clone());
         self.show_run(run, cx);
     }
@@ -1052,6 +1052,29 @@ impl Review {
                     }
                 }
                 body.push(note(agent_thread::summary(thread, now)).into_any_element());
+                if let Some(changes) = agent_thread::uncommitted_text(thread)
+                    && !panel.worktree_gone
+                {
+                    let why = agent_thread::commit_error_text(thread)
+                        .map(|error| format!(" {error}"))
+                        .unwrap_or_default();
+                    body.push(
+                        div()
+                            .debug_selector(|| "prompt-thread-uncommitted".into())
+                            .h_flex()
+                            .items_start()
+                            .gap(px(6.))
+                            .text_size(theme::SMALL_TEXT_SIZE)
+                            .line_height(relative(1.5))
+                            .text_color(rgb(color::WARNING_TEXT))
+                            .child(Icon::new(IconName::TriangleAlert).size(px(12.)).mt(px(2.)))
+                            .child(div().flex_1().min_w_0().child(format!(
+                                "{changes} left in the thread’s worktree, not in this pull \
+                                 request.{why} Ask the agent in a comment to commit what it left."
+                            )))
+                            .into_any_element(),
+                    );
+                }
                 if panel.worktree_gone {
                     body.push(
                         note(format!(
@@ -1359,11 +1382,43 @@ enum Message {
     Ended(Result<Outcome, String>),
 }
 
+/// The agent a review run starts and how: the program, folder,
+/// environment, arguments and model set for it in Settings, as an agent
+/// thread gets them.
+struct Launch {
+    agent: Arc<dyn Agent>,
+    config: AgentConfig,
+    model: Option<String>,
+}
+
+impl Launch {
+    /// The agent `id` as Settings configure it; the built-in agent with its
+    /// defaults when the app has no agent threads model (in tests).
+    fn of(id: &str, cx: &App) -> Option<Self> {
+        match AgentThreads::try_global(cx) {
+            Some(model) => {
+                let model = model.read(cx);
+                let entry = model.settings().agent(id);
+                Some(Self {
+                    agent: model.agents().get(id)?,
+                    config: entry.config(),
+                    model: entry.model,
+                })
+            }
+            None => Some(Self {
+                agent: Registry::builtin().get(id)?,
+                config: AgentConfig::default(),
+                model: None,
+            }),
+        }
+    }
+}
+
 impl AgentRun {
-    /// Starts `agent` on `prompt` in `dir`, saving the transcript in
-    /// `store` under pull request `number`.
+    /// Starts the agent of `launch` on `prompt` in `dir`, saving the
+    /// transcript in `store` under pull request `number`.
     fn start(
-        agent: Arc<dyn Agent>,
+        launch: Launch,
         prompt: String,
         dir: PathBuf,
         store: Store,
@@ -1372,6 +1427,7 @@ impl AgentRun {
     ) -> Self {
         let started = Timestamp::now();
         let (sender, mut messages) = futures::channel::mpsc::unbounded();
+        let agent = launch.agent.clone();
         let thread_agent = agent.clone();
         // A thread of its own: it blocks on the agent's output for as long
         // as the agent works.
@@ -1392,7 +1448,13 @@ impl AgentRun {
                     None
                 }
             };
-            let mut session = match start(thread_agent.as_ref(), &prompt, &dir) {
+            let mut session = match start(
+                thread_agent.as_ref(),
+                &launch.config,
+                launch.model.as_deref(),
+                &prompt,
+                &dir,
+            ) {
                 Ok(session) => session,
                 Err(error) => {
                     send(Message::Ended(Err(format!(
@@ -1548,19 +1610,21 @@ impl AgentRun {
 }
 
 /// Starts `agent` on `prompt` in `dir`, the checked-out working tree, as
-/// configured by default and outside GitEZ's sandbox.
+/// `config` and `model` (from Settings) say and outside GitEZ's sandbox.
 fn start(
     agent: &dyn Agent,
+    config: &AgentConfig,
+    model: Option<&str>,
     prompt: &str,
     dir: &std::path::Path,
 ) -> gitez_agent::Result<AgentProcess> {
     let session_id = uuid::Uuid::new_v4().to_string();
     let mut command = agent.command(
-        &AgentConfig::default(),
+        config,
         &RunSpec {
             prompt,
             cwd: dir,
-            model: None,
+            model,
             conversation: Conversation::New {
                 session_id: &session_id,
             },
@@ -1573,4 +1637,60 @@ fn start(
         ClaudeCode::keep_own_sandbox(&mut command);
     }
     AgentProcess::spawn(&command)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use gitez_settings::{AgentEntry, Settings};
+    use gpui_kit::TestAppContext;
+
+    use super::Launch;
+    use crate::agent_threads::{Options, init_with};
+
+    /// M5: "Send to Claude Code" runs the agent as Settings configure it,
+    /// with its program, folder, environment, arguments and model.
+    #[gpui_kit::test]
+    fn a_review_run_uses_the_agent_settings(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("data folder");
+        let entry = AgentEntry {
+            program: Some(PathBuf::from("/opt/agents/claude")),
+            config_dir: Some(PathBuf::from("/opt/agents/config")),
+            env: BTreeMap::from([("HTTPS_PROXY".to_owned(), "http://proxy:3128".to_owned())]),
+            args: vec!["--verbose".into()],
+            model: Some("haiku".into()),
+        };
+        Settings {
+            agents: BTreeMap::from([(gitez_agent::ClaudeCode::ID.to_owned(), entry.clone())]),
+            ..Settings::default()
+        }
+        .save(&Settings::path(&data_dir))
+        .expect("save");
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            init_with(
+                Options {
+                    data_dir: Some(data_dir),
+                    sandbox: Arc::new(gitez_sandbox::Passthrough),
+                    agents: gitez_agent::Registry::builtin(),
+                    secrets: Arc::new(gitez_secret::Memory::default()),
+                    exe: Err("no supervisor in tests".into()),
+                    watch: false,
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let launch = Launch::of(gitez_agent::ClaudeCode::ID, cx).expect("a known agent");
+            assert_eq!(launch.config, entry.config());
+            assert_eq!(launch.model.as_deref(), Some("haiku"));
+            assert!(Launch::of("no-such-agent", cx).is_none());
+        });
+    }
 }

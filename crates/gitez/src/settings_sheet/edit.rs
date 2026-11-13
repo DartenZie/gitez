@@ -56,6 +56,27 @@ fn host_of(raw: &str) -> Option<String> {
 /// home folder `home`, else absolute; no trailing `/`. The home folder
 /// itself and `/` are refused: the agent could not run.
 pub fn hidden_path(input: &str, home: Option<&Path>) -> Result<String, String> {
+    settings_path(
+        input,
+        home,
+        "Hiding the whole home folder or disk would stop the agent from running.",
+    )
+}
+
+/// A folder the agent may write in every thread, as Settings keeps it (as
+/// [`hidden_path`]). The home folder itself and `/` are refused: the
+/// sandbox would no longer keep the agent's writes in.
+pub fn writable_path(input: &str, home: Option<&Path>) -> Result<String, String> {
+    settings_path(
+        input,
+        home,
+        "Letting the agent write the whole home folder or disk would undo the sandbox.",
+    )
+}
+
+/// `input` as Settings keeps a path; `whole` says why the home folder or
+/// `/` is refused.
+fn settings_path(input: &str, home: Option<&Path>, whole: &str) -> Result<String, String> {
     let text = input.trim();
     if text.is_empty() {
         return Err("Type a path, or choose one.".to_owned());
@@ -72,9 +93,7 @@ pub fn hidden_path(input: &str, home: Option<&Path>) -> Result<String, String> {
         text.pop();
     }
     if text == "~" || text == "/" {
-        return Err(
-            "Hiding the whole home folder or disk would stop the agent from running.".into(),
-        );
+        return Err(whole.to_owned());
     }
     if !(text.starts_with("~/") || text.starts_with('/')) {
         return Err("Give a full path, or one that starts with ~/.".to_owned());
@@ -220,6 +239,22 @@ pub fn guess_setup_command(exists: impl Fn(&str) -> bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writable_paths_are_kept_like_hidden_ones_and_never_the_home_folder() {
+        let home = Path::new("/Users/me");
+        assert_eq!(
+            writable_path("/Users/me/.gradle/caches/", Some(home)).expect("valid"),
+            "~/.gradle/caches"
+        );
+        assert_eq!(
+            writable_path("/opt/cache", Some(home)).expect("valid"),
+            "/opt/cache"
+        );
+        assert!(writable_path("/Users/me", Some(home)).is_err());
+        assert!(writable_path("/", Some(home)).is_err());
+        assert!(writable_path("relative/dir", Some(home)).is_err());
+    }
 
     #[test]
     fn hosts_are_read_one_per_line_without_repeats() {

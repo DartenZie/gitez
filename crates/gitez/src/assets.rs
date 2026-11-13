@@ -24,6 +24,7 @@ icon_assets!(
         ChevronDown,
         ChevronUp,
         CircleAlert,
+        CircleStop,
         Cloud,
         Combine,
         Copy,

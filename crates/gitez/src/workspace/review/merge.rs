@@ -682,10 +682,21 @@ fn carry_out(
         None => None,
     };
     let common_dir = repository.common_dir();
+    // What GitEZ recorded of the worktree when it made it for a thread, so
+    // the check compares against that rather than only the git files.
+    // Found by the branch, so nothing in the worktree is looked at.
+    let record = head_worktree.as_ref().and_then(|_| {
+        gitez_agent_thread::Store::new(&common_dir)
+            .load_all()
+            .0
+            .into_iter()
+            .find(|thread| thread.branch == head)
+            .and_then(|thread| thread.worktree_record)
+    });
     let rebase_head = |onto: &str| -> anyhow::Result<()> {
         match &head_worktree {
             Some(dir) => {
-                gitez_agent_thread::rebase_in_worktree(&common_dir, dir, None, onto)?;
+                gitez_agent_thread::rebase_in_worktree(&common_dir, dir, record.as_ref(), onto)?;
                 Ok(())
             }
             None => Ok(git.rebase_branch(&head, onto, return_to.as_deref())?),

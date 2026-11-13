@@ -199,17 +199,30 @@ pub mod color {
     pub const HEAD_BADGE_TEXT: u32 = 0x0e_1a_28;
 
     /// Agent threads' state chips, background (with alpha where it has
-    /// eight digits) and text: Running; Preparing and Ready for review;
-    /// Queued, Waiting, No changes and Completed; Failed and Stopped, also
-    /// the text of a failed tool in a thread's activity.
+    /// eight digits) and text, one pair per state so no two states look
+    /// alike: Running (blue); Preparing (teal); Queued (grey, muted text);
+    /// Waiting for the usage limit (violet); Ready for review (green); an
+    /// Answer (light neutral); Uncommitted changes (amber); Failed (red),
+    /// also the text of a failed tool in a thread's activity; Stopped
+    /// (orange); Completed (grey, faint text).
     pub const THREAD_RUNNING: u32 = 0x5f_a8_f5_29;
     pub const THREAD_RUNNING_TEXT: u32 = 0x8f_c2_f8;
     pub const THREAD_PREPARING: u32 = 0x4f_c6_b0_29;
     pub const THREAD_PREPARING_TEXT: u32 = 0x7f_d8_c6;
     pub const THREAD_QUEUED: u32 = 0x26_26_2b;
     pub const THREAD_QUEUED_TEXT: u32 = 0xcf_cb_c0;
+    pub const THREAD_WAITING: u32 = 0xc0_8c_f0_29;
+    pub const THREAD_WAITING_TEXT: u32 = 0xd6_b4_f6;
+    pub const THREAD_READY: u32 = 0x6c_c5_8a_29;
+    pub const THREAD_READY_TEXT: u32 = DIFF_ADDED_TEXT;
+    pub const THREAD_ANSWER: u32 = 0x33_33_3a;
+    pub const THREAD_ANSWER_TEXT: u32 = TEXT;
+    pub const THREAD_UNCOMMITTED: u32 = 0xe8_b0_4b_29;
+    pub const THREAD_UNCOMMITTED_TEXT: u32 = CHIP_TEXT;
     pub const THREAD_FAILED: u32 = 0xf0_8a_7e_29;
     pub const THREAD_FAILED_TEXT: u32 = 0xf5_a8_9e;
+    pub const THREAD_STOPPED: u32 = 0xe8_9a_6c_29;
+    pub const THREAD_STOPPED_TEXT: u32 = 0xf2_b8_90;
     /// The border of a picker or option that is on; its background is
     /// [`SELECTED`].
     pub const PICKER_ON_BORDER: u32 = 0xe8_b0_4b_99;

@@ -940,7 +940,8 @@ status\n";
             let problem =
                 run_problem.unwrap_or_else(|| "GitEZ could not read the worktree.".to_owned());
             self.warn(format!(
-                "GitEZ could not check whether the agent left uncommitted changes: {problem} If                  it did, they are still in the worktree."
+                "GitEZ could not check whether the agent left uncommitted changes: {problem} If \
+                 it did, they are still in the worktree."
             ));
             return;
         }

@@ -486,3 +486,38 @@ fn a_newer_index_is_read_as_empty_and_never_overwritten() {
     fs::write(index.path(), "not json").expect("write");
     assert!(matches!(index.load(), Err(Error::Invalid { .. })));
 }
+
+#[test]
+fn the_index_reports_what_it_leaves_out_and_forgets_on_request() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let index = Index::new(&dir.path().join("data"));
+    assert_eq!(index.load_report().expect("report"), Default::default());
+    let one = dir.path().join("one").join(".git");
+    let two = dir.path().join("two").join(".git");
+    fs::create_dir_all(&one).expect("create folder");
+    fs::create_dir_all(&two).expect("create folder");
+    index.add(repository(&one, "one")).expect("add");
+    index.add(repository(&two, "two")).expect("add");
+    fs::remove_dir_all(dir.path().join("two")).expect("moved away");
+    let report = index.load_report().expect("report");
+    assert_eq!(report.repositories, [repository(&one, "one")]);
+    assert_eq!(report.missing, [repository(&two, "two")]);
+    assert_eq!(report.too_new, None);
+
+    index.remove(&two).expect("forget");
+    let report = index.load_report().expect("report");
+    assert!(report.missing.is_empty());
+    assert_eq!(report.repositories, [repository(&one, "one")]);
+    // Not listed: nothing changes.
+    index.remove(&dir.path().join("elsewhere")).expect("no-op");
+    assert_eq!(index.load().expect("load"), [repository(&one, "one")]);
+
+    let newer = "{\"version\": 9, \"repositories\": []}\n";
+    fs::write(index.path(), newer).expect("write");
+    assert_eq!(index.load_report().expect("report").too_new, Some(9));
+    assert!(matches!(
+        index.remove(&one),
+        Err(Error::TooNew { version: 9, .. })
+    ));
+    assert_eq!(fs::read_to_string(index.path()).expect("read"), newer);
+}

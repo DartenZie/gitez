@@ -987,3 +987,267 @@ fn e2e_u5_real_haiku() {
     assert_eq!(ahead, Some(2));
     assert!(text.contains("hello"), "{text:?}");
 }
+
+/// The fake `claude` of the uncommitted-work runs (C1). A prompt with "and
+/// commit it" commits `agent.txt` past the hook (`--no-verify`) and then
+/// leaves `draft.md`; any other prompt writes `draft.md` and tries to
+/// commit it, which the repository's pre-commit hook refuses.
+const LEAVING_CLAUDE: &str = r#"#!/bin/sh
+if [ "$1" = auth ]; then printf '{"loggedIn": true}\n'; exit 0; fi
+sid=""
+prev=""
+for arg in "$@"; do
+  case "$prev" in --session-id|--resume) sid="$arg" ;; esac
+  prev="$arg"
+done
+prompt=$(cat)
+say() { printf '%s\n' "$1"; }
+say '{"type":"system","subtype":"init","session_id":"'"$sid"'","model":"fake-model"}'
+tool() { say '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"'"$1"'"}}]}}'; }
+result() { say '{"type":"result","subtype":"success","is_error":false,"result":"'"$1"'","session_id":"'"$sid"'","num_turns":1,"duration_ms":5,"total_cost_usd":0.01}'; }
+case "$prompt" in
+  *"and commit it"*)
+    tool "git commit --no-verify"
+    printf 'one\n' > agent.txt && git add agent.txt && git commit --quiet --no-verify -m "Agent: add agent.txt" >&2
+    printf 'a draft\n' > draft.md
+    result "Committed agent.txt; draft.md is still a draft." ;;
+  *)
+    tool "git commit"
+    printf 'a draft\n' > draft.md && git add draft.md >&2
+    git commit --quiet -m "Agent: add draft.md" >&2 || true
+    result "Wrote draft.md; the pre-commit hook refused the commit." ;;
+esac
+"#;
+
+/// A repository whose pre-commit hook refuses every commit, and the
+/// leaving agent: the app, its window and the repository.
+fn leaving_app(base: &Path) -> (Shots, AnyWindowHandle, PathBuf, PathBuf) {
+    let work_dir = repository(base);
+    // `repository` points core.hooksPath here.
+    write_script(
+        &base.join("no hooks").join("pre-commit"),
+        "#!/bin/sh\necho 'pre-commit: run the linter first' >&2\nexit 1\n",
+    );
+    let mut agent = review_agent(base);
+    write_script(
+        agent.program.as_ref().expect("the fake agent"),
+        LEAVING_CLAUDE,
+    );
+    agent.env.clear();
+    let (mut shots, common_dir) = app(base, &work_dir, agent, None);
+    let (window, _) = shots.open_workspace(&work_dir);
+    (shots, window, work_dir, common_dir)
+}
+
+/// Waits until the thread `key` ended its turn with uncommitted changes
+/// recorded.
+fn wait_for_leftovers(shots: &mut Shots, key: &AgentThreadKey) -> Arc<AgentThread> {
+    let thread = wait_for(
+        shots,
+        key,
+        Duration::from_secs(30),
+        "the turn to end with uncommitted changes",
+        |thread| !thread.state.is_active() && thread.uncommitted.is_some(),
+    );
+    assert_eq!(thread.has_uncommitted(), Some(true), "{thread:#?}");
+    let uncommitted = thread.uncommitted.as_ref().expect("recorded");
+    assert!(
+        uncommitted
+            .paths
+            .iter()
+            .any(|path| path.contains("draft.md")),
+        "{uncommitted:?}"
+    );
+    assert!(
+        uncommitted
+            .commit_error
+            .as_deref()
+            .is_some_and(|error| error.contains("pre-commit")),
+        "the hook's words are kept: {uncommitted:?}"
+    );
+    thread
+}
+
+fn open_thread(shots: &mut Shots, window: AnyWindowHandle, key: &AgentThreadKey) {
+    shots.dispatch(
+        window,
+        crate::agent_threads::OpenAgentThread {
+            common_dir: key.common_dir.clone(),
+            id: key.id.clone(),
+        },
+    );
+}
+
+/// Settles until `done` holds, in real time, for up to `timeout`.
+fn settle_until(shots: &mut Shots, timeout: Duration, what: &str, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + timeout;
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        shots.settle();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// C1, case 1: the hook refuses the agent's commit, so the thread ends
+/// with uncommitted changes and says so; Complete asks; "Keep the
+/// worktree" completes it and keeps the folder with the change; removing
+/// the kept worktree asks again and deletes it.
+#[test]
+fn e2e_c1_uncommitted_keep_then_remove() {
+    if !crate::screenshot::enabled() || std::env::var_os("GITEZ_E2E").is_none() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let base = dir.path().canonicalize().expect("canonical");
+    let (mut shots, window, work_dir, common_dir) = leaving_app(&base);
+    let key = start(&mut shots, &work_dir, &common_dir, "Write draft.md", None);
+    let thread = wait_for_leftovers(&mut shots, &key);
+    assert_eq!(thread.pull_request, None, "nothing was committed");
+    open_thread(&mut shots, window, &key);
+    assert!(shots.has_id(window, "thread-ask-commit"));
+    shots.save(window, "fix-c1-1-uncommitted-thread");
+    shots.save_region(window, detail_region(), "fix-c1-1-uncommitted-thread-panel");
+
+    shots.click_id(window, "thread-complete");
+    assert!(
+        shots.has_id(window, "complete-keep"),
+        "Complete asks before discarding"
+    );
+    assert!(shots.has_id(window, "complete-discard"));
+    shots.save(window, "fix-c1-2-complete-asks");
+    shots.click_id(window, "complete-keep");
+    let completed = wait_for(
+        &mut shots,
+        &key,
+        Duration::from_secs(30),
+        "the thread to complete",
+        |thread| thread.state == State::Completed,
+    );
+    assert!(completed.worktree.join("draft.md").exists(), "kept");
+    shots.save(window, "fix-c1-3-completed-kept");
+    shots.save_region(window, detail_region(), "fix-c1-3-completed-kept-panel");
+
+    shots.click_id(window, "thread-remove-worktree");
+    assert!(shots.has_id(window, "remove-worktree-confirm"), "it asks");
+    shots.save(window, "fix-c1-4-remove-asks");
+    shots.click_id(window, "remove-worktree-confirm");
+    let worktree = completed.worktree.clone();
+    settle_until(
+        &mut shots,
+        Duration::from_secs(30),
+        "the worktree to be removed",
+        || !worktree.exists(),
+    );
+    let worktrees = gitez_command_output(&work_dir, &["worktree", "list", "--porcelain"]);
+    assert_eq!(
+        worktrees
+            .lines()
+            .filter(|line| line.starts_with("worktree "))
+            .count(),
+        1,
+        "{worktrees}"
+    );
+    shots.settle();
+    assert!(!shots.has_id(window, "thread-remove-worktree"));
+    shots.save_region(window, detail_region(), "fix-c1-5-removed-panel");
+}
+
+/// C1, case 2: "Discard and complete" removes the worktree and its
+/// uncommitted change.
+#[test]
+fn e2e_c1_uncommitted_discard() {
+    if !crate::screenshot::enabled() || std::env::var_os("GITEZ_E2E").is_none() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let base = dir.path().canonicalize().expect("canonical");
+    let (mut shots, window, work_dir, common_dir) = leaving_app(&base);
+    let key = start(&mut shots, &work_dir, &common_dir, "Write draft.md", None);
+    let thread = wait_for_leftovers(&mut shots, &key);
+    open_thread(&mut shots, window, &key);
+    shots.click_id(window, "thread-complete");
+    assert!(shots.has_id(window, "complete-discard"), "it asks");
+    shots.click_id(window, "complete-discard");
+    let completed = wait_for(
+        &mut shots,
+        &key,
+        Duration::from_secs(30),
+        "the thread to complete",
+        |thread| thread.state == State::Completed,
+    );
+    assert!(!thread.worktree.exists(), "discarded with the worktree");
+    let worktrees = gitez_command_output(&work_dir, &["worktree", "list", "--porcelain"]);
+    assert!(
+        !worktrees.contains(&completed.worktree.display().to_string()),
+        "{worktrees}"
+    );
+    shots.save_region(window, detail_region(), "fix-c1-6-discarded-panel");
+}
+
+/// C1, case 3: the agent commits past the hook and leaves a file, so its
+/// pull request comes with uncommitted changes; merging it completes the
+/// thread, keeps the worktree with the change, and the thread says so.
+#[test]
+fn e2e_c1_merge_keeps_leftovers() {
+    if !crate::screenshot::enabled() || std::env::var_os("GITEZ_E2E").is_none() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let base = dir.path().canonicalize().expect("canonical");
+    let (mut shots, window, work_dir, common_dir) = leaving_app(&base);
+    let key = start(
+        &mut shots,
+        &work_dir,
+        &common_dir,
+        "Write agent.txt and commit it",
+        None,
+    );
+    let thread = wait_for_leftovers(&mut shots, &key);
+    let number = thread.pull_request.expect("a pull request");
+    shots.dispatch(
+        window,
+        OpenAgentPullRequest {
+            common_dir: common_dir.clone(),
+            number,
+        },
+    );
+    shots.save(window, "fix-c1-7-pull-request-with-leftovers");
+    scroll_panel(&mut shots, window);
+    shots.save_region(
+        window,
+        panel_region(),
+        "fix-c1-7-pull-request-with-leftovers-panel",
+    );
+    shots.click_id(window, "pull-request-merge");
+    shots.save(window, "fix-c1-7-merge-dialog");
+    shots.click(window, merge_option());
+    let completed = wait_for(
+        &mut shots,
+        &key,
+        Duration::from_secs(30),
+        "the thread to complete",
+        |thread| thread.state == State::Completed,
+    );
+    assert!(
+        completed.worktree.join("draft.md").exists(),
+        "the merge keeps the worktree with its uncommitted change"
+    );
+    assert!(
+        completed
+            .warnings
+            .iter()
+            .any(|warning| warning.contains(&format!(
+                "Pull request #{number} was merged; GitEZ completed the thread but kept its worktree"
+            ))),
+        "{:?}",
+        completed.warnings
+    );
+    let merged = gitez_review::Store::new(&common_dir)
+        .load(number)
+        .expect("load");
+    assert_eq!(merged.state, gitez_review::State::Merged);
+    open_thread(&mut shots, window, &key);
+    assert!(shots.has_id(window, "thread-remove-worktree"));
+    shots.save(window, "fix-c1-8-merged-kept");
+    shots.save_region(window, detail_region(), "fix-c1-8-merged-kept-panel");
+}

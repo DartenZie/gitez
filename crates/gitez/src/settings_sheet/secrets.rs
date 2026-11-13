@@ -45,6 +45,8 @@ pub(super) struct Secrets {
     edit: Option<RowEdit>,
     /// The account being written, with the keychain busy.
     busy: Option<String>,
+    /// Follows the replacement field; replaced with it.
+    _replace_changes: Option<Subscription>,
     /// What went wrong with a row, by account.
     row_error: Option<(String, SharedString)>,
 }
@@ -111,6 +113,7 @@ impl Secrets {
             _checking: None,
             edit: None,
             busy: None,
+            _replace_changes: None,
             row_error: None,
         }
     }
@@ -240,7 +243,8 @@ impl SettingsSheet {
         } else if value.is_empty() {
             Some("Type the value. It goes to the keychain and is not shown again.".into())
         } else {
-            None
+            // Too short a value could not be kept out of what agents print.
+            gitez_settings::secret_value_problem(&value).map(SharedString::from)
         };
         if let Some(problem) = problem {
             self.secrets.error = Some(problem);
@@ -298,7 +302,7 @@ impl SettingsSheet {
                 .masked(true)
                 .placeholder("New value, stored in the keychain")
         });
-        self._subscriptions.push(cx.subscribe_in(
+        self.secrets._replace_changes = Some(cx.subscribe_in(
             &value,
             window,
             |this, _, event: &InputEvent, window, cx| match event {
@@ -327,6 +331,11 @@ impl SettingsSheet {
         let text = value.read(cx).value().to_string();
         if text.is_empty() {
             self.secrets.row_error = Some((account, "Type the new value.".into()));
+            cx.notify();
+            return;
+        }
+        if let Some(problem) = gitez_settings::secret_value_problem(&text) {
+            self.secrets.row_error = Some((account, problem.into()));
             cx.notify();
             return;
         }
@@ -588,9 +597,9 @@ impl SettingsSheet {
             )
             .child(description(
                 "Environment variables a thread can be given. You can replace a value but never \
-                 read it back, and values stay out of the repository, the prompt and transcripts. \
-                 With the Packages or Open network, a token lets the agent use that service; \
-                 GitEZ tells it never to push.",
+                 read it back. Values stay out of the repository and the prompt, and transcripts \
+                 hide them (4 characters or more). With Packages or Open, a token lets the agent \
+                 use that service; GitEZ tells it never to push.",
             ))
             .child(table)
     }
@@ -1037,8 +1046,33 @@ mod tests {
     use std::path::Path;
 
     use gitez_settings::SecretScope;
+    use gpui_kit::TestAppContext;
 
     use super::scope_label;
+
+    /// A value too short to be kept out of what agents print is refused,
+    /// and nothing is stored.
+    #[gpui_kit::test]
+    fn a_short_secret_value_is_refused(cx: &mut TestAppContext) {
+        let (_dir, sheet, mut cx) = crate::settings_sheet::tests::sheet(cx);
+        sheet.update_in(&mut cx, |sheet, window, cx| {
+            sheet
+                .secrets
+                .name
+                .update(cx, |input, cx| input.set_value("TOKEN", window, cx));
+            sheet
+                .secrets
+                .value
+                .update(cx, |input, cx| input.set_value("abc", window, cx));
+            sheet.add_secret(window, cx);
+        });
+        cx.run_until_parked();
+        sheet.read_with(&cx, |sheet, cx| {
+            let error = sheet.secrets.error.clone().expect("refused");
+            assert!(error.contains("shorter than 4 characters"), "{error}");
+            assert!(sheet.model.read(cx).settings().secrets.is_empty());
+        });
+    }
 
     #[test]
     fn scopes_are_named_for_the_open_repository() {

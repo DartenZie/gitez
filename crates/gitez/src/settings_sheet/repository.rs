@@ -21,6 +21,8 @@ pub(super) const SETUP_COMMAND_KEY: &str = "gitez.setupCommand";
 pub(super) struct RepositoryForm {
     work_dir: PathBuf,
     setup: Entity<InputState>,
+    /// Follows `setup`; dropped with the form.
+    _setup_changes: Subscription,
     /// The command in git config, once read; `None` when unset.
     saved: Option<Option<String>>,
     /// What GitEZ suggests, shown but never run or saved by itself.
@@ -68,15 +70,12 @@ impl SettingsSheet {
             return;
         };
         let setup = cx.new(|cx| InputState::new(window, cx));
-        self._subscriptions.push(cx.subscribe_in(
-            &setup,
-            window,
-            |this, _, event: &InputEvent, _, cx| {
+        let setup_changes =
+            cx.subscribe_in(&setup, window, |this, _, event: &InputEvent, _, cx| {
                 if let InputEvent::Change = event {
                     this.setup_typed(cx);
                 }
-            },
-        ));
+            });
         let worktrees = data_dir.map(|data_dir| {
             data_dir
                 .join("worktrees")
@@ -135,6 +134,7 @@ impl SettingsSheet {
             saving: false,
             worktrees: worktrees.map(|dir| (dir, false)),
             _loading: Some(loading),
+            _setup_changes: setup_changes,
         });
     }
 

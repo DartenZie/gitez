@@ -17,7 +17,7 @@ use gpui_kit::component::StyledExt as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::agent_thread::{agent_mark, chip, duration};
+use super::agent_thread::{Look, agent_mark, chip, duration};
 use crate::agent_threads::{AgentThreadKey, AgentThreads};
 use crate::theme::color;
 
@@ -148,16 +148,16 @@ impl Lane {
     /// The description column: state, title, then the tool and what it
     /// works on.
     pub fn description(&self, mono: SharedString) -> Div {
-        let label = match self.state {
-            State::Preparing => "Preparing",
-            _ => "Running",
+        let look = match self.state {
+            State::Preparing => Look::Preparing,
+            _ => Look::Running,
         };
         div()
             .h_flex()
             .flex_1()
             .min_w_0()
             .gap(px(7.))
-            .child(chip(self.state, None, label.to_owned()))
+            .child(chip(look, look.word().to_owned()))
             .child(
                 div()
                     .flex_shrink(1.)

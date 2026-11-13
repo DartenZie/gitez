@@ -52,6 +52,9 @@ pub enum ComposerMode {
         branches: Vec<(String, Oid)>,
         /// The branch checked out; `None` with a detached `HEAD`.
         current: Option<String>,
+        /// A bare repository: nothing to start from, which the composer
+        /// says.
+        bare: bool,
     },
     /// Home: in a repository picked with the Repository picker.
     Home,
@@ -74,6 +77,9 @@ struct Target {
     branches: Vec<(String, Oid)>,
     current: Option<String>,
     bare: bool,
+    /// Files with uncommitted changes in the main worktree, which a thread
+    /// does not start with; `None` while not known.
+    uncommitted: Option<usize>,
 }
 
 /// What was found out about the agents and the sandbox, in the background.
@@ -143,9 +149,9 @@ impl Composer {
         let model = AgentThreads::global(cx);
         let placeholder = match mode {
             ComposerMode::Repository { .. } => {
-                "Describe a task or ask a question about this repository"
+                "Say what the agent should do, or ask a question about this repository"
             }
-            ComposerMode::Home => "Describe a task or ask a question about a repository",
+            ComposerMode::Home => "Say what the agent should do, or ask about a repository",
         };
         let prompt = cx.new(|cx| {
             TextareaState::new(window, cx)
@@ -215,15 +221,18 @@ impl Composer {
             name,
             branches,
             current,
+            bare,
         } = &mode
         {
+            let uncommitted = self.target.as_ref().and_then(|target| target.uncommitted);
             let target = Target {
                 work_dir: work_dir.clone(),
                 common_dir: common_dir.clone(),
                 name: name.clone(),
                 branches: branches.clone(),
                 current: current.clone(),
-                bare: false,
+                bare: *bare,
+                uncommitted,
             };
             self.set_target(target);
         }
@@ -246,6 +255,17 @@ impl Composer {
             .filter(|from| target.branches.iter().any(|(name, _)| name == from));
         self.target = Some(target);
         self.target_error = None;
+    }
+
+    /// How many files have uncommitted changes in the repository's main
+    /// worktree, as the window read them.
+    pub fn set_uncommitted(&mut self, count: Option<usize>, cx: &mut Context<Self>) {
+        if let Some(target) = &mut self.target
+            && target.uncommitted != count
+        {
+            target.uncommitted = count;
+            cx.notify();
+        }
     }
 
     /// Puts the cursor in the prompt.
@@ -497,7 +517,15 @@ impl Composer {
                 "HEAD is detached: pick a branch to start from.".to_owned(),
                 false,
             ),
-            (Some(_), None) => {}
+            (Some(target), None) => {
+                // The thread's worktree is made from the branch's last
+                // commit; what the user has not committed stays behind.
+                if let (Some(count), Some(branch)) = (target.uncommitted, self.start_branch())
+                    && count > 0
+                {
+                    add(Severity::Warning, uncommitted_warning(branch), false);
+                }
+            }
         }
         match &self.environment {
             None => add(
@@ -645,6 +673,12 @@ fn read_target(path: &Path) -> anyhow::Result<Target> {
         Some(gitez_git::Head::Branch { name, .. }) => Some(name.clone()),
         _ => None,
     };
+    // The user's own working tree (never a thread's): what a thread would
+    // not start with.
+    let uncommitted = repository
+        .work_dir()
+        .and_then(|_| repository.status().ok())
+        .map(|status| status.files.len());
     Ok(Target {
         work_dir: repository
             .work_dir()
@@ -652,6 +686,7 @@ fn read_target(path: &Path) -> anyhow::Result<Target> {
         common_dir: repository.common_dir(),
         name: repository.name().into(),
         bare: repository.work_dir().is_none(),
+        uncommitted,
         branches: refs
             .branches
             .into_iter()
@@ -690,11 +725,17 @@ fn agent_subtitle(check: &AgentCheck) -> String {
     }
 }
 
-/// The one-line description of a network profile in its picker.
+/// What the composer says when the main worktree has uncommitted changes.
+pub(crate) fn uncommitted_warning(branch: &str) -> String {
+    format!("Starts from the last commit on `{branch}`; your uncommitted changes are not included")
+}
+
+/// The one-line description of a network profile in its picker, in the
+/// words of Settings.
 fn network_description(profile: NetworkProfile) -> &'static str {
     match profile {
-        NetworkProfile::AgentOnly => "Downloads from package registries fail",
-        NetworkProfile::Packages => "Agent API, package registries and origin",
+        NetworkProfile::AgentOnly => "Only the agent’s own API; package downloads fail",
+        NetworkProfile::Packages => "Agent API, package registries and this repository’s remotes",
         NetworkProfile::Open => "Any host",
     }
 }
@@ -992,8 +1033,9 @@ impl Composer {
                 }
                 menu.separator()
                     .item(menu_note(
-                        "Writes stay inside the worktree. ~/.ssh and other home secrets are \
-                         hidden.",
+                        "The agent writes only its worktree, its own temporary folder and its \
+                         own package caches. It reads the rest of the disk except hidden paths \
+                         such as ~/.ssh.",
                     ))
                     .item(menu_note(
                         "With Packages or Open, the agent could send out whatever it can read, \
@@ -1119,8 +1161,8 @@ impl Composer {
                     )
                     .child(separator())
                     .child(note(
-                        "Given as environment variables. Values never appear in the prompt or \
-                         the transcript.",
+                        "Given as environment variables, never put in the prompt. GitEZ hides \
+                         the values where the agent prints them in the transcript.",
                     ))
                     .child(
                         Button::new("composer-manage-secrets")
@@ -1570,6 +1612,7 @@ mod tests {
             name: "repo".into(),
             branches: vec![("main".into(), oid(1)), ("feature".into(), oid(2))],
             current: Some("feature".into()),
+            bare: false,
         };
         let window = cx.open_window(size(px(900.), px(600.)), |window, cx| {
             Composer::new(mode, window, cx)
@@ -1660,6 +1703,64 @@ mod tests {
         // The prompt is emptied for the next thread.
         composer.read_with(&cx, |composer, cx| {
             assert!(composer.prompt.read(cx).value().is_empty());
+        });
+    }
+
+    /// M4: with uncommitted changes in the main worktree the composer says
+    /// a thread does not start with them; Send still works.
+    #[gpui_kit::test]
+    fn uncommitted_changes_are_said_to_stay_behind(cx: &mut TestAppContext) {
+        let (composer, mut cx) = composer(cx);
+        let warning = super::uncommitted_warning("feature");
+        assert_eq!(
+            warning,
+            "Starts from the last commit on `feature`; your uncommitted changes are not included"
+        );
+        let has = |composer: &Composer, cx: &gpui_kit::App| {
+            composer.problems(cx).iter().any(|problem| {
+                problem.text == warning && problem.severity == super::Severity::Warning
+            })
+        };
+        composer.read_with(&cx, |composer, cx| assert!(!has(composer, cx)));
+        composer.update(&mut cx, |composer, cx| {
+            composer.set_uncommitted(Some(2), cx)
+        });
+        composer.read_with(&cx, |composer, cx| assert!(has(composer, cx)));
+        // Kept when the refs are read again.
+        composer.update(&mut cx, |composer, cx| {
+            let mode = composer.mode.clone();
+            composer.set_mode(mode, cx);
+        });
+        composer.read_with(&cx, |composer, cx| assert!(has(composer, cx)));
+        composer.update(&mut cx, |composer, cx| {
+            composer.set_uncommitted(Some(0), cx)
+        });
+        composer.read_with(&cx, |composer, cx| assert!(!has(composer, cx)));
+    }
+
+    /// Minor 16: a bare repository keeps its composer, which says why
+    /// nothing can start.
+    #[gpui_kit::test]
+    fn a_bare_repository_says_why_no_thread_can_start(cx: &mut TestAppContext) {
+        let (composer, mut cx) = composer(cx);
+        composer.update(&mut cx, |composer, cx| {
+            composer.set_mode(
+                ComposerMode::Repository {
+                    work_dir: "/repo.git".into(),
+                    common_dir: "/repo.git".into(),
+                    name: "repo".into(),
+                    branches: vec![("main".into(), oid(1))],
+                    current: Some("main".into()),
+                    bare: true,
+                },
+                cx,
+            )
+        });
+        composer.read_with(&cx, |composer, cx| {
+            assert!(composer.problems(cx).iter().any(|problem| {
+                problem.severity == super::Severity::Blocking
+                    && problem.text.contains("bare repository")
+            }));
         });
     }
 }

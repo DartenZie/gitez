@@ -602,6 +602,18 @@ fn drive(
     shots.type_text(window, "~/.config/u4-tool");
     shots.keys(window, "enter");
     shots.click(window, at(UNHIDE_AWS.0, UNHIDE_AWS.1));
+    // A path hidden by default is shown only after asking.
+    assert!(
+        settings_on_disk(&setup.data_dir)
+            .sandbox
+            .hidden_paths
+            .contains(&"~/.aws".to_owned()),
+        "not before the answer"
+    );
+    if prefix == "u4" {
+        shots.save(window, "fix-u4-unhide-asks");
+    }
+    shots.click_id(window, "unhide-confirm");
     let hidden = settings_on_disk(&setup.data_dir).sandbox.hidden_paths;
     assert!(
         hidden.contains(&"~/.config/u4-tool".to_owned()),

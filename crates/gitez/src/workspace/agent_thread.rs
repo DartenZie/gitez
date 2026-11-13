@@ -4,6 +4,7 @@
 //! wide, in Home; laid out as in the `C-3-Session` and `C-6-Thread` boards.
 
 pub mod activity;
+pub mod complete;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -25,7 +26,18 @@ use gpui_kit::*;
 use super::labels;
 use crate::agent_threads::{AgentThreadKey, AgentThreads, AgentThreadsEvent};
 use crate::theme::{self, color};
-use activity::{Entry, Row, TurnEvents};
+use activity::{Entry, Planned, Row, TurnEvents};
+
+/// The reply "Ask the agent to commit" puts in the box.
+const ASK_TO_COMMIT: &str = "You left uncommitted changes in the worktree. Commit what belongs to \
+    the task with a clear message, and remove what does not. If a pre-commit hook fails, fix what \
+    it reports and commit again.";
+
+/// Activity rows from which the list is virtual: only the rows in view are
+/// laid out and drawn, in a box of its own that scrolls.
+const VIRTUAL_FROM: usize = 40;
+/// Height of the virtual activity list.
+const VIRTUAL_HEIGHT: Pixels = px(520.);
 
 /// What the thread view asks of the window it is in.
 pub enum ThreadViewEvent {
@@ -92,6 +104,14 @@ pub struct ThreadView {
     /// By turn, aligned with the thread's turns.
     runs: Vec<Option<RunEvents>>,
     entries: Vec<Entry>,
+    /// The activity's rows as last drawn.
+    plan: Vec<Planned>,
+    /// The virtual list of the rows, once there are [`VIRTUAL_FROM`].
+    rows: ListState,
+    /// Whether the virtual list follows the newest row (while live).
+    following: bool,
+    /// [`VIRTUAL_FROM`]; tests change it to measure the list drawn whole.
+    virtual_from: usize,
     reading: Option<Task<()>>,
     /// The transcripts changed while being read.
     read_again: bool,
@@ -149,6 +169,10 @@ impl ThreadView {
             expanded: HashSet::new(),
             runs: Vec::new(),
             entries: Vec::new(),
+            plan: Vec::new(),
+            rows: ListState::new(0, ListAlignment::Top, px(400.)),
+            following: false,
+            virtual_from: VIRTUAL_FROM,
             reading: None,
             read_again: false,
             transcript_error: None,
@@ -422,18 +446,30 @@ impl ThreadView {
     }
 
     fn complete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.run(
-            Busy::Completing,
-            window,
-            cx,
-            |model, key, cx| model.complete(key, cx),
-            |_, window, cx| {
-                window.push_notification(
-                    crate::toast::success("Completed; the worktree is removed"),
-                    cx,
-                )
-            },
-        );
+        if self.busy.is_some() {
+            return;
+        }
+        complete::complete(self.key.clone(), self.completing_busy(cx), window, cx);
+    }
+
+    /// Removes the worktree the completed thread kept, after asking.
+    fn remove_worktree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy.is_some() {
+            return;
+        }
+        complete::remove_worktree(self.key.clone(), self.completing_busy(cx), window, cx);
+    }
+
+    /// Marks the view busy completing while [`complete`] works.
+    fn completing_busy(&self, cx: &mut Context<Self>) -> complete::Busy {
+        let view = cx.entity().downgrade();
+        std::rc::Rc::new(move |busy, _, cx| {
+            view.update(cx, |this, cx| {
+                this.busy = busy.then(|| (Busy::Completing, Task::ready(())));
+                cx.notify();
+            })
+            .ok();
+        })
     }
 
     fn retry(&mut self, network: NetworkProfile, window: &mut Window, cx: &mut Context<Self>) {
@@ -566,49 +602,148 @@ pub fn ago(time: Timestamp, now: Timestamp) -> String {
     crate::time::relative(git_time(time), now.as_second())
 }
 
-/// What `thread` is doing, or how it ended: "Running", "Waiting until
-/// 14:30", "Ready for review", "No changes", "Failed".
-pub fn state_label(thread: &AgentThread) -> String {
-    match thread.state {
-        State::Queued => "Queued".to_owned(),
-        State::Preparing => "Preparing".to_owned(),
-        State::Running => "Running".to_owned(),
-        State::Waiting => match thread.waiting_until {
-            Some(until) => format!("Waiting until {}", local_time(until)),
-            None => "Waiting".to_owned(),
-        },
-        State::Finished => ending_label(thread.ending).to_owned(),
-        State::Completed => "Completed".to_owned(),
+/// The one vocabulary of thread states every view uses (thread view, Home,
+/// the Agents popover, lanes, the review panel), each with its own colours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Look {
+    Queued,
+    Preparing,
+    Running,
+    /// Waiting for the agent's usage limit.
+    Waiting,
+    /// Finished with a pull request.
+    Ready,
+    /// Finished with an answer and nothing left in the worktree.
+    Answer,
+    /// Finished without a pull request, but with uncommitted changes left
+    /// in the worktree: never "no changes".
+    Uncommitted,
+    Failed,
+    Stopped,
+    Completed,
+}
+
+impl Look {
+    pub fn of(thread: &AgentThread) -> Self {
+        match thread.state {
+            State::Queued => Look::Queued,
+            State::Preparing => Look::Preparing,
+            State::Running => Look::Running,
+            State::Waiting => Look::Waiting,
+            State::Completed => Look::Completed,
+            State::Finished => match thread.ending {
+                Some(Ending::Failed) => Look::Failed,
+                Some(Ending::Stopped) => Look::Stopped,
+                _ if thread.pull_request.is_some() => Look::Ready,
+                _ if thread.has_uncommitted() == Some(true) => Look::Uncommitted,
+                Some(Ending::PullRequest) => Look::Ready,
+                Some(Ending::Answer) | None => Look::Answer,
+            },
+        }
+    }
+
+    /// The chip's background and the state's text colour.
+    pub fn colors(self) -> (Rgba, u32) {
+        match self {
+            Look::Queued => (rgb(color::THREAD_QUEUED), color::TEXT_MUTED),
+            Look::Preparing => (rgba(color::THREAD_PREPARING), color::THREAD_PREPARING_TEXT),
+            Look::Running => (rgba(color::THREAD_RUNNING), color::THREAD_RUNNING_TEXT),
+            Look::Waiting => (rgba(color::THREAD_WAITING), color::THREAD_WAITING_TEXT),
+            Look::Ready => (rgba(color::THREAD_READY), color::THREAD_READY_TEXT),
+            Look::Answer => (rgb(color::THREAD_ANSWER), color::THREAD_ANSWER_TEXT),
+            Look::Uncommitted => (
+                rgba(color::THREAD_UNCOMMITTED),
+                color::THREAD_UNCOMMITTED_TEXT,
+            ),
+            Look::Failed => (rgba(color::THREAD_FAILED), color::THREAD_FAILED_TEXT),
+            Look::Stopped => (rgba(color::THREAD_STOPPED), color::THREAD_STOPPED_TEXT),
+            Look::Completed => (rgb(color::THREAD_QUEUED), color::TEXT_FAINT),
+        }
+    }
+
+    /// The state's text colour.
+    pub fn text(self) -> u32 {
+        self.colors().1
+    }
+
+    /// Its word, without the time a waiting thread waits until.
+    pub fn word(self) -> &'static str {
+        match self {
+            Look::Queued => "Queued",
+            Look::Preparing => "Preparing",
+            Look::Running => "Running",
+            Look::Waiting => "Waiting",
+            Look::Ready => "Ready for review",
+            Look::Answer => "Answer",
+            Look::Uncommitted => "Uncommitted changes",
+            Look::Failed => "Failed",
+            Look::Stopped => "Stopped",
+            Look::Completed => "Completed",
+        }
     }
 }
 
-fn ending_label(ending: Option<Ending>) -> &'static str {
-    match ending {
-        Some(Ending::PullRequest) => "Ready for review",
-        Some(Ending::Answer) | None => "No changes",
-        Some(Ending::Failed) => "Failed",
-        Some(Ending::Stopped) => "Stopped",
+/// What `thread` is doing, or how it ended: "Running", "Waiting until
+/// 14:30", "Ready for review", "Answer", "Uncommitted changes", "Failed".
+pub fn state_label(thread: &AgentThread) -> String {
+    match (Look::of(thread), thread.waiting_until) {
+        (Look::Waiting, Some(until)) => format!("Waiting until {}", local_time(until)),
+        (look, _) => look.word().to_owned(),
     }
+}
+
+/// How a completed thread was completed: "Completed · PR #12 merged",
+/// "Completed · PR #12 closed", "Completed by hand". `pull_request` is the
+/// state of its pull request, when read.
+pub fn completed_label(thread: &AgentThread, pull_request: Option<gitez_review::State>) -> String {
+    match (thread.pull_request, pull_request) {
+        (Some(number), Some(gitez_review::State::Merged)) => {
+            format!("Completed · PR #{number} merged")
+        }
+        (Some(number), Some(gitez_review::State::Closed)) => {
+            format!("Completed · PR #{number} closed")
+        }
+        (Some(number), _) => format!("Completed · PR #{number}"),
+        (None, _) => "Completed by hand".to_owned(),
+    }
+}
+
+/// "3 uncommitted changes" left in `thread`'s worktree, if any; for a
+/// thread whose worktree was removed, nothing.
+pub fn uncommitted_text(thread: &AgentThread) -> Option<String> {
+    let uncommitted = thread
+        .uncommitted
+        .as_ref()
+        .filter(|found| found.count > 0)?;
+    Some(match uncommitted.count {
+        1 => "1 uncommitted change".to_owned(),
+        count => format!("{count} uncommitted changes"),
+    })
+}
+
+/// Why the changes `thread` left are still uncommitted, as the supervisor
+/// recorded it (git's or a hook's words), ending as a sentence.
+pub fn commit_error_text(thread: &AgentThread) -> Option<String> {
+    let error = thread.uncommitted.as_ref()?.commit_error.as_deref()?.trim();
+    if error.is_empty() {
+        return None;
+    }
+    Some(if error.ends_with(['.', '!', '?']) {
+        error.to_owned()
+    } else {
+        format!("{error}.")
+    })
 }
 
 /// The chip showing [`state_label`] in the state's colours.
 pub fn state_chip(thread: &AgentThread) -> Div {
-    chip(thread.state, thread.ending, state_label(thread))
+    chip(Look::of(thread), state_label(thread))
 }
 
-/// A chip saying `label` in the colours of `state` and `ending`.
-pub fn chip(state: State, ending: Option<Ending>, label: String) -> Div {
-    let (background, text) = match (state, ending) {
-        (State::Running, _) => (rgba(color::THREAD_RUNNING), color::THREAD_RUNNING_TEXT),
-        (State::Preparing, _) | (State::Finished, Some(Ending::PullRequest)) => {
-            (rgba(color::THREAD_PREPARING), color::THREAD_PREPARING_TEXT)
-        }
-        (State::Finished, Some(Ending::Failed | Ending::Stopped)) => {
-            (rgba(color::THREAD_FAILED), color::THREAD_FAILED_TEXT)
-        }
-        _ => (rgb(color::THREAD_QUEUED), color::THREAD_QUEUED_TEXT),
-    };
-    let mark = if state == State::Completed {
+/// A chip saying `label` in the colours of `look`.
+pub fn chip(look: Look, label: String) -> Div {
+    let (background, text) = look.colors();
+    let mark = if look == Look::Completed {
         Icon::new(IconName::Check).size(px(11.)).into_any_element()
     } else {
         div()
@@ -632,6 +767,60 @@ pub fn chip(state: State, ending: Option<Ending>, label: String) -> Div {
         .whitespace_nowrap()
         .child(mark)
         .child(label)
+}
+
+/// The 16 px mark of a thread's state, in its colour: a ring with a dot
+/// while running (dashed while preparing), a dashed ring while queued or
+/// waiting, a pull-request mark when ready for review, a speech bubble for
+/// an answer, a warning for uncommitted changes, a cross when it failed, a
+/// square when stopped, and when completed a merge mark (merged), a crossed
+/// circle (closed) or a tick (by hand). `pull_request` is the state of its
+/// pull request, when read.
+pub fn state_icon(thread: &AgentThread, pull_request: Option<gitez_review::State>) -> AnyElement {
+    let look = Look::of(thread);
+    let hex = look.text();
+    let ring = |dashed: bool| {
+        div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(12.))
+            .rounded_full()
+            .border_2()
+            .border_color(rgb(hex))
+            .when(dashed, |this| this.border_dashed())
+    };
+    let icon = |name: IconName| {
+        Icon::new(name)
+            .size(px(14.))
+            .text_color(rgb(hex))
+            .into_any_element()
+    };
+    let mark = match look {
+        Look::Running => ring(false)
+            .child(div().size(px(4.)).rounded_full().bg(rgb(hex)))
+            .into_any_element(),
+        Look::Preparing | Look::Queued | Look::Waiting => ring(true).into_any_element(),
+        Look::Ready => icon(IconName::GitPullRequestArrow),
+        Look::Answer => icon(IconName::MessageSquare),
+        Look::Uncommitted => icon(IconName::TriangleAlert),
+        Look::Failed => icon(IconName::CircleX),
+        Look::Stopped => icon(IconName::CircleStop),
+        Look::Completed => match (thread.pull_request, pull_request) {
+            (Some(_), Some(gitez_review::State::Merged)) => icon(IconName::GitMerge),
+            (Some(_), Some(gitez_review::State::Closed)) => icon(IconName::CircleX),
+            _ => icon(IconName::Check),
+        },
+    };
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(px(16.))
+        .mt(px(1.))
+        .child(mark)
+        .into_any_element()
 }
 
 /// `time` as hours and minutes in the local time zone.
@@ -683,18 +872,10 @@ pub fn summary(thread: &AgentThread, now: Timestamp) -> String {
     let mut parts = match thread.state {
         State::Queued => vec!["Waits for a free slot".to_owned()],
         State::Preparing | State::Running | State::Waiting => vec![run, steps],
-        State::Finished | State::Completed => {
-            let when = ago(finished_at(thread), now);
-            let mut parts = Vec::new();
-            if thread.state == State::Completed {
-                parts.push(ending_label(thread.ending).to_owned());
-                parts.push(format!("finished {when}"));
-            } else {
-                parts.push(format!("Finished {when}"));
-            }
-            parts.push(format!("{run} run"));
-            parts
-        }
+        State::Finished | State::Completed => vec![
+            format!("Finished {}", ago(finished_at(thread), now)),
+            format!("{run} run"),
+        ],
     };
     parts.extend(cost);
     parts.join(" · ")
@@ -856,11 +1037,14 @@ impl ThreadView {
                     .when(can_complete, |this| {
                         this.child(
                             Button::new("thread-complete")
+                                .debug_selector(|| "thread-complete".into())
                                 .h(px(28.))
                                 .compact()
                                 .icon(Icon::new(IconName::Check).size(px(13.)))
                                 .label("Complete")
-                                .tooltip("Removes the worktree. The thread stays readable.")
+                                .tooltip(crate::workspace::toolbar::agents::complete_tooltip(
+                                    thread,
+                                ))
                                 .loading(busy == Some(Busy::Completing))
                                 .disabled(busy.is_some())
                                 .on_click(
@@ -968,7 +1152,10 @@ impl ThreadView {
                 .into_any_element(),
             ));
         }
-        if thread.state != State::Completed {
+        // Looked up with the thread in the background: never a disk read
+        // while drawing.
+        let present = self.model.read(cx).facts(&self.key).worktree_present;
+        if thread.state != State::Completed || present {
             let worktree = thread.worktree.clone();
             rows = rows.child(row(
                 "Worktree",
@@ -987,7 +1174,7 @@ impl ThreadView {
                             .text_color(rgb(color::TEXT_SECONDARY))
                             .child(crate::recent::display(&worktree)),
                     )
-                    .when(worktree.exists(), |this| {
+                    .when(present, |this| {
                         this.child(
                             Button::new("thread-reveal-worktree")
                                 .ghost()
@@ -1110,21 +1297,26 @@ impl ThreadView {
         let common_dir = self.key.common_dir.clone();
         let completed = thread.state == State::Completed;
         // How the pull request ended, once read, for a completed thread.
+        let worktree = if self.model.read(cx).facts(&self.key).worktree_present {
+            "its worktree kept (see above)"
+        } else {
+            "its worktree removed"
+        };
         let note = match (completed, self.details.pull_request_state) {
             (false, _) => "Review comments go back to this thread and run in its worktree.".into(),
             (true, Some(gitez_review::State::Merged)) => format!(
-                "Merged into {}. The thread is completed and its worktree removed.",
+                "Merged into {}. The thread is completed and {worktree}.",
                 thread.start.branch
             ),
             (true, Some(gitez_review::State::Closed)) => {
-                "Closed without merging. The thread is completed and its worktree removed.".into()
+                format!("Closed without merging. The thread is completed and {worktree}.")
             }
             (true, Some(gitez_review::State::Open)) => {
                 "Reopened after the thread was completed; it is reviewed like any other pull \
                  request."
                     .into()
             }
-            (true, None) => "The thread is completed and its worktree removed.".into(),
+            (true, None) => format!("The thread is completed and {worktree}."),
         };
         let button = Button::new("thread-open-pull-request")
             .h(px(34.))
@@ -1281,7 +1473,7 @@ impl ThreadView {
         if !open {
             return log;
         }
-        let rows = activity::rows(&self.entries, &self.expanded, live);
+        let rows = self.plan.len();
         let body = div()
             .v_flex()
             .py(px(4.))
@@ -1296,7 +1488,7 @@ impl ThreadView {
                     .text_color(rgb(color::THREAD_FAILED_TEXT))
                     .child(error.clone()),
             )
-        } else if rows.is_empty() {
+        } else if rows == 0 {
             body.child(
                 div()
                     .px(px(12.))
@@ -1311,16 +1503,63 @@ impl ThreadView {
                         "The agent took no steps"
                     }),
             )
-        } else {
-            let user = self.details.user_name.clone();
-            body.children(
-                rows.into_iter()
-                    .enumerate()
-                    .map(|(index, row)| self.render_row(index, row, user.as_deref(), cx)),
+        } else if rows >= self.virtual_from {
+            // Only the rows in view are laid out: a transcript of thousands
+            // of steps draws as fast as a short one.
+            body.child(
+                list(
+                    self.rows.clone(),
+                    // Each row takes the list's width, as when drawn whole.
+                    cx.processor(|this, index: usize, _, cx| {
+                        div()
+                            .w_full()
+                            .child(this.render_planned(index, cx))
+                            .into_any_element()
+                    }),
+                )
+                .h(VIRTUAL_HEIGHT)
+                .w_full(),
             )
+        } else {
+            body.children((0..rows).map(|index| self.render_planned(index, cx)))
         };
         log = log.child(body);
         log
+    }
+
+    /// Plans the activity's rows for this frame and keeps the virtual list
+    /// in step: the rows that changed are measured again, the others keep
+    /// their place; while the agent works the list follows the newest.
+    fn plan_rows(&mut self, thread: &AgentThread) {
+        let live = thread.state == State::Running
+            && thread.turns.last().is_some_and(|turn| turn.ended.is_none());
+        let plan = activity::plan(&self.entries, &self.expanded, live);
+        if plan != self.plan {
+            let (old, count) = activity::changed(&self.plan, &plan);
+            if self.rows.item_count() == self.plan.len() {
+                self.rows.splice(old, count);
+            } else {
+                self.rows.reset(plan.len());
+            }
+            self.plan = plan;
+        }
+        if live != self.following {
+            self.following = live;
+            self.rows.set_follow_mode(if live {
+                FollowMode::Tail
+            } else {
+                FollowMode::Normal
+            });
+        }
+    }
+
+    /// Row `index` of the activity.
+    fn render_planned(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(planned) = self.plan.get(index) else {
+            return div().into_any_element();
+        };
+        let row = activity::row_of(&self.entries, planned);
+        self.render_row(index, row, self.details.user_name.as_deref(), cx)
     }
 
     fn render_row(
@@ -1586,14 +1825,189 @@ impl ThreadView {
                             .h(px(28.))
                             .icon(Icon::new(IconName::RotateCcw).size(px(13.)))
                             .label(label)
+                            .tooltip(crate::workspace::toolbar::agents::retry_tooltip(
+                                thread, network,
+                            ))
                             .loading(busy == Some(Busy::Retrying))
                             .disabled(busy.is_some())
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.retry(network, window, cx)
                             })),
                     ),
+                )
+                .children(
+                    crate::workspace::toolbar::agents::wider_network_warning(
+                        thread.network,
+                        network,
+                    )
+                    .map(|warning| {
+                        div()
+                            .debug_selector(|| "thread-retry-warning".into())
+                            .h_flex()
+                            .items_start()
+                            .gap(px(8.))
+                            .text_size(px(12.))
+                            .line_height(relative(1.5))
+                            .text_color(rgb(color::WARNING_TEXT))
+                            .child(Icon::new(IconName::TriangleAlert).size(px(13.)).mt(px(2.)))
+                            .child(div().flex_1().min_w_0().child(warning))
+                    }),
                 ),
         )
+    }
+
+    /// What the agent left uncommitted in the worktree, or that GitEZ no
+    /// longer trusts it, and the ways forward: ask the agent to commit,
+    /// complete (which asks first), or remove a worktree a completed
+    /// thread kept. Known only from what the supervisor recorded; GitEZ
+    /// never looks into the worktree itself.
+    fn render_uncommitted(&self, thread: &AgentThread, cx: &mut Context<Self>) -> Option<Div> {
+        let facts = self.model.read(cx).facts(&self.key);
+        let completed = thread.state == State::Completed;
+        if thread.state.is_active() || (completed && !facts.worktree_present) {
+            return None;
+        }
+        let uncommitted = thread.uncommitted.as_ref().filter(|found| found.count > 0);
+        if uncommitted.is_none() && facts.untrusted.is_none() {
+            return None;
+        }
+        let busy = self.busy.as_ref().map(|(busy, _)| *busy);
+        let mono = cx.theme().mono_font_family.clone();
+        let title = match (completed, uncommitted_text(thread)) {
+            (true, Some(text)) => format!("Worktree kept: {text}"),
+            (true, None) => "Worktree kept".to_owned(),
+            (false, Some(text)) => format!("{text} in the worktree"),
+            (false, None) => "GitEZ no longer trusts the worktree".to_owned(),
+        };
+        let mut card = div()
+            .debug_selector(|| "thread-uncommitted".into())
+            .v_flex()
+            .gap(px(8.))
+            .px(px(14.))
+            .py(px(12.))
+            .rounded(px(8.))
+            .border_1()
+            .border_color(rgb(color::WARNING_BORDER))
+            .bg(rgba(color::THREAD_UNCOMMITTED))
+            .child(
+                div()
+                    .h_flex()
+                    .gap(px(8.))
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(Look::Uncommitted.text()))
+                    .child(Icon::new(IconName::TriangleAlert).size(px(14.)))
+                    .child(title),
+            )
+            .child(
+                div()
+                    .font_family(mono.clone())
+                    .text_size(px(11.5))
+                    .text_color(rgb(color::TEXT_SECONDARY))
+                    .child(crate::recent::display(&thread.worktree)),
+            );
+        if let Some(uncommitted) = uncommitted {
+            if !uncommitted.paths.is_empty() {
+                let more = (uncommitted.count as usize).saturating_sub(uncommitted.paths.len());
+                card = card.child(
+                    div()
+                        .v_flex()
+                        .gap(px(2.))
+                        .font_family(mono.clone())
+                        .text_size(px(11.5))
+                        .text_color(rgb(color::TEXT_SECONDARY))
+                        .children(
+                            uncommitted
+                                .paths
+                                .iter()
+                                .map(|path| div().child(path.trim().to_owned())),
+                        )
+                        .when(more > 0, |this| {
+                            this.child(
+                                div()
+                                    .text_color(rgb(color::TEXT_MUTED))
+                                    .child(format!("and {more} more")),
+                            )
+                        }),
+                );
+            }
+            if let Some(error) = commit_error_text(thread) {
+                card = card.child(
+                    div()
+                        .text_size(px(12.))
+                        .line_height(relative(1.5))
+                        .text_color(rgb(color::WARNING_TEXT))
+                        .child(error),
+                );
+            }
+        }
+        let explanation = match (&facts.untrusted, completed) {
+            (Some(problem), _) => complete::untrusted_text(thread, problem),
+            (None, true) => "The thread is completed, but its worktree was kept so these \
+                 changes are not lost. Remove it when you have saved what you need."
+                .to_owned(),
+            (None, false) if thread.pull_request.is_some() => {
+                "They are not in the pull request. Ask the agent to commit them; merging or \
+                 closing the pull request keeps the worktree while they are there."
+                    .to_owned()
+            }
+            (None, false) => "They are not on the thread’s branch. Ask the agent to commit them, \
+                 or Complete to decide whether to keep or discard them."
+                .to_owned(),
+        };
+        card = card.child(
+            div()
+                .text_size(px(12.))
+                .line_height(relative(1.5))
+                .text_color(rgb(color::TEXT_SECONDARY))
+                .child(explanation),
+        );
+        let mut buttons = div().h_flex().gap(px(8.));
+        if !completed && can_reply(thread) && uncommitted.is_some() {
+            buttons = buttons.child(
+                Button::new("thread-ask-commit")
+                    .debug_selector(|| "thread-ask-commit".into())
+                    .h(px(28.))
+                    .compact()
+                    .icon(Icon::new(IconName::GitCommitHorizontal).size(px(13.)))
+                    .label("Ask the agent to commit")
+                    .tooltip("Puts a reply asking for a commit in the box below")
+                    .disabled(busy.is_some())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.reply.update(cx, |reply, cx| {
+                            reply.set_value(ASK_TO_COMMIT, window, cx);
+                            reply.focus(window, cx);
+                        });
+                        cx.notify();
+                    })),
+            );
+        }
+        if completed && facts.untrusted.is_none() {
+            buttons = buttons.child(
+                Button::new("thread-remove-worktree")
+                    .debug_selector(|| "thread-remove-worktree".into())
+                    .danger()
+                    .h(px(28.))
+                    .compact()
+                    .icon(Icon::new(IconName::Delete).size(px(13.)))
+                    .label("Remove worktree")
+                    .tooltip("Asks first: removing it discards what is in it")
+                    .loading(busy == Some(Busy::Completing))
+                    .disabled(busy.is_some())
+                    .on_click(cx.listener(|this, _, window, cx| this.remove_worktree(window, cx))),
+            );
+        }
+        let worktree = thread.worktree.clone();
+        buttons = buttons.child(
+            Button::new("thread-uncommitted-reveal")
+                .ghost()
+                .h(px(28.))
+                .compact()
+                .icon(Icon::new(IconName::FolderOpen).size(px(13.)))
+                .label("Show in Finder")
+                .on_click(move |_, _, cx| cx.reveal_path(&worktree)),
+        );
+        Some(card.child(buttons))
     }
 
     fn render_warnings(&self, thread: &AgentThread) -> Option<Div> {
@@ -1731,6 +2145,9 @@ impl ThreadView {
 
 impl Render for ThreadView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(thread) = self.thread(cx) {
+            self.plan_rows(&thread);
+        }
         let pane = div().v_flex().size_full().bg(rgb(if self.wide {
             color::BACKGROUND
         } else {
@@ -1784,6 +2201,7 @@ impl Render for ThreadView {
             .v_flex()
             .gap(px(20.))
             .when(!self.wide, |this| this.px(px(18.)))
+            .children(self.render_uncommitted(&thread, cx))
             .children(self.render_warnings(&thread))
             .children(self.render_failure(&thread, cx))
             .children(self.render_prompt(&thread))
@@ -2075,6 +2493,53 @@ mod tests {
         });
     }
 
+    /// A thread whose commit a hook refused says what it left, why, and
+    /// offers to ask the agent to commit.
+    #[gpui_kit::test]
+    fn uncommitted_changes_show_a_card_and_complete_asks(cx: &mut TestAppContext) {
+        let (dir, common_dir, id) = repository_with_thread(|thread| {
+            thread.state = State::Finished;
+            thread.ending = Some(Ending::Answer);
+            thread.session_id = Some("session".into());
+            thread.turns[0].result = Some(result("Wrote draft.md.", true));
+            thread.uncommitted = Some(gitez_agent_thread::Uncommitted {
+                checked: Timestamp::now(),
+                count: 1,
+                paths: vec!["?? draft.md".into()],
+                commit_error: Some(
+                    "GitEZ could not commit the changes the agent left:\npre-commit: lint first"
+                        .into(),
+                ),
+            });
+        });
+        let made = Store::new(&common_dir).load(&id).expect("load");
+        gitez_agent_thread::create_worktree(
+            &dir.path().join("repo"),
+            &made.worktree,
+            &made.branch,
+            &made.start.commit,
+        )
+        .expect("worktree");
+        std::fs::write(made.worktree.join("draft.md"), "a draft\n").expect("write");
+        let key = AgentThreadKey { common_dir, id };
+        let (view, mut cx) = open(dir.path(), key, cx);
+        assert!(cx.debug_bounds("thread-uncommitted").is_some());
+        assert!(cx.debug_bounds("thread-ask-commit").is_some());
+        assert!(cx.debug_bounds("thread-remove-worktree").is_none());
+        view.read_with(&cx, |view, cx| {
+            let thread = view.thread(cx).expect("the thread is read");
+            assert_eq!(super::state_label(&thread), "Uncommitted changes");
+            assert_eq!(
+                super::commit_error_text(&thread).as_deref(),
+                Some("GitEZ could not commit the changes the agent left:\npre-commit: lint first.")
+            );
+        });
+        assert!(cx.debug_bounds("thread-complete").is_some());
+        // Clicking Complete asks first: `e2e_c1_uncommitted_keep_then_remove`
+        // (it needs gpui-kit's Root for the dialog).
+        assert!(made.worktree.join("draft.md").exists());
+    }
+
     /// Stream-JSON lines of a transcript: `("text", words)` for what the
     /// agent wrote, `("fail", why)` for a tool that failed, and
     /// `(tool, detail)` for a tool use.
@@ -2157,8 +2622,21 @@ mod tests {
         }
         let store = Store::new(&common_dir);
         let thread = store.load(&id).expect("the thread is read");
+        // A real worktree, as the supervisor makes it: a bare folder would
+        // rightly be shown as one GitEZ no longer trusts.
         if thread.state != State::Completed {
-            std::fs::create_dir_all(&thread.worktree).expect("worktree folder");
+            if pull_request {
+                let path = thread.worktree.to_str().expect("a UTF-8 path");
+                git(&work_dir, &["worktree", "add", "-q", path, &thread.branch]);
+            } else {
+                gitez_agent_thread::create_worktree(
+                    &work_dir,
+                    &thread.worktree,
+                    &thread.branch,
+                    &thread.start.commit,
+                )
+                .expect("worktree");
+            }
         }
         let mut shots =
             crate::screenshot::Shots::from_env(&dir.path().join("data")).expect("enabled");
@@ -2287,6 +2765,89 @@ mod tests {
             done.steps = 9;
             turn.result = Some(done);
         });
+    }
+
+    /// A running thread whose transcript has `steps` steps, half of them
+    /// text, so none collapse: as many rows as steps.
+    fn long_thread(steps: usize) -> (tempfile::TempDir, AgentThreadKey) {
+        let steps: Vec<(String, String)> = (0..steps)
+            .map(|step| {
+                if step % 2 == 0 {
+                    (
+                        "text".to_owned(),
+                        format!("Step {step}: checking `the layout` again."),
+                    )
+                } else {
+                    (
+                        "Bash".to_owned(),
+                        format!("cargo test -p gitez-git step_{step}"),
+                    )
+                }
+            })
+            .collect();
+        let steps: Vec<(&str, &str)> = steps
+            .iter()
+            .map(|(kind, value)| (kind.as_str(), value.as_str()))
+            .collect();
+        let lines = transcript(&steps);
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let (dir, common_dir, id) = repository_with(PROMPT, &lines, |thread| {
+            thread.state = State::Running;
+            thread.turns[0].ended = None;
+        });
+        (dir, AgentThreadKey { common_dir, id })
+    }
+
+    /// Opens the activity of `key` and times drawing it `frames` times.
+    fn draw_activity(
+        dir: &Path,
+        key: AgentThreadKey,
+        virtual_from: usize,
+        cx: &mut TestAppContext,
+    ) -> (usize, std::time::Duration, bool) {
+        let (view, mut cx) = open(dir, key, cx);
+        view.update(&mut cx, |view, cx| {
+            view.virtual_from = virtual_from;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let frames = 5;
+        let started = std::time::Instant::now();
+        for _ in 0..frames {
+            view.update(&mut cx, |_, cx| cx.notify());
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        let each = started.elapsed() / frames;
+        let rows = view.read_with(&cx, |view, _| view.plan.len());
+        let following = view.read_with(&cx, |view, _| view.rows.is_following_tail());
+        (rows, each, following)
+    }
+
+    /// M1: a long transcript is a virtual list that follows the newest
+    /// step while the agent works.
+    #[gpui_kit::test]
+    fn a_long_activity_is_virtual_and_follows_the_newest_step(cx: &mut TestAppContext) {
+        let (dir, key) = long_thread(400);
+        let (rows, _, following) = draw_activity(dir.path(), key, super::VIRTUAL_FROM, cx);
+        assert_eq!(rows, 400);
+        assert!(following, "a live list follows its newest row");
+    }
+
+    /// Times drawing the activity of 2,000 and 20,000 steps whole and
+    /// virtual: `GITEZ_MEASURE=1 cargo test -p gitez measure_activity --
+    /// --nocapture`.
+    #[gpui_kit::test]
+    fn measure_activity(cx: &mut TestAppContext) {
+        if std::env::var_os("GITEZ_MEASURE").is_none() {
+            return;
+        }
+        for steps in [2_000, 20_000] {
+            for (name, virtual_from) in [("whole", usize::MAX), ("virtual", super::VIRTUAL_FROM)] {
+                let (dir, key) = long_thread(steps);
+                let (rows, each, _) = draw_activity(dir.path(), key, virtual_from, cx);
+                eprintln!("activity {steps} steps ({rows} rows), {name}: {each:?} a frame");
+            }
+        }
     }
 
     #[test]

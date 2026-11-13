@@ -122,13 +122,40 @@ pub fn entries(turns: &[TurnEvents<'_>]) -> Vec<Entry> {
     entries
 }
 
+/// A row of the activity list by where it comes from, so a long list can
+/// be kept and each row read from the entries only when it is drawn.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Planned {
+    /// Entry `index`; `live` when it is the step the agent is on now.
+    Entry { index: usize, live: bool },
+    /// Steps left out, as [`Row::More`].
+    More {
+        group: usize,
+        count: usize,
+        names: String,
+    },
+}
+
 /// The rows showing `entries`. In each run of tool steps that did not fail,
 /// the steps after the first [`SHOWN_IN_A_RUN`] collapse into one
 /// [`Row::More`], unless its `group` is in `expanded` or fewer than two
 /// would collapse. While `live`, the last entry is the step running now: it
 /// is never collapsed.
+#[cfg(test)]
 pub fn rows<'a>(entries: &'a [Entry], expanded: &HashSet<usize>, live: bool) -> Vec<Row<'a>> {
+    plan(entries, expanded, live)
+        .iter()
+        .map(|planned| row_of(entries, planned))
+        .collect()
+}
+
+/// [`rows`] as [`Planned`] rows.
+pub fn plan(entries: &[Entry], expanded: &HashSet<usize>, live: bool) -> Vec<Planned> {
     let live_index = live.then(|| entries.len().checked_sub(1)).flatten();
+    let entry = |index: usize| Planned::Entry {
+        index,
+        live: Some(index) == live_index,
+    };
     let mut rows = Vec::with_capacity(entries.len());
     let mut index = 0;
     while index < entries.len() {
@@ -137,7 +164,7 @@ pub fn rows<'a>(entries: &'a [Entry], expanded: &HashSet<usize>, live: bool) -> 
                 && Some(index) != live_index
         };
         if !in_run(index) {
-            rows.push(row(entries, index, live_index));
+            rows.push(entry(index));
             index += 1;
             continue;
         }
@@ -148,10 +175,10 @@ pub fn rows<'a>(entries: &'a [Entry], expanded: &HashSet<usize>, live: bool) -> 
         }
         let hidden = start + SHOWN_IN_A_RUN..end;
         if hidden.len() < 2 || expanded.contains(&hidden.start) {
-            rows.extend((start..end).map(|index| row(entries, index, live_index)));
+            rows.extend((start..end).map(entry));
         } else {
-            rows.extend((start..hidden.start).map(|index| row(entries, index, live_index)));
-            rows.push(Row::More {
+            rows.extend((start..hidden.start).map(entry));
+            rows.push(Planned::More {
                 group: hidden.start,
                 count: hidden.len(),
                 names: tool_names(&entries[hidden]),
@@ -162,22 +189,54 @@ pub fn rows<'a>(entries: &'a [Entry], expanded: &HashSet<usize>, live: bool) -> 
     rows
 }
 
-fn row(entries: &[Entry], index: usize, live_index: Option<usize>) -> Row<'_> {
-    match &entries[index] {
-        Entry::Prompt { kind, text } => Row::Prompt { kind: *kind, text },
-        Entry::Continued(kind) => Row::Continued(*kind),
-        Entry::Text(text) => Row::Text(text),
-        Entry::Tool {
-            name,
-            detail,
-            failure,
-        } => Row::Tool {
-            name,
-            detail,
-            failure: failure.as_deref(),
-            live: Some(index) == live_index,
+/// The row `planned` names, read from `entries` (an empty text if it is
+/// out of range).
+pub fn row_of<'a>(entries: &'a [Entry], planned: &Planned) -> Row<'a> {
+    match planned {
+        Planned::Entry { index, live } => match entries.get(*index) {
+            Some(Entry::Prompt { kind, text }) => Row::Prompt { kind: *kind, text },
+            Some(Entry::Continued(kind)) => Row::Continued(*kind),
+            Some(Entry::Text(text)) => Row::Text(text),
+            Some(Entry::Tool {
+                name,
+                detail,
+                failure,
+            }) => Row::Tool {
+                name,
+                detail,
+                failure: failure.as_deref(),
+                live: *live,
+            },
+            None => Row::Text(""),
+        },
+        Planned::More {
+            group,
+            count,
+            names,
+        } => Row::More {
+            group: *group,
+            count: *count,
+            names: names.clone(),
         },
     }
+}
+
+/// What turns the list `old` into `new`: the range of `old` that changed
+/// and how many rows of `new` replace it, keeping the rows before and
+/// after (and so their measured heights and the scroll position).
+pub fn changed(old: &[Planned], new: &[Planned]) -> (std::ops::Range<usize>, usize) {
+    let prefix = old
+        .iter()
+        .zip(new)
+        .take_while(|(old, new)| old == new)
+        .count();
+    let suffix = old[prefix..]
+        .iter()
+        .rev()
+        .zip(new[prefix..].iter().rev())
+        .take_while(|(old, new)| old == new)
+        .count();
+    (prefix..old.len() - suffix, new.len() - prefix - suffix)
 }
 
 /// "Read, Grep": the tools of `entries`, each once, in the order they were

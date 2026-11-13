@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use gitez_agent_thread::{AgentThread, Ending, State, Timestamp};
+use gitez_agent_thread::{AgentThread, State, Timestamp};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::*;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -20,15 +20,18 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::agent_thread::{
-    ThreadView, ThreadViewEvent, ago, can_complete, finished_at, state_label,
-};
+use super::agent_thread::{Look, ThreadView, ThreadViewEvent, ago, finished_at, state_icon};
 use super::composer::{Composer, ComposerEvent, ComposerMode};
 use super::labels;
-use super::toolbar::agents::{Item, RowAction, agents_indicator, elapsed, row_actions};
+use super::toolbar::agents::{
+    Item, Part, RowAction, agents_indicator, complete_tooltip, elapsed, indicator_parts,
+    render_notices, retry_tooltip, row_actions, status_line, status_line_element,
+};
 use super::toolbar::{home_button, repository_menu};
 use super::{CloneRepository, InitRepository, OpenRepository};
-use crate::agent_threads::{AgentThreadKey, AgentThreads, OpenSettings, StartRequest};
+use crate::agent_threads::{
+    AgentThreadKey, AgentThreads, Counts, Notice, OpenSettings, StartRequest,
+};
 use crate::theme::{self, color};
 
 #[cfg(all(test, target_os = "macos"))]
@@ -95,6 +98,11 @@ pub(crate) fn list(threads: &AgentThreads, filter: Option<&Path>) -> Listed {
                 common_dir: repository.common_dir.clone(),
                 repository: repository.name.clone(),
                 thread: thread.clone(),
+                facts: repository
+                    .facts
+                    .get(&thread.id)
+                    .cloned()
+                    .unwrap_or_default(),
             };
             match thread.state {
                 State::Finished => listed.finished.push(item),
@@ -206,7 +214,27 @@ pub struct Home {
     busy: HashSet<AgentThreadKey>,
     /// Why the last repository could not be opened.
     error: Option<SharedString>,
+    /// The sidebar's entries as last drawn, and their virtual list: only
+    /// the rows in view are laid out, however many threads there are.
+    entries: Vec<SidebarEntry>,
+    rows: ListState,
+    /// Queued threads' places in the queue, for their rows.
+    places: HashMap<AgentThreadKey, usize>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// An entry of the sidebar's list.
+#[derive(Debug, Clone, PartialEq)]
+enum SidebarEntry {
+    /// What could not be read, watched or completed.
+    Notices(Vec<Notice>),
+    /// "Finished" with how many.
+    Finished(usize),
+    Note(&'static str),
+    Row(Box<Item>, Kind),
+    /// "Active and completed" with how many, to expand or collapse.
+    More(usize),
+    Group(&'static str, &'static str),
 }
 
 impl EventEmitter<HomeEvent> for Home {}
@@ -249,6 +277,9 @@ impl Home {
             starting: false,
             busy: HashSet::new(),
             error: None,
+            entries: Vec::new(),
+            rows: ListState::new(0, ListAlignment::Top, px(300.)),
+            places: HashMap::new(),
             _subscriptions: subscriptions,
         }
     }
@@ -391,7 +422,24 @@ impl Home {
             RowAction::Retry(network) => self
                 .model
                 .update(cx, |model, cx| model.retry(&key, network, cx)),
-            RowAction::Complete => self.model.update(cx, |model, cx| model.complete(&key, cx)),
+            RowAction::Complete => {
+                let view = cx.entity().downgrade();
+                let busy_key = key.clone();
+                let busy: super::agent_thread::complete::Busy =
+                    std::rc::Rc::new(move |busy, _, cx| {
+                        view.update(cx, |this, cx| {
+                            if busy {
+                                this.busy.insert(busy_key.clone());
+                            } else {
+                                this.busy.remove(&busy_key);
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                    });
+                super::agent_thread::complete::complete(key, busy, window, cx);
+                return;
+            }
             RowAction::Stop | RowAction::Cancel => {
                 self.model.update(cx, |model, cx| model.stop(&key, cx))
             }
@@ -402,15 +450,8 @@ impl Home {
             let result = task.await;
             this.update_in(cx, |this, window, cx| {
                 this.busy.remove(&key);
-                match result {
-                    Ok(()) if action == RowAction::Complete => window.push_notification(
-                        crate::toast::success("Completed; the worktree is removed"),
-                        cx,
-                    ),
-                    Ok(()) => {}
-                    Err(error) => {
-                        window.push_notification(crate::toast::error(format!("{error:#}")), cx)
-                    }
+                if let Err(error) = result {
+                    window.push_notification(crate::toast::error(format!("{error:#}")), cx)
                 }
                 cx.notify();
             })
@@ -433,77 +474,6 @@ enum Kind {
     Active,
     Waiting,
     Completed,
-}
-
-/// The 16 px mark of a thread's state, as on the board.
-fn state_icon(thread: &AgentThread) -> AnyElement {
-    let ring = |hex: u32, dashed: bool| {
-        div()
-            .flex()
-            .items_center()
-            .justify_center()
-            .size(px(12.))
-            .rounded_full()
-            .border_2()
-            .border_color(rgb(hex))
-            .when(dashed, |this| this.border_dashed())
-    };
-    let icon = |name: IconName, hex: u32| {
-        Icon::new(name)
-            .size(px(15.))
-            .text_color(rgb(hex))
-            .into_any_element()
-    };
-    let mark = match (thread.state, thread.ending) {
-        (State::Running, _) => ring(color::BRANCH_BLUE, false)
-            .child(
-                div()
-                    .size(px(4.))
-                    .rounded_full()
-                    .bg(rgb(color::BRANCH_BLUE)),
-            )
-            .into_any_element(),
-        (State::Preparing, _) => ring(color::BRANCH_TEAL, true).into_any_element(),
-        (State::Queued | State::Waiting, _) => ring(color::TEXT_FAINT, true).into_any_element(),
-        (State::Completed, _) if thread.pull_request.is_some() => {
-            icon(IconName::GitMerge, color::TEXT_FAINT)
-        }
-        (State::Completed, _) => icon(IconName::CircleCheck, color::TEXT_FAINT),
-        (State::Finished, Some(Ending::Failed | Ending::Stopped)) => {
-            icon(IconName::CircleX, color::DIFF_REMOVED)
-        }
-        (State::Finished, _) if thread.pull_request.is_some() => {
-            icon(IconName::GitPullRequestArrow, color::THREAD_PREPARING_TEXT)
-        }
-        (State::Finished, _) => icon(IconName::MessageSquare, color::TEXT_MUTED),
-    };
-    div()
-        .flex()
-        .flex_none()
-        .items_center()
-        .justify_center()
-        .size(px(16.))
-        .mt(px(1.))
-        .child(mark)
-        .into_any_element()
-}
-
-/// The state shown on a finished or completed row, in its colour.
-fn ending_text(thread: &AgentThread) -> (String, u32) {
-    match (thread.state, thread.ending) {
-        (State::Completed, _) => (
-            match (thread.pull_request, thread.ending) {
-                (Some(number), _) => format!("PR #{number}"),
-                (None, Some(Ending::Failed)) => "Failed".to_owned(),
-                (None, Some(Ending::Stopped)) => "Stopped".to_owned(),
-                (None, _) => "No changes".to_owned(),
-            },
-            color::TEXT_FAINT,
-        ),
-        (_, Some(Ending::Failed | Ending::Stopped)) => (state_label(thread), color::DIFF_REMOVED),
-        (_, Some(Ending::PullRequest)) => (state_label(thread), color::THREAD_PREPARING_TEXT),
-        _ => (state_label(thread), color::TEXT_MUTED),
-    }
 }
 
 /// A section's heading, with its count at the end.
@@ -660,7 +630,162 @@ impl Home {
             ))
     }
 
-    fn render_sidebar(&self, listed: &Listed, cx: &mut Context<Self>) -> Div {
+    /// The sidebar's entries for `listed`.
+    fn sidebar_entries(&self, listed: Listed, cx: &App) -> Vec<SidebarEntry> {
+        let model = self.model.read(cx);
+        let mut entries = Vec::new();
+        let notices = model.notices(self.filter.as_deref());
+        if !notices.is_empty() {
+            entries.push(SidebarEntry::Notices(notices));
+        }
+        let any_thread = model
+            .repositories()
+            .iter()
+            .any(|repository| !repository.threads.is_empty());
+        entries.push(SidebarEntry::Finished(listed.finished.len()));
+        if listed.finished.is_empty() {
+            entries.push(SidebarEntry::Note(if any_thread {
+                "No finished threads"
+            } else {
+                "No threads yet. Ask an agent in the launcher: each thread works on its own \
+                 branch in its own worktree, and shows here when it needs you."
+            }));
+        }
+        let more = listed.more();
+        entries.extend(
+            listed
+                .finished
+                .into_iter()
+                .map(|item| SidebarEntry::Row(Box::new(item), Kind::Finished)),
+        );
+        entries.push(SidebarEntry::More(more));
+        if self.more_open {
+            if more == 0 {
+                entries.push(SidebarEntry::Note(
+                    "No active, waiting or completed threads",
+                ));
+            }
+            for (title, selector, items, kind) in [
+                ("Active", "home-group-active", listed.active, Kind::Active),
+                (
+                    "Waiting",
+                    "home-group-waiting",
+                    listed.waiting,
+                    Kind::Waiting,
+                ),
+                (
+                    "Completed",
+                    "home-group-completed",
+                    listed.completed,
+                    Kind::Completed,
+                ),
+            ] {
+                if items.is_empty() {
+                    continue;
+                }
+                entries.push(SidebarEntry::Group(title, selector));
+                entries.extend(
+                    items
+                        .into_iter()
+                        .map(|item| SidebarEntry::Row(Box::new(item), kind)),
+                );
+            }
+        }
+        entries
+    }
+
+    /// Takes in the sidebar's entries for this frame: the ones that changed
+    /// are measured again, the others keep their place.
+    fn set_entries(&mut self, entries: Vec<SidebarEntry>) {
+        if entries == self.entries {
+            return;
+        }
+        let prefix = self
+            .entries
+            .iter()
+            .zip(&entries)
+            .take_while(|(old, new)| old == new)
+            .count();
+        let suffix = self.entries[prefix..]
+            .iter()
+            .rev()
+            .zip(entries[prefix..].iter().rev())
+            .take_while(|(old, new)| old == new)
+            .count();
+        if self.rows.item_count() == self.entries.len() {
+            self.rows.splice(
+                prefix..self.entries.len() - suffix,
+                entries.len() - prefix - suffix,
+            );
+        } else {
+            self.rows.reset(entries.len());
+        }
+        self.entries = entries;
+    }
+
+    /// Entry `index` of the sidebar's list.
+    fn render_entry(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(entry) = self.entries.get(index) else {
+            return div().into_any_element();
+        };
+        match entry {
+            SidebarEntry::Notices(notices) => div()
+                .pb(px(4.))
+                .child(render_notices(notices.clone(), "home-notice", cx))
+                .into_any_element(),
+            SidebarEntry::Finished(count) => {
+                section_heading("Finished", Some(*count), cx).into_any_element()
+            }
+            SidebarEntry::Note(text) => note(text).into_any_element(),
+            SidebarEntry::Row(item, kind) => self
+                .render_row(item, *kind, &self.places, Timestamp::now(), cx)
+                .into_any_element(),
+            SidebarEntry::More(more) => {
+                let toggle = div()
+                    .id("home-more")
+                    .debug_selector(|| "home-more".into())
+                    .h_flex()
+                    .gap(px(8.))
+                    .h(px(34.))
+                    .px(px(16.))
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(color::TEXT_SECONDARY))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(color::NAV_HOVER)).text_color(rgb(color::TEXT)))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_more(cx)))
+                    .child(
+                        Icon::new(if self.more_open {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(px(12.)),
+                    )
+                    .child("Active and completed")
+                    .child(
+                        div()
+                            .ml_auto()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_size(px(11.))
+                            .text_color(rgb(color::TEXT_FAINT))
+                            .child(more.to_string()),
+                    );
+                div()
+                    .v_flex()
+                    .mt(px(12.))
+                    .border_t_1()
+                    .border_color(rgb(color::ROW_DIVIDER))
+                    .child(toggle)
+                    .into_any_element()
+            }
+            SidebarEntry::Group(title, selector) => {
+                group_heading(title, selector).into_any_element()
+            }
+        }
+    }
+
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
         let launcher = self.thread.is_none();
         let new_thread = div()
             .id("home-new-thread")
@@ -774,101 +899,24 @@ impl Home {
                     .child(div().flex_1().min_w_0().child(filter)),
             );
 
-        let any_thread = model
-            .repositories()
-            .iter()
-            .any(|repository| !repository.threads.is_empty());
-        let now = Timestamp::now();
-        let places = queue_places(model);
         let limit = model.settings().threads.max_running as usize;
         let running = model.running();
         let waiting = model.counts(None).waiting;
-        let mut list = div()
-            .id("home-threads")
-            .v_flex()
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .pb(px(10.))
-            .child(section_heading("Finished", Some(listed.finished.len()), cx));
-        if listed.finished.is_empty() {
-            list = list.child(note(if any_thread {
-                "No finished threads"
-            } else {
-                "No threads yet. Ask an agent in the launcher: each thread works on its own \
-                 branch in its own worktree, and shows here when it needs you."
-            }));
-        }
-        for item in &listed.finished {
-            list = list.child(self.render_row(item, Kind::Finished, &places, now, cx));
-        }
-
-        let more = listed.more();
-        let toggle = div()
-            .id("home-more")
-            .debug_selector(|| "home-more".into())
-            .h_flex()
-            .gap(px(8.))
-            .h(px(34.))
-            .px(px(16.))
-            .text_size(px(12.))
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(rgb(color::TEXT_SECONDARY))
-            .cursor_pointer()
-            .hover(|style| style.bg(rgb(color::NAV_HOVER)).text_color(rgb(color::TEXT)))
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_more(cx)))
-            .child(
-                Icon::new(if self.more_open {
-                    IconName::ChevronDown
-                } else {
-                    IconName::ChevronRight
-                })
-                .size(px(12.)),
-            )
-            .child("Active and completed")
-            .child(
+        let list = gpui_kit::list(
+            self.rows.clone(),
+            // Each entry takes the list's width, so long rows shorten
+            // their text rather than overflow.
+            cx.processor(|this, index: usize, _, cx| {
                 div()
-                    .ml_auto()
-                    .font_family(cx.theme().mono_font_family.clone())
-                    .text_size(px(11.))
-                    .text_color(rgb(color::TEXT_FAINT))
-                    .child(more.to_string()),
-            );
-        let mut section = div()
-            .v_flex()
-            .mt(px(12.))
-            .border_t_1()
-            .border_color(rgb(color::ROW_DIVIDER))
-            .child(toggle);
-        if self.more_open {
-            if more == 0 {
-                section = section.child(note("No active, waiting or completed threads"));
-            }
-            for (title, selector, items, kind) in [
-                ("Active", "home-group-active", &listed.active, Kind::Active),
-                (
-                    "Waiting",
-                    "home-group-waiting",
-                    &listed.waiting,
-                    Kind::Waiting,
-                ),
-                (
-                    "Completed",
-                    "home-group-completed",
-                    &listed.completed,
-                    Kind::Completed,
-                ),
-            ] {
-                if items.is_empty() {
-                    continue;
-                }
-                section = section.child(group_heading(title, selector));
-                for item in items {
-                    section = section.child(self.render_row(item, kind, &places, now, cx));
-                }
-            }
-        }
-        list = list.child(section);
+                    .w_full()
+                    .child(this.render_entry(index, cx))
+                    .into_any_element()
+            }),
+        )
+        .w_full()
+        .flex_1()
+        .min_h_0()
+        .pb(px(10.));
 
         let mut slots = format!("{running} of {limit} agents running");
         if waiting > 0 {
@@ -1005,11 +1053,12 @@ impl Home {
         let mut buttons = Vec::new();
         match kind {
             Kind::Finished | Kind::Completed => {
-                let (text, hex) = ending_text(thread);
+                let limit = self.model.read(cx).settings().threads.max_running as usize;
+                let spans = status_line(thread, &item.facts, None, limit, now);
                 second = second
                     .min_h(px(22.))
                     .child(dot())
-                    .child(ellipsis().flex_1().text_color(rgb(hex)).child(text));
+                    .child(status_line_element(spans, cx).flex_1().min_w_0());
                 if kind == Kind::Finished {
                     for (index, action) in row_actions(thread).into_iter().enumerate() {
                         buttons.push(self.row_button(action, index, thread, &key, busy, cx));
@@ -1023,6 +1072,13 @@ impl Home {
                     None if preparing => (Some("Setup".to_owned()), "creating the worktree".into()),
                     None => (None, "starting the agent".to_owned()),
                 };
+                let look = Look::of(thread);
+                second = second.child(dot()).child(
+                    div()
+                        .flex_none()
+                        .text_color(rgb(look.text()))
+                        .child(look.word()),
+                );
                 if let Some(tool) = tool {
                     second = second.child(
                         div()
@@ -1049,12 +1105,11 @@ impl Home {
                 );
             }
             Kind::Waiting => {
-                let text = if thread.state == State::Queued {
-                    "Waits for a free slot".to_owned()
-                } else {
-                    format!("{} · usage limit", state_label(thread))
-                };
-                second = second.child(dot()).child(ellipsis().flex_1().child(text));
+                let limit = self.model.read(cx).settings().threads.max_running as usize;
+                let spans = status_line(thread, &item.facts, None, limit, now);
+                second = second
+                    .child(dot())
+                    .child(status_line_element(spans, cx).flex_1().min_w_0());
             }
         }
         // Retry and Complete go under the line, as in the popover: beside
@@ -1120,7 +1175,7 @@ impl Home {
                 }
             })
             .on_click(open)
-            .child(state_icon(thread))
+            .child(state_icon(thread, item.facts.pull_request))
             .child(text)
     }
 
@@ -1155,14 +1210,14 @@ impl Home {
         .label(action.label(thread.network))
         .disabled(busy);
         let button = match action {
-            RowAction::Retry(_) => button
+            RowAction::Retry(network) => button
                 .icon(Icon::new(IconName::RotateCcw).size(px(12.)))
                 .loading(busy)
-                .tooltip("Run the thread again, continuing its conversation"),
+                .tooltip(retry_tooltip(thread, network)),
             RowAction::Complete => button
                 .icon(Icon::new(IconName::Check).size(px(12.)))
                 .loading(busy)
-                .tooltip("Removes the worktree. The thread stays readable."),
+                .tooltip(complete_tooltip(thread)),
             RowAction::PullRequest(number) => button
                 .label(format!("PR #{number}"))
                 .icon(Icon::new(IconName::GitPullRequestArrow).size(px(12.)))
@@ -1419,58 +1474,23 @@ impl Home {
     }
 }
 
-/// What a recent repository's threads need, for its row: "3 active",
-/// "1 waiting", "1 PR ready", "2 answers", "1 failed"; only what is not
-/// zero. With whether to put the live dot in front.
+/// What a recent repository's threads need, for its row, in the words and
+/// colours of the Agents indicator: "3 active", "1 waiting", "2 ready",
+/// "1 failed", "1 stopped"; only what is not zero. With whether to put the
+/// live dot in front.
 fn badges(threads: &[Arc<AgentThread>]) -> Vec<(String, u32, bool)> {
-    let count =
-        |test: &dyn Fn(&AgentThread) -> bool| threads.iter().filter(|thread| test(thread)).count();
-    let finished = |thread: &AgentThread| thread.state == State::Finished;
-    let active = count(&|thread| matches!(thread.state, State::Preparing | State::Running));
-    let waiting = count(&|thread| matches!(thread.state, State::Queued | State::Waiting));
-    let pull_requests = count(&|thread| {
-        finished(thread)
-            && thread.ending == Some(Ending::PullRequest)
-            && thread.pull_request.is_some()
-    });
-    let answers = count(&|thread| {
-        finished(thread)
-            && can_complete(thread)
-            && !matches!(thread.ending, Some(Ending::Failed | Ending::Stopped))
-    });
-    let failed = count(&|thread| {
-        finished(thread) && matches!(thread.ending, Some(Ending::Failed | Ending::Stopped))
-    });
-    let plural = |count: usize, one: &str, more: &str| {
-        format!("{count} {}", if count == 1 { one } else { more })
-    };
-    [
-        (active > 0).then(|| (format!("{active} active"), color::THREAD_RUNNING_TEXT, true)),
-        (waiting > 0).then(|| (format!("{waiting} waiting"), color::TEXT_SECONDARY, false)),
-        (pull_requests > 0).then(|| {
-            (
-                format!("{pull_requests} PR ready"),
-                color::THREAD_PREPARING_TEXT,
-                false,
-            )
-        }),
-        (answers > 0).then(|| {
-            (
-                plural(answers, "answer", "answers"),
-                color::TEXT_SECONDARY,
-                false,
-            )
-        }),
-        (failed > 0).then(|| (format!("{failed} failed"), color::THREAD_FAILED_TEXT, false)),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
+    indicator_parts(Counts::of(threads.iter().map(Arc::as_ref)))
+        .into_iter()
+        .map(|(part, text)| (text, part.color(), part == Part::Active))
+        .collect()
 }
 
 impl Render for Home {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let listed = list(self.model.read(cx), self.filter.as_deref());
+        self.places = queue_places(self.model.read(cx));
+        let entries = self.sidebar_entries(listed, cx);
+        self.set_entries(entries);
         let main = match &self.thread {
             Some((view, _)) => div()
                 .flex_1()
@@ -1493,7 +1513,7 @@ impl Render for Home {
                     .items_start()
                     .flex_1()
                     .min_h_0()
-                    .child(self.render_sidebar(&listed, cx))
+                    .child(self.render_sidebar(cx))
                     .child(main),
             )
     }
@@ -1713,6 +1733,55 @@ mod tests {
     fn redraw(cx: &mut VisualTestContext) {
         cx.run_until_parked();
         cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
+    /// Times drawing Home with 2,000 and 20,000 finished threads (the
+    /// sidebar a virtual list, every row listed and compared each frame):
+    /// `GITEZ_MEASURE=1 cargo test -p gitez measure_home -- --nocapture`.
+    #[gpui_kit::test]
+    fn measure_home(cx: &mut TestAppContext) {
+        if std::env::var_os("GITEZ_MEASURE").is_none() {
+            return;
+        }
+        let (fixture, home, mut cx) = home(cx);
+        let model = cx.update(|_, cx| AgentThreads::global(cx));
+        let template = model.read_with(&cx, |model, _| {
+            model
+                .repository(&fixture.alpha)
+                .and_then(|repository| {
+                    repository
+                        .threads
+                        .iter()
+                        .find(|thread| thread.id == fixture.answer)
+                        .cloned()
+                })
+                .expect("the answer")
+        });
+        for count in [2_000, 20_000] {
+            let threads: Vec<Arc<AgentThread>> = (0..count)
+                .map(|index| {
+                    let mut thread = (*template).clone();
+                    thread.id = AgentThreadId::new(format!("measured-{index}")).expect("an id");
+                    thread.title = format!("Measured thread number {index}");
+                    Arc::new(thread)
+                })
+                .collect();
+            model.update(&mut cx, |model, cx| {
+                model.replace_threads(&fixture.alpha, threads);
+                cx.notify();
+            });
+            redraw(&mut cx);
+            let frames = 5;
+            let started = std::time::Instant::now();
+            for _ in 0..frames {
+                home.update(&mut cx, |_, cx| cx.notify());
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+            }
+            eprintln!(
+                "home {count} threads: {:?} a frame",
+                started.elapsed() / frames
+            );
+        }
     }
 
     #[gpui_kit::test]

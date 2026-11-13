@@ -11,7 +11,7 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::edit::{format_hosts, hidden_path, parse_hosts};
+use super::edit::{format_hosts, hidden_path, parse_hosts, writable_path};
 use super::{
     SettingsSheet, card, chip, description, error_text, label, muted, section, small_button,
 };
@@ -31,9 +31,16 @@ pub(super) struct SandboxPanel {
     /// The allowlist editor, while open: one host per line.
     hosts: Option<Entity<TextareaState>>,
     hosts_error: Option<SharedString>,
+    /// Follows the allowlist editor; replaced with it.
+    _hosts_changes: Option<Subscription>,
     /// The "Hide a path" field, while open.
     hide: Option<Entity<InputState>>,
     hide_error: Option<SharedString>,
+    _hide_changes: Option<Subscription>,
+    /// The "Let it write a folder" field, while open.
+    write: Option<Entity<InputState>>,
+    write_error: Option<SharedString>,
+    _write_changes: Option<Subscription>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +70,12 @@ impl SettingsSheet {
             .as_ref()
             .map(|check| matches!(check.status, Status::Ready { .. }));
         (self.sandbox.install.clone(), ready)
+    }
+
+    /// For tests: why the last folder typed could not be made writable.
+    #[cfg(test)]
+    pub(super) fn sandbox_write_error(&self) -> Option<&SharedString> {
+        self.sandbox.write_error.as_ref()
     }
 
     /// Asks the sandbox in the background whether it can run.
@@ -171,16 +184,15 @@ impl SettingsSheet {
                 .placeholder("One host per line, such as crates.io or *.example.com")
                 .default_value(text)
         });
-        self._subscriptions.push(cx.subscribe_in(
-            &editor,
-            window,
-            |this, _, event: &InputEvent, _, cx| {
-                if let InputEvent::Change = event {
-                    this.sandbox.hosts_error = None;
-                    cx.notify();
-                }
-            },
-        ));
+        self.sandbox._hosts_changes =
+            Some(
+                cx.subscribe_in(&editor, window, |this, _, event: &InputEvent, _, cx| {
+                    if let InputEvent::Change = event {
+                        this.sandbox.hosts_error = None;
+                        cx.notify();
+                    }
+                }),
+            );
         editor.update(cx, |editor, cx| editor.focus(window, cx));
         self.sandbox.hosts = Some(editor);
         self.sandbox.hosts_error = None;
@@ -223,7 +235,7 @@ impl SettingsSheet {
     fn start_hiding(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let input =
             cx.new(|cx| InputState::new(window, cx).placeholder("~/.config/tool, or a full path"));
-        self._subscriptions.push(cx.subscribe_in(
+        self.sandbox._hide_changes = Some(cx.subscribe_in(
             &input,
             window,
             |this, _, event: &InputEvent, window, cx| match event {
@@ -301,6 +313,63 @@ impl SettingsSheet {
         .detach();
     }
 
+    /// Stops hiding `path`; for one of the credential folders hidden by
+    /// default, only after asking.
+    pub(super) fn ask_unhide_path(
+        &mut self,
+        path: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !DEFAULT_HIDDEN_PATHS.contains(&path) {
+            self.unhide_path(path, cx);
+            return;
+        }
+        let view = cx.entity().downgrade();
+        let path = path.to_owned();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (view, path) = (view.clone(), path.clone());
+            dialog
+                .title(format!("Let the agent read {path}?"))
+                .w(px(460.))
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .line_height(relative(1.5))
+                        .text_color(rgb(color::TEXT_SECONDARY))
+                        .child(format!(
+                            "{path} holds credentials, which GitEZ hides from every agent by \
+                             default. Once it is readable, a thread with Packages or Open could \
+                             send what is in it anywhere, and with Agent API only the agent can \
+                             still put it in what it writes."
+                        )),
+                )
+                .footer(
+                    div()
+                        .h_flex()
+                        .justify_end()
+                        .gap(px(8.))
+                        .child(
+                            Button::new("unhide-cancel")
+                                .debug_selector(|| "unhide-cancel".into())
+                                .primary()
+                                .label("Keep it hidden")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("unhide-confirm")
+                                .debug_selector(|| "unhide-confirm".into())
+                                .danger()
+                                .label("Stop hiding")
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    view.update(cx, |this, cx| this.unhide_path(&path, cx)).ok();
+                                }),
+                        ),
+                )
+        });
+    }
+
     fn unhide_path(&mut self, path: &str, cx: &mut Context<Self>) {
         let path = path.to_owned();
         self.model.update(cx, |model, cx| {
@@ -310,6 +379,79 @@ impl SettingsSheet {
                         .sandbox
                         .hidden_paths
                         .retain(|hidden| *hidden != path)
+                },
+                cx,
+            );
+        });
+    }
+
+    fn start_writing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("~/.gradle/caches"));
+        self.sandbox._write_changes = Some(cx.subscribe_in(
+            &input,
+            window,
+            |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } => this.add_typed_writable(window, cx),
+                InputEvent::Change => {
+                    this.sandbox.write_error = None;
+                    cx.notify();
+                }
+                _ => {}
+            },
+        ));
+        input.update(cx, |input, cx| input.focus(window, cx));
+        self.sandbox.write = Some(input);
+        self.sandbox.write_error = None;
+        cx.notify();
+    }
+
+    fn add_typed_writable(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(input) = &self.sandbox.write else {
+            return;
+        };
+        let typed = input.read(cx).value().to_string();
+        self.add_writable(&typed, cx);
+    }
+
+    /// Lets the agent of every thread write `typed`.
+    pub(super) fn add_writable(&mut self, typed: &str, cx: &mut Context<Self>) {
+        let path = match writable_path(typed, dirs::home_dir().as_deref()) {
+            Ok(path) => path,
+            Err(error) => {
+                self.sandbox.write_error = Some(error.into());
+                cx.notify();
+                return;
+            }
+        };
+        if self
+            .model
+            .read(cx)
+            .settings()
+            .sandbox
+            .writable_paths
+            .contains(&path)
+        {
+            self.sandbox.write_error = Some(format!("{path} is writable already.").into());
+            cx.notify();
+            return;
+        }
+        self.model.update(cx, |model, cx| {
+            model.update_settings(|settings| settings.sandbox.writable_paths.push(path), cx);
+        });
+        self.sandbox.write = None;
+        self.sandbox.write_error = None;
+        cx.notify();
+    }
+
+    pub(super) fn remove_writable(&mut self, path: &str, cx: &mut Context<Self>) {
+        let path = path.to_owned();
+        self.model.update(cx, |model, cx| {
+            model.update_settings(
+                |settings| {
+                    settings
+                        .sandbox
+                        .writable_paths
+                        .retain(|known| *known != path)
                 },
                 cx,
             );
@@ -691,19 +833,144 @@ impl SettingsSheet {
             )
     }
 
-    fn render_files(&self, cx: &mut Context<Self>) -> Div {
+    /// What the agent may write: always its worktree, its own temporary
+    /// folder and package caches and its own branch; and the folders added
+    /// here, shared with the user's own builds.
+    fn render_writes(&self, cx: &mut Context<Self>) -> Div {
         let settings = self.model.read(cx).settings().clone();
-        let hidden = &settings.sandbox.hidden_paths;
+        let writable = &settings.sandbox.writable_paths;
         let view = cx.entity().downgrade();
-        let defaults: Vec<String> = DEFAULT_HIDDEN_PATHS
-            .iter()
-            .map(|p| (*p).to_owned())
-            .collect();
-        let writes = div()
+        let mut chips = div().h_flex().flex_wrap().gap(px(4.));
+        for (index, path) in writable.iter().enumerate() {
+            let (view, path_text) = (view.clone(), path.clone());
+            chips = chips.child(
+                chip(path.clone(), cx).pr(px(2.)).gap(px(2.)).child(
+                    Button::new(("unwrite", index))
+                        .debug_selector(move || format!("unwrite-{index}"))
+                        .ghost()
+                        .size(px(16.))
+                        .text_color(rgb(color::TEXT_MUTED))
+                        .icon(Icon::new(IconName::Close).size(px(10.)))
+                        .accessibility_label(format!("Stop letting the agent write {path}"))
+                        .tooltip(format!("Stop letting the agent write {path}"))
+                        .on_click(move |_, _, cx| {
+                            view.update(cx, |this, cx| this.remove_writable(&path_text, cx))
+                                .ok();
+                        }),
+                ),
+            );
+        }
+        if self.sandbox.write.is_none() {
+            let view = view.clone();
+            chips = chips.child(
+                Button::new("write-path")
+                    .debug_selector(|| "write-path".into())
+                    .ghost()
+                    .compact()
+                    .h(px(22.))
+                    .px(px(6.))
+                    .text_size(px(12.))
+                    .text_color(rgb(color::TEXT_SECONDARY))
+                    .icon(Icon::new(IconName::Plus).size(px(11.)))
+                    .label("Let it write a folder")
+                    .on_click(move |_, window, cx| {
+                        view.update(cx, |this, cx| this.start_writing(window, cx))
+                            .ok();
+                    }),
+            );
+        }
+        let mut value = div()
+            .flex_1()
+            .min_w_0()
+            .v_flex()
+            .gap(px(6.))
+            .child(
+                "The thread’s worktree and its own branch, its own temporary folder, and its own \
+                 package caches: with Packages or Open they start as copies of yours; with Agent \
+                 API only it reads yours and cargo and Go work offline.",
+            )
+            .child(muted("Also in every thread:"))
+            .child(chips);
+        if let Some(input) = &self.sandbox.write {
+            value = value.child(
+                div()
+                    .h_flex()
+                    .gap(px(6.))
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Input::new(input)
+                                .small()
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .bg(rgb(color::FIELD)),
+                        ),
+                    )
+                    .child(
+                        Button::new("write-cancel")
+                            .ghost()
+                            .small()
+                            .label("Cancel")
+                            .on_click({
+                                let view = view.clone();
+                                move |_, _, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.sandbox.write = None;
+                                        this.sandbox.write_error = None;
+                                        cx.notify();
+                                    })
+                                    .ok();
+                                }
+                            }),
+                    )
+                    .child(
+                        Button::new("write-save")
+                            .debug_selector(|| "write-save".into())
+                            .primary()
+                            .small()
+                            .label("Allow")
+                            .on_click(move |_, window, cx| {
+                                view.update(cx, |this, cx| this.add_typed_writable(window, cx))
+                                    .ok();
+                            }),
+                    ),
+            );
+        }
+        if let Some(error) = self.sandbox.write_error.clone() {
+            value = value.child(error_text(error));
+        }
+        if !writable.is_empty() || self.sandbox.write.is_some() {
+            value = value.child(
+                div()
+                    .debug_selector(|| "write-warning".into())
+                    .h_flex()
+                    .items_start()
+                    .gap(px(6.))
+                    .child(
+                        Icon::new(IconName::TriangleAlert)
+                            .size(px(12.))
+                            .mt(px(2.))
+                            .text_color(rgb(color::ACCENT)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(12.))
+                            .line_height(relative(1.5))
+                            .text_color(rgb(color::WARNING_TEXT))
+                            .child(
+                                "These folders are shared, not copied: the agent can change what \
+                                 is in them, and your own builds outside the sandbox use what it \
+                                 left there, a cache it changed included.",
+                            ),
+                    ),
+            );
+        }
+        div()
             .h_flex()
+            .items_start()
             .gap(px(12.))
-            .min_h(px(44.))
             .px(px(12.))
+            .py(px(10.))
             .border_b_1()
             .border_color(rgb(color::ROW_DIVIDER))
             .text_size(px(12.5))
@@ -714,16 +981,18 @@ impl SettingsSheet {
                     .text_color(rgb(color::TEXT_MUTED))
                     .child("Writes"),
             )
-            .child(div().flex_1().child("Only the thread’s worktree"))
-            .child(
-                div()
-                    .h_flex()
-                    .gap(px(5.))
-                    .text_size(px(11.5))
-                    .text_color(rgb(color::TEXT_MUTED))
-                    .child(Icon::new(IconName::Lock).size(px(12.)))
-                    .child("Always"),
-            );
+            .child(value)
+    }
+
+    fn render_files(&self, cx: &mut Context<Self>) -> Div {
+        let settings = self.model.read(cx).settings().clone();
+        let hidden = &settings.sandbox.hidden_paths;
+        let view = cx.entity().downgrade();
+        let defaults: Vec<String> = DEFAULT_HIDDEN_PATHS
+            .iter()
+            .map(|p| (*p).to_owned())
+            .collect();
+        let writes = self.render_writes(cx);
         let mut chips = div().h_flex().flex_wrap().gap(px(4.));
         for (index, path) in hidden.iter().enumerate() {
             let (view, path_text) = (view.clone(), path.clone());
@@ -736,9 +1005,11 @@ impl SettingsSheet {
                         .icon(Icon::new(IconName::Close).size(px(10.)))
                         .accessibility_label(format!("Stop hiding {path}"))
                         .tooltip(format!("Stop hiding {path}"))
-                        .on_click(move |_, _, cx| {
-                            view.update(cx, |this, cx| this.unhide_path(&path_text, cx))
-                                .ok();
+                        .on_click(move |_, window, cx| {
+                            view.update(cx, |this, cx| {
+                                this.ask_unhide_path(&path_text, window, cx)
+                            })
+                            .ok();
                         }),
                 ),
             );

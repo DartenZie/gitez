@@ -231,6 +231,41 @@ impl Shots {
         });
     }
 
+    /// Clicks the middle of the element with id `id`, where a fresh frame
+    /// of `window` draws it, as the pointer would.
+    /// Dialogs slide in on animations that run in real time, so this
+    /// first waits (up to two seconds) until the element stops moving.
+    pub fn click_id(&mut self, window: AnyWindowHandle, id: &'static str) {
+        let mut bounds = None;
+        for _ in 0..40 {
+            let now = self
+                .cx
+                .update_window(window, |_, window, cx| {
+                    gpui_kit::test::TestWindowExt::render_frame(window, cx);
+                    gpui_kit::test::TestWindowExt::try_find(window, id)
+                        .map(|element| element.bounds())
+                })
+                .expect("the window is open");
+            if now.is_some() && now == bounds {
+                break;
+            }
+            bounds = now;
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        self.update_window(window, |window, cx| {
+            gpui_kit::test::TestWindowExt::render_frame(window, cx);
+            gpui_kit::test::TestWindowExt::click(window, id, cx);
+        });
+    }
+
+    /// Whether a fresh frame of `window` draws an element with id `id`.
+    pub fn has_id(&mut self, window: AnyWindowHandle, id: &'static str) -> bool {
+        self.update_window(window, |window, cx| {
+            gpui_kit::test::TestWindowExt::render_frame(window, cx);
+            !gpui_kit::test::TestWindowExt::find_all(window, id).is_empty()
+        })
+    }
+
     /// Scrolls by `lines` (positive: down) at `position`.
     pub fn scroll(&mut self, window: AnyWindowHandle, position: Point<Pixels>, lines: f32) {
         self.hover(window, position);

@@ -18,12 +18,14 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::agent_threads::{
-    AgentThreadKey, AgentThreads, Counts, OpenAgentPullRequest, OpenAgentThread, OpenSettings,
+    AgentThreadKey, AgentThreads, Counts, Notice, OpenAgentPullRequest, OpenAgentThread,
+    OpenSettings, ThreadFacts,
 };
 use crate::theme::{self, color};
 use crate::workspace::ShowHome;
 use crate::workspace::agent_thread::{
-    ago, blocked_hosts, can_complete, duration, finished_at, suggested_retry,
+    Look, ago, blocked_hosts, can_complete, completed_label, duration, finished_at, state_icon,
+    state_label, suggested_retry, uncommitted_text,
 };
 
 /// Height of the indicator, as the toolbar's other buttons.
@@ -53,27 +55,32 @@ pub(crate) enum Part {
     Waiting,
     Ready,
     Failed,
+    Stopped,
 }
 
 impl Part {
-    fn color(self) -> u32 {
+    /// In the colour of the state it counts, as rows show it.
+    pub(crate) fn color(self) -> u32 {
         match self {
-            Part::Active => color::THREAD_RUNNING_TEXT,
-            Part::Waiting => color::TEXT_SECONDARY,
-            Part::Ready => color::THREAD_PREPARING_TEXT,
-            Part::Failed => color::THREAD_FAILED_TEXT,
+            Part::Active => Look::Running.text(),
+            Part::Waiting => Look::Waiting.text(),
+            Part::Ready => Look::Ready.text(),
+            Part::Failed => Look::Failed.text(),
+            Part::Stopped => Look::Stopped.text(),
         }
     }
 }
 
-/// What the indicator says after "Agents": "2 active", "1 waiting",
-/// "1 ready", "1 failed", only the parts that are not zero.
+/// What the indicator (and Home's heading) says of `counts`: "2 active",
+/// "1 waiting", "1 ready", "1 failed", "1 stopped", only the parts that
+/// are not zero.
 pub(crate) fn indicator_parts(counts: Counts) -> Vec<(Part, String)> {
     [
         (Part::Active, counts.active, "active"),
         (Part::Waiting, counts.waiting, "waiting"),
         (Part::Ready, counts.ready, "ready"),
         (Part::Failed, counts.failed, "failed"),
+        (Part::Stopped, counts.stopped, "stopped"),
     ]
     .into_iter()
     .filter(|(_, count, _)| *count > 0)
@@ -136,12 +143,14 @@ pub(crate) fn group_of(thread: &AgentThread) -> Group {
 }
 
 /// A thread in the popover, with its repository.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Item {
     pub common_dir: PathBuf,
     /// Shown on the row only when the popover lists every repository.
     pub repository: SharedString,
     pub thread: Arc<AgentThread>,
+    /// What else is known of it.
+    pub facts: ThreadFacts,
 }
 
 impl Item {
@@ -233,6 +242,51 @@ impl RowAction {
     }
 }
 
+/// What Complete does to `thread`, for its tooltip.
+pub(crate) fn complete_tooltip(thread: &AgentThread) -> &'static str {
+    if thread.has_uncommitted() == Some(true) {
+        "Asks first: the worktree has uncommitted changes, which removing it discards"
+    } else {
+        "Removes the worktree, and the branch if it has no commits. The thread stays readable."
+    }
+}
+
+/// What Retry with `network` does to `thread`, for its tooltip: run the
+/// first prompt again, continue the conversation, or only commit and
+/// create the pull request; and what a wider network allows.
+pub(crate) fn retry_tooltip(thread: &AgentThread, network: NetworkProfile) -> String {
+    let plan = thread.clone().request_retry(network, Timestamp::now());
+    let mut text = match plan {
+        Ok(gitez_agent_thread::RetryPlan::RunAgain) => {
+            "Run the first prompt again in a new conversation (the agent never started)"
+        }
+        Ok(gitez_agent_thread::RetryPlan::Finish) => {
+            "Commit and create the pull request again; the agent does not run"
+        }
+        Ok(gitez_agent_thread::RetryPlan::Continue) | Err(_) => {
+            "Run the thread again, continuing its conversation"
+        }
+    }
+    .to_owned();
+    if let Some(warning) = wider_network_warning(thread.network, network) {
+        text.push_str(". ");
+        text.push_str(warning);
+    }
+    text
+}
+
+/// The known limit of a wider network, when a retry moves `from` to `to`
+/// and `to` is Packages or Open.
+pub(crate) fn wider_network_warning(
+    from: NetworkProfile,
+    to: NetworkProfile,
+) -> Option<&'static str> {
+    (from != to && to != NetworkProfile::AgentOnly).then_some(
+        "With Packages or Open the sandbox cannot separate the agent from the commands it runs, \
+         so the agent could send out whatever it can read, including its own login.",
+    )
+}
+
 /// A piece of a row's second line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Span {
@@ -266,6 +320,7 @@ impl Span {
 /// `limit` is how many agents may run at once.
 pub(crate) fn status_line(
     thread: &AgentThread,
+    facts: &ThreadFacts,
     repository: Option<&str>,
     limit: usize,
     now: Timestamp,
@@ -286,7 +341,7 @@ pub(crate) fn status_line(
     };
     match thread.state {
         State::Queued => {
-            spans.push(Span::new("Queued", color::TEXT_SECONDARY));
+            spans.push(Span::new("Queued", Look::Queued.text()));
             let agents = if limit == 1 {
                 "the agent is".to_owned()
             } else {
@@ -295,19 +350,13 @@ pub(crate) fn status_line(
             spans.push(Span::new(format!(" · starts when {agents} free"), muted));
         }
         State::Waiting => {
-            spans.push(Span::new(
-                crate::workspace::agent_thread::state_label(thread),
-                color::TEXT_SECONDARY,
-            ));
+            spans.push(Span::new(state_label(thread), Look::Waiting.text()));
             spans.push(Span::new(" · usage limit", muted));
         }
         State::Preparing | State::Running => {
             let preparing = thread.state == State::Preparing;
-            spans.push(if preparing {
-                Span::new("Preparing", color::THREAD_PREPARING_TEXT)
-            } else {
-                Span::new("Running", color::THREAD_RUNNING_TEXT)
-            });
+            let look = Look::of(thread);
+            spans.push(Span::new(look.word(), look.text()));
             let (tool, detail) = match &thread.activity {
                 Some(activity) => (activity.tool.clone(), activity.detail.clone()),
                 None if preparing => (None, "creating the worktree".to_owned()),
@@ -325,7 +374,7 @@ pub(crate) fn status_line(
             let when = ago(finished_at(thread), now);
             match thread.ending {
                 Some(Ending::Failed) => {
-                    spans.push(Span::new(after("Failed"), color::THREAD_FAILED_TEXT));
+                    spans.push(Span::new(after("Failed"), Look::Failed.text()));
                     spans.push(Span::new(format!(" · {when}"), muted));
                     if let Some(host) = blocked_hosts(thread).first() {
                         let more = blocked_hosts(thread).len() - 1;
@@ -343,38 +392,60 @@ pub(crate) fn status_line(
                     }
                 }
                 Some(Ending::Stopped) => {
-                    spans.push(Span::new(after("Stopped"), color::THREAD_FAILED_TEXT));
+                    spans.push(Span::new(after("Stopped"), Look::Stopped.text()));
                     spans.push(Span::new(format!(" · {when}"), muted));
                 }
                 Some(Ending::PullRequest) | Some(Ending::Answer) | None => {
-                    match thread.pull_request {
-                        Some(number) => spans.push(Span::new(
-                            format!("PR #{number}"),
-                            color::THREAD_PREPARING_TEXT,
-                        )),
-                        None => spans.push(Span::new("No changes", color::TEXT_SECONDARY)),
+                    let look = Look::of(thread);
+                    match (thread.pull_request, look) {
+                        (Some(number), _) => {
+                            spans.push(Span::new(format!("PR #{number}"), look.text()))
+                        }
+                        (None, Look::Uncommitted) => {
+                            let text = uncommitted_text(thread).unwrap_or_default();
+                            spans.push(Span::new(text, look.text()));
+                        }
+                        (None, _) => spans.push(Span::new(look.word(), look.text())),
                     }
                     spans.push(Span::new(format!(" · finished {when}"), muted));
                 }
             }
+            // Left in the worktree: said on every row, never hidden behind
+            // the state.
+            if Look::of(thread) != Look::Uncommitted
+                && let Some(text) = uncommitted_text(thread)
+            {
+                spans.insert(
+                    spans.len().min(repository.map_or(1, |_| 3)),
+                    Span::new(format!(" · {text}"), Look::Uncommitted.text()),
+                );
+            }
         }
         State::Completed => {
             let when = ago(thread.completed.unwrap_or(thread.updated), now);
-            spans.push(Span::new("Completed", color::TEXT_FAINT));
-            if let Some(number) = thread.pull_request {
-                spans.push(Span::new(format!(" · PR #{number}"), color::TEXT_FAINT));
+            spans.push(Span::new(
+                completed_label(thread, facts.pull_request),
+                Look::Completed.text(),
+            ));
+            if facts.worktree_present {
+                let kept = match uncommitted_text(thread) {
+                    Some(text) => format!(" · worktree kept: {text}"),
+                    None => " · worktree kept".to_owned(),
+                };
+                spans.push(Span::new(kept, Look::Uncommitted.text()));
             }
-            spans.push(Span::new(format!(" · {when}"), color::TEXT_FAINT));
+            spans.push(Span::new(format!(" · {when}"), Look::Completed.text()));
         }
     }
     spans
 }
 
-/// How long an active thread has run: "now", "14 min".
+/// How long an active thread has run: "just now", "14 min", as the lanes
+/// say it.
 pub(crate) fn elapsed(thread: &AgentThread, now: Timestamp) -> String {
     let seconds = thread.run_time(now).as_secs();
     if seconds < 60 {
-        "now".to_owned()
+        "just now".to_owned()
     } else {
         duration(seconds)
     }
@@ -401,10 +472,17 @@ fn items(
             }
             continue;
         }
-        items.extend(repository.threads.iter().map(|thread| Item {
-            common_dir: repository.common_dir.clone(),
-            repository: repository.name.clone(),
-            thread: thread.clone(),
+        items.extend(repository.threads.iter().map(|thread| {
+            Item {
+                common_dir: repository.common_dir.clone(),
+                repository: repository.name.clone(),
+                thread: thread.clone(),
+                facts: repository
+                    .facts
+                    .get(&thread.id)
+                    .cloned()
+                    .unwrap_or_default(),
+            }
         }));
     }
     (items, elsewhere)
@@ -476,7 +554,7 @@ fn render_popover(
     scope: Option<&AgentsScope>,
     focus: &FocusHandle,
     busy: &Entity<Busy>,
-    window: &mut Window,
+    _window: &mut Window,
     cx: &mut Context<PopoverState>,
 ) -> Div {
     let popover = cx.entity().downgrade();
@@ -486,6 +564,9 @@ fn render_popover(
     let running = model.read(cx).running();
     let now = Timestamp::now();
     let groups = grouped(items);
+    let notices = model
+        .read(cx)
+        .notices(scope.map(|scope| scope.common_dir.as_path()));
 
     let gear = Button::new("agents-settings")
         .ghost()
@@ -533,6 +614,9 @@ fn render_popover(
         .max_h(LIST_MAX_HEIGHT)
         .overflow_y_scroll()
         .pb(px(4.));
+    if !notices.is_empty() {
+        list = list.child(render_notices(notices, "agents-notice", cx));
+    }
     if groups.is_empty() {
         list = list.child(empty(scope));
     }
@@ -558,7 +642,6 @@ fn render_popover(
                     popover: popover.clone(),
                     busy: busy.downgrade(),
                 },
-                window,
                 cx,
             );
             list = list.child(row);
@@ -631,6 +714,68 @@ fn render_popover(
         .child(footer)
 }
 
+/// What could not be read, watched or completed, each with its reason,
+/// and for a repository that was moved or deleted a button to stop listing
+/// it. Shared with Home; `id` prefixes the buttons' ids.
+pub(crate) fn render_notices(notices: Vec<Notice>, id: &'static str, cx: &App) -> Div {
+    let model = AgentThreads::global(cx).downgrade();
+    div()
+        .v_flex()
+        .gap(px(6.))
+        .mx(px(8.))
+        .mt(px(8.))
+        .children(notices.into_iter().enumerate().map(|(index, notice)| {
+            let forget = notice.forget.clone().map(|common_dir| {
+                let model = model.clone();
+                Button::new((id, index))
+                    .debug_selector(move || format!("{id}-forget-{index}"))
+                    .compact()
+                    .h(px(22.))
+                    .text_size(px(11.5))
+                    .label("Remove from list")
+                    .tooltip("Stop listing this repository; its threads stay in its git folder")
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        model
+                            .update(cx, |model, cx| {
+                                model.forget_repository(common_dir.clone(), cx)
+                            })
+                            .ok();
+                    })
+            });
+            div()
+                .h_flex()
+                .items_start()
+                .gap(px(8.))
+                .px(px(10.))
+                .py(px(7.))
+                .rounded(px(8.))
+                .border_1()
+                .border_color(rgb(color::WARNING_BORDER))
+                .child(
+                    Icon::new(IconName::TriangleAlert)
+                        .size(px(13.))
+                        .mt(px(2.))
+                        .text_color(rgb(color::ACCENT)),
+                )
+                .child(
+                    div()
+                        .v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap(px(6.))
+                        .child(
+                            div()
+                                .text_size(px(11.5))
+                                .line_height(relative(1.45))
+                                .text_color(rgb(color::WARNING_TEXT))
+                                .child(notice.text.clone()),
+                        )
+                        .children(forget),
+                )
+        }))
+}
+
 /// What a row's handlers need.
 struct RowContext {
     focus: FocusHandle,
@@ -686,63 +831,12 @@ fn empty(scope: Option<&AgentsScope>) -> Div {
         )
 }
 
-/// The 16 px mark of a thread's state, as on the board: a ring with a dot
-/// while running (dashed while preparing) in the branch's colour, a dashed
-/// grey ring while waiting, a cross when it failed, a filled circle for a
-/// pull request, a speech bubble for an answer, a tick when completed.
-fn state_icon(thread: &AgentThread) -> AnyElement {
-    let branch = theme::branch_color(&thread.branch);
-    let ring = |hex: u32, dashed: bool| {
-        div()
-            .flex()
-            .items_center()
-            .justify_center()
-            .size(px(12.))
-            .rounded_full()
-            .border_2()
-            .border_color(rgb(hex))
-            .when(dashed, |this| this.border_dashed())
-    };
-    let icon = |name: IconName, hex: u32| {
-        Icon::new(name)
-            .size(px(14.))
-            .text_color(rgb(hex))
-            .into_any_element()
-    };
-    let mark = match (thread.state, thread.ending) {
-        (State::Running, _) => ring(branch, false)
-            .child(div().size(px(4.)).rounded_full().bg(rgb(branch)))
-            .into_any_element(),
-        (State::Preparing, _) => ring(branch, true).into_any_element(),
-        (State::Queued | State::Waiting, _) => ring(color::TEXT_FAINT, true).into_any_element(),
-        (State::Completed, _) => icon(IconName::Check, color::TEXT_FAINT),
-        (State::Finished, Some(Ending::Failed | Ending::Stopped)) => {
-            icon(IconName::CircleX, color::DIFF_REMOVED)
-        }
-        (State::Finished, _) if thread.pull_request.is_some() => div()
-            .size(px(11.))
-            .rounded_full()
-            .bg(rgb(branch))
-            .into_any_element(),
-        (State::Finished, _) => icon(IconName::MessageSquare, color::TEXT_MUTED),
-    };
-    div()
-        .flex()
-        .flex_none()
-        .items_center()
-        .justify_center()
-        .size(px(16.))
-        .mt(px(1.))
-        .child(mark)
-        .into_any_element()
-}
-
 /// The second line of a row, cut with an ellipsis. GPUI measures a line
 /// for its ellipsis in one font, so the line is one text in the UI font,
 /// and only a monospaced span at its end gets an element (and an
 /// ellipsis) of its own; a monospaced span inside the line keeps the UI
 /// font.
-fn status_line_element(mut spans: Vec<Span>, window: &Window, cx: &App) -> Div {
+pub(crate) fn status_line_element(mut spans: Vec<Span>, cx: &App) -> Div {
     let ellipsis = || {
         div()
             .min_w_0()
@@ -755,16 +849,20 @@ fn status_line_element(mut spans: Vec<Span>, window: &Window, cx: &App) -> Div {
         .is_some_and(|span| span.mono && spans.len() > 1)
         .then(|| spans.pop())
         .flatten();
-    let base = window.text_style();
     let mut text = String::new();
-    let mut runs = Vec::new();
+    let mut highlights = Vec::new();
     for span in spans {
-        let mut run = base.to_run(span.text.len());
-        run.color = rgb(span.color).into();
+        let start = text.len();
         text.push_str(&span.text);
-        runs.push(run);
+        highlights.push((
+            start..text.len(),
+            HighlightStyle {
+                color: Some(rgb(span.color).into()),
+                ..HighlightStyle::default()
+            },
+        ));
     }
-    let head = StyledText::new(text).with_runs(runs);
+    let head = StyledText::new(text).with_highlights(highlights);
     let line = div().h_flex().min_w_0().text_size(px(11.5));
     match tail {
         None => line.child(ellipsis().flex_1().child(head)),
@@ -789,7 +887,6 @@ fn render_row(
     now: Timestamp,
     busy: bool,
     context: RowContext,
-    window: &mut Window,
     cx: &mut Context<PopoverState>,
 ) -> Stateful<Div> {
     let thread = &item.thread;
@@ -797,7 +894,7 @@ fn render_row(
     let completed = thread.state == State::Completed;
     let actions = row_actions(thread);
     let repository = all_repositories.then_some(item.repository.as_ref());
-    let spans = status_line(thread, repository, limit, now);
+    let spans = status_line(thread, &item.facts, repository, limit, now);
     let failed = group_of(thread) == Group::NeedsAttention;
     let id = SharedString::from(format!("agents-row-{}", thread.id.as_str()));
 
@@ -824,7 +921,7 @@ fn render_row(
             }
         })
         .child(thread.title.clone());
-    let line = status_line_element(spans, window, cx);
+    let line = status_line_element(spans, cx);
     let text = div()
         .v_flex()
         .flex_1()
@@ -882,7 +979,7 @@ fn render_row(
         .cursor_pointer()
         .hover(|style| style.bg(rgb(color::PALETTE_HOVER)))
         .on_click(open)
-        .child(state_icon(thread))
+        .child(state_icon(thread, item.facts.pull_request))
         .child(body)
         .child(trailing)
 }
@@ -913,10 +1010,11 @@ fn row_button(
         .label(action.label(thread.network))
         .disabled(busy);
     let button = match action {
-        RowAction::Retry(_) => button
+        RowAction::Retry(network) => button
             .primary()
             .icon(Icon::new(IconName::RotateCcw).size(px(12.)))
-            .loading(busy),
+            .loading(busy)
+            .tooltip(retry_tooltip(thread, network)),
         RowAction::Stop | RowAction::Cancel => button
             .ghost()
             .text_color(rgb(color::THREAD_FAILED_TEXT))
@@ -930,7 +1028,7 @@ fn row_button(
             .when(!failed, |this| this.ghost())
             .icon(Icon::new(IconName::Check).size(px(12.)))
             .loading(busy)
-            .tooltip("Removes the worktree. The thread stays readable."),
+            .tooltip(complete_tooltip(thread)),
         RowAction::PullRequest(number) => button
             .when(completed, |this| {
                 this.ghost().label(format!("PR #{number}"))
@@ -986,7 +1084,26 @@ fn run(
         }
         RowAction::Stop | RowAction::Cancel => model.update(cx, |model, cx| model.stop(key, cx)),
         RowAction::Retry(network) => model.update(cx, |model, cx| model.retry(key, network, cx)),
-        RowAction::Complete => model.update(cx, |model, cx| model.complete(key, cx)),
+        RowAction::Complete => {
+            // The question it may ask is a dialog of the window, which the
+            // popover would cover.
+            dismiss(popover, window, cx);
+            let (busy, busy_key) = (busy.clone(), key.clone());
+            let busy: crate::workspace::agent_thread::complete::Busy =
+                std::rc::Rc::new(move |on, _, cx| {
+                    busy.update(cx, |busy, cx| {
+                        if on {
+                            busy.0.insert(busy_key.clone());
+                        } else {
+                            busy.0.remove(&busy_key);
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                });
+            crate::workspace::agent_thread::complete::complete(key.clone(), busy, window, cx);
+            return;
+        }
     };
     busy.update(cx, |busy, cx| {
         busy.0.insert(key.clone());
@@ -1003,15 +1120,8 @@ fn run(
                     cx.notify();
                 })
                 .ok();
-                match result {
-                    Ok(()) if action == RowAction::Complete => window.push_notification(
-                        crate::toast::success("Completed; the worktree is removed"),
-                        cx,
-                    ),
-                    Ok(()) => {}
-                    Err(error) => {
-                        window.push_notification(crate::toast::error(format!("{error:#}")), cx)
-                    }
+                if let Err(error) = result {
+                    window.push_notification(crate::toast::error(format!("{error:#}")), cx)
                 }
             })
             .ok();
@@ -1028,8 +1138,8 @@ mod tests {
     use gitez_sandbox::NetworkProfile;
 
     use super::{
-        Group, Item, Part, RowAction, grouped, indicator_label, indicator_parts, row_actions,
-        status_line,
+        Group, Item, Part, RowAction, ThreadFacts, grouped, indicator_label, indicator_parts,
+        row_actions, status_line,
     };
     use crate::agent_threads::Counts;
 
@@ -1063,6 +1173,7 @@ mod tests {
             waiting: 0,
             ready: 1,
             failed: 1,
+            stopped: 1,
             completed: 7,
         };
         assert_eq!(
@@ -1071,11 +1182,12 @@ mod tests {
                 (Part::Active, "2 active".to_owned()),
                 (Part::Ready, "1 ready".to_owned()),
                 (Part::Failed, "1 failed".to_owned()),
+                (Part::Stopped, "1 stopped".to_owned()),
             ]
         );
         assert_eq!(
             indicator_label(counts),
-            "Agents: 2 active, 1 ready, 1 failed"
+            "Agents: 2 active, 1 ready, 1 failed, 1 stopped"
         );
         let waiting = Counts {
             waiting: 3,
@@ -1147,7 +1259,7 @@ mod tests {
             "the label names the network it changes to"
         );
         let now: Timestamp = "2026-11-13T10:46:00Z".parse().expect("a time");
-        let line: String = status_line(&failed, None, 3, now)
+        let line: String = status_line(&failed, &ThreadFacts::default(), None, 3, now)
             .into_iter()
             .map(|span| span.text)
             .collect();
@@ -1170,6 +1282,7 @@ mod tests {
                 common_dir: PathBuf::from("/repo/.git"),
                 repository: "repo".into(),
                 thread: Arc::new(thread),
+                facts: ThreadFacts::default(),
             }
         };
         let groups = grouped(vec![
@@ -1205,13 +1318,77 @@ mod tests {
     #[test]
     fn a_queued_thread_says_when_it_starts() {
         let now = Timestamp::now();
-        let line: String = status_line(&thread(State::Queued, None), Some("gitez"), 3, now)
-            .into_iter()
-            .map(|span| span.text)
-            .collect();
+        let line: String = status_line(
+            &thread(State::Queued, None),
+            &ThreadFacts::default(),
+            Some("gitez"),
+            3,
+            now,
+        )
+        .into_iter()
+        .map(|span| span.text)
+        .collect();
         assert_eq!(
             line,
             "gitez · Queued · starts when one of the 3 agents is free"
         );
+    }
+
+    /// C1: a thread that left uncommitted changes never reads "No changes",
+    /// on any row; a completed one whose worktree was kept says so.
+    #[test]
+    fn uncommitted_changes_are_said_on_every_row() {
+        let now: Timestamp = "2026-11-13T10:46:00Z".parse().expect("a time");
+        let line = |thread: &AgentThread, facts: &ThreadFacts| -> String {
+            status_line(thread, facts, None, 3, now)
+                .into_iter()
+                .map(|span| span.text)
+                .collect()
+        };
+        let mut answer = thread(State::Finished, Some(Ending::Answer));
+        answer.updated = "2026-11-13T10:40:00Z".parse().expect("a time");
+        assert!(line(&answer, &ThreadFacts::default()).starts_with("Answer · finished"));
+        answer.uncommitted = Some(gitez_agent_thread::Uncommitted {
+            checked: now,
+            count: 3,
+            paths: vec!["?? notes.txt".into()],
+            commit_error: Some("pre-commit hook failed".into()),
+        });
+        let text = line(&answer, &ThreadFacts::default());
+        assert!(
+            text.starts_with("3 uncommitted changes · finished"),
+            "{text}"
+        );
+        assert!(!text.contains("No changes"));
+        assert_eq!(
+            crate::workspace::agent_thread::Look::of(&answer),
+            crate::workspace::agent_thread::Look::Uncommitted
+        );
+        // A failed one says both.
+        let mut failed = answer.clone();
+        failed.ending = Some(Ending::Failed);
+        assert!(line(&failed, &ThreadFacts::default()).contains("Failed · 3 uncommitted changes"));
+        // Completed by hand with the worktree kept.
+        let mut completed = answer.clone();
+        completed.state = State::Completed;
+        let kept = ThreadFacts {
+            worktree_present: true,
+            ..ThreadFacts::default()
+        };
+        let text = line(&completed, &kept);
+        assert!(
+            text.starts_with("Completed by hand · worktree kept: 3 uncommitted changes"),
+            "{text}"
+        );
+        // Completed with its pull request merged.
+        let mut merged = thread(State::Completed, Some(Ending::PullRequest));
+        merged.pull_request = Some(7);
+        let facts = ThreadFacts {
+            pull_request: Some(gitez_review::State::Merged),
+            ..ThreadFacts::default()
+        };
+        assert!(line(&merged, &facts).starts_with("Completed · PR #7 merged"));
+        // Uncommitted changes count as ready for review.
+        assert_eq!(Counts::of([&answer]).ready, 1);
     }
 }
