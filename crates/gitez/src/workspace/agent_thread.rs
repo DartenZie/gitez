@@ -578,13 +578,32 @@ pub fn blocked_hosts(thread: &AgentThread) -> &[String] {
 }
 
 /// The network a retry of `thread` should use: Packages when Agent API only
-/// blocked hosts in its last run, otherwise the thread's own.
-pub fn suggested_retry(thread: &AgentThread) -> NetworkProfile {
-    if !blocked_hosts(thread).is_empty() && thread.network == NetworkProfile::AgentOnly {
+/// blocked a host in its last run that Packages allows (one of
+/// `package_hosts`, the Settings list), otherwise the thread's own. Hosts
+/// Packages would block as well, such as the agent's own telemetry, which
+/// the real Claude Code tries in every run, never widen the network.
+pub fn suggested_retry(thread: &AgentThread, package_hosts: &[String]) -> NetworkProfile {
+    let packages_help = blocked_hosts(thread)
+        .iter()
+        .any(|host| package_host(package_hosts, host));
+    if packages_help && thread.network == NetworkProfile::AgentOnly {
         NetworkProfile::Packages
     } else {
         thread.network
     }
+}
+
+/// Whether `host` is one of `package_hosts`, which may name a domain and
+/// its subdomains as `*.example.com`.
+fn package_host(package_hosts: &[String], host: &str) -> bool {
+    package_hosts.iter().any(|allowed| {
+        allowed.eq_ignore_ascii_case(host)
+            || allowed.strip_prefix("*.").is_some_and(|domain| {
+                host.len() > domain.len()
+                    && host[host.len() - domain.len()..].eq_ignore_ascii_case(domain)
+                    && host[..host.len() - domain.len()].ends_with('.')
+            })
+    })
 }
 
 /// When `thread` last stopped: its newest turn's end, else its last change.
@@ -1024,6 +1043,7 @@ impl ThreadView {
                         };
                         this.child(
                             Button::new("thread-stop")
+                                .debug_selector(|| "thread-stop".into())
                                 .h(px(28.))
                                 .compact()
                                 .icon(Icon::new(IconName::Square).size(px(12.)))
@@ -1756,7 +1776,14 @@ impl ThreadView {
             return None;
         }
         let busy = self.busy.as_ref().map(|(busy, _)| *busy);
-        let network = self.retry_network.unwrap_or(suggested_retry(thread));
+        let package_hosts = &AgentThreads::global(cx)
+            .read(cx)
+            .settings()
+            .sandbox
+            .package_hosts;
+        let network = self
+            .retry_network
+            .unwrap_or_else(|| suggested_retry(thread, package_hosts));
         let label = if network != thread.network && self.retry_network.is_none() {
             format!("Retry with {}", network.label())
         } else {
@@ -2117,6 +2144,7 @@ impl ThreadView {
                         .child(
                             div().h_flex().gap(px(10.)).child(continues).child(
                                 Button::new("thread-send")
+                                    .debug_selector(|| "thread-send".into())
                                     .primary()
                                     .h(px(28.))
                                     .label("Send")

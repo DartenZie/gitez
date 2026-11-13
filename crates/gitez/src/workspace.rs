@@ -30,6 +30,8 @@ mod stash;
 mod status_bar;
 mod steps;
 mod tag;
+#[cfg(all(test, target_os = "macos"))]
+mod threads_real_shots;
 mod toolbar;
 
 use std::collections::HashMap;

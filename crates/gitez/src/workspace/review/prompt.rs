@@ -561,7 +561,14 @@ impl Review {
         let Some(thread) = self.agent_thread_for_pull_request(cx) else {
             return;
         };
-        let network = agent_thread::suggested_retry(&thread);
+        let network = agent_thread::suggested_retry(
+            &thread,
+            &AgentThreads::global(cx)
+                .read(cx)
+                .settings()
+                .sandbox
+                .package_hosts,
+        );
         self.ask_thread(ThreadAction::Retry, cx, move |model, key, cx| {
             model.retry(key, network, cx)
         });
@@ -605,6 +612,14 @@ impl Review {
         let cannot_send = self.cannot_send(cx);
         let options = &pull_request.prompt;
         let thread = self.agent_thread_for_pull_request(cx);
+        // Made by an agent thread, completed or not: its review threads are
+        // called comments throughout, also after the merge.
+        let made_by_thread = AgentThreads::try_global(cx).is_some_and(|threads| {
+            threads
+                .read(cx)
+                .for_pull_request(&panel.common_dir, pull_request.number)
+                .is_some()
+        });
         let sending = matches!(panel.thread_busy, Some((ThreadAction::Send, _)));
 
         let comments = open.iter().map(|thread| {
@@ -822,6 +837,7 @@ impl Review {
                             .when_some(agent.as_ref(), |this, agent| {
                                 this.child(
                                     Button::new("prompt-send")
+                                        .debug_selector(|| "prompt-send".into())
                                         .primary()
                                         .flex_grow(2.)
                                         .flex_basis(relative(0.))
@@ -855,7 +871,7 @@ impl Review {
                     .child(
                         // Beside an agent thread, review threads are called
                         // comments, to keep the two apart.
-                        muted(if thread.is_some() {
+                        muted(if made_by_thread {
                             "Comments resolve themselves when a new commit on this branch \
                              changes the lines they point at. You can reopen any of them."
                         } else {

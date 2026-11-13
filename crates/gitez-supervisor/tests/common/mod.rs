@@ -285,6 +285,22 @@ impl Fixture {
         path
     }
 
+    /// A script that runs `exe` (a `gitez` binary, run as `gitez supervise
+    /// …`) with this fixture's data folder and `GITEZ_TEST_SANDBOX=passthrough`.
+    pub fn gitez_exe(&self, exe: &Path) -> PathBuf {
+        let path = self.base.join("bin").join("gitez-supervise");
+        write_script(
+            &path,
+            &format!(
+                "#!/bin/sh\nexport GITEZ_DATA_DIR='{}'\nexport GITEZ_TEST_SANDBOX=passthrough\n\
+                 exec '{}' supervise \"$@\"\n",
+                self.data_dir.display(),
+                exe.display(),
+            ),
+        );
+        path
+    }
+
     /// Starts a supervisor process for `id`, as the GUI does.
     pub fn launch(&self, id: &AgentThreadId, command: Command, secrets: &Secrets) -> u32 {
         let exe = self.supervisor_exe();

@@ -205,14 +205,14 @@ pub(crate) enum RowAction {
 }
 
 /// The actions a row of `thread` offers, in the order shown.
-pub(crate) fn row_actions(thread: &AgentThread) -> Vec<RowAction> {
+pub(crate) fn row_actions(thread: &AgentThread, package_hosts: &[String]) -> Vec<RowAction> {
     let mut actions = Vec::new();
     match thread.state {
         State::Queued => actions.push(RowAction::Cancel),
         State::Preparing | State::Running | State::Waiting => actions.push(RowAction::Stop),
         State::Finished => {
             if matches!(thread.ending, Some(Ending::Failed | Ending::Stopped)) {
-                actions.push(RowAction::Retry(suggested_retry(thread)));
+                actions.push(RowAction::Retry(suggested_retry(thread, package_hosts)));
             }
             if let Some(number) = thread.pull_request {
                 actions.push(RowAction::PullRequest(number));
@@ -892,7 +892,14 @@ fn render_row(
     let thread = &item.thread;
     let key = item.key();
     let completed = thread.state == State::Completed;
-    let actions = row_actions(thread);
+    let actions = row_actions(
+        thread,
+        &AgentThreads::global(cx)
+            .read(cx)
+            .settings()
+            .sandbox
+            .package_hosts,
+    );
     let repository = all_repositories.then_some(item.repository.as_ref());
     let spans = status_line(thread, &item.facts, repository, limit, now);
     let failed = group_of(thread) == Group::NeedsAttention;
@@ -1199,34 +1206,40 @@ mod tests {
     #[test]
     fn rows_offer_the_action_that_fits_the_state() {
         assert_eq!(
-            row_actions(&thread(State::Queued, None)),
+            row_actions(&thread(State::Queued, None), &[]),
             [RowAction::Cancel]
         );
         assert_eq!(
-            row_actions(&thread(State::Running, None)),
+            row_actions(&thread(State::Running, None), &[]),
             [RowAction::Stop]
         );
         assert_eq!(
-            row_actions(&thread(State::Preparing, None)),
+            row_actions(&thread(State::Preparing, None), &[]),
             [RowAction::Stop]
         );
         assert_eq!(
-            row_actions(&thread(State::Finished, Some(Ending::Answer))),
+            row_actions(&thread(State::Finished, Some(Ending::Answer)), &[]),
             [RowAction::Complete]
         );
         let mut pull_request = thread(State::Finished, Some(Ending::PullRequest));
         pull_request.pull_request = Some(12);
-        assert_eq!(row_actions(&pull_request), [RowAction::PullRequest(12)]);
         assert_eq!(
-            row_actions(&thread(State::Finished, Some(Ending::Failed))),
+            row_actions(&pull_request, &[]),
+            [RowAction::PullRequest(12)]
+        );
+        assert_eq!(
+            row_actions(&thread(State::Finished, Some(Ending::Failed)), &[]),
             [
                 RowAction::Retry(NetworkProfile::AgentOnly),
                 RowAction::Complete
             ]
         );
-        assert!(row_actions(&thread(State::Completed, Some(Ending::Answer))).is_empty());
+        assert!(row_actions(&thread(State::Completed, Some(Ending::Answer)), &[]).is_empty());
         pull_request.state = State::Completed;
-        assert_eq!(row_actions(&pull_request), [RowAction::PullRequest(12)]);
+        assert_eq!(
+            row_actions(&pull_request, &[]),
+            [RowAction::PullRequest(12)]
+        );
     }
 
     #[test]
@@ -1251,7 +1264,11 @@ mod tests {
             )
             .expect("a turn"),
         );
-        let actions = row_actions(&failed);
+        let package_hosts: Vec<String> = gitez_settings::DEFAULT_PACKAGE_HOSTS
+            .iter()
+            .map(|host| (*host).to_owned())
+            .collect();
+        let actions = row_actions(&failed, &package_hosts);
         assert_eq!(actions[0], RowAction::Retry(NetworkProfile::Packages));
         assert_eq!(
             actions[0].label(failed.network),
@@ -1266,6 +1283,47 @@ mod tests {
         assert_eq!(
             line,
             "Failed after 6 min · 40 min ago · static.crates.io and 1 more blocked by Agent API only"
+        );
+    }
+
+    /// The real Claude Code tries its own telemetry and MCP hosts in every
+    /// run; Packages would block them too, so they never make Retry widen
+    /// the network. A host Packages allows still does, also by `*.` rule.
+    #[test]
+    fn only_hosts_packages_allows_suggest_packages() {
+        let mut stopped = thread(State::Finished, Some(Ending::Stopped));
+        let mut turn: gitez_agent_thread::Turn = serde_json::from_str(
+            r#"{
+                "kind": "start", "prompt": "Wait", "requested": "2026-11-13T10:00:00Z",
+                "resume": false, "started": null, "ended": null, "transcript": null,
+                "result": {
+                    "success": false, "message": "", "cost_usd": null, "duration_ms": null,
+                    "steps": 1, "exit_code": null, "stopped": true,
+                    "blocked_hosts": ["mcp-proxy.anthropic.com", "http-intake.logs.us5.datadoghq.com"]
+                }
+            }"#,
+        )
+        .expect("a turn");
+        stopped.turns.push(turn.clone());
+        let package_hosts: Vec<String> = gitez_settings::DEFAULT_PACKAGE_HOSTS
+            .iter()
+            .map(|host| (*host).to_owned())
+            .collect();
+        assert_eq!(
+            super::suggested_retry(&stopped, &package_hosts),
+            NetworkProfile::AgentOnly
+        );
+        if let Some(result) = turn.result.as_mut() {
+            result.blocked_hosts.push("cdn.example.org".into());
+        }
+        stopped.turns[0] = turn;
+        assert_eq!(
+            super::suggested_retry(&stopped, &["*.example.org".to_owned()]),
+            NetworkProfile::Packages
+        );
+        assert_eq!(
+            super::suggested_retry(&stopped, &["*.ample.org".to_owned()]),
+            NetworkProfile::AgentOnly
         );
     }
 

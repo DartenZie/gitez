@@ -1060,7 +1060,10 @@ impl Home {
                     .child(dot())
                     .child(status_line_element(spans, cx).flex_1().min_w_0());
                 if kind == Kind::Finished {
-                    for (index, action) in row_actions(thread).into_iter().enumerate() {
+                    let package_hosts = &self.model.read(cx).settings().sandbox.package_hosts;
+                    for (index, action) in
+                        row_actions(thread, package_hosts).into_iter().enumerate()
+                    {
                         buttons.push(self.row_button(action, index, thread, &key, busy, cx));
                     }
                 }
@@ -1114,9 +1117,12 @@ impl Home {
         }
         // Retry and Complete go under the line, as in the popover: beside
         // them the state would not fit.
-        let wide_buttons = row_actions(thread)
-            .iter()
-            .any(|action| matches!(action, RowAction::Retry(_)));
+        let wide_buttons = row_actions(
+            thread,
+            &self.model.read(cx).settings().sandbox.package_hosts,
+        )
+        .iter()
+        .any(|action| matches!(action, RowAction::Retry(_)));
         let text = div()
             .v_flex()
             .flex_1()

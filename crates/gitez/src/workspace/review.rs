@@ -20,6 +20,7 @@ use gitez_review::{FileUpdate, LineChange, PullRequest, State, Store, Timestamp}
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::*;
 use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::text::TextView;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -2164,7 +2165,18 @@ impl Review {
                                 .text_size(px(13.))
                                 .line_height(relative(1.55))
                                 .text_color(rgb(color::TEXT_SECONDARY))
-                                .child(pull_request.description.clone()),
+                                // A thread's pull request takes the agent's
+                                // final message, which is Markdown.
+                                .child(
+                                    TextView::markdown(
+                                        SharedString::from(format!(
+                                            "pull-request-description-{}",
+                                            pull_request.number
+                                        )),
+                                        pull_request.description.clone(),
+                                    )
+                                    .selectable(true),
+                                ),
                         )
                     }),
             )

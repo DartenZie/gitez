@@ -533,6 +533,36 @@ mod at {
     }
 }
 
+/// Finding 9: a repository listed with threads that was moved or deleted
+/// shows in the launcher's Repository picker as unavailable, and Home
+/// says so with "Remove from list".
+#[test]
+fn screenshot_u6_moved_repository() {
+    if !crate::screenshot::enabled() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let base = dir.path().canonicalize().expect("canonical");
+    let here = named_repository(&base, "notes-site");
+    let gone = base.join("old-api");
+    let data_dir = base.join("data");
+    std::fs::create_dir_all(&data_dir).expect("data folder");
+    save_settings(&data_dir, &common_dir_of(&here), fake_agent(&base, true), 3);
+    index(&data_dir, &here, "notes-site");
+    gitez_agent_thread::Index::new(&data_dir)
+        .add(IndexedRepository {
+            common_dir: gone.join(".git"),
+            work_dir: gone.clone(),
+            name: "old-api".into(),
+        })
+        .expect("index");
+    let mut shots = Shots::from_env(&data_dir).expect("enabled");
+    let (window, _) = open_home(&mut shots, &[&gone, &here]);
+    shots.save(window, "u6-moved-home");
+    shots.click(window, at::picker("repository"));
+    shots.save(window, "u6-moved-picker");
+}
+
 /// Home with no threads and no recent repositories; then with three
 /// repositories' threads.
 #[test]
@@ -1030,4 +1060,53 @@ fn e2e_u6_home_real_haiku() {
     assert_eq!(shown, Some(key(&work_dir, &id)));
     shots.save(window, "u6-real-3-done");
     assert_eq!(done.model.as_deref(), Some("haiku"));
+    // A reply continues the same thread in its worktree.
+    let replied = Instant::now();
+    shots.click(window, at::reply());
+    shots.type_text(
+        window,
+        "Now also add a file bye.txt containing bye and commit it. Do nothing else.",
+    );
+    shots.save(window, "u6-real-4-reply-typed");
+    shots.keys(window, "cmd-enter");
+    wait_until(
+        &mut shots,
+        &common_dir,
+        Duration::from_secs(60),
+        "the reply to start",
+        |threads| {
+            threads
+                .iter()
+                .any(|thread| thread.id == id && thread.turns.len() == 2)
+        },
+    );
+    shots.save(window, "u6-real-5-continuing");
+    let threads = wait_until(
+        &mut shots,
+        &common_dir,
+        Duration::from_secs(300),
+        "the reply to finish",
+        |threads| {
+            threads.iter().any(|thread| {
+                thread.id == id && thread.turns.len() == 2 && !thread.state.is_active()
+            })
+        },
+    );
+    let after = threads
+        .iter()
+        .find(|thread| thread.id == id)
+        .expect("the thread");
+    eprintln!(
+        "reply done after {:?}: {:?} {:?}, pull request {:?}, resumed {}, session kept {}",
+        replied.elapsed(),
+        after.state,
+        after.ending,
+        after.pull_request,
+        after.turns[1].resume,
+        after.session_id == done.session_id,
+    );
+    shots.save(window, "u6-real-6-replied");
+    assert!(after.turns[1].resume, "the reply resumes the conversation");
+    assert_eq!(after.session_id, done.session_id);
+    assert!(after.worktree.join("bye.txt").is_file(), "{after:#?}");
 }

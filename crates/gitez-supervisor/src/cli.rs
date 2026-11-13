@@ -156,9 +156,7 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Result<Args, String> {
 /// The pass-through sandbox, only in debug builds and only when
 /// `GITEZ_TEST_SANDBOX=passthrough`. The pipeline then warns on the thread.
 fn test_sandbox() -> Option<Arc<dyn gitez_sandbox::Sandbox>> {
-    if cfg!(debug_assertions)
-        && std::env::var_os("GITEZ_TEST_SANDBOX").is_some_and(|value| value == "passthrough")
-    {
+    if gitez_sandbox::passthrough_from_env(cfg!(debug_assertions)) {
         Some(Arc::new(gitez_sandbox::Passthrough))
     } else {
         None

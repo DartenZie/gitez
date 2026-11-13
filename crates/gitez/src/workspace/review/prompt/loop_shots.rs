@@ -922,7 +922,7 @@ fn e2e_u5_real_haiku() {
     );
     shots.save(window, "u5-real-1-before");
     scroll_panel(&mut shots, window);
-    shots.click(window, send_button());
+    shots.click_id(window, "prompt-send");
     std::thread::sleep(Duration::from_secs(2));
     shots.settle();
     let sent = shots.update(|cx| {

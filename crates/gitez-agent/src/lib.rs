@@ -23,7 +23,9 @@ pub use test_command::detect_test_command;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("{name} is not installed: no `{program}` was found on the PATH or in {searched}")]
+    #[error(
+        "{name} is not installed: no program named {program} was found on the PATH or in {searched}"
+    )]
     NotInstalled {
         name: &'static str,
         program: &'static str,

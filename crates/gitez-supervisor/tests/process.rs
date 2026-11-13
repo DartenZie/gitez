@@ -273,6 +273,44 @@ fn secrets_reach_the_agent_and_nothing_gitez_writes() {
     assert!(!calls[0].contains(value));
 }
 
+/// A shipped `gitez` ignores `GITEZ_TEST_SANDBOX=passthrough`: with no
+/// sandbox installed, the thread fails before the agent runs. Runs only
+/// when `GITEZ_RELEASE_EXE` names a release build of `gitez` (`cargo build
+/// --release -p gitez`, then `GITEZ_RELEASE_EXE=target/release/gitez`),
+/// on a machine where `srt` is not on the `PATH`.
+#[test]
+fn a_release_build_never_runs_without_a_sandbox() {
+    let Some(exe) = std::env::var_os("GITEZ_RELEASE_EXE") else {
+        return;
+    };
+    let exe = Path::new(&exe).canonicalize().expect("the release gitez");
+    let fixture = Fixture::new();
+    let id = fixture.create("COMMIT").id;
+    let script = fixture.gitez_exe(&exe);
+    gitez_supervisor::launch(gitez_supervisor::Launch {
+        exe: &script,
+        prefix: &[],
+        command: Command::Start,
+        common_dir: &fixture.common_dir(),
+        thread: &id,
+        secrets: &Secrets::default(),
+    })
+    .expect("launch the release supervisor");
+    let thread = fixture.wait_for(&id, LONG, is_done);
+    assert_eq!(thread.ending, Some(Ending::Failed), "{thread:#?}");
+    assert!(
+        thread
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("GITEZ_TEST_SANDBOX")),
+        "{thread:#?}"
+    );
+    // The fake agent never ran.
+    assert_eq!(fixture.calls(), Vec::<String>::new());
+    let failure = format!("{thread:?}");
+    assert!(failure.contains("sandbox"), "{failure}");
+}
+
 /// Runs the supervisor binary directly with `args` and `stdin`.
 fn supervise(fixture: &Fixture, args: &[&str], stdin: &str) -> i32 {
     let mut child = Process::new(env!("CARGO_BIN_EXE_gitez-supervisor"))

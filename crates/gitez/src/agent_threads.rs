@@ -290,9 +290,8 @@ pub(crate) fn init_with(options: Options, cx: &mut App) {
 /// `GITEZ_TEST_SANDBOX=passthrough` in a debug build, so the UI does not
 /// ask for a sandbox the supervisor will not use.
 fn test_sandbox() -> Option<Arc<dyn gitez_sandbox::Sandbox>> {
-    (cfg!(debug_assertions)
-        && std::env::var_os("GITEZ_TEST_SANDBOX").is_some_and(|value| value == "passthrough"))
-    .then(|| Arc::new(gitez_sandbox::Passthrough) as Arc<dyn gitez_sandbox::Sandbox>)
+    gitez_sandbox::passthrough_from_env(cfg!(debug_assertions))
+        .then(|| Arc::new(gitez_sandbox::Passthrough) as Arc<dyn gitez_sandbox::Sandbox>)
 }
 
 /// Logs `message` when `GITEZ_DEBUG_THREADS` is set.
@@ -380,6 +379,11 @@ impl AgentThreads {
         {
             repository.threads = threads;
         }
+    }
+
+    /// Listed repositories whose git folder is gone (moved or deleted).
+    pub fn missing_repositories(&self) -> &[IndexedRepository] {
+        &self.missing
     }
 
     pub fn repository_by_work_dir(&self, work_dir: &Path) -> Option<&RepositoryThreads> {

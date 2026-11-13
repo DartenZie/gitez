@@ -100,6 +100,9 @@ struct AgentCheck {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Problem {
     text: SharedString,
+    /// Parts of `text` in the mono font (a branch, a command), with the
+    /// colour of a branch.
+    mono: Vec<(std::ops::Range<usize>, Option<u32>)>,
     severity: Severity,
     /// Whether Settings can fix it.
     settings: bool,
@@ -113,6 +116,44 @@ enum Severity {
     Hint,
     /// Send works; the thread may still fail.
     Warning,
+}
+
+/// A sentence in which some parts are set in the mono font, as the composer
+/// shows a branch or a command; never with Markdown backticks.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Sentence {
+    pub(crate) text: String,
+    pub(crate) mono: Vec<(std::ops::Range<usize>, Option<u32>)>,
+}
+
+impl Sentence {
+    fn plain(mut self, text: &str) -> Self {
+        self.text.push_str(text);
+        self
+    }
+
+    /// `text` in the mono font, in `color` (a branch's) or the sentence's.
+    fn mono(mut self, text: &str, color: Option<u32>) -> Self {
+        let start = self.text.len();
+        self.text.push_str(text);
+        self.mono.push((start..self.text.len(), color));
+        self
+    }
+}
+
+impl From<String> for Sentence {
+    fn from(text: String) -> Self {
+        Sentence::default().plain(&text)
+    }
+}
+
+/// A repository in Home's Repository picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepositoryChoice {
+    path: PathBuf,
+    name: SharedString,
+    /// Why it cannot be picked (it was moved or deleted).
+    unavailable: Option<SharedString>,
 }
 
 /// The "Ask an agent" composer.
@@ -204,8 +245,9 @@ impl Composer {
         if composer.target.is_none()
             && let Some(path) = composer
                 .repository_choices(cx)
-                .first()
-                .map(|(path, _)| path.clone())
+                .into_iter()
+                .find(|choice| choice.unavailable.is_none())
+                .map(|choice| choice.path)
         {
             composer.choose_repository(path, cx);
         }
@@ -331,17 +373,45 @@ impl Composer {
     }
 
     /// Home: the repositories to pick from, recent ones first, then those
-    /// with threads; with their names.
-    fn repository_choices(&self, cx: &App) -> Vec<(PathBuf, SharedString)> {
-        let mut choices: Vec<(PathBuf, SharedString)> = crate::recent::paths(cx)
+    /// with threads; with their names. A listed repository that was moved
+    /// or deleted is shown, last, with why it cannot be picked.
+    fn repository_choices(&self, cx: &App) -> Vec<RepositoryChoice> {
+        let model = self.model.read(cx);
+        let missing = model.missing_repositories();
+        let unavailable = |path: &Path| {
+            missing
+                .iter()
+                .any(|repository| repository.work_dir == path)
+                .then(|| SharedString::from("Moved or deleted"))
+        };
+        let mut choices: Vec<RepositoryChoice> = crate::recent::paths(cx)
             .iter()
-            .map(|path| (path.clone(), folder_name(path)))
+            .map(|path| RepositoryChoice {
+                path: path.clone(),
+                name: folder_name(path),
+                unavailable: unavailable(path),
+            })
             .collect();
-        for repository in self.model.read(cx).repositories() {
-            if !choices.iter().any(|(path, _)| *path == repository.work_dir) {
-                choices.push((repository.work_dir.clone(), repository.name.clone()));
+        let listed = model
+            .repositories()
+            .iter()
+            .map(|repository| (&repository.work_dir, repository.name.clone()))
+            .chain(
+                missing
+                    .iter()
+                    .map(|repository| (&repository.work_dir, repository.name.clone().into())),
+            );
+        for (work_dir, name) in listed {
+            if !choices.iter().any(|choice| choice.path == *work_dir) {
+                choices.push(RepositoryChoice {
+                    path: work_dir.clone(),
+                    name,
+                    unavailable: unavailable(work_dir),
+                });
             }
         }
+        // Those that can be picked first, each group in its order.
+        choices.sort_by_key(|choice| choice.unavailable.is_some());
         choices
     }
 
@@ -392,8 +462,9 @@ impl Composer {
             Some(target) => Some(target.work_dir.clone()),
             None if self.target_error.is_none() => self
                 .repository_choices(cx)
-                .first()
-                .map(|(path, _)| path.clone()),
+                .into_iter()
+                .find(|choice| choice.unavailable.is_none())
+                .map(|choice| choice.path),
             None => None,
         };
         if let Some(path) = path {
@@ -485,36 +556,47 @@ impl Composer {
     /// order to show them.
     fn problems(&self, cx: &App) -> Vec<Problem> {
         let mut problems = Vec::new();
-        let mut add = |severity, text: String, settings| {
+        let mut add = |severity, text: Sentence, settings| {
             problems.push(Problem {
-                text: text.into(),
+                text: text.text.into(),
+                mono: text.mono,
                 severity,
                 settings,
             })
         };
         match (&self.target, &self.target_error) {
-            (_, Some(error)) => add(Severity::Blocking, error.to_string(), false),
-            (None, None) if self._loading.is_some() => {
-                add(Severity::Hint, "Reading the repository…".to_owned(), false)
-            }
+            (_, Some(error)) => add(Severity::Blocking, error.to_string().into(), false),
+            (None, None) if self._loading.is_some() => add(
+                Severity::Hint,
+                "Reading the repository…".to_owned().into(),
+                false,
+            ),
             (None, None) => add(
                 Severity::Blocking,
-                "Pick a repository to start the thread in.".to_owned(),
+                "Pick a repository to start the thread in."
+                    .to_owned()
+                    .into(),
                 false,
             ),
             (Some(target), None) if target.bare => add(
                 Severity::Blocking,
-                "A bare repository has no working tree to start from.".to_owned(),
+                "A bare repository has no working tree to start from."
+                    .to_owned()
+                    .into(),
                 false,
             ),
             (Some(target), None) if target.branches.is_empty() => add(
                 Severity::Blocking,
-                "The repository has no branch to start from yet: make a first commit.".to_owned(),
+                "The repository has no branch to start from yet: make a first commit."
+                    .to_owned()
+                    .into(),
                 false,
             ),
             (Some(_), None) if self.start_branch().is_none() => add(
                 Severity::Blocking,
-                "HEAD is detached: pick a branch to start from.".to_owned(),
+                "HEAD is detached: pick a branch to start from."
+                    .to_owned()
+                    .into(),
                 false,
             ),
             (Some(target), None) => {
@@ -530,14 +612,14 @@ impl Composer {
         match &self.environment {
             None => add(
                 Severity::Hint,
-                "Checking the agent and the sandbox…".to_owned(),
+                "Checking the agent and the sandbox…".to_owned().into(),
                 false,
             ),
             Some(environment) => {
                 if let gitez_sandbox::Status::Missing { fix } = &environment.sandbox {
                     add(
                         Severity::Blocking,
-                        format!("No sandbox to run the agent in. {fix}"),
+                        format!("No sandbox to run the agent in. {fix}").into(),
                         true,
                     );
                 }
@@ -545,7 +627,7 @@ impl Composer {
                 match self.agent_check() {
                     None => add(
                         Severity::Blocking,
-                        format!("GitEZ does not know the agent {name}."),
+                        format!("GitEZ does not know the agent {name}.").into(),
                         true,
                     ),
                     Some(AgentCheck {
@@ -557,7 +639,7 @@ impl Composer {
                         ..
                     }) => add(
                         Severity::Blocking,
-                        format!("{}. Set its program in Settings.", capitalise(reason)),
+                        format!("{}. Set its program in Settings.", capitalise(reason)).into(),
                         true,
                     ),
                     Some(AgentCheck {
@@ -565,10 +647,12 @@ impl Composer {
                         ..
                     }) => add(
                         Severity::Warning,
-                        format!(
-                            "{name} is not signed in: run `claude auth login` in a terminal, or \
-                             give the thread an ANTHROPIC_API_KEY secret."
-                        ),
+                        Sentence::default()
+                            .plain(&format!("{name} is not signed in: run "))
+                            .mono("claude auth login", None)
+                            .plain(" in a terminal, or give the thread an ")
+                            .mono("ANTHROPIC_API_KEY", None)
+                            .plain(" secret."),
                         false,
                     ),
                     Some(_) => {}
@@ -578,7 +662,9 @@ impl Composer {
         if self.prompt.read(cx).value().trim().is_empty() {
             add(
                 Severity::Hint,
-                "Write what the agent should do, then send it.".to_owned(),
+                "Write what the agent should do, then send it."
+                    .to_owned()
+                    .into(),
                 false,
             );
         }
@@ -725,9 +811,13 @@ fn agent_subtitle(check: &AgentCheck) -> String {
     }
 }
 
-/// What the composer says when the main worktree has uncommitted changes.
-pub(crate) fn uncommitted_warning(branch: &str) -> String {
-    format!("Starts from the last commit on `{branch}`; your uncommitted changes are not included")
+/// What the composer says when the main worktree has uncommitted changes;
+/// the branch is shown as the "Ask an agent to work from …" row shows it.
+pub(crate) fn uncommitted_warning(branch: &str) -> Sentence {
+    Sentence::default()
+        .plain("Starts from the last commit on ")
+        .mono(branch, Some(theme::branch_color(branch)))
+        .plain("; your uncommitted changes are not included")
 }
 
 /// The one-line description of a network profile in its picker, in the
@@ -1206,6 +1296,7 @@ impl Composer {
             .dropdown_menu(move |mut menu, _, _| {
                 menu = menu
                     .min_w(px(300.))
+                    .max_w(px(520.))
                     .max_h(px(360.))
                     .scrollable(true)
                     .check_side(Side::Right)
@@ -1213,24 +1304,54 @@ impl Composer {
                 if choices.is_empty() {
                     menu = menu.item(menu_note("No repositories yet. Open one first."));
                 }
-                for (path, name) in &choices {
+                for choice in &choices {
                     let view = view.clone();
-                    let (path, name, mono) = (path.clone(), name.clone(), mono.clone());
+                    let RepositoryChoice {
+                        path,
+                        name,
+                        unavailable,
+                    } = choice.clone();
+                    let mono = mono.clone();
                     let shown = crate::recent::display(&path);
                     let picked = chosen.as_ref() == Some(&path);
+                    let disabled = unavailable.is_some();
                     menu = menu.item(
                         PopupMenuItem::element(move |_, _| {
                             div()
                                 .h_flex()
+                                // Long paths end in an ellipsis inside the
+                                // menu's width.
+                                .max_w(px(460.))
+                                .overflow_hidden()
                                 .gap(px(10.))
+                                .when(unavailable.is_some(), |this| this.opacity(0.55))
                                 .child(initial_square(&name, px(20.)))
                                 .child(
                                     div()
                                         .v_flex()
+                                        .flex_1()
+                                        .min_w_0()
                                         .gap(px(2.))
-                                        .child(div().text_size(px(12.5)).child(name.clone()))
                                         .child(
                                             div()
+                                                .h_flex()
+                                                .gap(px(6.))
+                                                .text_size(px(12.5))
+                                                .child(name.clone())
+                                                .when_some(unavailable.clone(), |this, why| {
+                                                    this.child(
+                                                        div()
+                                                            .text_size(px(11.))
+                                                            .text_color(rgb(color::TEXT_MUTED))
+                                                            .child(why),
+                                                    )
+                                                }),
+                                        )
+                                        .child(
+                                            div()
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .text_ellipsis()
                                                 .font_family(mono.clone())
                                                 .text_size(px(11.))
                                                 .text_color(rgb(color::TEXT_MUTED))
@@ -1239,7 +1360,11 @@ impl Composer {
                                 )
                         })
                         .checked(picked)
+                        .disabled(disabled)
                         .on_click(move |_, _, cx| {
+                            if disabled {
+                                return;
+                            }
                             view.update(cx, |this, cx| this.choose_repository(path.clone(), cx))
                                 .ok();
                         }),
@@ -1310,6 +1435,7 @@ impl Composer {
             return None;
         }
         let settings = shown.iter().any(|problem| problem.settings);
+        let mono = cx.theme().mono_font_family.clone();
         Some(
             div()
                 .h_flex()
@@ -1331,7 +1457,12 @@ impl Composer {
                             .line_height(relative(1.5))
                             .text_color(rgb(text))
                             .child(Icon::new(icon).size(px(13.)).mt(px(2.)))
-                            .child(div().flex_1().min_w_0().child(problem.text.clone()))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(sentence_text(problem, &mono)),
+                            )
                     }),
                 ))
                 .when(settings, |this| {
@@ -1347,6 +1478,27 @@ impl Composer {
                 }),
         )
     }
+}
+
+/// A problem's text with its mono parts set in `mono` (and a branch's
+/// colour); it wraps like plain text.
+fn sentence_text(problem: &Problem, mono: &SharedString) -> StyledText {
+    let highlights = problem.mono.iter().map(|(range, color)| {
+        (
+            range.clone(),
+            HighlightStyle {
+                color: color.map(|color| rgb(color).into()),
+                ..HighlightStyle::default()
+            },
+        )
+    });
+    let fonts = problem
+        .mono
+        .iter()
+        .map(|(range, _)| (range.clone(), mono.clone()));
+    StyledText::new(problem.text.clone())
+        .with_highlights(highlights)
+        .with_font_family_overrides(fonts)
 }
 
 /// A rounded square with the first letter of `name`, for a repository.
@@ -1627,6 +1779,63 @@ mod tests {
         (composer, cx)
     }
 
+    /// Finding 9: Home's Repository picker shows a repository that was
+    /// moved or deleted as unavailable, and never picks it.
+    #[gpui_kit::test]
+    fn a_moved_repository_cannot_be_picked(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let data_dir = dir.path().join("data");
+        let gone = dir.path().join("gone");
+        let here = dir.path().join("here");
+        std::fs::create_dir_all(here.join(".git")).expect("a git folder");
+        let index = gitez_agent_thread::Index::new(&data_dir);
+        for (work_dir, name) in [(&gone, "gone"), (&here, "here")] {
+            index
+                .add(gitez_agent_thread::IndexedRepository {
+                    common_dir: work_dir.join(".git"),
+                    work_dir: work_dir.clone(),
+                    name: name.into(),
+                })
+                .expect("listed");
+        }
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+            crate::recent::init_in_memory(cx);
+            // Opened last, so first among the recent ones.
+            crate::recent::opened(&gone, cx);
+            init_with(
+                Options {
+                    data_dir: Some(data_dir.clone()),
+                    sandbox: Arc::new(gitez_sandbox::Passthrough),
+                    agents: gitez_agent::Registry::builtin(),
+                    secrets: Arc::new(gitez_secret::Memory::default()),
+                    exe: Err("no supervisor in tests".into()),
+                    watch: false,
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let window = cx.open_window(size(px(900.), px(600.)), |window, cx| {
+            Composer::new(ComposerMode::Home, window, cx)
+        });
+        let composer = window
+            .update(cx, |_, _, cx| cx.entity())
+            .expect("window open");
+        let cx = VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        composer.read_with(&cx, |composer, cx| {
+            let choices = composer.repository_choices(cx);
+            let shown: Vec<(&str, Option<&str>)> = choices
+                .iter()
+                .map(|choice| (choice.name.as_ref(), choice.unavailable.as_deref()))
+                .collect();
+            // Those that can be picked first; the gone one says why.
+            assert_eq!(shown, [("here", None), ("gone", Some("Moved or deleted"))]);
+        });
+    }
+
     #[gpui_kit::test]
     fn sending_emits_the_picked_branch_network_and_secrets(cx: &mut TestAppContext) {
         let (composer, mut cx) = composer(cx);
@@ -1712,13 +1921,24 @@ mod tests {
     fn uncommitted_changes_are_said_to_stay_behind(cx: &mut TestAppContext) {
         let (composer, mut cx) = composer(cx);
         let warning = super::uncommitted_warning("feature");
+        // The branch is set in the mono font, not quoted with backticks.
         assert_eq!(
-            warning,
-            "Starts from the last commit on `feature`; your uncommitted changes are not included"
+            warning.text,
+            "Starts from the last commit on feature; your uncommitted changes are not included"
+        );
+        let start = "Starts from the last commit on ".len();
+        assert_eq!(
+            warning.mono,
+            vec![(
+                start..start + "feature".len(),
+                Some(crate::theme::branch_color("feature"))
+            )]
         );
         let has = |composer: &Composer, cx: &gpui_kit::App| {
             composer.problems(cx).iter().any(|problem| {
-                problem.text == warning && problem.severity == super::Severity::Warning
+                problem.text == warning.text
+                    && problem.mono == warning.mono
+                    && problem.severity == super::Severity::Warning
             })
         };
         composer.read_with(&cx, |composer, cx| assert!(!has(composer, cx)));

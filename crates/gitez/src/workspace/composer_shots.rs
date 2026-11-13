@@ -683,4 +683,15 @@ fn e2e_u2_composer_real_haiku() {
     );
     shots.save(window, "u2-real-4-done");
     assert_eq!(done.model.as_deref(), Some("haiku"));
+    assert_eq!(done.ending, Some(Ending::PullRequest), "{done:#?}");
+    // The local pull request it made opens in the window.
+    let number = done.pull_request.expect("a pull request");
+    crate::workspace::threads_real_shots::open_pull_request(
+        &mut shots,
+        window,
+        &workspace,
+        &common_dir,
+        number,
+    );
+    shots.save(window, "u2-real-5-pull-request");
 }
