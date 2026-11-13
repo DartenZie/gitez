@@ -5,7 +5,10 @@
 //! bubblewrap binds existing paths only, so a file the policy allows is
 //! made writable through the folder that holds it (git replaces ref and
 //! lock files by renaming them, which a bound file would not allow), and
-//! patterns are left out.
+//! patterns are left out. A file whose folder holds a path the policy
+//! denies (such as `packed-refs.lock`, in a git dir with `hooks` and
+//! `config`) is left out too: binding that folder would make everything
+//! else in it writable (`packed-refs`, `HEAD`, `info/attributes`, …).
 
 use std::path::{Path, PathBuf};
 
@@ -13,7 +16,8 @@ use crate::policy::{Policy, WritePath, is_pattern};
 use crate::seatbelt::MANDATORY_DENIES;
 
 /// The folders `policy` makes writable on Linux: its trees, and the folder
-/// of each file. Patterns are left out.
+/// of each file unless that folder holds (or is) a path the policy denies.
+/// Patterns are left out.
 pub(crate) fn write_dirs(policy: &Policy) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     for write in &policy.write {
@@ -22,7 +26,15 @@ pub(crate) fn write_dirs(policy: &Policy) -> Vec<PathBuf> {
         }
         let dir = match write {
             WritePath::Tree(path) => Some(path.clone()),
-            WritePath::File(path) => path.parent().map(Path::to_path_buf),
+            WritePath::File(path) => path
+                .parent()
+                .filter(|folder| {
+                    !policy
+                        .deny_write
+                        .iter()
+                        .any(|denied| !is_pattern(denied) && denied.starts_with(folder))
+                })
+                .map(Path::to_path_buf),
         };
         if let Some(dir) = dir
             && !dirs.contains(&dir)
@@ -136,5 +148,65 @@ mod tests {
              --chdir /w/wt"
         );
         assert!(!args.contains("--unshare-net"));
+    }
+
+    /// M1: a thread's policy on Linux binds its own refs' folders but never
+    /// the common git dir, whatever lock file in it the policy allows.
+    #[test]
+    fn a_file_beside_denied_paths_does_not_open_its_folder() {
+        let git = Path::new("/w/repo/.git");
+        let policy = Policy {
+            write: vec![
+                WritePath::Tree("/w/wt".into()),
+                WritePath::Tree(git.join("objects")),
+                WritePath::Tree(git.join("worktrees/t")),
+                WritePath::File(git.join("refs/heads/agent/t")),
+                WritePath::File(git.join("refs/heads/agent/t.lock")),
+                WritePath::File(git.join("logs/refs/heads/agent/t")),
+                WritePath::File(git.join("packed-refs.lock")),
+            ],
+            deny_write: vec![
+                git.join("hooks"),
+                git.join("config"),
+                git.join("gitez"),
+                git.join("objects/info/alternates"),
+                git.join("worktrees/t/commondir"),
+                "/w/wt/.git".into(),
+            ],
+            deny_read: Vec::new(),
+            network: Network::Open,
+            certificate_service: false,
+        };
+        let dirs = write_dirs(&policy);
+        assert_eq!(
+            dirs,
+            [
+                PathBuf::from("/w/wt"),
+                git.join("objects"),
+                git.join("worktrees/t"),
+                git.join("refs/heads/agent"),
+                git.join("logs/refs/heads/agent"),
+            ]
+        );
+        assert!(!dirs.iter().any(|dir| dir == git), "{dirs:?}");
+        let exists = |path: &Path| {
+            let text = path.to_string_lossy();
+            (text.starts_with("/w/") || text == "/tmp/claude")
+                .then_some(!text.ends_with("commondir"))
+        };
+        let args = args(&policy, Path::new("/w/wt"), None, exists).join(" ");
+        assert!(!args.contains("--bind /w/repo/.git /w/repo/.git"), "{args}");
+        for denied in [
+            "/w/repo/.git/hooks",
+            "/w/repo/.git/config",
+            "/w/repo/.git/objects/info/alternates",
+            "/w/repo/.git/worktrees/t/commondir",
+            "/w/wt/.git",
+        ] {
+            assert!(
+                args.contains(&format!("--ro-bind {denied} {denied}")),
+                "{denied} read-only in {args}"
+            );
+        }
     }
 }

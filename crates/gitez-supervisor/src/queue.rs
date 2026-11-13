@@ -12,7 +12,7 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use gitez_settings::{DEFAULT_MAX_RUNNING, Loaded, Settings};
 
@@ -74,7 +74,7 @@ impl Queue {
     ) -> std::io::Result<Waited> {
         fs::create_dir_all(&self.tickets)?;
         fs::create_dir_all(&self.slots)?;
-        let name = format!("{:020}-{thread}.{TICKET}", now_nanos());
+        let name = self.next_name(thread)?;
         let mut ticket = Ticket::create(&self.tickets, name)?;
         let mut max_running = DEFAULT_MAX_RUNNING;
         loop {
@@ -101,6 +101,32 @@ impl Queue {
                 return Ok(Waited::Stopped);
             }
         }
+    }
+
+    /// The name for a new ticket of `thread`: one more than the highest
+    /// sequence number already in the queue, so a new ticket always sorts
+    /// after those already waiting. m3: the order does not depend on the
+    /// wall clock, which can jump backwards; two tickets that pick the same
+    /// number sort by their thread suffix, which is stable (no corruption,
+    /// only a tie broken deterministically).
+    fn next_name(&self, thread: &str) -> std::io::Result<String> {
+        let mut highest = 0_u64;
+        for entry in fs::read_dir(&self.tickets)? {
+            let name = match entry {
+                Ok(entry) => entry.file_name().into_string().unwrap_or_default(),
+                Err(_) => continue,
+            };
+            // `<20-digit sequence>-<thread>.{ticket,new}`.
+            if let Some((digits, _)) = name.split_once('-')
+                && let Ok(number) = digits.parse::<u64>()
+            {
+                highest = highest.max(number);
+            }
+        }
+        Ok(format!(
+            "{:020}-{thread}.{TICKET}",
+            highest.saturating_add(1)
+        ))
     }
 
     fn max_running(&self) -> Option<u32> {
@@ -182,13 +208,6 @@ fn is_abandoned(path: &Path) -> bool {
         Ok(file) => file.try_lock_shared().is_ok(),
         Err(_) => false,
     }
-}
-
-fn now_nanos() -> u128 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|since| since.as_nanos())
-        .unwrap_or_default()
 }
 
 /// Sleeps for `duration`, checking `stop` every 100 ms. Returns whether

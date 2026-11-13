@@ -327,6 +327,30 @@ pub fn is_env_name(name: &str) -> bool {
         && chars.all(|c| matches!(c, 'A'..='Z' | '0'..='9' | '_'))
 }
 
+/// The shortest secret value GitEZ can keep out of what it writes
+/// (transcripts, logs, pull request descriptions): it replaces every
+/// occurrence of a value, and of each line of a multi-line value, of at
+/// least this many characters. A shorter value would match ordinary words
+/// and numbers, and replacing those would garble the agent's output.
+pub const MIN_SECRET_LEN: usize = 4;
+
+/// Why `value` cannot be a secret's value, said for the user, or `None`
+/// when it can. Settings must refuse such a value: GitEZ could not keep it
+/// out of transcripts. Lines of a multi-line value (a key file) that are
+/// shorter than [`MIN_SECRET_LEN`] are not replaced; the rest of it is.
+pub fn secret_value_problem(value: &str) -> Option<String> {
+    let value = value.trim_end_matches(['\r', '\n']);
+    if value.trim().is_empty() {
+        return Some("The value is empty.".to_owned());
+    }
+    (value.chars().count() < MIN_SECRET_LEN).then(|| {
+        format!(
+            "The value is shorter than {MIN_SECRET_LEN} characters, too short for GitEZ to keep \
+             it out of what agents print."
+        )
+    })
+}
+
 fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|&value| value.to_owned()).collect()
 }
@@ -600,6 +624,16 @@ mod tests {
             matches!(Settings::load(&path), Err(Error::Invalid { .. })),
             "a file without a version is not GitEZ settings"
         );
+    }
+
+    #[test]
+    fn short_secret_values_are_refused() {
+        assert!(secret_value_problem("").is_some());
+        assert!(secret_value_problem(" \n").is_some());
+        assert!(secret_value_problem("abc").is_some());
+        assert!(secret_value_problem("abc\n").is_some());
+        assert_eq!(secret_value_problem("abcd"), None);
+        assert_eq!(secret_value_problem("-----BEGIN KEY-----\nab\n"), None);
     }
 
     #[test]

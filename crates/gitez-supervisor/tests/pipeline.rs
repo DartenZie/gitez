@@ -133,6 +133,69 @@ fn changes_the_agent_left_are_committed_by_gitez() {
     );
     assert_eq!(git(&thread.worktree, &["status", "--porcelain"]), "");
     assert_eq!(thread.pull_request, Some(1));
+    // The supervisor recorded that nothing is left uncommitted.
+    let uncommitted = thread.uncommitted.expect("the worktree was checked");
+    assert_eq!(uncommitted.count, 0);
+    assert!(uncommitted.commit_error.is_none());
+}
+
+/// The GUI-critical finding, library half: when GitEZ's commit of the
+/// leftovers fails (a failing pre-commit hook), the changes stay in the
+/// worktree and the thread records them — never "No changes".
+#[test]
+fn a_failed_leftover_commit_is_recorded_not_hidden() {
+    let fixture = Fixture::new();
+    // A hook that refuses the leftover commit. It is on the common dir, so
+    // the worktree's commit uses it too.
+    let hooks = fixture.base.join("no hooks");
+    let pre_commit = hooks.join("pre-commit");
+    std::fs::write(
+        &pre_commit,
+        "#!/bin/sh\necho 'no commits today' >&2\nexit 1\n",
+    )
+    .expect("write the hook");
+    std::fs::set_permissions(
+        &pre_commit,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .expect("chmod");
+
+    let id = fixture.create("LEAVE a file uncommitted").id;
+    let thread = fixture.run(&id, Command::Start);
+    // The run itself did not fail; the leftover commit did.
+    assert_ne!(thread.ending, Some(Ending::Failed), "{thread:#?}");
+    let uncommitted = thread
+        .uncommitted
+        .clone()
+        .expect("the worktree was checked");
+    assert!(
+        uncommitted.count > 0,
+        "the change is still there: {uncommitted:?}"
+    );
+    assert!(
+        uncommitted
+            .paths
+            .iter()
+            .any(|path| path.contains("left.txt")),
+        "{uncommitted:?}"
+    );
+    let error = uncommitted.commit_error.expect("a recorded failure");
+    assert!(
+        error.contains("hook") || error.contains("no commits today"),
+        "{error}"
+    );
+    assert!(thread.has_uncommitted() == Some(true));
+    assert!(thread.leftover_commit_failed());
+    // The change really is still in the worktree.
+    assert!(!git(&thread.worktree, &["status", "--porcelain"]).is_empty());
+    assert!(
+        thread
+            .warnings
+            .iter()
+            .any(|w| w.contains("could not commit")),
+        "{:?}",
+        thread.warnings
+    );
 }
 
 #[test]

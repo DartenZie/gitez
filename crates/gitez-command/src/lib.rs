@@ -509,6 +509,39 @@ impl Git {
         rebased.map(drop)
     }
 
+    /// [`Git::rebase_onto`] hardened for a working tree whose files are not
+    /// trusted (an agent thread's): hooks off (`core.hooksPath=/dev/null`),
+    /// no submodule recursion, the filesystem monitor off and credentials
+    /// and terminal prompts off. `git rebase` replays history and does not
+    /// run git inside a submodule, so a planted submodule's own config
+    /// cannot run a command; these settings also keep a hook or filter
+    /// driver from running. The caller must have checked the worktree's
+    /// `.git` pointer and admin files first
+    /// (`gitez_agent_thread::check_worktree`).
+    pub fn rebase_onto_untrusted(&self, onto: &str) -> Result<()> {
+        let hardened = [
+            ("GIT_CONFIG_COUNT", "4"),
+            ("GIT_CONFIG_KEY_0", "core.hooksPath"),
+            ("GIT_CONFIG_VALUE_0", "/dev/null"),
+            ("GIT_CONFIG_KEY_1", "submodule.recurse"),
+            ("GIT_CONFIG_VALUE_1", "false"),
+            ("GIT_CONFIG_KEY_2", "core.fsmonitor"),
+            ("GIT_CONFIG_VALUE_2", "false"),
+            ("GIT_CONFIG_KEY_3", "credential.helper"),
+            ("GIT_CONFIG_VALUE_3", ""),
+        ];
+        let rebased = self.run_with_env(
+            ["rebase", "--quiet", "--no-gpg-sign", onto],
+            None,
+            &hardened,
+        );
+        if rebased.is_err() {
+            self.run_with_env(["rebase", "--abort"], None, &hardened)
+                .ok();
+        }
+        rebased.map(drop)
+    }
+
     /// Replays the commits of branch `branch` on top of branch `onto`, like
     /// `git rebase onto branch`; `onto` does not move. When git cannot
     /// finish, the rebase is given up and nothing changes. Afterwards
@@ -1113,6 +1146,27 @@ impl Git {
                 OsStr::new("worktree"),
                 OsStr::new("add"),
                 OsStr::new("--quiet"),
+                OsStr::new("--"),
+                path.as_os_str(),
+                OsStr::new(branch),
+            ],
+            None,
+        )
+        .map(drop)
+    }
+
+    /// [`Git::worktree_add`] without checking out any file, like `git
+    /// worktree add --no-checkout <path> <branch>`: the worktree has its
+    /// `.git`, `HEAD` and git dir, an empty index and no files. No hook or
+    /// filter runs. For a branch whose files should be checked out
+    /// elsewhere, such as inside a sandbox.
+    pub fn worktree_add_without_checkout(&self, path: &Path, branch: &str) -> Result<()> {
+        self.run(
+            [
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                OsStr::new("--quiet"),
+                OsStr::new("--no-checkout"),
                 OsStr::new("--"),
                 path.as_os_str(),
                 OsStr::new(branch),

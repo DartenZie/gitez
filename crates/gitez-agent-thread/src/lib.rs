@@ -32,15 +32,16 @@ pub use error::{Error, Result};
 pub use index::{Index, IndexedRepository};
 pub use model::{
     Activity, AgentThread, AgentThreadId, CONTINUE_PROMPT, Ending, Failure, NewAgentThread,
-    RetryPlan, Start, State, Step, SupervisorInfo, Turn, TurnKind, TurnResult,
+    RetryPlan, Start, State, Step, SupervisorInfo, Turn, TurnKind, TurnResult, Uncommitted,
+    WorktreeRecord,
 };
 pub use names::{repository_key, slug, title_from_prompt};
 pub use prepare::{CACHE_DIRS, PrepareReport, PrepareStep, clone_tree, prepare};
 pub use store::{Run, RunHeader, Store};
 pub use watch::{Watcher, watch};
 pub use worktree::{
-    CompleteReport, ScratchDirs, complete, create_worktree, scratch_dirs, worktree_git_dir,
-    worktree_path,
+    CompleteReport, CreatedWorktree, IfUncommitted, Kept, ScratchDirs, check_worktree, complete,
+    create_worktree, rebase_in_worktree, scratch_dirs, worktree_git_dir, worktree_path,
 };
 
 /// Times are RFC 3339 UTC, as in gitez-review.

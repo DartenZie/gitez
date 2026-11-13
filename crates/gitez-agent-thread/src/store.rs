@@ -224,6 +224,8 @@ impl Store {
             warnings: Vec::new(),
             supervisor: None,
             completed: None,
+            worktree_record: None,
+            uncommitted: None,
         };
         let lock = Lock::take(&self.thread_dir(&thread.id).join(LOCK_FILE))?;
         self.write(lock, &thread)?;

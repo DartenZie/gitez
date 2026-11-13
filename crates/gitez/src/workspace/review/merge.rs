@@ -667,9 +667,12 @@ fn carry_out(
         _ => None,
     };
     // A branch checked out in a linked worktree, such as an agent thread's,
-    // can be rebased only there: git refuses to check it out here.
+    // can be rebased only there: git refuses to check it out here. The
+    // worktree's working tree is the agent's, so the rebase does not run
+    // `git` there directly; `rebase_in_worktree` checks the worktree's
+    // `.git` pointer and git dir first and hardens the rebase.
     let head_worktree = match repository.linked_worktree_of(&head)? {
-        Some(dir) if dir.exists() => Some(Git::new(dir)),
+        Some(dir) if dir.exists() => Some(dir),
         Some(_) => {
             // Its folder was deleted: git holds the branch for it until
             // pruned.
@@ -678,17 +681,24 @@ fn carry_out(
         }
         None => None,
     };
+    let common_dir = repository.common_dir();
+    let rebase_head = |onto: &str| -> anyhow::Result<()> {
+        match &head_worktree {
+            Some(dir) => {
+                gitez_agent_thread::rebase_in_worktree(&common_dir, dir, None, onto)?;
+                Ok(())
+            }
+            None => Ok(git.rebase_branch(&head, onto, return_to.as_deref())?),
+        }
+    };
     let recorder = Recorder::start(git.work_dir());
     let (Some(how), Some(message)) = (how, message) else {
-        match &head_worktree {
-            Some(worktree) => worktree.rebase_onto(&base)?,
-            None => git.rebase_branch(&head, &base, return_to.as_deref())?,
-        }
+        rebase_head(&base)?;
         return Ok((Done::Rebased, recorder.finish(ResetMode::Keep)));
     };
     let how = match (how, &head_worktree) {
-        (MergeMethod::Rebase, Some(worktree)) => {
-            worktree.rebase_onto(&base)?;
+        (MergeMethod::Rebase, Some(_)) => {
+            rebase_head(&base)?;
             MergeMethod::FastForward
         }
         (how, _) => how,

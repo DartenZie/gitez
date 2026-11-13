@@ -44,19 +44,35 @@ pub(crate) struct Place {
 /// (`profile` Packages or Open): there the host list already lets data
 /// out, and without it pip, Go and other programs that verify
 /// certificates through macOS reach no host.
+///
+/// The files git trusts to find the repository are never writable: the
+/// worktree's `.git`, and the `commondir`, `gitdir`, `config`,
+/// `config.worktree` and `locked` files of its own git dir (an agent that
+/// could change them would point GitEZ's later git commands at a
+/// repository of its own); so are the object store's pointers to other
+/// stores and its commit graph. The sandbox also keeps these from being
+/// moved, replaced or hard linked, and blocks moving the folders above
+/// them, the worktree folder included.
+///
+/// A writable path whose own name is a symbolic link is left out and
+/// returned: the sandbox would follow it, and whoever could write the
+/// folder it is in (an earlier run of the agent, for a folder such as its
+/// temporary one) could point it anywhere.
 pub(crate) fn policy(
     place: &Place,
     needs: &AgentNeeds,
     settings: &Settings,
     network: Network,
     profile: Option<NetworkProfile>,
-) -> Policy {
+) -> (Policy, Vec<PathBuf>) {
     let common = real(&place.common_dir);
+    let worktree = real(&place.worktree);
+    let git_dir = real(&place.worktree_git_dir);
     let branch_ref = Path::new("refs/heads").join(&place.branch);
     let mut write = vec![
-        WritePath::Tree(real(&place.worktree)),
+        WritePath::Tree(worktree.clone()),
         WritePath::Tree(common.join("objects")),
-        WritePath::Tree(real(&place.worktree_git_dir)),
+        WritePath::Tree(git_dir.clone()),
         WritePath::File(real(&common.join(&branch_ref))),
         WritePath::File(real(&common.join(format!("{}.lock", branch_ref.display())))),
         WritePath::File(real(&common.join("logs").join(&branch_ref))),
@@ -85,16 +101,25 @@ pub(crate) fn policy(
             .iter()
             .map(|path| WritePath::Tree(real(path))),
     );
+    let (write, refused): (Vec<WritePath>, Vec<WritePath>) =
+        write.into_iter().partition(|write| !is_link(write.path()));
     let data = real(&place.data_dir);
-    Policy {
+    let mut deny_write = vec![
+        common.join("hooks"),
+        common.join("config"),
+        common.join("gitez"),
+        common.join("objects/info/alternates"),
+        common.join("objects/info/http-alternates"),
+        common.join("objects/info/commit-graph"),
+        common.join("objects/info/commit-graphs"),
+        worktree.join(".git"),
+        data.join("settings.json"),
+        data.join("threads.json"),
+    ];
+    deny_write.extend(GIT_DIR_POINTERS.iter().map(|name| git_dir.join(name)));
+    let policy = Policy {
         write,
-        deny_write: vec![
-            common.join("hooks"),
-            common.join("config"),
-            common.join("gitez"),
-            data.join("settings.json"),
-            data.join("threads.json"),
-        ],
+        deny_write,
         deny_read: settings
             .hidden_paths()
             .iter()
@@ -102,7 +127,25 @@ pub(crate) fn policy(
             .collect(),
         network,
         certificate_service: downloads(profile),
-    }
+    };
+    (
+        policy,
+        refused
+            .into_iter()
+            .map(|write| write.path().to_owned())
+            .collect(),
+    )
+}
+
+/// The files in a linked worktree's git dir that tell git where the
+/// repository and the worktree are, or configure it; none of them is
+/// written by git after `git worktree add`.
+const GIT_DIR_POINTERS: [&str; 5] = ["commondir", "gitdir", "config", "config.worktree", "locked"];
+
+/// Whether `path` itself (not a folder above it) is a symbolic link.
+fn is_link(path: &Path) -> bool {
+    let pattern = path.to_string_lossy().contains('*');
+    !pattern && std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
 }
 
 /// Whether commands with `profile` reach package registries (`None`: no
@@ -201,9 +244,19 @@ pub(crate) fn remote_host(url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
-/// `path` with symbolic links resolved as far as it exists (the sandbox
-/// sees real paths: `/private/var`, not `/var`), the rest appended.
+/// `path` with the symbolic links of its folders resolved as far as they
+/// exist (the sandbox sees real paths: `/private/var`, not `/var`), its
+/// own name kept: a link there is not followed (see [`policy`]).
 pub(crate) fn real(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => real_all(parent).join(name),
+        _ => real_all(path),
+    }
+}
+
+/// `path` with every symbolic link resolved as far as it exists, the rest
+/// appended.
+fn real_all(path: &Path) -> PathBuf {
     let mut existing = path;
     let mut rest = Vec::new();
     loop {
@@ -293,13 +346,14 @@ mod tests {
         };
         let mut settings = Settings::default();
         settings.sandbox.writable_paths = vec![base.join("gradle").to_string_lossy().into_owned()];
-        let policy = policy(
+        let (policy, refused) = policy(
             &place,
             &needs,
             &settings,
             Network::Hosts(Vec::new()),
             Some(NetworkProfile::AgentOnly),
         );
+        assert!(refused.is_empty());
         let has = |write: WritePath| policy.write.contains(&write);
         assert!(has(WritePath::Tree(base.join("wt"))));
         assert!(has(WritePath::Tree(common.join("objects"))));
@@ -317,8 +371,24 @@ mod tests {
                 .iter()
                 .any(|write| write.path() == common.join("refs/heads/main"))
         );
-        for denied in ["hooks", "config", "gitez"] {
-            assert!(policy.deny_write.contains(&common.join(denied)));
+        for denied in [
+            "hooks",
+            "config",
+            "gitez",
+            "objects/info/alternates",
+            "objects/info/commit-graph",
+        ] {
+            assert!(policy.deny_write.contains(&common.join(denied)), "{denied}");
+        }
+        // (a), (b): the files git trusts to find the repository.
+        assert!(policy.deny_write.contains(&base.join("wt/.git")));
+        for name in ["commondir", "gitdir", "config", "config.worktree", "locked"] {
+            assert!(
+                policy
+                    .deny_write
+                    .contains(&common.join("worktrees/wt").join(name)),
+                "{name}"
+            );
         }
         assert!(policy.deny_write.contains(&base.join("data/settings.json")));
         assert!(!policy.deny_read.is_empty());
@@ -346,12 +416,53 @@ mod tests {
                 Network::Hosts(Vec::new()),
                 profile,
             )
+            .0
             .certificate_service
         };
         assert!(!open(None));
         assert!(!open(Some(NetworkProfile::AgentOnly)));
         assert!(open(Some(NetworkProfile::Packages)));
         assert!(open(Some(NetworkProfile::Open)));
+    }
+
+    /// (e) A writable folder replaced by a link is not made writable: the
+    /// sandbox would follow the link wherever it points.
+    #[test]
+    fn a_linked_write_path_is_left_out() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let base = dir.path().canonicalize().expect("canonical");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(base.join("data/tmp")).expect("tmp");
+        let tmp = base.join("data/tmp/repo-x");
+        std::os::unix::fs::symlink(&home, &tmp).expect("link");
+        let lock = base.join("locks");
+        std::os::unix::fs::symlink(&home, &lock).expect("link");
+        let place = Place {
+            common_dir: base.join("repo/.git"),
+            worktree: base.join("wt"),
+            worktree_git_dir: base.join("repo/.git/worktrees/wt"),
+            branch: "agent/x".to_owned(),
+            tmp_dir: tmp.clone(),
+            caches_dir: base.join("data/caches/repo-x"),
+            data_dir: base.join("data"),
+        };
+        let needs = AgentNeeds {
+            write_dirs: vec![lock.clone()],
+            ..AgentNeeds::default()
+        };
+        let (policy, refused) = policy(
+            &place,
+            &needs,
+            &Settings::default(),
+            Network::Hosts(Vec::new()),
+            None,
+        );
+        assert_eq!(refused, [tmp.clone(), lock.clone()]);
+        for write in &policy.write {
+            assert!(!write.path().starts_with(&home), "{write:?}");
+        }
+        assert_eq!(real(&tmp), tmp, "the link itself is named, not followed");
     }
 
     #[test]

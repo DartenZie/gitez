@@ -11,9 +11,10 @@ use crate::{Error, Result};
 const VERSION: u32 = 1;
 /// The most the supervisor reads from its standard input.
 const MAX_INPUT: u64 = 1024 * 1024;
-/// Values shorter than this are not redacted: they would match ordinary
-/// words and numbers.
-const MIN_REDACTED: usize = 6;
+/// Values (and lines of multi-line values) shorter than this are not
+/// redacted: they would match ordinary words and numbers. Settings refuse
+/// shorter values; [`Secrets::too_short`] names any that arrive anyway.
+const MIN_REDACTED: usize = gitez_settings::MIN_SECRET_LEN;
 
 /// Secret values by environment variable name. `Debug` prints names only.
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -54,18 +55,30 @@ impl Secrets {
         self.0.is_empty()
     }
 
-    /// `line` with every value of 6 or more characters replaced by
-    /// `[secret NAME]`, also in its JSON-escaped form.
+    /// The names of the secrets whose value is too short to redact
+    /// ([`gitez_settings::MIN_SECRET_LEN`]).
+    pub fn too_short(&self) -> Vec<&str> {
+        self.0
+            .iter()
+            .filter(|(_, value)| redacted_forms(value).is_empty())
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+
+    /// `line` with every secret value replaced by `[secret NAME]`, also in
+    /// its JSON-escaped form. Output is redacted line by line, so a value
+    /// with line breaks (a key file) is also replaced line by line: each of
+    /// its lines of 4 or more characters wherever it appears. Values (and
+    /// lines) shorter than that are left (see [`Secrets::too_short`]).
     pub fn redact(&self, line: &str) -> String {
         let mut forms: Vec<(String, &str)> = Vec::new();
         for (name, value) in &self.0 {
-            if value.chars().count() < MIN_REDACTED {
-                continue;
-            }
-            forms.push((value.clone(), name));
-            let escaped = json_escaped(value);
-            if escaped != *value {
-                forms.push((escaped, name));
+            for form in redacted_forms(value) {
+                let escaped = json_escaped(&form);
+                if escaped != form {
+                    forms.push((escaped, name));
+                }
+                forms.push((form, name));
             }
         }
         forms.retain(|(form, _)| line.contains(form.as_str()));
@@ -158,6 +171,24 @@ impl std::fmt::Debug for Secrets {
     }
 }
 
+/// What of `value` is replaced: the whole value and, for a multi-line
+/// value, each of its lines (without `\r`), each of at least
+/// [`MIN_REDACTED`] characters.
+fn redacted_forms(value: &str) -> Vec<String> {
+    let mut forms: Vec<String> = Vec::new();
+    let whole = value.trim_end_matches(['\r', '\n']);
+    let lines = whole.split('\n').map(|line| line.trim_end_matches('\r'));
+    for form in std::iter::once(value)
+        .chain(std::iter::once(whole))
+        .chain(lines)
+    {
+        if form.trim().chars().count() >= MIN_REDACTED && !forms.iter().any(|known| known == form) {
+            forms.push(form.to_owned());
+        }
+    }
+    forms
+}
+
 /// `value` as it appears inside a JSON string.
 fn json_escaped(value: &str) -> String {
     let quoted = serde_json::to_string(value).expect("a string serialises");
@@ -191,6 +222,44 @@ mod tests {
         let json = serde_json::json!({ "text": "pa\"ss\\word" }).to_string();
         assert_eq!(secrets.redact(&json), r#"{"text":"[secret QUOTED]"}"#);
         assert_eq!(secrets.redact("pa\"ss\\word"), "[secret QUOTED]");
+    }
+
+    /// M2: a key file's lines are replaced wherever they appear one by one,
+    /// as they do in output read line by line, and the whole key in a JSON
+    /// string.
+    #[test]
+    fn multi_line_values_are_redacted_line_by_line() {
+        let key = "-----BEGIN KEY-----\r\nMIIEabcdefghij\nklmnopqr==\nxy\n-----END KEY-----\n";
+        let secrets = secrets(&[("SSH_KEY", key)]);
+        let printed: Vec<String> = format!("cat key:\n{key}done")
+            .lines()
+            .map(|line| secrets.redact(line))
+            .collect();
+        assert_eq!(
+            printed,
+            [
+                "cat key:",
+                "[secret SSH_KEY]",
+                "[secret SSH_KEY]",
+                "[secret SSH_KEY]",
+                "xy",
+                "[secret SSH_KEY]",
+                "done"
+            ]
+        );
+        let json = serde_json::json!({ "output": key }).to_string();
+        assert_eq!(secrets.redact(&json), r#"{"output":"[secret SSH_KEY]"}"#);
+        assert!(secrets.too_short().is_empty());
+    }
+
+    /// m1: from 4 characters every value is redacted, shorter ones are
+    /// named so the thread can warn.
+    #[test]
+    fn short_values_are_redacted_from_four_characters() {
+        let secrets = secrets(&[("PIN", "4821"), ("TINY", "ab"), ("BLANK", "   ")]);
+        assert_eq!(secrets.redact("pin 4821!"), "pin [secret PIN]!");
+        assert_eq!(secrets.redact("ab"), "ab");
+        assert_eq!(secrets.too_short(), ["BLANK", "TINY"]);
     }
 
     #[test]

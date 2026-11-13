@@ -89,6 +89,10 @@ impl Fixture {
         git(&self.root, &["rev-parse", "HEAD"])
     }
 
+    pub fn tip(&self, branch: &str) -> String {
+        git(&self.root, &["rev-parse", &format!("refs/heads/{branch}")])
+    }
+
     pub fn new_thread(&self, prompt: &str) -> NewAgentThread {
         NewAgentThread {
             prompt: prompt.to_owned(),

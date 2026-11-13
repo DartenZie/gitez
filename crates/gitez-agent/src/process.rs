@@ -2,7 +2,7 @@
 //! a way to stop it, and how it ended. It knows nothing about agents; an
 //! agent only builds the command.
 
-use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+use std::io::{BufReader, Read as _, Write as _};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -13,6 +13,13 @@ use crate::{CommandSpec, Error, Result};
 /// Keep this much of the end of the process's error output, to explain a
 /// failure.
 const STDERR_TAIL: usize = 8 * 1024;
+/// The longest output line kept whole. Claude Code's stream-JSON lines are
+/// far shorter (a tool result is cut long before this); a longer line is
+/// cut here, so a program that prints without line ends cannot make GitEZ
+/// hold all of it in memory.
+pub const MAX_LINE: usize = 8 * 1024 * 1024;
+/// Put at the end of a line cut at [`MAX_LINE`].
+pub const CUT_MARK: &str = " [GitEZ cut this line: it was longer than 8 MiB]";
 /// How often to check whether the process has exited once its output ended.
 const EXIT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
@@ -127,20 +134,11 @@ impl AgentProcess {
     }
 
     /// The next line of output, without its line ending; `None` once the
-    /// process and everything it started closed their output.
+    /// process and everything it started closed their output. A line longer
+    /// than [`MAX_LINE`] bytes is cut there and ends with [`CUT_MARK`]; the
+    /// rest of it is read and dropped.
     pub fn next_line(&mut self) -> Result<Option<String>> {
-        let mut line = Vec::new();
-        let read = self
-            .stdout
-            .read_until(b'\n', &mut line)
-            .map_err(Error::Read)?;
-        if read == 0 {
-            return Ok(None);
-        }
-        while matches!(line.last(), Some(b'\n' | b'\r')) {
-            line.pop();
-        }
-        Ok(Some(String::from_utf8_lossy(&line).into_owned()))
+        read_line(&mut self.stdout, MAX_LINE).map_err(Error::Read)
     }
 
     pub fn stopper(&self) -> Stopper {
@@ -223,6 +221,50 @@ enum Signal {
     Kill,
 }
 
+/// The next line of `reader`, at most `max` bytes of it kept (see
+/// [`AgentProcess::next_line`]).
+fn read_line(reader: &mut impl std::io::BufRead, max: usize) -> std::io::Result<Option<String>> {
+    let mut line = Vec::new();
+    let mut cut = false;
+    let mut any = false;
+    loop {
+        let buffer = match reader.fill_buf() {
+            Ok(buffer) => buffer,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if buffer.is_empty() {
+            break;
+        }
+        any = true;
+        let (chunk, ended) = match buffer.iter().position(|&byte| byte == b'\n') {
+            Some(at) => (&buffer[..at], Some(at + 1)),
+            None => (buffer, None),
+        };
+        let room = max.saturating_sub(line.len());
+        if chunk.len() > room {
+            cut = true;
+        }
+        line.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        let used = ended.unwrap_or(buffer.len());
+        reader.consume(used);
+        if ended.is_some() {
+            break;
+        }
+    }
+    if !any {
+        return Ok(None);
+    }
+    while matches!(line.last(), Some(b'\n' | b'\r')) {
+        line.pop();
+    }
+    let mut text = String::from_utf8_lossy(&line).into_owned();
+    if cut {
+        text.push_str(CUT_MARK);
+    }
+    Ok(Some(text))
+}
+
 /// `mutex` locked; a panic elsewhere while holding it does not matter for
 /// a process handle or a flag.
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -243,4 +285,35 @@ pub(crate) fn find_program(
         .map(|dir| dir.join(program))
         .chain(candidates.iter().cloned())
         .find(|candidate| candidate.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lines_are_read_whole_and_without_their_ends() {
+        let mut input = &b"one\r\ntwo\n\nlast"[..];
+        let mut lines = Vec::new();
+        while let Some(line) = read_line(&mut input, 100).expect("read") {
+            lines.push(line);
+        }
+        assert_eq!(lines, ["one", "two", "", "last"]);
+    }
+
+    /// m2: an endless line is cut, and the lines after it still come.
+    #[test]
+    fn an_over_long_line_is_cut_and_the_next_one_still_read() {
+        let mut text = vec![b'x'; 10_000];
+        text.extend_from_slice(b"\nnext\n");
+        let mut reader = std::io::BufReader::with_capacity(64, &text[..]);
+        let first = read_line(&mut reader, 1000).expect("read").expect("a line");
+        assert_eq!(first.len(), 1000 + CUT_MARK.len());
+        assert!(first.ends_with(CUT_MARK));
+        assert_eq!(
+            read_line(&mut reader, 1000).expect("read").as_deref(),
+            Some("next")
+        );
+        assert_eq!(read_line(&mut reader, 1000).expect("read"), None);
+    }
 }

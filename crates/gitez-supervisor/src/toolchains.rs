@@ -210,7 +210,18 @@ pub(crate) fn prepare(
             continue;
         }
         let own = dir.join(cache.name);
-        let exists = fs::symlink_metadata(&own).is_ok_and(|meta| meta.is_dir());
+        let found = fs::symlink_metadata(&own);
+        if found.as_ref().is_ok_and(|meta| !meta.is_dir()) {
+            // A link or file the agent put there: never written through
+            // or used, so the cache it names stays the user's, read-only.
+            prepared.log.push(format!(
+                "left out the thread's {} cache: {} is not a folder",
+                cache.name,
+                own.display()
+            ));
+            continue;
+        }
+        let exists = found.is_ok();
         if !exists && (downloads || cache.always) {
             let started = Instant::now();
             match create(&own, cache, lookup) {
@@ -445,6 +456,30 @@ mod tests {
         assert!(
             caches.join("cargo/registry/new.crate").is_file(),
             "not cloned again"
+        );
+    }
+
+    /// (e) A link the agent left in place of one of its caches is neither
+    /// written through nor handed to the next command.
+    #[test]
+    fn a_linked_cache_is_left_out() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let home = home(dir.path());
+        let caches = dir.path().join("caches/repo-x");
+        let elsewhere = dir.path().join("elsewhere");
+        fs::create_dir_all(&caches).expect("create");
+        fs::create_dir_all(&elsewhere).expect("create");
+        std::os::unix::fs::symlink(&elsewhere, caches.join("cargo")).expect("link");
+        std::os::unix::fs::symlink(&elsewhere, caches.join("go-build")).expect("link");
+        let prepared = prepare(&caches, true, &[], &lookup(&home));
+        assert_eq!(value(&prepared.env, "CARGO_HOME"), None);
+        assert_eq!(value(&prepared.env, "GOCACHE"), None);
+        assert_eq!(fs::read_dir(&elsewhere).expect("read").count(), 0);
+        assert!(
+            prepared
+                .log
+                .iter()
+                .any(|line| line.contains("not a folder"))
         );
     }
 

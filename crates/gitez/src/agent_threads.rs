@@ -19,8 +19,8 @@ use anyhow::{Context as _, bail};
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gitez_agent_thread::{
-    AgentThread, AgentThreadId, Ending, Index, IndexedRepository, NewAgentThread, State, Step,
-    Store, Timestamp, TurnKind,
+    AgentThread, AgentThreadId, Ending, IfUncommitted, Index, IndexedRepository, Kept,
+    NewAgentThread, State, Step, Store, Timestamp, TurnKind,
 };
 use gitez_sandbox::NetworkProfile;
 use gitez_secret::SecretStore;
@@ -579,7 +579,11 @@ impl AgentThreads {
             // removed.
             thread.clone().mark_completed(Timestamp::now())?;
             let work_dir = work_dir.context("GitEZ does not know this thread’s repository")?;
-            gitez_agent_thread::complete(&work_dir, &thread)?;
+            // Refuse by default: an uncommitted worktree is never removed on
+            // one click. The GUI confirms, then calls again with Discard or
+            // Keep (see gitez_agent_thread::IfUncommitted). A tampered
+            // worktree is refused the same way.
+            gitez_agent_thread::complete(&work_dir, &thread, IfUncommitted::Refuse)?;
             store.update(&key.id, |thread| thread.mark_completed(Timestamp::now()))?;
             changes.unbounded_send(vec![thread_file(&key)]).ok();
             Ok(())
@@ -1458,13 +1462,29 @@ fn complete_for_pull_request(
     } else {
         "closed"
     };
-    let removed = gitez_agent_thread::complete(work_dir, &thread);
+    // Automatic completion after a merge or close keeps a worktree that has
+    // uncommitted changes (or that GitEZ no longer trusts) rather than
+    // destroying work: the user removes it later with an explicit Complete.
+    let removed = gitez_agent_thread::complete(work_dir, &thread, IfUncommitted::Keep);
     let warning = match &removed {
-        Ok(report) if !report.worktree_removed => Some(format!(
-            "The thread’s worktree folder was already gone when pull request #{number} was \
-             {how}."
-        )),
-        Ok(_) => None,
+        Ok(report) => match &report.kept {
+            Some(Kept::Uncommitted { .. }) => Some(format!(
+                "Pull request #{number} was {how}; GitEZ completed the thread but kept its \
+                 worktree at {} because it has uncommitted changes. Remove it when you have \
+                 saved what you need.",
+                thread.worktree.display()
+            )),
+            Some(Kept::Untrusted(problem)) => Some(format!(
+                "Pull request #{number} was {how}; GitEZ completed the thread but kept its \
+                 worktree at {}: {problem} Remove it yourself.",
+                thread.worktree.display()
+            )),
+            None if !report.worktree_removed => Some(format!(
+                "The thread’s worktree folder was already gone when pull request #{number} was \
+                 {how}."
+            )),
+            None => None,
+        },
         Err(error) => Some(format!(
             "Pull request #{number} was {how}, but GitEZ could not remove the thread’s worktree \
              at {}: {}. Remove the folder yourself.",
@@ -1545,6 +1565,8 @@ mod tests {
             warnings: Vec::new(),
             supervisor: None,
             completed: None,
+            worktree_record: None,
+            uncommitted: None,
         }
     }
 

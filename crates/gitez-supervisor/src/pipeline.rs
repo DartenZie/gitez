@@ -17,9 +17,9 @@ use gitez_agent::{
 };
 use gitez_agent_thread::{
     Activity, AgentThread, AgentThreadId, CONTINUE_PROMPT, Ending, PrepareStep, RunHeader, State,
-    Step, Store, SupervisorInfo, Timestamp, Turn, TurnKind, TurnResult,
+    Step, Store, SupervisorInfo, Timestamp, Turn, TurnKind, TurnResult, Uncommitted,
 };
-use gitez_git::{HeadPlace, RefState, Repository};
+use gitez_git::{RefState, Repository};
 use gitez_sandbox::{Network, NetworkProfile, Sandbox as _, Status};
 use gitez_settings::{Loaded, Settings};
 use jiff::SignedDuration;
@@ -43,6 +43,8 @@ const ACTIVITY_EVERY: Duration = Duration::from_secs(1);
 const RESET_MARGIN_POLLS: u32 = 60;
 /// Lines of output kept to explain a failure.
 const TAIL_LINES: usize = 20;
+/// How many of the worktree's uncommitted paths are recorded (for the UI).
+const UNCOMMITTED_PATHS: usize = 10;
 const SETUP_LOG: &str = "setup.log";
 const SETUP_COMMAND_KEY: &str = "gitez.setupCommand";
 const PASSTHROUGH_WARNING: &str = "Ran without a sandbox (GITEZ_TEST_SANDBOX)";
@@ -294,50 +296,127 @@ impl Pipeline<'_> {
         }
     }
 
-    /// Step 3: create the worktree, or check it is the thread's.
+    /// Step 3: create the worktree, or check it is the thread's: its git
+    /// files must be as GitEZ recorded them (see
+    /// [`gitez_agent_thread::check_worktree`]) before anything runs there.
+    /// A branch with commits beyond the start is checked out inside the
+    /// sandbox, never here.
     fn worktree(&mut self) -> Result<(), End> {
         let failed = |message: String| End::Failed(Step::Worktree, message);
         let main_dir = self.main_dir().map_err(failed)?;
         let worktree = self.thread.worktree.clone();
-        let exists = worktree.exists();
+        let exists = std::fs::symlink_metadata(&worktree).is_ok();
         if !exists || !self.thread.prepared {
             self.set_preparing("creating worktree");
         }
-        if !exists {
+        if exists {
+            gitez_agent_thread::check_worktree(
+                &self.common_dir,
+                &worktree,
+                self.thread.worktree_record.as_ref(),
+            )
+            .map_err(|error| failed(error.to_string()))?;
+        } else {
             // A folder deleted by hand is still registered with git.
             gitez_command::Git::new(&main_dir).worktree_prune().ok();
         }
-        let worktree_git_dir = gitez_agent_thread::create_worktree(
+        let created = gitez_agent_thread::create_worktree(
             &main_dir,
             &worktree,
             &self.thread.branch,
             &self.thread.start.commit,
         )
         .map_err(|error| failed(error.to_string()))?;
-        if !exists && self.thread.prepared {
-            // A new folder needs preparing again.
-            self.save(|thread| thread.prepared = false);
+        if !exists || self.thread.worktree_record.is_none() {
+            let record = created.record.clone();
+            self.save(|thread| {
+                thread.worktree_record = Some(record);
+                // A new folder needs preparing again.
+                if !exists {
+                    thread.prepared = false;
+                }
+            });
         }
         let scratch =
             gitez_agent_thread::scratch_dirs(&self.env.data_dir, &self.repository_key(), &self.id);
-        let tmp_dir = scratch.tmp;
-        create_private_dir(&tmp_dir).map_err(|error| {
-            failed(format!(
-                "GitEZ could not create {}: {error}",
-                tmp_dir.display()
-            ))
-        })?;
+        for dir in [&scratch.tmp, &scratch.caches] {
+            match own_dir(dir) {
+                Ok(false) => {}
+                Ok(true) => self.warn(format!(
+                    "{} was not a folder (perhaps a link the agent made); GitEZ replaced it with \
+                     an empty one.",
+                    dir.display()
+                )),
+                Err(error) => {
+                    return Err(failed(format!(
+                        "GitEZ could not create {}: {error}",
+                        dir.display()
+                    )));
+                }
+            }
+        }
         self.place = Some(Place {
             common_dir: self.common_dir.clone(),
             worktree,
-            worktree_git_dir,
+            worktree_git_dir: created.git_dir,
             branch: self.thread.branch.clone(),
-            tmp_dir,
+            tmp_dir: scratch.tmp,
             caches_dir: scratch.caches,
             data_dir: self.env.data_dir.clone(),
         });
         self.worktree_ready = true;
+        if created.needs_checkout {
+            self.checkout()?;
+        }
         Ok(())
+    }
+
+    /// Checks out the branch in a worktree made without its files, inside
+    /// the sandbox without network: the files may be the agent's, and a
+    /// checkout runs filter drivers and can run hooks.
+    fn checkout(&mut self) -> Result<(), End> {
+        self.set_preparing("checking out the branch");
+        let command = self.command(
+            "/bin/sh",
+            vec![
+                "-c".to_owned(),
+                "exec 2>&1\ngit reset --hard --quiet".to_owned(),
+            ],
+            None,
+        );
+        let settings = self.settings();
+        let mut output = VecDeque::new();
+        let ran = self.run_command(
+            Kind::Setup,
+            command,
+            &AgentNeeds::default(),
+            &settings,
+            None,
+            |_, line| push_tail(&mut output, line.to_owned()),
+        )?;
+        if self.env.stop.load(Ordering::SeqCst) {
+            return Err(End::Stopped);
+        }
+        if !ran.outcome.success {
+            let lines: Vec<String> = output.into();
+            return Err(End::Failed(
+                Step::Worktree,
+                format!(
+                    "GitEZ could not check out {} in the worktree:\n{}",
+                    self.thread.branch,
+                    lines.join("\n")
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The settings, or the defaults when they cannot be read.
+    fn settings(&self) -> Settings {
+        match Settings::load(&self.env.settings_path) {
+            Ok(Loaded::Current(settings)) => settings,
+            _ => Settings::default(),
+        }
     }
 
     /// Step 4: copy includes, clone caches, run the setup command.
@@ -773,91 +852,148 @@ impl Pipeline<'_> {
         }
     }
 
-    /// Step 7: commit what the agent left uncommitted, in the sandbox
-    /// without network, so hooks run sandboxed. Never fails the thread.
+    /// Step 7: inside the sandbox without network, read the worktree's
+    /// status, commit what the agent left uncommitted (so hooks run
+    /// sandboxed), and read the status again; record what remains on the
+    /// thread ([`AgentThread::uncommitted`]). Everything that reads the
+    /// worktree's files runs in the sandbox: its content is the agent's,
+    /// and its output is untrusted text here. Never fails the thread.
+    ///
+    /// `check_place` already made sure, this run, that the worktree's git
+    /// files are the ones GitEZ recorded, so the git this runs in the
+    /// sandbox is the thread's own repository.
     fn commit_leftovers(&mut self) {
-        let worktree = self.thread.worktree.clone();
-        let Ok(repository) = Repository::open(&worktree) else {
-            return;
-        };
-        let status = match repository.status() {
-            Ok(status) => status,
-            Err(error) => {
-                self.warn(format!(
-                    "Could not read the worktree's status: {error}. Changes the agent left \
-                     uncommitted, if any, are still in the worktree."
-                ));
-                return;
-            }
-        };
-        if status.is_clean() {
-            return;
-        }
-        let branch = self.thread.branch.clone();
-        let on_branch = matches!(
-            repository.ref_state().map(|state| state.head),
-            Ok(Some(HeadPlace::Branch(name))) if name == branch
-        );
-        if !on_branch {
-            self.warn(format!(
-                "The worktree is no longer on {branch}, so GitEZ did not commit the changes the \
-                 agent left. They are still in the worktree."
-            ));
-            return;
-        }
         if self.place.is_none() {
             return;
         }
+        let branch = self.thread.branch.clone();
+        let checked = Timestamp::now();
         self.set_activity_detail("committing leftovers");
-        let tip_before = tip(&worktree);
         let message = format!(
             "{}\n\nChanges the agent left uncommitted, committed by GitEZ.\n",
             self.thread.title
         );
-        let command = self.command(
-            "/bin/sh",
-            vec![
-                "-c".to_owned(),
-                "git add --all && git commit --quiet --file=-".to_owned(),
-            ],
-            Some(message),
-        );
-        let settings = match Settings::load(&self.env.settings_path) {
-            Ok(Loaded::Current(settings)) => settings,
-            _ => Settings::default(),
-        };
-        let mut output = VecDeque::new();
+        // One sandboxed shell run: status, commit if on the branch and
+        // dirty, status again. Sentinels mark the sections; the status
+        // lines are `git status --porcelain` output, untrusted here.
+        let script = "\
+status() { git status --porcelain 2>&1; }\n\
+branch=$(git symbolic-ref --short -q HEAD || true)\n\
+printf '%s %s\\n' GITEZ-HEAD \"$branch\"\n\
+dirty=$(status)\n\
+if [ -n \"$dirty\" ]; then\n\
+  if [ \"$branch\" = \"$GITEZ_BRANCH\" ]; then\n\
+    git add --all >&2 || true\n\
+    if printf '%s' \"$GITEZ_COMMIT_MESSAGE\" | git commit --quiet --file=- >&2; then\n\
+      echo GITEZ-COMMIT-OK\n\
+    else\n\
+      echo \"GITEZ-COMMIT-FAILED rc=$?\"\n\
+    fi\n\
+  else\n\
+    echo GITEZ-COMMIT-WRONG-BRANCH\n\
+  fi\n\
+fi\n\
+echo GITEZ-STATUS\n\
+status\n";
+        let mut command = self.command("/bin/sh", vec!["-c".to_owned(), script.to_owned()], None);
+        command
+            .env
+            .push(("GITEZ_BRANCH".to_owned(), branch.clone()));
+        command
+            .env
+            .push(("GITEZ_COMMIT_MESSAGE".to_owned(), message));
+        let settings = self.settings();
+        let mut lines: Vec<String> = Vec::new();
         let ran = self.run_command(
             Kind::Commit,
             command,
             &AgentNeeds::default(),
             &settings,
             None,
-            |_, line| push_tail(&mut output, line.to_owned()),
+            |_, line| lines.push(line.to_owned()),
         );
-        let tip_after = tip(&worktree);
-        let committed = tip_after.is_some() && tip_after != tip_before;
-        let problem = match ran {
-            Err(End::Failed(_, message)) => Some(message),
-            Err(_) => Some("it was stopped".to_owned()),
-            Ok(ran) if !ran.outcome.success || !committed => {
-                let mut lines: Vec<String> = output.into();
-                if !ran.outcome.stderr.is_empty() {
-                    lines.push(self.secrets.redact(&ran.outcome.stderr));
-                }
-                let text = lines.join("\n");
-                Some(if text.trim().is_empty() {
-                    "git did not commit them".to_owned()
-                } else {
-                    text.trim().to_owned()
-                })
-            }
+        let stderr = match &ran {
+            Ok(ran) => self.secrets.redact(&ran.outcome.stderr),
+            Err(_) => String::new(),
+        };
+        let run_problem = match &ran {
+            Err(End::Failed(_, message)) => Some(message.clone()),
+            Err(_) => Some("GitEZ was stopped before it finished.".to_owned()),
+            Ok(ran) if !ran.outcome.success => Some(
+                last_lines(&stderr, TAIL_LINES)
+                    .trim()
+                    .to_owned()
+                    .pipe(|tail| {
+                        if tail.is_empty() {
+                            "the sandbox command did not succeed".to_owned()
+                        } else {
+                            tail
+                        }
+                    }),
+            ),
             Ok(_) => None,
         };
-        if let Some(problem) = problem {
+        let outcome = CommitOutcome::parse(&lines);
+        if !outcome.checked {
+            // The worktree could not be read (the run failed, or was
+            // stopped): its state is unknown, not "no changes".
+            let problem =
+                run_problem.unwrap_or_else(|| "GitEZ could not read the worktree.".to_owned());
             self.warn(format!(
-                "Could not commit the changes the agent left: {problem}. They are still in the \
-                 worktree."
+                "GitEZ could not check whether the agent left uncommitted changes: {problem} If                  it did, they are still in the worktree."
+            ));
+            return;
+        }
+        let paths: Vec<String> = outcome
+            .status
+            .iter()
+            .take(UNCOMMITTED_PATHS)
+            .map(|line| self.secrets.redact(line))
+            .collect();
+        let count = outcome.status.len() as u32;
+        // Why the agent's changes are still uncommitted, if they are.
+        let commit_error = match &outcome.commit {
+            _ if count == 0 => None,
+            Some(CommitStep::Ok) => Some(format!(
+                "GitEZ committed, but {count} change(s) are still uncommitted: {}",
+                paths.join("; ")
+            )),
+            Some(CommitStep::WrongBranch) => Some(format!(
+                "The worktree is no longer on {branch}, so GitEZ did not commit the changes the \
+                 agent left."
+            )),
+            Some(CommitStep::Failed) => Some(commit_failure(&stderr)),
+            // Dirty, but the commit step did not run (the run itself failed).
+            None => Some(run_problem.clone().unwrap_or_else(|| {
+                "GitEZ could not commit the changes the agent left.".to_owned()
+            })),
+        };
+        let uncommitted = Uncommitted {
+            checked,
+            count,
+            paths,
+            commit_error: commit_error.clone(),
+        };
+        let too_short: Vec<String> = self
+            .secrets
+            .too_short()
+            .iter()
+            .map(|&n| n.to_owned())
+            .collect();
+        self.save(|thread| thread.uncommitted = Some(uncommitted.clone()));
+        if let Some(problem) = run_problem.filter(|_| outcome.commit.is_none()) {
+            self.warn(format!(
+                "GitEZ could not check or commit the worktree: {problem}"
+            ));
+        }
+        if let Some(error) = &commit_error {
+            self.warn(error.clone());
+        }
+        if !too_short.is_empty() {
+            self.warn(format!(
+                "These secrets' values are too short for GitEZ to keep out of transcripts, so \
+                 GitEZ did not redact them: {}.",
+                too_short.join(", ")
             ));
         }
     }
@@ -938,6 +1074,10 @@ impl Pipeline<'_> {
             Some(profile) => self.network(profile, needs, settings),
             None => Network::Hosts(Vec::new()),
         };
+        // Every run, as the last run may have changed them: GitEZ's own
+        // folders must still be what they were, never links, before GitEZ
+        // writes caches in them and the sandbox makes them writable.
+        self.check_place(&place)?;
         let writable: Vec<PathBuf> = settings
             .writable_paths()
             .iter()
@@ -957,7 +1097,17 @@ impl Pipeline<'_> {
                 command.env.push((name, value));
             }
         }
-        let policy = policy::policy(&place, needs, settings, network, profile);
+        let (policy, refused) = policy::policy(&place, needs, settings, network, profile);
+        for path in refused {
+            let warning = format!(
+                "{} is a symbolic link, so the sandbox did not make it writable. Make the folder \
+                 it points to writable in Settings instead if the agent needs it.",
+                path.display()
+            );
+            if !self.thread.warnings.contains(&warning) {
+                self.warn(warning);
+            }
+        }
         let wrapped = self
             .env
             .sandbox
@@ -1008,6 +1158,32 @@ impl Pipeline<'_> {
             tail,
             blocked_hosts,
         })
+    }
+
+    /// Fails unless the worktree's git files are as recorded and the
+    /// thread's own folders are real folders.
+    fn check_place(&mut self, place: &Place) -> Result<(), End> {
+        gitez_agent_thread::check_worktree(
+            &place.common_dir,
+            &place.worktree,
+            self.thread.worktree_record.as_ref(),
+        )
+        .map_err(|error| End::Failed(Step::Worktree, error.to_string()))?;
+        for dir in [&place.tmp_dir, &place.caches_dir] {
+            if own_dir(dir).map_err(|error| {
+                End::Failed(
+                    Step::Worktree,
+                    format!("GitEZ could not create {}: {error}", dir.display()),
+                )
+            })? {
+                self.warn(format!(
+                    "{} was not a folder (perhaps a link the agent made); GitEZ replaced it with \
+                     an empty one.",
+                    dir.display()
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// A command run in the worktree, with GitEZ's environment.
@@ -1143,6 +1319,79 @@ impl Pipeline<'_> {
         Ok(())
     }
 }
+
+/// What the sandboxed leftover-commit script reported.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CommitOutcome {
+    /// The commit step, if it ran (the worktree was dirty).
+    commit: Option<CommitStep>,
+    /// `git status --porcelain` lines after the commit: the worktree's
+    /// remaining changes, untrusted text.
+    status: Vec<String>,
+    /// Whether the final status section was reached: without it the
+    /// worktree's state is not known.
+    checked: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitStep {
+    Ok,
+    Failed,
+    WrongBranch,
+}
+
+impl CommitOutcome {
+    /// Reads the sentinel-marked sections the script printed. Unknown
+    /// lines before `GITEZ-STATUS` (a hook's own output on stdout, say) are
+    /// ignored; everything after it is the status.
+    fn parse(lines: &[String]) -> Self {
+        let mut outcome = CommitOutcome::default();
+        let mut in_status = false;
+        for line in lines {
+            if in_status {
+                if !line.is_empty() {
+                    outcome.status.push(line.clone());
+                }
+                continue;
+            }
+            match line.as_str() {
+                "GITEZ-STATUS" => {
+                    in_status = true;
+                    outcome.checked = true;
+                }
+                "GITEZ-COMMIT-OK" => outcome.commit = Some(CommitStep::Ok),
+                "GITEZ-COMMIT-WRONG-BRANCH" => outcome.commit = Some(CommitStep::WrongBranch),
+                _ if line.starts_with("GITEZ-COMMIT-FAILED") => {
+                    outcome.commit = Some(CommitStep::Failed);
+                }
+                _ => {}
+            }
+        }
+        outcome
+    }
+}
+
+/// Why GitEZ's commit of the leftovers failed, from the run's error output.
+fn commit_failure(stderr: &str) -> String {
+    let tail = last_lines(stderr, TAIL_LINES);
+    if tail.trim().is_empty() {
+        "GitEZ could not commit the changes the agent left (a failing hook, perhaps).".to_owned()
+    } else {
+        format!(
+            "GitEZ could not commit the changes the agent left:\n{}",
+            tail.trim()
+        )
+    }
+}
+
+/// Lets a value be post-processed inline, for readability.
+trait Pipe: Sized {
+    fn pipe<T>(self, f: impl FnOnce(Self) -> T) -> T {
+        f(self)
+    }
+}
+
+impl<T> Pipe for T {}
 
 /// A command that ran.
 struct Ran {
@@ -1310,15 +1559,6 @@ fn ref_state(work_dir: &Path) -> Option<RefState> {
     Repository::open(work_dir).ok()?.ref_state().ok()
 }
 
-/// The commit `HEAD` of the repository at `work_dir` is on.
-fn tip(work_dir: &Path) -> Option<gitez_git::Oid> {
-    Repository::open(work_dir)
-        .ok()?
-        .resolve_commit("HEAD")
-        .ok()
-        .flatten()
-}
-
 /// Names whose value differs between `before` and `after`, including
 /// names only one of them has.
 fn changed<V: PartialEq>(before: &BTreeMap<String, V>, after: &BTreeMap<String, V>) -> Vec<String> {
@@ -1344,15 +1584,27 @@ fn last_lines(text: &str, count: usize) -> String {
     lines[lines.len().saturating_sub(count)..].join("\n")
 }
 
-fn create_private_dir(path: &Path) -> std::io::Result<()> {
+/// Makes `path` a private folder of the thread's own, if it is not one: a
+/// link or file the agent put in its place (it may write in the folder's
+/// parent's entry for it) is removed, never followed. The sandbox makes
+/// the folder writable, so it must not lead anywhere else. Returns whether
+/// something else was there.
+fn own_dir(path: &Path) -> std::io::Result<bool> {
     use std::os::unix::fs::DirBuilderExt as _;
-    if path.is_dir() {
-        return Ok(());
+    let replaced = match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => return Ok(false),
+        Ok(_) => {
+            std::fs::remove_file(path)?;
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(path)
+    std::fs::DirBuilder::new().mode(0o700).create(path)?;
+    Ok(replaced)
 }
 
 /// A line for supervisor.log (the supervisor's standard error). Never

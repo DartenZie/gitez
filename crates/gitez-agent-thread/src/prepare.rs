@@ -33,6 +33,9 @@ pub struct PrepareReport {
     pub cloned: Vec<String>,
     /// Cache folders not cloned because the filesystem cannot.
     pub not_cloned: Vec<String>,
+    /// Files not copied because a folder on their way in the worktree is a
+    /// link or a file: copying through it would write outside the worktree.
+    pub skipped: Vec<PathBuf>,
 }
 
 /// Copies the files `.worktreeinclude` lists (and git ignores) from the
@@ -43,6 +46,12 @@ pub struct PrepareReport {
 /// folder skipped silently). Files that already exist in the worktree are
 /// left as they are. The setup command is not run here (the supervisor
 /// runs it in the sandbox).
+///
+/// The worktree may already hold what the agent or the setup command left
+/// (a retry after a failed setup, a branch with the agent's commits), so
+/// nothing is written through a link: every folder on the way to a copied
+/// file must be a real folder in the worktree (missing ones are created),
+/// and an existing file or link is never written over.
 pub fn prepare(
     main: &gitez_git::Repository,
     worktree: &Path,
@@ -53,6 +62,12 @@ pub fn prepare(
             "The repository has no working tree to prepare a worktree from.",
         ));
     };
+    if !fs::symlink_metadata(worktree).is_ok_and(|meta| meta.is_dir()) {
+        return Err(Error::refused(format!(
+            "{} is not a folder.",
+            worktree.display()
+        )));
+    }
     let mut done = PrepareReport::default();
 
     let includes = main.worktree_include_files()?;
@@ -69,8 +84,10 @@ pub fn prepare(
         });
     }
     for relative in to_copy {
-        if copy_include(&main_dir, worktree, relative)? {
-            done.copied.push(relative.clone());
+        match copy_include(&main_dir, worktree, relative)? {
+            Copied::Yes => done.copied.push(relative.clone()),
+            Copied::No => {}
+            Copied::Unsafe => done.skipped.push(relative.clone()),
         }
     }
 
@@ -92,30 +109,74 @@ pub fn prepare(
         let _ = fs::remove_dir_all(&target);
         done.not_cloned.push(dir.to_owned());
         let relative = PathBuf::from(dir);
-        if includes.contains(&relative) && copy_include(&main_dir, worktree, &relative)? {
-            done.copied.push(relative);
+        if includes.contains(&relative) {
+            match copy_include(&main_dir, worktree, &relative)? {
+                Copied::Yes => done.copied.push(relative),
+                Copied::No => {}
+                Copied::Unsafe => done.skipped.push(relative),
+            }
         }
     }
     Ok(done)
 }
 
+/// Whether [`copy_include`] copied.
+enum Copied {
+    Yes,
+    /// It is already there, or gone from the main worktree.
+    No,
+    /// A folder on its way is a link or a file.
+    Unsafe,
+}
+
 /// Copies `relative` from `main_dir` into `worktree` unless it exists
-/// there. Returns whether it copied.
-fn copy_include(main_dir: &Path, worktree: &Path, relative: &Path) -> Result<bool> {
+/// there, through real folders only.
+fn copy_include(main_dir: &Path, worktree: &Path, relative: &Path) -> Result<Copied> {
+    let Some(parent) = real_parent(worktree, relative)? else {
+        return Ok(Copied::Unsafe);
+    };
+    let Some(name) = relative.file_name() else {
+        return Ok(Copied::Unsafe);
+    };
     let source = main_dir.join(relative);
-    let target = worktree.join(relative);
+    let target = parent.join(name);
     if fs::symlink_metadata(&target).is_ok() {
-        return Ok(false);
+        return Ok(Copied::No);
     }
     let Ok(meta) = fs::symlink_metadata(&source) else {
         // Gone since it was listed.
-        return Ok(false);
+        return Ok(Copied::No);
     };
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent).map_err(Error::io(parent))?;
-    }
     copy_entry(&source, &target, &meta)?;
-    Ok(true)
+    Ok(Copied::Yes)
+}
+
+/// The folder in `worktree` that `relative` goes in, every folder on the
+/// way a real one (missing ones created); `None` when one is a link or a
+/// file, or `relative` leaves the worktree (`..`, an absolute path).
+fn real_parent(worktree: &Path, relative: &Path) -> Result<Option<PathBuf>> {
+    let mut dir = worktree.to_owned();
+    let Some(parent) = relative.parent() else {
+        return Ok(None);
+    };
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Ok(None);
+    }
+    for component in parent.components() {
+        dir.push(component);
+        match fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&dir).map_err(Error::io(&dir))?;
+            }
+            Err(error) => return Err(Error::io(&dir)(error)),
+        }
+    }
+    Ok(Some(dir))
 }
 
 /// Copies a file, symlink or folder tree, keeping permissions.

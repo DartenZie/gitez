@@ -139,7 +139,9 @@ fn an_update_waits_for_a_held_lock() {
 fn an_update_gives_up_on_a_lock_held_too_long() {
     let (_dir, store, id) = example_store();
     let lock = store.thread_dir(&id).join("thread.json.lock");
-    fs::write(&lock, "").expect("hold the lock");
+    // A live writer: it holds the lock file's advisory lock.
+    let held = fs::File::create(&lock).expect("create the lock");
+    held.lock().expect("hold the lock");
     let started = Instant::now();
     let result = store.update(&id, |thread| {
         thread.title = "Changed".to_owned();
@@ -157,6 +159,26 @@ fn an_update_gives_up_on_a_lock_held_too_long() {
         store.load(&id).expect("load").title,
         "Add a blame view to the commit detail"
     );
+    drop(held);
+}
+
+/// M3: a lock file whose writer died (nobody holds its advisory lock) no
+/// longer wedges the thread: the next writer removes it.
+#[test]
+fn a_lock_left_by_a_writer_that_died_is_broken() {
+    let (_dir, store, id) = example_store();
+    let lock = store.thread_dir(&id).join("thread.json.lock");
+    fs::write(&lock, "half written").expect("a dead writer's lock");
+    let started = Instant::now();
+    store
+        .update(&id, |thread| {
+            thread.title = "Changed".to_owned();
+            Ok(())
+        })
+        .expect("the stale lock is broken");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(store.load(&id).expect("load").title, "Changed");
+    assert!(!lock.exists());
 }
 
 #[test]

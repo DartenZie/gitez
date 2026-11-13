@@ -208,6 +208,42 @@ pub struct SupervisorInfo {
     pub started: Timestamp,
 }
 
+/// What GitEZ recorded about a thread's worktree when it created it: the
+/// files git trusts to find the repository. The sandbox keeps the agent
+/// from changing them, and GitEZ checks them against this record before it
+/// runs anything in the worktree outside the sandbox.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeRecord {
+    /// The worktree's own git dir, `<common dir>/worktrees/<name>`.
+    pub git_dir: PathBuf,
+    /// The content of `<worktree>/.git`.
+    pub dot_git: String,
+    /// The content of `<git_dir>/commondir`.
+    pub commondir: String,
+    /// The content of `<git_dir>/gitdir`.
+    pub gitdir: String,
+    /// The content of `<git_dir>/config.worktree`, if git made one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_worktree: Option<String>,
+}
+
+/// What the supervisor found in the worktree at the end of the thread's
+/// last run, from `git status` run inside the sandbox. The paths are the
+/// agent's: untrusted text, to show and never to act on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Uncommitted {
+    pub checked: Timestamp,
+    /// Changed, deleted and untracked paths (0: the worktree is clean).
+    pub count: u32,
+    /// The first few of them, as `git status --porcelain` printed them.
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// Why GitEZ's own commit of the changes the agent left failed, when
+    /// it tried (git's or a hook's words).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_error: Option<String>,
+}
+
 /// A prompt given to a coding agent working on its own branch in its own
 /// worktree, and the conversation that follows: one `thread.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -256,6 +292,14 @@ pub struct AgentThread {
     pub supervisor: Option<SupervisorInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed: Option<Timestamp>,
+    /// The worktree's git files as GitEZ made them; `None` before the
+    /// worktree exists (and for threads from before GitEZ recorded it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_record: Option<WorktreeRecord>,
+    /// Uncommitted changes in the worktree at the end of the last run;
+    /// `None` when unknown (never checked, or the check failed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uncommitted: Option<Uncommitted>,
 }
 
 /// What a new agent thread starts with (the GUI fills it in).
@@ -299,6 +343,22 @@ impl AgentThread {
             .filter_map(|turn| turn.result.as_ref())
             .map(|result| result.message.as_str())
             .find(|message| !message.is_empty())
+    }
+
+    /// Whether the worktree had uncommitted changes at the end of the last
+    /// run: `None` when unknown.
+    pub fn has_uncommitted(&self) -> Option<bool> {
+        self.uncommitted
+            .as_ref()
+            .map(|uncommitted| uncommitted.count > 0)
+    }
+
+    /// Whether GitEZ tried to commit the changes the agent left and
+    /// failed, so they are still uncommitted in the worktree.
+    pub fn leftover_commit_failed(&self) -> bool {
+        self.uncommitted
+            .as_ref()
+            .is_some_and(|uncommitted| uncommitted.count > 0 && uncommitted.commit_error.is_some())
     }
 
     /// The turn the supervisor should run next: the last one with
