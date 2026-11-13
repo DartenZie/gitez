@@ -32,6 +32,7 @@ use super::{CloneRepository, InitRepository, OpenRepository};
 use crate::agent_threads::{
     AgentThreadKey, AgentThreads, Counts, Notice, OpenSettings, StartRequest,
 };
+use crate::motion;
 use crate::theme::{self, color};
 
 #[cfg(all(test, target_os = "macos"))]
@@ -935,17 +936,16 @@ impl Home {
             .border_color(rgb(color::BORDER))
             .text_size(px(11.5))
             .text_color(rgb(color::TEXT_MUTED))
-            .child(
+            .child(if running > 0 {
+                motion::blinking_dot(px(6.), color::BRANCH_BLUE).into_any_element()
+            } else {
                 div()
                     .flex_none()
                     .size(px(6.))
                     .rounded_full()
-                    .bg(rgb(if running > 0 {
-                        color::BRANCH_BLUE
-                    } else {
-                        color::TEXT_FAINT
-                    })),
-            )
+                    .bg(rgb(color::TEXT_FAINT))
+                    .into_any_element()
+            })
             .child(
                 div()
                     .flex_1()
@@ -1190,7 +1190,7 @@ impl Home {
                 }
             })
             .on_click(open)
-            .child(state_icon(thread, item.facts.pull_request))
+            .child(state_icon(thread, item.facts.pull_request, true))
             .child(text)
     }
 
@@ -1472,12 +1472,7 @@ impl Home {
                                     .gap(px(5.))
                                     .text_color(rgb(hex))
                                     .when(live, |this| {
-                                        this.child(
-                                            div()
-                                                .size(px(6.))
-                                                .rounded_full()
-                                                .bg(rgb(color::BRANCH_BLUE)),
-                                        )
+                                        this.child(motion::blinking_dot(px(6.), color::BRANCH_BLUE))
                                     })
                                     .child(text)
                             })),

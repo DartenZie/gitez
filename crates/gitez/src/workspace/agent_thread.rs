@@ -25,6 +25,7 @@ use gpui_kit::*;
 
 use super::labels;
 use crate::agent_threads::{AgentThreadKey, AgentThreads, AgentThreadsEvent};
+use crate::motion;
 use crate::theme::{self, color};
 use activity::{Entry, Planned, Row, TurnEvents};
 
@@ -782,11 +783,14 @@ pub fn state_chip(thread: &AgentThread) -> Div {
     chip(Look::of(thread), state_label(thread))
 }
 
-/// A chip saying `label` in the colours of `look`.
+/// A chip saying `label` in the colours of `look`. Its dot blinks while
+/// the thread runs or is prepared, as on the boards.
 pub fn chip(look: Look, label: String) -> Div {
     let (background, text) = look.colors();
     let mark = if look == Look::Completed {
         Icon::new(IconName::Check).size(px(11.)).into_any_element()
+    } else if matches!(look, Look::Running | Look::Preparing) {
+        motion::blinking_dot(px(6.), text).into_any_element()
     } else {
         div()
             .flex_none()
@@ -817,8 +821,14 @@ pub fn chip(look: Look, label: String) -> Div {
 /// an answer, a warning for uncommitted changes, a cross when it failed, a
 /// square when stopped, and when completed a merge mark (merged), a crossed
 /// circle (closed) or a tick (by hand). `pull_request` is the state of its
-/// pull request, when read.
-pub fn state_icon(thread: &AgentThread, pull_request: Option<gitez_review::State>) -> AnyElement {
+/// pull request, when read. With `moving`, a running thread's dot blinks
+/// and a preparing thread's ring turns (Home's rows); without, they stand
+/// still (the Agents popover, as on the boards).
+pub fn state_icon(
+    thread: &AgentThread,
+    pull_request: Option<gitez_review::State>,
+    moving: bool,
+) -> AnyElement {
     let look = Look::of(thread);
     let hex = look.text();
     let ring = |dashed: bool| {
@@ -839,9 +849,13 @@ pub fn state_icon(thread: &AgentThread, pull_request: Option<gitez_review::State
             .into_any_element()
     };
     let mark = match look {
+        Look::Running if moving => ring(false)
+            .child(motion::blinking_dot(px(4.), hex))
+            .into_any_element(),
         Look::Running => ring(false)
             .child(div().size(px(4.)).rounded_full().bg(rgb(hex)))
             .into_any_element(),
+        Look::Preparing if moving => motion::spinning_ring(px(12.), px(2.), hex).into_any_element(),
         Look::Preparing | Look::Queued | Look::Waiting => ring(true).into_any_element(),
         Look::Ready => icon(IconName::GitPullRequestArrow),
         Look::Answer => icon(IconName::MessageSquare),
@@ -1567,12 +1581,7 @@ impl ThreadView {
                         .gap(px(5.))
                         .text_size(px(11.5))
                         .text_color(rgb(color::THREAD_RUNNING_TEXT))
-                        .child(
-                            div()
-                                .size(px(6.))
-                                .rounded_full()
-                                .bg(rgb(color::BRANCH_BLUE)),
-                        )
+                        .child(motion::blinking_dot(px(6.), color::BRANCH_BLUE))
                         .child("live"),
                 )
             })
@@ -1740,23 +1749,28 @@ impl ThreadView {
                                 }))
                                 .child(detail.to_owned()),
                         )
-                        .child(
-                            Icon::new(if live {
-                                IconName::LoaderCircle
-                            } else if failure.is_some() {
+                        .child(if live {
+                            // Turning, as the board's `spin`.
+                            motion::spinner(
+                                IconName::LoaderCircle.path(),
+                                px(12.),
+                                color::THREAD_RUNNING_TEXT,
+                            )
+                            .into_any_element()
+                        } else {
+                            Icon::new(if failure.is_some() {
                                 IconName::CircleAlert
                             } else {
                                 IconName::Check
                             })
                             .size(px(12.))
-                            .text_color(rgb(if live {
-                                color::THREAD_RUNNING_TEXT
-                            } else if failure.is_some() {
+                            .text_color(rgb(if failure.is_some() {
                                 color::THREAD_FAILED_TEXT
                             } else {
                                 color::TEXT_FAINT
-                            })),
-                        ),
+                            }))
+                            .into_any_element()
+                        }),
                 )
                 .when_some(failure, |this, failure| {
                     this.child(

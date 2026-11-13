@@ -12,6 +12,7 @@
 use gitez_git::graph::{Row, Segment};
 use gpui_kit::*;
 
+use crate::motion::{self, Mark};
 use crate::theme;
 
 /// Horizontal distance between lanes.
@@ -32,8 +33,8 @@ const WORKING_TREE_BORDER: Pixels = px(1.6);
 /// The node of the "Ask an agent…" row.
 const COMPOSER_RADIUS: Pixels = px(6.5);
 const COMPOSER_BORDER: Pixels = px(1.4);
-/// The border of an active agent thread's node, and the dot of a running
-/// one.
+/// The border of an active agent thread's node (dashed and turning while
+/// preparing), and the dot of a running one.
 const LIVE_BORDER: Pixels = px(2.2);
 const LIVE_DOT: Pixels = px(2.2);
 /// Dash and gap of the dashed line. Each row paints its piece of the line
@@ -78,9 +79,11 @@ pub enum Node {
     WorkingTree,
     /// The "Ask an agent…" row: a faint hollow node with a plus.
     Composer,
-    /// An agent thread whose worktree is being prepared: hollow and dashed.
+    /// An agent thread whose worktree is being prepared: hollow and dashed,
+    /// the dashes turning.
     Preparing,
-    /// An agent thread whose agent runs: a ring with a dot in the middle.
+    /// An agent thread whose agent runs: a ring with a dot in the middle,
+    /// and a ring pulsing out of it.
     Running,
 }
 
@@ -142,14 +145,14 @@ pub fn node_cell(
 ) -> impl IntoElement {
     canvas(
         |_, _, _| {},
-        move |bounds, _, window, _| {
+        move |bounds, _, window, cx| {
             window.with_content_mask(Some(ContentMask { bounds }), |window| {
                 paint_through(&through, bounds, scroll, window);
                 let center = point(lane_x(bounds, scroll, lane), bounds.center().y);
                 if down && let Some(path) = dashed_line(center, point(center.x, bounds.bottom())) {
                     window.paint_path(path, rgb(color));
                 }
-                paint_node(node, center, color, window);
+                paint_node(node, center, color, window, cx);
             });
         },
     )
@@ -173,7 +176,7 @@ fn paint_through(through: &[Dashed], bounds: Bounds<Pixels>, scroll: Pixels, win
     }
 }
 
-fn paint_node(node: Node, center: Point<Pixels>, color: u32, window: &mut Window) {
+fn paint_node(node: Node, center: Point<Pixels>, color: u32, window: &mut Window, cx: &mut App) {
     let background = rgb(theme::color::BACKGROUND);
     match node {
         Node::WorkingTree => window.paint_quad(quad(
@@ -213,25 +216,22 @@ fn paint_node(node: Node, center: Point<Pixels>, color: u32, window: &mut Window
                 }
             }
         }
-        Node::Preparing => window.paint_quad(quad(
-            circle_bounds(center, NODE_RADIUS),
-            NODE_RADIUS,
-            background,
-            LIVE_BORDER,
-            rgb(color),
-            BorderStyle::Dashed,
-        )),
+        // A dashed ring that turns, as the board's `spin`.
+        Node::Preparing => motion::paint(
+            Mark::Spin {
+                center,
+                radius: NODE_RADIUS,
+                width: LIVE_BORDER,
+                color,
+                fill: Some(theme::color::BACKGROUND),
+            },
+            window,
+            cx,
+        ),
         Node::Running => {
-            // A faint halo stands for the board's pulse: the history is not
-            // animated, so idle windows cost nothing.
-            window.paint_quad(quad(
-                circle_bounds(center, HEAD_RING_RADIUS),
-                HEAD_RING_RADIUS,
-                transparent_black(),
-                HEAD_RING_WIDTH,
-                theme::with_alpha(color, 0.35),
-                BorderStyle::default(),
-            ));
+            // The board's `pulse`: a ring growing from the node and fading
+            // (a faint still ring with reduced motion).
+            motion::paint(Mark::Pulse { center, color }, window, cx);
             window.paint_quad(quad(
                 circle_bounds(center, NODE_RADIUS),
                 NODE_RADIUS,

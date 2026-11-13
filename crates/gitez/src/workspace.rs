@@ -17,6 +17,10 @@ mod history;
 mod home;
 mod labels;
 mod lanes;
+#[cfg(all(test, target_os = "macos"))]
+mod motion_shots;
+#[cfg(test)]
+mod motion_tests;
 mod new_pull_request;
 mod palette;
 mod remote;
@@ -59,6 +63,7 @@ use crate::agent_threads::{
     AgentThreadKey, AgentThreads, AgentThreadsEvent, CurrentRepository, OpenAgentPullRequest,
     OpenAgentThread, StartRequest,
 };
+use crate::motion;
 use crate::repository::Snapshot;
 use crate::theme::{self, color};
 use crate::undo::{Direction, UndoLog};
@@ -673,6 +678,10 @@ impl Workspace {
     /// GitEZ, replacing any earlier watch.
     fn watch(&mut self, snapshot: &Snapshot, window: &mut Window, cx: &mut Context<Self>) {
         self._watcher = None;
+        #[cfg(test)]
+        if cx.has_global::<NoWatch>() {
+            return;
+        }
         let (sender, mut changes) = futures::channel::mpsc::unbounded::<Vec<PathBuf>>();
         let repository = snapshot.repository.clone();
         // Watching a large tree recursively can take a while on Linux.
@@ -2159,6 +2168,14 @@ impl Workspace {
     }
 }
 
+/// Set by tests on GPUI's deterministic scheduler, which the file
+/// watcher's own thread would disturb: the repository is not watched.
+#[cfg(test)]
+pub(crate) struct NoWatch;
+
+#[cfg(test)]
+impl Global for NoWatch {}
+
 impl Focusable for Workspace {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -2172,6 +2189,9 @@ impl Render for Workspace {
         let home = self.home_shown().then(|| self.home(window, cx));
 
         div()
+            // First: what live marks registered at the last paint is
+            // cleared. Under the palette's backdrop they stand still.
+            .child(motion::content_start(self.palette_open))
             .key_context("Workspace")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::prompt_for_repository))

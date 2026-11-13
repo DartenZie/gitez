@@ -9,6 +9,7 @@
 mod agent_threads;
 mod assets;
 mod menus;
+mod motion;
 mod project_icon;
 mod recent;
 mod repository;
@@ -77,7 +78,9 @@ fn main() -> ExitCode {
                 window_min_size: Some(size(px(960.), px(600.))),
                 ..Default::default()
             };
-            gpui_kit::open_window(options, cx, |window, cx| {
+            // The window's content is cached under a layer that moves the
+            // live marks of agent threads (see `motion`).
+            motion::open_window(options, cx, |window, cx| {
                 cx.new(|cx| Workspace::new(path, window, cx))
             })
             .expect("failed to open the main window");

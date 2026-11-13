@@ -28,6 +28,7 @@ use super::composer::{Composer, ComposerEvent};
 use super::lanes::Lane;
 use super::{graph, labels};
 use crate::agent_threads::{AgentThreadKey, AgentThreads};
+use crate::motion;
 use crate::repository::Snapshot;
 use crate::theme::{self, color};
 use crate::time;
@@ -1262,6 +1263,7 @@ impl History {
             .justify_center()
             .child(
                 div()
+                    .relative()
                     .h_flex()
                     .gap(px(6.))
                     .pl(px(16.))
@@ -1269,6 +1271,7 @@ impl History {
                     .py(px(8.))
                     .rounded(px(12.))
                     .bg(rgb(color::BUTTON))
+                    .child(motion::occluder())
                     .border_1()
                     .border_color(rgb(color::PICK_BAR_BORDER))
                     .shadow_lg()
@@ -2032,6 +2035,8 @@ impl History {
                 .left(px(10.))
                 .right(columns::END_PADDING)
                 .occlude()
+                // Over the live lanes: their moving marks stay under it.
+                .child(motion::occluder())
                 .child(composer.clone()),
         )
     }

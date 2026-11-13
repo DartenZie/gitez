@@ -49,6 +49,10 @@ pub fn window_size() -> Size<Pixels> {
 /// How many steps of 50 ms of test time [`Shots::settle`] runs.
 const SETTLE_STEPS: usize = 40;
 
+/// The point of their animation live marks are shown at (pulse ring a
+/// third grown, a blinking dot at 80 %), unless a test lets them move.
+pub const MOTION_TIME: Duration = Duration::from_millis(300);
+
 /// A GitEZ app on the test platform that draws real pixels.
 pub struct Shots {
     cx: HeadlessAppContext,
@@ -92,6 +96,9 @@ impl Shots {
             crate::recent::init_in_memory(cx);
             init_with(options, cx);
             cx.bind_keys(crate::workspace::key_bindings());
+            // Live marks are caught at one point of their motion, so a shot
+            // does not depend on how long the test ran.
+            crate::motion::set_fixed_time(Some(MOTION_TIME), cx);
         });
         let mut shots = Self { cx, dir };
         shots.settle();
@@ -122,12 +129,92 @@ impl Shots {
         opened
     }
 
-    /// The main window at its opening size, with the repository at `path`.
+    /// The main window at its opening size, with the repository at `path`,
+    /// under the live layer as in the app.
     pub fn open_workspace(&mut self, path: &Path) -> (AnyWindowHandle, Entity<Workspace>) {
         let path = path.to_owned();
-        self.open(window_size(), |window, cx| {
-            cx.new(|cx| Workspace::new(Some(path), window, cx))
-        })
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds {
+                origin: point(px(0.), px(0.)),
+                size: window_size(),
+            })),
+            focus: true,
+            show: true,
+            ..Default::default()
+        };
+        let opened = self
+            .cx
+            .update(|cx| {
+                crate::motion::open_window(options, cx, |window, cx| {
+                    cx.new(|cx| Workspace::new(Some(path), window, cx))
+                })
+            })
+            .expect("the window opens");
+        self.settle();
+        opened
+    }
+
+    /// Lets live marks move with the test clock (`None`), or holds them at
+    /// one point of their animation.
+    pub fn set_motion_time(&mut self, time: Option<Duration>) {
+        self.cx.update(|cx| crate::motion::set_fixed_time(time, cx));
+    }
+
+    /// Advances the test clock by `step` and runs what is then due, without
+    /// [`Shots::settle`]'s two seconds.
+    pub fn advance(&mut self, step: Duration) {
+        self.cx.advance_clock(step);
+        self.cx.run_until_parked();
+    }
+
+    /// The part of `window` in `bounds` (logical pixels) as drawn now: no
+    /// settling, so the clock stays where [`Shots::advance`] left it.
+    pub fn capture_region(
+        &mut self,
+        window: AnyWindowHandle,
+        bounds: Bounds<Pixels>,
+    ) -> image::RgbaImage {
+        let image = self
+            .cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                window.render_to_image()
+            })
+            .expect("the window is open")
+            .expect("the window renders");
+        crop(&image, bounds)
+    }
+
+    /// The mean time `window.draw` takes over `frames` frames, each after
+    /// `prepare` and a frame's time ([`crate::motion::FRAME`]) on the clock.
+    /// Only drawing is timed (layout, prepaint, paint), not the GPU.
+    pub fn time_frames(
+        &mut self,
+        window: AnyWindowHandle,
+        frames: u32,
+        prepare: impl Fn(&mut Window, &mut App),
+    ) -> Duration {
+        let mut total = Duration::ZERO;
+        for _ in 0..frames {
+            self.cx
+                .update_window(window, |_, window, cx| prepare(window, cx))
+                .expect("the window is open");
+            self.advance(crate::motion::FRAME);
+            total += self
+                .cx
+                .update_window(window, |_, window, cx| {
+                    let started = std::time::Instant::now();
+                    window.draw(cx).clear(cx);
+                    started.elapsed()
+                })
+                .expect("the window is open");
+        }
+        total / frames
+    }
+
+    /// Writes `image` to `<GITEZ_SCREENSHOTS>/<name>.png`.
+    pub fn save_image(&self, image: image::RgbaImage, name: &str) -> PathBuf {
+        self.write(image, name)
     }
 
     /// Runs what is pending and two seconds of timers, so repositories,
@@ -298,13 +385,7 @@ impl Shots {
         name: &str,
     ) -> PathBuf {
         let image = self.render(window);
-        let scale = |value: Pixels| (f32::from(value) * 2.).round().max(0.) as u32;
-        let x = scale(bounds.origin.x).min(image.width());
-        let y = scale(bounds.origin.y).min(image.height());
-        let width = scale(bounds.size.width).min(image.width() - x);
-        let height = scale(bounds.size.height).min(image.height() - y);
-        let crop = image::imageops::crop_imm(&image, x, y, width, height).to_image();
-        self.write(crop, name)
+        self.write(crop(&image, bounds), name)
     }
 
     fn render(&mut self, window: AnyWindowHandle) -> image::RgbaImage {
@@ -324,6 +405,16 @@ impl Shots {
         eprintln!("screenshot: {}", path.display());
         path
     }
+}
+
+/// The part of a 2× `image` in `bounds` (logical pixels).
+fn crop(image: &image::RgbaImage, bounds: Bounds<Pixels>) -> image::RgbaImage {
+    let scale = |value: Pixels| (f32::from(value) * 2.).round().max(0.) as u32;
+    let x = scale(bounds.origin.x).min(image.width());
+    let y = scale(bounds.origin.y).min(image.height());
+    let width = scale(bounds.size.width).min(image.width() - x);
+    let height = scale(bounds.size.height).min(image.height() - y);
+    image::imageops::crop_imm(image, x, y, width, height).to_image()
 }
 
 /// Loads the fonts in the folder `GITEZ_SCREENSHOT_FONTS` names, if set.

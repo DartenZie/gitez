@@ -22,6 +22,7 @@ use crate::agent_threads::{
     AgentThreadKey, AgentThreads, Counts, Notice, OpenAgentPullRequest, OpenAgentThread,
     OpenSettings, ThreadFacts,
 };
+use crate::motion;
 use crate::theme::{self, color};
 use crate::workspace::ShowHome;
 use crate::workspace::agent_thread::{
@@ -542,12 +543,7 @@ pub(crate) fn agents_indicator(
                 .text_size(px(12.))
                 .text_color(rgb(part.color()))
                 .when(part == Part::Active, |this| {
-                    this.child(
-                        div()
-                            .size(px(6.))
-                            .rounded_full()
-                            .bg(rgb(color::BRANCH_BLUE)),
-                    )
+                    this.child(motion::blinking_dot(px(6.), color::BRANCH_BLUE))
                 })
                 .child(text)
         }));
@@ -998,7 +994,7 @@ fn render_row(
         .cursor_pointer()
         .hover(|style| style.bg(rgb(color::PALETTE_HOVER)))
         .on_click(open)
-        .child(state_icon(thread, item.facts.pull_request))
+        .child(state_icon(thread, item.facts.pull_request, false))
         .child(body)
         .child(trailing)
 }

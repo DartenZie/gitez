@@ -295,11 +295,16 @@ fn test_sandbox() -> Option<Arc<dyn gitez_sandbox::Sandbox>> {
 }
 
 /// Logs `message` when `GITEZ_DEBUG_THREADS` is set.
-fn debug(message: impl FnOnce() -> String) {
-    static ON: OnceLock<bool> = OnceLock::new();
-    if *ON.get_or_init(|| std::env::var_os(DEBUG_ENV).is_some_and(|value| !value.is_empty())) {
+pub(crate) fn debug(message: impl FnOnce() -> String) {
+    if debugging() {
         eprintln!("gitez threads: {}", message());
     }
+}
+
+/// Whether `GITEZ_DEBUG_THREADS` is set.
+pub(crate) fn debugging() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(DEBUG_ENV).is_some_and(|value| !value.is_empty()))
 }
 
 impl AgentThreads {
