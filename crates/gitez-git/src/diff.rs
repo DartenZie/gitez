@@ -12,6 +12,7 @@ use gix::object::tree::EntryKind;
 use gix::object::tree::diff::Change;
 
 use crate::details::{kind, trees};
+use crate::merge::tree_before_changes;
 use crate::{ChangeKind, Error, LineCounts, Oid, Repository, Result, WorktreeChange};
 
 /// Unchanged lines shown around each change, as `git diff` does.
@@ -249,17 +250,18 @@ impl Repository {
         tree_diff(&repo, &old_tree, &new_tree, options)
     }
 
-    /// The changes commit `head` makes since it left commit `base`, like
-    /// `git diff base...head`: from their merge base (or the empty tree,
-    /// when there is none) to `head`, in path order.
+    /// The changes commit `head` makes since it left commit `base`, in path
+    /// order: from their merge base (or the empty tree, when there is none)
+    /// to `head`, like `git diff base...head`, but without the changes
+    /// `base` has as well. Changes of `base` that reached `head` some other
+    /// way than a merge commit, such as a squash or a cherry-pick, are
+    /// therefore not shown as the branch's own.
     pub fn branch_diff(&self, base: Oid, head: Oid, options: DiffOptions) -> Result<BranchDiff> {
-        let repo = self.local();
+        // The tree compared with stays in memory.
+        let repo = self.local().with_object_memory();
         let merge_base = repo.merge_base(base, head)?;
         let merge_base = merge_base.map(|id| id.detach());
-        let old_tree = match merge_base {
-            Some(id) => repo.find_commit(id)?.tree()?,
-            None => repo.empty_tree(),
-        };
+        let old_tree = tree_before_changes(&repo, merge_base, base, head)?;
         let new_tree = repo.find_commit(head)?.tree()?;
         let files = tree_diff(&repo, &old_tree, &new_tree, options)?;
         let (ahead, _) = self.ahead_behind(head, base)?;

@@ -33,6 +33,9 @@ prompt, or send it straight to [Claude Code](https://docs.claude.com/en/docs/cla
 - Read the diff in unified or split view, and mark files as viewed. A viewed
   file opens again when it changes. Swipe sideways, or hold Shift and scroll,
   to read long lines.
+- The diff shows only what the branch itself changes. Changes that are also on
+  the base branch do not show, whether the base was merged into the branch,
+  squashed into it or cherry-picked.
 - Comment on one line or a range of lines. Threads support replies and
   **Resolve**, and a thread resolves itself when a new commit changes its lines.
   Hover a comment to edit or delete it.
