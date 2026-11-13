@@ -3,7 +3,7 @@
 //! the ways to bring the branch in. It opens for a local pull request, or
 //! when a branch is dropped on another in the history.
 
-use gitez_command::{Git, MergeMethod, MergeOutcome, ResetMode};
+use gitez_command::{Git, MergeMethod, MergeOutcome, ResetMode, WorktreeProblem};
 use gitez_git::{Head, MergePreview, Oid, RefKind, RefLabel, Repository};
 use gitez_review::{PullRequest, State, Store, Timestamp};
 use gpui_kit::assets::IconName;
@@ -671,14 +671,17 @@ fn carry_out(
     // worktree's working tree is the agent's, so the rebase does not run
     // `git` there directly; `rebase_in_worktree` checks the worktree's
     // `.git` pointer and git dir first and hardens the rebase.
-    let head_worktree = match repository.linked_worktree_of(&head)? {
-        Some(dir) if dir.exists() => Some(dir),
-        Some(_) => {
+    // The main working tree is left alone, as before: a branch checked
+    // out there while a linked one is open is git's to refuse.
+    let head_worktree = match git.worktree_of(&head)? {
+        Some(worktree) if !worktree.linked => None,
+        Some(worktree) if worktree.problem == Some(WorktreeProblem::Missing) => {
             // Its folder was deleted: git holds the branch for it until
             // pruned.
             git.worktree_prune()?;
             None
         }
+        Some(worktree) => Some(worktree.path),
         None => None,
     };
     let common_dir = repository.common_dir();
@@ -923,12 +926,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let (main, worktree, number) = thread_repository(dir.path());
         let repository = Repository::open(&main).expect("open");
+        let found = Git::new(&main)
+            .worktree_of("agent/fix")
+            .expect("read")
+            .expect("checked out in the worktree");
+        assert!(found.linked);
         assert_eq!(
-            repository
-                .linked_worktree_of("agent/fix")
-                .expect("read")
-                .map(|dir| dir.canonicalize().expect("canonical")),
-            Some(worktree.canonicalize().expect("canonical"))
+            found.path.canonicalize().expect("canonical"),
+            worktree.canonicalize().expect("canonical")
         );
         let store = Store::new(&repository.common_dir());
         let (done, _) = carry_out(
@@ -980,7 +985,7 @@ mod tests {
         .expect("rebased here and merged");
         assert!(matches!(done, Done::Merged(Some(_))));
         assert_eq!(
-            repository.linked_worktree_of("agent/fix").expect("read"),
+            Git::new(&main).worktree_of("agent/fix").expect("read"),
             None
         );
         assert_eq!(git(&main, &["branch", "--show-current"]), "main");

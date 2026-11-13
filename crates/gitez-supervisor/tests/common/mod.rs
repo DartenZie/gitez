@@ -360,7 +360,7 @@ impl Fixture {
     }
 }
 
-fn write_script(path: &Path, body: &str) {
+pub fn write_script(path: &Path, body: &str) {
     std::fs::write(path, body).expect("write script");
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 }

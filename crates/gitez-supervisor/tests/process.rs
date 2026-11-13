@@ -99,6 +99,64 @@ fn stop_interrupts_the_agent_and_ends_the_thread_as_stopped() {
     ));
 }
 
+/// Whether process `pid` is still there (a zombie counts until reaped).
+fn process_exists(pid: u32) -> bool {
+    let pid = rustix::process::Pid::from_raw(pid as i32).expect("a pid");
+    rustix::process::test_kill_process(pid).is_ok()
+}
+
+/// The git GitEZ runs itself to make the worktree is in a process group
+/// of its own, which no signal to the supervisor reaches: Stop cancels it,
+/// with the user's hook it waits for.
+#[test]
+fn stop_ends_the_git_that_makes_the_worktree_with_its_hook() {
+    let fixture = Fixture::new();
+    // `git worktree add` runs the main repository's post-checkout hook,
+    // which here never ends by itself.
+    let pids = fixture.base.join("hook pids");
+    common::write_script(
+        &fixture.base.join("no hooks").join("post-checkout"),
+        &format!(
+            "#!/bin/sh\necho $$ > '{pids}.tmp'\nsleep 600 &\necho $! >> '{pids}.tmp'\n\
+             mv '{pids}.tmp' '{pids}'\nwait\n",
+            pids = pids.display()
+        ),
+    );
+    let id = fixture.create("What is the answer?").id;
+    let thread_dir = fixture.thread_dir(&id);
+    fixture.launch(&id, Command::Start, &Secrets::default());
+    wait_until(LONG, "the hook to start", || pids.is_file());
+    let hook: Vec<u32> = std::fs::read_to_string(&pids)
+        .expect("read the pids")
+        .lines()
+        .map(|line| line.trim().parse().expect("a pid"))
+        .collect();
+    assert_eq!(hook.len(), 2, "{hook:?}");
+    let preparing = fixture.load(&id);
+    assert_eq!(preparing.state, State::Preparing, "{preparing:#?}");
+
+    let stopped_at = Instant::now();
+    stop(
+        &thread_dir,
+        preparing.supervisor.as_ref().expect("supervisor"),
+    )
+    .expect("stop");
+    let thread = fixture.wait_for(&id, Duration::from_secs(15), is_done);
+    // The cancel's grace period is 2 s, the stop is noticed within 0.1 s.
+    assert!(stopped_at.elapsed() < Duration::from_secs(10));
+    assert_eq!(thread.ending, Some(Ending::Stopped), "{thread:#?}");
+    assert!(thread.error.is_none(), "{thread:#?}");
+    assert!(fixture.calls().is_empty(), "the agent never ran");
+    wait_until(
+        Duration::from_secs(5),
+        "the hook and its child to go",
+        || hook.iter().all(|pid| !process_exists(*pid)),
+    );
+    wait_until(Duration::from_secs(5), "the supervisor to exit", || {
+        !is_running(&thread_dir)
+    });
+}
+
 #[test]
 fn the_global_limit_queues_threads_in_order_and_cleans_dead_tickets() {
     let fixture = Fixture::with_limit(1);

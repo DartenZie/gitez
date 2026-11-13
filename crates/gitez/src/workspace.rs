@@ -18,6 +18,8 @@ mod home;
 mod labels;
 mod lanes;
 #[cfg(all(test, target_os = "macos"))]
+mod merge_shots;
+#[cfg(all(test, target_os = "macos"))]
 mod motion_shots;
 #[cfg(test)]
 mod motion_tests;
@@ -82,7 +84,7 @@ pub use home::NewThread;
 use home::{Home, HomeEvent};
 use new_pull_request::{FormEvent, NewPullRequestForm};
 use palette::{Palette, PaletteCommand, PaletteContext, PaletteEvent};
-use remote::{RemoteActions, RemoteOp};
+use remote::{RemoteActions, RunningRemote};
 use remotes::RemoteForm;
 use review::{MergeDialog, MergeEvent, MergedPullRequest, Merging, Review, ReviewEvent, Tips};
 use rewrite::{Rewrite, RewriteEvent};
@@ -106,6 +108,7 @@ actions!(
         Fetch,
         Pull,
         Push,
+        CancelRemote,
         NewBranch,
         NewTag,
         AddRemote,
@@ -203,7 +206,7 @@ pub struct Workspace {
     /// Changing a branch or a stash.
     git_command: Option<Task<()>>,
     /// The fetch, pull or push running, if one is.
-    remote_op: Option<(RemoteOp, Task<()>)>,
+    remote_op: Option<RunningRemote>,
     /// The command palette of the open repository, kept while hidden so a
     /// command run from it can finish.
     palette: Option<(Entity<Palette>, Subscription)>,
@@ -300,6 +303,7 @@ impl Workspace {
                 SidebarEvent::PushBranch(branch) => {
                     this.push_branch(branch.clone(), false, window, cx)
                 }
+                SidebarEvent::CancelRemote => this.cancel_remote(&CancelRemote, window, cx),
                 SidebarEvent::Unstash { index, pop } => this.unstash(*index, *pop, window, cx),
                 SidebarEvent::DropStash(index) => this.drop_stash(*index, window, cx),
             }),
@@ -2082,6 +2086,14 @@ impl Workspace {
         };
         self.history
             .update(cx, |history, cx| history.set_lanes(lanes, cx));
+        // The sidebar does not offer to pull a thread's branch.
+        let branches = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| remote::ThreadWorktrees::of(snapshot, cx).branches)
+            .unwrap_or_default();
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.set_thread_branches(branches, cx));
     }
 
     /// Starts the agent thread the composer asks for, then shows it. If it
@@ -2221,6 +2233,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::fetch))
             .on_action(cx.listener(Self::pull))
             .on_action(cx.listener(Self::push))
+            .on_action(cx.listener(Self::cancel_remote))
             .on_action(cx.listener(Self::new_branch))
             .on_action(cx.listener(Self::new_tag))
             .on_action(cx.listener(Self::add_remote))
@@ -2249,7 +2262,11 @@ impl Render for Workspace {
                 focus: self.focus_handle.clone(),
                 loading: self.loading.is_some() || self.cloning.is_some(),
                 remote: snapshot.as_deref().map(RemoteActions::of),
-                running: self.remote_op.as_ref().map(|(op, _)| *op),
+                running: self.remote_op.as_ref().map(|running| running.op),
+                cancelling: self
+                    .remote_op
+                    .as_ref()
+                    .is_some_and(|running| running.cancelling),
                 can_branch: snapshot
                     .as_ref()
                     .and_then(|snapshot| snapshot.refs.head.as_ref())

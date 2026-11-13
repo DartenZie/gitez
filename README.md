@@ -254,7 +254,22 @@ run in the same sandbox.
 - **Rewrite history**: reword, edit, squash, fixup, drop and reorder commits,
   and autosquash `fixup!` commits. The old tip is kept as `refs/gitez/backup/<branch>`.
 - **Branches, remotes, tags and stashes**: create, rename, delete, check out,
-  pull, push, fetch, set upstreams, revert and reset.
+  pull, push, fetch, set upstreams, revert and reset. Pulling a branch that is
+  not checked out fast-forwards it. If the branch is checked out in another
+  worktree, GitEZ pulls it there, so that worktree's files follow; it changes
+  nothing when the branch has commits of its own, when uncommitted changes
+  are in the way, or when the worktree is missing or locked, and says which.
+  An agent thread's branch is not pulled while it is checked out in the
+  thread's worktree: GitEZ runs `git` there only inside the sandbox.
+- **Cancel a fetch, pull or push**: while one runs, **Cancel** is in the
+  toolbar and on the branch's or remote's row in the sidebar. It ends `git`
+  and every process it started, such as `ssh`: they are asked to stop and
+  killed if they are still there 2 seconds later. If `git` writes a message
+  and then neither continues nor exits for 3 seconds, GitEZ shows the message
+  while the operation is still running, with **Cancel** beside it. A `git`
+  command run from the palette has **Cancel** too. **Stop** on an agent
+  thread likewise ends the `git` that GitEZ runs to make its worktree, with
+  any hook it waits for.
 - **Undo and redo** for most actions: commits, checkouts, merges, rebases,
   resets, stashes, discarded changes and more.
 - **Syntax highlighting** in diffs, the conflict editor and the file editor,

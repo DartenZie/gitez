@@ -309,6 +309,11 @@ impl Pipeline<'_> {
         if !exists || !self.thread.prepared {
             self.set_preparing("creating worktree");
         }
+        // Git runs here, outside the sandbox and in a process group of its
+        // own, with the user's hooks (`post-checkout`): a stop ends it.
+        let operation = gitez_command::Operation::new();
+        let cancel = CancelOnStop::start(operation.clone(), self.env.stop.clone());
+        let git = gitez_command::Git::new(&main_dir).with_operation(&operation);
         if exists {
             gitez_agent_thread::check_worktree(
                 &self.common_dir,
@@ -318,15 +323,19 @@ impl Pipeline<'_> {
             .map_err(|error| failed(error.to_string()))?;
         } else {
             // A folder deleted by hand is still registered with git.
-            gitez_command::Git::new(&main_dir).worktree_prune().ok();
+            git.worktree_prune().ok();
         }
-        let created = gitez_agent_thread::create_worktree(
-            &main_dir,
+        let created = gitez_agent_thread::create_worktree_with(
+            &git,
             &worktree,
             &self.thread.branch,
             &self.thread.start.commit,
-        )
-        .map_err(|error| failed(error.to_string()))?;
+        );
+        cancel.finish();
+        let created = created.map_err(|error| match error {
+            gitez_agent_thread::Error::Git(error) if error.is_cancelled() => End::Stopped,
+            error => failed(error.to_string()),
+        })?;
         if !exists || self.thread.worktree_record.is_none() {
             let record = created.record.clone();
             self.save(|thread| {
@@ -1418,6 +1427,48 @@ impl Kind {
             Self::Agent => Step::Agent,
             Self::Commit => Step::Commit,
         }
+    }
+}
+
+/// Cancels the git commands of an [`Operation`](gitez_command::Operation)
+/// from a thread of its own once the stop flag is set: those GitEZ runs
+/// itself, each in a process group of its own, which a stop reaches no
+/// other way.
+struct CancelOnStop {
+    done: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl CancelOnStop {
+    fn start(operation: gitez_command::Operation, stop: Arc<AtomicBool>) -> Self {
+        let done = Arc::new(AtomicBool::new(false));
+        let finished = done.clone();
+        let handle = std::thread::spawn(move || {
+            while !finished.load(Ordering::SeqCst) {
+                if stop.load(Ordering::SeqCst) {
+                    operation.cancel();
+                    return;
+                }
+                std::thread::sleep(crate::queue::STOP_CHECK);
+            }
+        });
+        Self {
+            done,
+            handle: Some(handle),
+        }
+    }
+
+    fn finish(mut self) {
+        self.done.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            handle.join().ok();
+        }
+    }
+}
+
+impl Drop for CancelOnStop {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::SeqCst);
     }
 }
 

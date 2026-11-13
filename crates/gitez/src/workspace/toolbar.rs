@@ -15,8 +15,8 @@ use gpui_kit::*;
 use super::palette::lowercase_first;
 use super::remote::{RemoteActions, RemoteOp};
 use super::{
-    Fetch, NewBranch, NewPullRequest, OpenPalette, OpenRecent, OpenRepository, Pull, Push,
-    RedoStep, ShowHome, StashChanges, UndoStep,
+    CancelRemote, Fetch, NewBranch, NewPullRequest, OpenPalette, OpenRecent, OpenRepository, Pull,
+    Push, RedoStep, ShowHome, StashChanges, UndoStep,
 };
 use crate::theme::{self, color};
 use agents::{AgentsScope, agents_indicator};
@@ -62,6 +62,8 @@ pub struct Toolbar {
     pub remote: Option<RemoteActions>,
     /// The remote operation running, if one is.
     pub running: Option<RemoteOp>,
+    /// Whether it was cancelled and is ending.
+    pub cancelling: bool,
     /// Whether there is a commit to start a branch from.
     pub can_branch: bool,
     /// Whether there are uncommitted changes to stash.
@@ -136,7 +138,19 @@ impl RenderOnce for Toolbar {
                     ),
             )
             .child(separator())
-            .child(div().h_flex().gap(px(6.)).children(self.remote_buttons(cx)))
+            .child(
+                div()
+                    .h_flex()
+                    .gap(px(6.))
+                    .children(self.remote_buttons(cx))
+                    .when_some(self.running, |this, op| {
+                        this.child(
+                            div()
+                                .debug_selector(|| "toolbar-cancel-remote".into())
+                                .child(cancel_button(op, self.cancelling)),
+                        )
+                    }),
+            )
             .child(separator())
             .child(
                 div()
@@ -423,6 +437,26 @@ pub(crate) fn home_button(home: bool) -> Button {
         .on_click(|_, window, cx| window.dispatch_action(Box::new(ShowHome), cx))
 }
 
+/// Ends remote operation `op`, which is running, with every process git
+/// started for it; it only waits once the operation is `cancelling`.
+fn cancel_button(op: RemoteOp, cancelling: bool) -> Button {
+    Button::new("cancel-remote")
+        .h(BUTTON_HEIGHT)
+        .icon(IconName::Close)
+        .label(if cancelling {
+            "Cancelling…"
+        } else {
+            "Cancel"
+        })
+        .tooltip(if cancelling {
+            format!("Ending the {}", op.noun())
+        } else {
+            format!("Cancel the {}", op.noun())
+        })
+        .disabled(cancelling)
+        .on_click(|_, window, cx| window.dispatch_action(Box::new(CancelRemote), cx))
+}
+
 fn separator() -> impl IntoElement {
     div().w(px(1.)).h(px(20.)).bg(rgb(color::SEPARATOR))
 }
@@ -481,7 +515,110 @@ fn palette_entry() -> impl IntoElement {
 
 #[cfg(test)]
 mod tests {
-    use super::initial;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    // Not everything: `gpui_kit::test` would replace `#[test]`.
+    use gpui_kit::{
+        Context, FocusHandle, InteractiveElement as _, IntoElement, Modifiers, ParentElement as _,
+        Render, TestAppContext, VisualTestContext, Window, div, px, size,
+    };
+
+    use super::{Toolbar, initial};
+    use crate::workspace::CancelRemote;
+    use crate::workspace::remote::RemoteOp;
+
+    /// A window with the toolbar alone, counting the cancels it asks for.
+    struct Host {
+        focus: FocusHandle,
+        running: Option<RemoteOp>,
+        cancelling: bool,
+        cancels: Rc<Cell<u32>>,
+    }
+
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let cancels = self.cancels.clone();
+            div()
+                .track_focus(&self.focus)
+                .on_action(move |_: &CancelRemote, _, _| cancels.set(cancels.get() + 1))
+                .child(Toolbar {
+                    repository_name: Some("gitez".into()),
+                    repository_icon: None,
+                    repository_path: None,
+                    focus: self.focus.clone(),
+                    loading: false,
+                    remote: None,
+                    running: self.running,
+                    cancelling: self.cancelling,
+                    can_branch: false,
+                    can_stash: false,
+                    undo: None,
+                    redo: None,
+                    agents: None,
+                })
+        }
+    }
+
+    #[gpui_kit::test]
+    fn a_running_remote_operation_can_be_cancelled_from_the_toolbar(cx: &mut TestAppContext) {
+        // The Agents indicator reads the threads model; its data folder is
+        // this test's own.
+        let data = tempfile::tempdir().expect("temp dir");
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+            crate::agent_threads::init_with(
+                crate::agent_threads::Options {
+                    data_dir: Some(data.path().to_owned()),
+                    sandbox: std::sync::Arc::new(gitez_sandbox::Passthrough),
+                    agents: gitez_agent::Registry::builtin(),
+                    secrets: std::sync::Arc::new(gitez_secret::Memory::default()),
+                    exe: Err("no supervisor in tests".into()),
+                    watch: false,
+                },
+                cx,
+            );
+        });
+        let cancels = Rc::new(Cell::new(0));
+        let window = cx.open_window(size(px(1200.), px(60.)), {
+            let cancels = cancels.clone();
+            |window, cx| {
+                let focus = cx.focus_handle();
+                window.focus(&focus, cx);
+                Host {
+                    focus,
+                    running: None,
+                    cancelling: false,
+                    cancels,
+                }
+            }
+        });
+        let host = window
+            .update(cx, |_, _, cx| cx.entity())
+            .expect("window open");
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let show = |running: Option<RemoteOp>, cancelling: bool, cx: &mut VisualTestContext| {
+            host.update(cx, |host, cx| {
+                host.running = running;
+                host.cancelling = cancelling;
+                cx.notify();
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.debug_bounds("toolbar-cancel-remote")
+        };
+
+        assert_eq!(show(None, false, &mut cx), None);
+
+        let button = show(Some(RemoteOp::Pull), false, &mut cx).expect("cancel drawn");
+        cx.simulate_click(button.center(), Modifiers::default());
+        assert_eq!(cancels.get(), 1);
+
+        // Once cancelled the button stays, but only waits.
+        let button = show(Some(RemoteOp::Pull), true, &mut cx).expect("cancelling drawn");
+        cx.simulate_click(button.center(), Modifiers::default());
+        assert_eq!(cancels.get(), 1);
+    }
 
     #[test]
     fn the_initial_is_the_first_letter_or_digit_in_upper_case() {

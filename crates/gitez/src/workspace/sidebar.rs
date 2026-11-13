@@ -8,12 +8,14 @@ use gitez_git::{Branch, Oid, RemoteBranch, Stash, Tag};
 use gitez_review::{PullRequest, State};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::history::{DraggedBranch, DraggedLabel};
+use super::remote::{RemoteOp, RemoteTarget};
 use crate::repository::{Snapshot, Tracking};
 use crate::theme::{self, color};
 use crate::time;
@@ -27,6 +29,10 @@ const ROW_TEXT_SIZE: Pixels = px(12.5);
 
 /// The branches of agent threads, listed in Branches as one folder.
 const AGENT_FOLDER: &str = "agent/";
+
+/// Why a branch of an agent thread cannot be pulled, under the disabled
+/// Pull in its menu.
+const THREAD_PULL_REASON: &str = "Checked out in the thread\u{2019}s worktree";
 
 /// How far the branches in a folder are indented, beyond a row's padding.
 const FOLDER_INDENT: Pixels = px(14.);
@@ -94,6 +100,33 @@ pub enum SidebarEvent {
     /// Pull or push the branch with this name, checked out or not.
     PullBranch(String),
     PushBranch(String),
+    /// End the fetch, pull or push running.
+    CancelRemote,
+}
+
+/// The fetch, pull or push running, for the row it works on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningRow {
+    pub op: RemoteOp,
+    pub target: RemoteTarget,
+    /// Whether it was cancelled and is ending.
+    pub cancelling: bool,
+}
+
+impl RunningRow {
+    /// Whether it works on local branch `name`.
+    fn on_branch(&self, name: &str) -> bool {
+        matches!(&self.target, RemoteTarget::Branch(branch) if branch == name)
+    }
+
+    /// Whether it works on remote `name`.
+    fn on_remote(&self, name: &str) -> bool {
+        match &self.target {
+            RemoteTarget::Remotes => true,
+            RemoteTarget::Remote(remote) => remote == name,
+            RemoteTarget::Branch(_) => false,
+        }
+    }
 }
 
 pub struct Sidebar {
@@ -107,6 +140,11 @@ pub struct Sidebar {
     expanded_folders: HashSet<String>,
     /// The local branch being dragged, here or in the history.
     dragging: Option<SharedString>,
+    /// The fetch, pull or push running, shown on its row.
+    running: Option<RunningRow>,
+    /// The branches of the repository's agent threads that are checked
+    /// out in the threads' worktrees, which are not pulled.
+    thread_branches: HashSet<String>,
 }
 
 impl Sidebar {
@@ -118,6 +156,26 @@ impl Sidebar {
             expanded_remotes: HashSet::new(),
             expanded_folders: HashSet::new(),
             dragging: None,
+            running: None,
+            thread_branches: HashSet::new(),
+        }
+    }
+
+    /// Sets which branches are agent threads' checked out in their
+    /// worktrees: their menus do not offer Pull.
+    pub fn set_thread_branches(&mut self, branches: HashSet<String>, cx: &mut Context<Self>) {
+        if self.thread_branches != branches {
+            self.thread_branches = branches;
+            cx.notify();
+        }
+    }
+
+    /// Shows `running`, the fetch, pull or push in progress, on the row it
+    /// works on, with a button that cancels it; `None` once it has ended.
+    pub fn set_running(&mut self, running: Option<RunningRow>, cx: &mut Context<Self>) {
+        if self.running != running {
+            self.running = running;
+            cx.notify();
         }
     }
 
@@ -248,6 +306,7 @@ impl Render for Sidebar {
         }
         let snapshot = self.snapshot.clone();
         let dragging = self.dragging.clone();
+        let running = self.running.clone();
 
         div()
             .id("sidebar")
@@ -312,8 +371,11 @@ impl Render for Sidebar {
                 let mut remote_rows = Vec::new();
                 for (remote, branches) in &remotes {
                     let expanded = self.expanded_remotes.contains(*remote);
-                    remote_rows
-                        .push(remote_row(remote, branches.len(), expanded, cx).into_any_element());
+                    let running = running.as_ref().filter(|running| running.on_remote(remote));
+                    remote_rows.push(
+                        remote_row(remote, branches.len(), expanded, running, cx)
+                            .into_any_element(),
+                    );
                     if expanded {
                         remote_rows.extend(
                             branches
@@ -342,11 +404,17 @@ impl Render for Sidebar {
                 let branch_row_of =
                     |branch: &Branch, in_folder: Option<&str>, cx: &mut Context<Self>| {
                         let lifted = dragging.as_deref() == Some(branch.name.as_str());
+                        let running = running
+                            .as_ref()
+                            .filter(|running| running.on_branch(&branch.name));
+                        let in_thread = self.thread_branches.contains(&branch.name);
                         branch_row(
                             branch,
                             in_folder,
                             snapshot.tracking.get(&branch.name),
                             lifted,
+                            running,
+                            in_thread,
                             cx,
                         )
                         .into_any_element()
@@ -515,15 +583,59 @@ fn folder_row(
         .child(trailing(count.to_string()))
 }
 
+/// The end of the row a fetch, pull or push is `running` on: that it
+/// runs, and the button that cancels it.
+fn running_end(running: &RunningRow, cx: &mut Context<Sidebar>) -> impl IntoElement {
+    let noun = running.op.noun();
+    div()
+        .h_flex()
+        .flex_none()
+        .gap(px(4.))
+        .child(Spinner::new().xsmall().color(rgb(color::TEXT_MUTED).into()))
+        .when(!running.cancelling, |this| {
+            this.child(
+                div()
+                    .id("cancel-remote")
+                    .debug_selector(|| "sidebar-cancel-remote".into())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(16.))
+                    .rounded(px(3.))
+                    .text_color(rgb(color::TEXT_MUTED))
+                    .hover(|style| {
+                        style
+                            .bg(rgb(color::BUTTON_HOVER))
+                            .text_color(rgb(color::TEXT))
+                    })
+                    .tooltip(move |window, cx| {
+                        Tooltip::new(format!("Cancel the {noun}")).build(window, cx)
+                    })
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.emit(SidebarEvent::CancelRemote);
+                    }))
+                    .child(Icon::new(IconName::Close).size(px(12.))),
+            )
+        })
+}
+
 /// A local branch: double-click checks it out, right-click shows what else
 /// can be done with it. It can be dragged onto another branch, here or in the
 /// history, to merge it there; `lifted` while it is. In `folder`, it is
-/// indented under the folder's row and named without the folder.
+/// indented under the folder's row and named without the folder. While a
+/// pull or push of it is `running`, the row says so in place of its ahead
+/// and behind counts. A branch `in_thread`, an agent thread's checked out
+/// in its worktree, is not pulled: git would run there outside the
+/// sandbox.
+#[allow(clippy::too_many_arguments)]
 fn branch_row(
     branch: &Branch,
     folder: Option<&str>,
     tracking: Option<&Tracking>,
     lifted: bool,
+    running: Option<&RunningRow>,
+    in_thread: bool,
     cx: &mut Context<Sidebar>,
 ) -> impl IntoElement {
     let branch_color = rgb(theme::branch_color(&branch.name));
@@ -551,7 +663,8 @@ fn branch_row(
             }
             parts.join(" ")
         })
-        .filter(|text| !text.is_empty());
+        .filter(|text| !text.is_empty() && running.is_none());
+    let running = running.map(|running| running_end(running, cx).into_any_element());
 
     let name = folder
         .and_then(|folder| branch.name.strip_prefix(folder))
@@ -569,6 +682,7 @@ fn branch_row(
         .when_some(ahead_behind, |this, text| {
             this.child(trailing(text).font_weight(FontWeight::NORMAL))
         })
+        .children(running)
         .id(SharedString::from(format!("branch-{}", branch.name)))
         .debug_selector({
             let name = branch.name.clone();
@@ -631,8 +745,10 @@ fn branch_row(
                 .separator()
                 .item(
                     item("Pull", |name, _| SidebarEvent::PullBranch(name.to_owned()))
-                        .disabled(!tracked),
+                        .disabled(!tracked || in_thread),
                 )
+                // Menu items have no tooltip: the reason is its own row.
+                .when(in_thread && tracked, |menu| menu.label(THREAD_PULL_REASON))
                 .item(item(if tracked { "Push" } else { "Publish" }, |name, _| {
                     SidebarEvent::PushBranch(name.to_owned())
                 }))
@@ -755,11 +871,13 @@ fn pull_request_row(pull_request: &PullRequest, cx: &mut Context<Sidebar>) -> im
         )
 }
 
-/// A remote; click to list its branches.
+/// A remote; click to list its branches. While a fetch from it or a push
+/// to it is `running`, the row says so in place of its branch count.
 fn remote_row(
     remote: &str,
     branches: usize,
     expanded: bool,
+    running: Option<&RunningRow>,
     cx: &mut Context<Sidebar>,
 ) -> impl IntoElement {
     let count = if branches == 1 {
@@ -768,13 +886,17 @@ fn remote_row(
         format!("{branches} branches")
     };
     let name = remote.to_owned();
+    let end = match running {
+        Some(running) => running_end(running, cx).into_any_element(),
+        None => trailing(count).into_any_element(),
+    };
     row()
         .id(SharedString::from(format!("remote-{remote}")))
         .cursor_pointer()
         .on_click(cx.listener(move |this, _, _, cx| this.toggle_remote(&name, cx)))
         .child(Icon::new(IconName::Cloud).size(px(14.)))
         .child(label(remote.to_owned()))
-        .child(trailing(count))
+        .child(end)
         .child(
             Icon::new(if expanded {
                 IconName::ChevronDown
@@ -925,13 +1047,16 @@ fn stash_row(stash: &Stash, now: i64, cx: &mut Context<Sidebar>) -> impl IntoEle
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::path::Path;
+    use std::rc::Rc;
     use std::sync::Arc;
 
     use gpui_kit::{Entity, Modifiers, TestAppContext, VisualTestContext, px, size};
 
-    use super::Sidebar;
+    use super::{RunningRow, Sidebar, SidebarEvent};
     use crate::repository::Snapshot;
+    use crate::workspace::remote::{RemoteOp, RemoteTarget};
 
     fn git(dir: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
@@ -1011,5 +1136,85 @@ mod tests {
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert!(cx.debug_bounds("branch-folder-agent/").is_some());
         assert!(cx.debug_bounds("branch-agent/other").is_none());
+    }
+
+    #[gpui_kit::test]
+    fn the_row_of_a_running_pull_or_fetch_offers_to_cancel_it(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("a.txt"), "a\n").expect("write");
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "start"]);
+        git(root, &["remote", "add", "origin", "../nowhere.git"]);
+        // A remote is listed once it has a branch.
+        git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+        });
+        let snapshot = Arc::new(Snapshot::load(root).expect("read the repository"));
+        let window = cx.open_window(size(px(280.), px(700.)), |_, _| Sidebar::new());
+        let sidebar = window
+            .update(cx, |_, _, cx| cx.entity())
+            .expect("window open");
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let cancels = Rc::new(Cell::new(0));
+        let _subscription = cx.update(|_, cx| {
+            let cancels = cancels.clone();
+            cx.subscribe(&sidebar, move |_, event: &SidebarEvent, _| {
+                if matches!(event, SidebarEvent::CancelRemote) {
+                    cancels.set(cancels.get() + 1);
+                }
+            })
+        });
+        let show = |running: Option<RunningRow>, cx: &mut VisualTestContext| {
+            sidebar.update(cx, |sidebar, cx| {
+                sidebar.set_snapshot(snapshot.clone(), cx);
+                sidebar.set_running(running, cx);
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.debug_bounds("sidebar-cancel-remote")
+        };
+
+        // Nothing runs: nothing to cancel.
+        assert_eq!(show(None, &mut cx), None);
+
+        // A pull of the branch: its row has the button, and it asks to
+        // cancel.
+        let pull = RunningRow {
+            op: RemoteOp::Pull,
+            target: RemoteTarget::Branch("main".to_owned()),
+            cancelling: false,
+        };
+        let button = show(Some(pull.clone()), &mut cx).expect("cancel drawn on the branch");
+        cx.simulate_click(button.center(), Modifiers::default());
+        assert_eq!(cancels.get(), 1);
+
+        // Once cancelled it only waits.
+        let ending = RunningRow {
+            cancelling: true,
+            ..pull.clone()
+        };
+        assert_eq!(show(Some(ending), &mut cx), None);
+
+        // A pull of another branch is not shown on this one.
+        let other = RunningRow {
+            target: RemoteTarget::Branch("other".to_owned()),
+            ..pull
+        };
+        assert_eq!(show(Some(other), &mut cx), None);
+
+        // A fetch from every remote is shown on the remote, lower down.
+        let fetch = RunningRow {
+            op: RemoteOp::Fetch,
+            target: RemoteTarget::Remotes,
+            cancelling: false,
+        };
+        let on_remote = show(Some(fetch), &mut cx).expect("cancel drawn on the remote");
+        assert!(on_remote.top() > button.top());
+        cx.simulate_click(on_remote.center(), Modifiers::default());
+        assert_eq!(cancels.get(), 2);
     }
 }

@@ -49,7 +49,9 @@ two-face = { version = "0.4.5", default-features = false, features = ["syntect-f
 keyring = "4.2.0"
 # Copy-on-write clones of cache folders (APFS clonefile, Linux FICLONE).
 reflink-copy = "0.1.32"
-# Process groups, signals and setsid without unsafe code.
+# Process groups, signals and setsid without unsafe code: the agent's
+# process group, and a git that never finishes ended together with the
+# processes it started.
 rustix = { version = "1.1.6", features = ["process"] }
 # SIGTERM to the supervisor ends the agent's turn cleanly.
 signal-hook = "0.4.6"

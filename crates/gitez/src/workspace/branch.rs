@@ -10,6 +10,7 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::remote::{RemoteOp, RemoteTarget};
 use super::{NewBranch, Workspace};
 use crate::theme::color;
 use crate::undo::{self, Recorder};
@@ -447,7 +448,9 @@ impl Workspace {
             return;
         }
         let (on, branch) = (remote.clone(), name.clone());
-        self.run_git(
+        self.run_remote(
+            RemoteOp::Push,
+            RemoteTarget::Remote(remote.clone()),
             None,
             move |git| git.delete_remote_branch(&on, &branch),
             move |_, result, _, window, cx| {

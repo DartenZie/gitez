@@ -312,6 +312,85 @@ fn a_branch_checked_out_elsewhere_is_kept() {
     assert!(exists(&fixture, &main_thread.branch));
 }
 
+/// Git's list of working trees is asked, so a branch checked out in the
+/// main worktree is found also when GitEZ has a linked one open, and one
+/// in a locked worktree too.
+#[test]
+fn a_branch_checked_out_in_any_worktree_is_kept_wherever_gitez_runs() {
+    let fixture = Fixture::new();
+    let linked = fixture.root.parent().expect("base").join("linked tree");
+    git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "side",
+            linked.to_str().expect("utf-8"),
+        ],
+    );
+    let (thread, head) = worked(&fixture, "Main from linked", 0);
+    git(
+        &fixture.root,
+        &["merge", "--quiet", "--no-ff", "-m", "Merge", &thread.branch],
+    );
+    fs::remove_dir_all(&thread.worktree).expect("deleted by hand");
+    git(&fixture.root, &["worktree", "prune"]);
+    git(&fixture.root, &["switch", "--quiet", &thread.branch]);
+    let report =
+        complete(&linked, &thread, IfUncommitted::Keep, Some(&merged(&head))).expect("complete");
+    match &report.branch_kept {
+        Some(BranchKept::CheckedOut(place)) => assert_eq!(
+            place.canonicalize().expect("exists"),
+            fixture.root.canonicalize().expect("exists")
+        ),
+        kept => panic!("expected checked out in the main worktree, got {kept:?}"),
+    }
+    assert!(exists(&fixture, &thread.branch));
+
+    // In a locked worktree.
+    git(&fixture.root, &["switch", "--quiet", "main"]);
+    let (locked_thread, locked_head) = worked(&fixture, "Locked", 0);
+    git(
+        &fixture.root,
+        &[
+            "merge",
+            "--quiet",
+            "--no-ff",
+            "-m",
+            "Merge",
+            &locked_thread.branch,
+        ],
+    );
+    fs::remove_dir_all(&locked_thread.worktree).expect("deleted by hand");
+    git(&fixture.root, &["worktree", "prune"]);
+    let stick = fixture.root.parent().expect("base").join("on a stick");
+    git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--lock",
+            stick.to_str().expect("utf-8"),
+            &locked_thread.branch,
+        ],
+    );
+    let report = complete(
+        &fixture.root,
+        &locked_thread,
+        IfUncommitted::Keep,
+        Some(&merged(&locked_head)),
+    )
+    .expect("complete");
+    assert!(
+        matches!(&report.branch_kept, Some(BranchKept::CheckedOut(_))),
+        "{report:?}"
+    );
+    assert!(exists(&fixture, &locked_thread.branch));
+}
+
 #[test]
 fn a_kept_worktree_keeps_the_branch_until_it_is_removed() {
     let fixture = Fixture::new();

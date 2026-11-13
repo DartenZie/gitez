@@ -41,8 +41,8 @@ pub use store::{Run, RunHeader, Store};
 pub use watch::{Watcher, watch};
 pub use worktree::{
     BranchKept, CompleteReport, CreatedWorktree, IfUncommitted, Kept, Merged, ScratchDirs,
-    check_worktree, complete, create_worktree, rebase_in_worktree, scratch_dirs, worktree_git_dir,
-    worktree_path,
+    check_worktree, complete, create_worktree, create_worktree_with, rebase_in_worktree,
+    scratch_dirs, worktree_git_dir, worktree_path,
 };
 
 /// Times are RFC 3339 UTC, as in gitez-review.

@@ -327,6 +327,48 @@ impl Shots {
         });
     }
 
+    /// Clicks the right button at `position`, as to open a context menu.
+    pub fn right_click(&mut self, window: AnyWindowHandle, position: Point<Pixels>) {
+        self.hover(window, position);
+        self.update_window(window, |window, cx| {
+            let modifiers = window.modifiers();
+            window.dispatch_event(
+                MouseDownEvent {
+                    button: MouseButton::Right,
+                    position,
+                    modifiers,
+                    click_count: 1,
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.render_frame(cx);
+            window.dispatch_event(
+                MouseUpEvent {
+                    button: MouseButton::Right,
+                    position,
+                    modifiers,
+                    click_count: 1,
+                }
+                .to_platform_input(),
+                cx,
+            );
+        });
+    }
+
+    /// Where a fresh frame of `window` draws the element with id `id`.
+    pub fn bounds_of(
+        &mut self,
+        window: AnyWindowHandle,
+        id: &'static str,
+    ) -> Option<Bounds<Pixels>> {
+        self.update_window(window, |window, cx| {
+            gpui_kit::test::TestWindowExt::render_frame(window, cx);
+            gpui_kit::test::TestWindowExt::try_find(window, id).map(|element| element.bounds())
+        })
+    }
+
     /// Clicks the middle of the element with id `id`, where a fresh frame
     /// of `window` draws it, as the pointer would.
     /// Dialogs slide in on animations that run in real time, so this

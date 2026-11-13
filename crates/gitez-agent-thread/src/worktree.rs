@@ -8,7 +8,7 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
 
 use gitez_command::Git;
-use gitez_git::{HeadPlace, Repository};
+use gitez_git::Repository;
 
 use crate::{AgentThread, AgentThreadId, Error, Result, WorktreeRecord, repository_key};
 
@@ -153,6 +153,20 @@ pub fn create_worktree(
     branch: &str,
     start_commit: &str,
 ) -> Result<CreatedWorktree> {
+    create_worktree_with(&Git::new(main_work_dir), path, branch, start_commit)
+}
+
+/// [`create_worktree`] with `git`, a handle on the main working tree: one
+/// made [`Git::with_operation`] can be cancelled while git runs, such as
+/// the user's `post-checkout` hook, and then fails with
+/// [`gitez_command::Error::Cancelled`] (in [`Error::Git`]).
+pub fn create_worktree_with(
+    git: &Git,
+    path: &Path,
+    branch: &str,
+    start_commit: &str,
+) -> Result<CreatedWorktree> {
+    let main_work_dir = git.work_dir();
     let main = Repository::open(main_work_dir)?;
     let common_dir = main.common_dir();
     if path.exists() {
@@ -182,7 +196,6 @@ pub fn create_worktree(
         }
     }
 
-    let git = Git::new(main_work_dir);
     let tip = main.resolve_commit(&format!("refs/heads/{branch}"))?;
     let start = gitez_git::Oid::from_hex(start_commit.as_bytes()).ok();
     if tip.is_none() {
@@ -428,14 +441,6 @@ fn checked_out(git_dir: &Path) -> Result<Option<String>> {
         .trim_end_matches(['\r', '\n'])
         .strip_prefix("ref: refs/heads/")
         .map(str::to_owned))
-}
-
-/// The branch checked out in the main working tree at `work_dir`, if any.
-fn checked_out_branch(work_dir: &Path) -> Result<Option<String>> {
-    Ok(match Repository::open(work_dir)?.ref_state()?.head {
-        Some(HeadPlace::Branch(name) | HeadPlace::Unborn(name)) => Some(name),
-        _ => None,
-    })
 }
 
 /// What [`complete`] does with a worktree that has uncommitted changes:
@@ -688,8 +693,10 @@ fn delete_branch_if_safe(
     if !empty && !merged_tip {
         return Ok((None, say(BranchKept::Unmerged)));
     }
-    if let Some(place) = checked_out_in(main_work_dir, &main, &thread.branch)? {
-        return Ok((None, say(BranchKept::CheckedOut(place))));
+    // Any working tree: the main one (also when GitEZ has a linked one
+    // open), a linked one, a locked one, or one whose folder is gone.
+    if let Some(place) = git.worktree_of(&thread.branch)? {
+        return Ok((None, say(BranchKept::CheckedOut(place.path))));
     }
     let tip = tip.to_string();
     git.update_refs(&[gitez_command::RefUpdate {
@@ -698,18 +705,4 @@ fn delete_branch_if_safe(
         new: None,
     }])?;
     Ok((Some(tip), None))
-}
-
-/// The worktree that has `branch` checked out, if one has: the main
-/// worktree at `main_work_dir` or a linked one (its folder may be gone
-/// while git still records it).
-fn checked_out_in(
-    main_work_dir: &Path,
-    main: &Repository,
-    branch: &str,
-) -> Result<Option<PathBuf>> {
-    if checked_out_branch(main_work_dir)?.as_deref() == Some(branch) {
-        return Ok(Some(main_work_dir.to_owned()));
-    }
-    Ok(main.linked_worktree_of(branch)?)
 }
