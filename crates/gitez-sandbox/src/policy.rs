@@ -40,6 +40,15 @@ pub struct Policy {
     /// Not readable (hidden).
     pub deny_read: Vec<PathBuf>,
     pub network: Network,
+    /// Whether programs may ask macOS's certificate trust service
+    /// (`com.apple.trustd.agent`) to verify TLS certificates, as Python's
+    /// pip (through `truststore`), Go programs and others do; without it
+    /// they cannot reach any HTTPS host. trustd fetches revocation and
+    /// issuer data itself, outside the sandbox, which is a way past the
+    /// host list: allow it only where the host list already lets data
+    /// out. srt calls it `enableWeakerNetworkIsolation`. The Open profile
+    /// always allows it; Linux has no such service.
+    pub certificate_service: bool,
 }
 
 /// Whether `path` is a pattern rather than a name.

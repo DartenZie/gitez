@@ -35,10 +35,13 @@ pub use model::{
     RetryPlan, Start, State, Step, SupervisorInfo, Turn, TurnKind, TurnResult,
 };
 pub use names::{repository_key, slug, title_from_prompt};
-pub use prepare::{CACHE_DIRS, PrepareReport, PrepareStep, prepare};
+pub use prepare::{CACHE_DIRS, PrepareReport, PrepareStep, clone_tree, prepare};
 pub use store::{Run, RunHeader, Store};
 pub use watch::{Watcher, watch};
-pub use worktree::{CompleteReport, complete, create_worktree, worktree_git_dir, worktree_path};
+pub use worktree::{
+    CompleteReport, ScratchDirs, complete, create_worktree, scratch_dirs, worktree_git_dir,
+    worktree_path,
+};
 
 /// Times are RFC 3339 UTC, as in gitez-review.
 pub use jiff::Timestamp;

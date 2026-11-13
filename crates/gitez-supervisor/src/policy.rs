@@ -29,18 +29,27 @@ pub(crate) struct Place {
     pub(crate) branch: String,
     /// `<data>/tmp/<repo key>-<id>`, the commands' `TMPDIR`.
     pub(crate) tmp_dir: PathBuf,
+    /// `<data>/caches/<repo key>-<id>`, the thread's own toolchain caches
+    /// (see `toolchains`).
+    pub(crate) caches_dir: PathBuf,
     pub(crate) data_dir: PathBuf,
 }
 
 /// The policy for a command of the thread at `place`: it may write its
 /// worktree, the objects and its own branch's ref files of the repository,
-/// its temporary folder and what the agent needs; never the hooks, the
-/// git config, GitEZ's own files in the git dir or GitEZ's settings.
+/// its temporary folder and caches, what the agent needs and the folders
+/// the user made writable in Settings; never the hooks, the git config,
+/// GitEZ's own files in the git dir or GitEZ's settings. The certificate
+/// service is open when the network reaches more than the agent's API
+/// (`profile` Packages or Open): there the host list already lets data
+/// out, and without it pip, Go and other programs that verify
+/// certificates through macOS reach no host.
 pub(crate) fn policy(
     place: &Place,
     needs: &AgentNeeds,
     settings: &Settings,
     network: Network,
+    profile: Option<NetworkProfile>,
 ) -> Policy {
     let common = real(&place.common_dir);
     let branch_ref = Path::new("refs/heads").join(&place.branch);
@@ -56,6 +65,7 @@ pub(crate) fn policy(
         // stays read-only.
         WritePath::File(common.join("packed-refs.lock")),
         WritePath::Tree(real(&place.tmp_dir)),
+        WritePath::Tree(real(&place.caches_dir)),
     ];
     write.extend(
         needs
@@ -68,6 +78,12 @@ pub(crate) fn policy(
             .write_files
             .iter()
             .map(|file| WritePath::File(real(file))),
+    );
+    write.extend(
+        settings
+            .writable_paths()
+            .iter()
+            .map(|path| WritePath::Tree(real(path))),
     );
     let data = real(&place.data_dir);
     Policy {
@@ -85,7 +101,17 @@ pub(crate) fn policy(
             .map(|path| real(path))
             .collect(),
         network,
+        certificate_service: downloads(profile),
     }
+}
+
+/// Whether commands with `profile` reach package registries (`None`: no
+/// network at all).
+pub(crate) fn downloads(profile: Option<NetworkProfile>) -> bool {
+    matches!(
+        profile,
+        Some(NetworkProfile::Packages | NetworkProfile::Open)
+    )
 }
 
 /// The hosts a network profile allows: the agent's own; with Packages also
@@ -257,6 +283,7 @@ mod tests {
             worktree_git_dir: common.join("worktrees/wt"),
             branch: "agent/x".to_owned(),
             tmp_dir: base.join("data/tmp/repo-x"),
+            caches_dir: base.join("data/caches/repo-x"),
             data_dir: base.join("data"),
         };
         let needs = AgentNeeds {
@@ -264,7 +291,15 @@ mod tests {
             write_files: vec![base.join("lock")],
             hosts: Vec::new(),
         };
-        let policy = policy(&place, &needs, &Settings::default(), Network::Open);
+        let mut settings = Settings::default();
+        settings.sandbox.writable_paths = vec![base.join("gradle").to_string_lossy().into_owned()];
+        let policy = policy(
+            &place,
+            &needs,
+            &settings,
+            Network::Hosts(Vec::new()),
+            Some(NetworkProfile::AgentOnly),
+        );
         let has = |write: WritePath| policy.write.contains(&write);
         assert!(has(WritePath::Tree(base.join("wt"))));
         assert!(has(WritePath::Tree(common.join("objects"))));
@@ -272,6 +307,8 @@ mod tests {
         assert!(has(WritePath::File(common.join("refs/heads/agent/x.lock"))));
         assert!(has(WritePath::File(common.join("logs/refs/heads/agent/x"))));
         assert!(has(WritePath::Tree(base.join("data/tmp/repo-x"))));
+        assert!(has(WritePath::Tree(base.join("data/caches/repo-x"))));
+        assert!(has(WritePath::Tree(base.join("gradle"))));
         assert!(has(WritePath::Tree(base.join("config/projects/p"))));
         assert!(has(WritePath::File(base.join("lock"))));
         assert!(
@@ -285,6 +322,36 @@ mod tests {
         }
         assert!(policy.deny_write.contains(&base.join("data/settings.json")));
         assert!(!policy.deny_read.is_empty());
+        assert!(!policy.certificate_service, "closed without package hosts");
+    }
+
+    #[test]
+    fn the_certificate_service_opens_with_the_package_hosts() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let base = dir.path().canonicalize().expect("canonical");
+        let place = Place {
+            common_dir: base.join("repo/.git"),
+            worktree: base.join("wt"),
+            worktree_git_dir: base.join("repo/.git/worktrees/wt"),
+            branch: "agent/x".to_owned(),
+            tmp_dir: base.join("data/tmp/repo-x"),
+            caches_dir: base.join("data/caches/repo-x"),
+            data_dir: base.join("data"),
+        };
+        let open = |profile| {
+            policy(
+                &place,
+                &AgentNeeds::default(),
+                &Settings::default(),
+                Network::Hosts(Vec::new()),
+                profile,
+            )
+            .certificate_service
+        };
+        assert!(!open(None));
+        assert!(!open(Some(NetworkProfile::AgentOnly)));
+        assert!(open(Some(NetworkProfile::Packages)));
+        assert!(open(Some(NetworkProfile::Open)));
     }
 
     #[test]

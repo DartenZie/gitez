@@ -27,6 +27,7 @@ fn policy(write: Vec<WritePath>, network: Network) -> Policy {
         deny_write: Vec::new(),
         deny_read: Vec::new(),
         network,
+        certificate_service: false,
     }
 }
 
@@ -183,6 +184,18 @@ fn macos_settings_tell_trees_from_files_and_keep_patterns() {
 }
 
 #[test]
+fn the_certificate_service_is_opened_only_when_asked_and_only_on_macos() {
+    let mut policy = policy(Vec::new(), Network::Hosts(vec!["pypi.org".into()]));
+    let closed = settings(&policy, &["pypi.org".to_owned()], Os::Mac);
+    assert!(closed.get("enableWeakerNetworkIsolation").is_none());
+    policy.certificate_service = true;
+    let open = settings(&policy, &["pypi.org".to_owned()], Os::Mac);
+    assert_eq!(open["enableWeakerNetworkIsolation"], json!(true));
+    let linux = settings(&policy, &["pypi.org".to_owned()], Os::Linux);
+    assert!(linux.get("enableWeakerNetworkIsolation").is_none());
+}
+
+#[test]
 fn no_hosts_is_no_network() {
     let settings = settings(
         &policy(Vec::new(), Network::Hosts(Vec::new())),
@@ -316,9 +329,28 @@ fn wrap_keeps_env_cwd_and_stdin() {
         "CLAUDE_CODE_TMPDIR".to_owned(),
         tmp.to_string_lossy().into_owned()
     )));
+    // Node.js's own clients use srt's proxy.
+    assert!(
+        out.env
+            .contains(&("NODE_USE_ENV_PROXY".to_owned(), "1".to_owned()))
+    );
     assert!(out.env_remove.starts_with(&command.env_remove));
     assert!(tmp.is_dir(), "the thread's temporary folder is created");
     let dashes = out.args.iter().position(|arg| arg == "--").expect("a --");
+    // srt itself keeps its sockets in the private, short run folder, not in
+    // the command's temporary folder, which the sandbox can write.
+    let srt_tmp = out
+        .env
+        .iter()
+        .rev()
+        .find(|(name, _)| name == "TMPDIR")
+        .map(|(_, value)| PathBuf::from(value))
+        .expect("srt's TMPDIR");
+    assert_eq!(
+        Path::new(&out.args[dashes - 1]).parent(),
+        Some(srt_tmp.as_path())
+    );
+    assert!(srt_tmp.as_os_str().len() <= SHORT_BASE_MAX + "/gitez-sandbox-XXXXXX".len());
     assert_eq!(
         out.args[dashes + 1..],
         [
@@ -616,6 +648,7 @@ impl Repo {
                 self.root.path().join("home/.docker/config.json"),
             ],
             network,
+            certificate_service: false,
         }
     }
 
@@ -792,4 +825,12 @@ fn real_open_signals() {
         )
         .expect("it wraps");
     hard_stop(&wrapped.command);
+}
+
+#[test]
+fn a_long_temporary_folder_gives_way_to_tmp() {
+    let short = PathBuf::from("/var/folders/ab/cdefgh_ijklmn/T");
+    assert_eq!(short_base(short.clone()), short);
+    let long = PathBuf::from(format!("/Users/someone/{}", "deep/".repeat(20)));
+    assert_eq!(short_base(long), Path::new("/tmp"));
 }

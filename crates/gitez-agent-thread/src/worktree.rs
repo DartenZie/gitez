@@ -24,6 +24,76 @@ pub fn worktree_path(
         .join(id.as_str())
 }
 
+/// A thread's own folders in GitEZ's data folder, beside its worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScratchDirs {
+    /// `<data_dir>/tmp/<repository key>-<id>`: the `TMPDIR` of its commands.
+    pub tmp: PathBuf,
+    /// `<data_dir>/caches/<repository key>-<id>`: its own package and build
+    /// caches (Cargo home, npm cache and the like), so that nothing it
+    /// downloads lands in the user's shared caches.
+    pub caches: PathBuf,
+}
+
+/// The scratch folders of thread `id` of the repository GitEZ keys as
+/// `repository_key` (the name of the folder its worktrees are in).
+pub fn scratch_dirs(data_dir: &Path, repository_key: &str, id: &AgentThreadId) -> ScratchDirs {
+    let name = format!("{repository_key}-{id}");
+    ScratchDirs {
+        tmp: data_dir.join("tmp").join(&name),
+        caches: data_dir.join("caches").join(name),
+    }
+}
+
+/// The scratch folders of `thread`, from where GitEZ put its worktree
+/// (`<data_dir>/worktrees/<repository key>/<id>`); `None` for a worktree
+/// elsewhere.
+fn scratch_dirs_of(thread: &AgentThread) -> Option<ScratchDirs> {
+    let key_dir = thread.worktree.parent()?;
+    let worktrees = key_dir.parent()?;
+    if worktrees.file_name()? != "worktrees" {
+        return None;
+    }
+    let key = key_dir.file_name()?.to_str()?;
+    Some(scratch_dirs(worktrees.parent()?, key, &thread.id))
+}
+
+/// Removes `dir` and everything in it, if it is a folder (never through a
+/// symbolic link). Best effort: what cannot be removed stays.
+fn remove_scratch(dir: &Path) {
+    if fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir()) {
+        // Cached downloads are read-only files in read-only folders (Go,
+        // Cargo sources); make them removable first.
+        make_writable(dir);
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(unix)]
+fn make_writable(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Ok(meta) = fs::symlink_metadata(dir) else {
+        return;
+    };
+    if !meta.is_dir() {
+        return;
+    }
+    let mode = meta.permissions().mode();
+    if mode & 0o700 != 0o700 {
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(mode | 0o700));
+    }
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                make_writable(&entry.path());
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn make_writable(_dir: &Path) {}
+
 /// Creates branch `branch` at `start_commit` unless it exists, then
 /// `git worktree add <path> <branch>`, run in `main_work_dir`. Fails if
 /// `path` exists and is not a worktree of `branch` (an empty folder is
@@ -110,7 +180,8 @@ pub struct CompleteReport {
 /// Completes `thread`: `git worktree remove --force` (skipped when the
 /// folder is gone), `git worktree prune`, and deletes the branch when its
 /// tip is still `thread.start.commit` (no commits of its own) and it is not
-/// checked out in the main worktree. Does not change thread.json; the
+/// checked out in the main worktree; then removes the thread's
+/// [`ScratchDirs`] (best effort). Does not change thread.json; the
 /// caller then calls `mark_completed`. Fails, with git's words, when the
 /// folder exists but git does not know it as a worktree: GitEZ never
 /// deletes a folder git does not vouch for.
@@ -137,6 +208,10 @@ pub fn complete(main_work_dir: &Path, thread: &AgentThread) -> Result<CompleteRe
         git.delete_branch(&thread.branch, true)?;
         true
     };
+    if let Some(dirs) = scratch_dirs_of(thread) {
+        remove_scratch(&dirs.tmp);
+        remove_scratch(&dirs.caches);
+    }
     Ok(CompleteReport {
         worktree_removed,
         branch_deleted,

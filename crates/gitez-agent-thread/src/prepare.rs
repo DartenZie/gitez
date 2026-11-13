@@ -152,17 +152,20 @@ fn symlink(_link: &Path, _target: &Path) -> std::io::Result<()> {
     Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
 }
 
-/// Clones the folder `source` to `target` copy-on-write: one `clonefile`
-/// of the whole tree.
+/// Clones the folder `source` to `target` (which must not exist)
+/// copy-on-write: one `clonefile` of the whole tree. Fails where the
+/// filesystem cannot clone (another volume, no APFS); the caller removes
+/// what a failed clone left.
 #[cfg(target_os = "macos")]
-fn clone_tree(source: &Path, target: &Path) -> std::io::Result<()> {
+pub fn clone_tree(source: &Path, target: &Path) -> std::io::Result<()> {
     reflink_copy::reflink(source, target)
 }
 
-/// Clones the folder `source` to `target` copy-on-write, file by file;
-/// fails on the first file the filesystem cannot clone.
+/// Clones the folder `source` to `target` (which must not exist)
+/// copy-on-write, file by file; fails on the first file the filesystem
+/// cannot clone. The caller removes what a failed clone left.
 #[cfg(not(target_os = "macos"))]
-fn clone_tree(source: &Path, target: &Path) -> std::io::Result<()> {
+pub fn clone_tree(source: &Path, target: &Path) -> std::io::Result<()> {
     let meta = fs::symlink_metadata(source)?;
     fs::create_dir(target)?;
     for entry in fs::read_dir(source)? {

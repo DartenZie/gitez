@@ -599,6 +599,7 @@ mod tests {
             ],
             deny_read: vec!["/Users/u/.ssh".into(), "/work/wt/secret".into()],
             network: Network::Open,
+            certificate_service: false,
         }
     }
 

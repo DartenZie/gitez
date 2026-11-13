@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use common::{Fixture, git};
 use gitez_agent_thread::{
-    CACHE_DIRS, CompleteReport, Error, PrepareStep, complete, create_worktree, prepare, watch,
-    worktree_git_dir,
+    CACHE_DIRS, CompleteReport, Error, PrepareStep, complete, create_worktree, prepare,
+    scratch_dirs, watch, worktree_git_dir,
 };
 
 fn canonical(path: &Path) -> PathBuf {
@@ -140,6 +140,40 @@ fn completing_removes_the_worktree_and_a_branch_without_commits() {
     create_worktree(&fixture.root, &gone.worktree, &gone.branch, &start).expect("create");
     fs::remove_dir_all(&gone.worktree).expect("remove folder");
 
+    // The thread's temporary folder and caches go too, read-only cached
+    // sources included; another thread's stay.
+    let key = idle
+        .worktree
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .expect("the repository key folder")
+        .to_owned();
+    let data_dir = idle
+        .worktree
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .expect("the data folder")
+        .to_owned();
+    let scratch = scratch_dirs(&data_dir, &key, &idle.id);
+    assert_eq!(
+        scratch.tmp,
+        data_dir.join("tmp").join(format!("{key}-{}", idle.id))
+    );
+    assert_eq!(
+        scratch.caches,
+        data_dir.join("caches").join(format!("{key}-{}", idle.id))
+    );
+    let sources = scratch.caches.join("cargo/registry/src/crate-1.0");
+    fs::create_dir_all(&sources).expect("create caches");
+    fs::write(sources.join("lib.rs"), "").expect("write");
+    #[cfg(unix)]
+    set_mode(&sources, 0o555);
+    fs::create_dir_all(&scratch.tmp).expect("create tmp");
+    let other = scratch_dirs(&data_dir, &key, &busy.id);
+    fs::create_dir_all(&other.caches).expect("create other caches");
+
     assert_eq!(
         complete(&fixture.root, &idle).expect("complete"),
         CompleteReport {
@@ -148,6 +182,9 @@ fn completing_removes_the_worktree_and_a_branch_without_commits() {
         }
     );
     assert!(!idle.worktree.exists());
+    assert!(!scratch.tmp.exists(), "the temporary folder is removed");
+    assert!(!scratch.caches.exists(), "the caches are removed");
+    assert!(other.caches.exists(), "another thread's caches stay");
     assert_eq!(
         complete(&fixture.root, &busy).expect("complete"),
         CompleteReport {

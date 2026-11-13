@@ -114,6 +114,7 @@ mod tests {
             deny_write: vec!["/w/repo/.git/hooks".into()],
             deny_read: vec!["/h/.ssh".into(), "/h/.netrc".into(), "/h/.aws".into()],
             network: Network::Open,
+            certificate_service: false,
         };
         let exists = |path: &Path| match path.to_str() {
             Some("/h/.ssh") | Some("/w/wt") | Some("/w/repo/.git/refs/heads/agent") => Some(true),

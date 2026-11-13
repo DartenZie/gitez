@@ -97,6 +97,13 @@ pub struct SandboxSettings {
     /// Paths hidden from the agent, `~` for the home folder. Default:
     /// [`DEFAULT_HIDDEN_PATHS`].
     pub hidden_paths: Vec<String>,
+    /// Extra folders (or files) the agent may write in every thread, `~`
+    /// for the home folder, for tools whose caches GitEZ does not give
+    /// each thread itself (for example `~/.gradle/caches`). What is
+    /// written there is shared with programs that run outside the
+    /// sandbox. GitEZ's own denies (the repository's hooks and config,
+    /// GitEZ's settings) still win. Default: none.
+    pub writable_paths: Vec<String>,
 }
 
 /// How one agent is run: an agent entry in Settings.
@@ -172,6 +179,7 @@ impl Default for SandboxSettings {
             default_network: NetworkProfile::default(),
             package_hosts: strings(DEFAULT_PACKAGE_HOSTS),
             hidden_paths: strings(DEFAULT_HIDDEN_PATHS),
+            writable_paths: Vec::new(),
         }
     }
 }
@@ -276,6 +284,12 @@ impl Settings {
     /// out: a sandbox rule needs an absolute path.
     pub fn hidden_paths(&self) -> Vec<PathBuf> {
         expand_all(&self.sandbox.hidden_paths, dirs::home_dir().as_deref())
+    }
+
+    /// `writable_paths` with `~` expanded, absolute paths only (as
+    /// [`Settings::hidden_paths`]).
+    pub fn writable_paths(&self) -> Vec<PathBuf> {
+        expand_all(&self.sandbox.writable_paths, dirs::home_dir().as_deref())
     }
 }
 
@@ -401,6 +415,7 @@ mod tests {
         settings.sandbox.default_network = NetworkProfile::Packages;
         settings.sandbox.package_hosts = vec!["crates.io".to_owned()];
         settings.sandbox.hidden_paths = vec!["~/.ssh".to_owned()];
+        settings.sandbox.writable_paths = vec!["~/.gradle/caches".to_owned()];
         settings.agents.insert(
             "claude-code".to_owned(),
             AgentEntry {
@@ -432,6 +447,8 @@ mod tests {
             strings(DEFAULT_PACKAGE_HOSTS)
         );
         assert_eq!(settings.sandbox.hidden_paths, strings(DEFAULT_HIDDEN_PATHS));
+        assert!(settings.sandbox.writable_paths.is_empty());
+        assert!(settings.writable_paths().is_empty());
         assert!(settings.agents.is_empty());
         assert!(settings.secrets.is_empty());
         assert_eq!(settings.agent("claude-code"), AgentEntry::default());
@@ -492,6 +509,10 @@ mod tests {
             settings.sandbox.package_hosts,
             strings(DEFAULT_PACKAGE_HOSTS)
         );
+        assert!(
+            settings.sandbox.writable_paths.is_empty(),
+            "a file written before writable_paths existed has none"
+        );
     }
 
     #[test]
@@ -512,6 +533,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&text).expect("json");
         assert_eq!(json["threads"]["max_running"], 5);
         assert_eq!(json["sandbox"]["default_network"], "packages");
+        assert_eq!(json["sandbox"]["writable_paths"][0], "~/.gradle/caches");
         assert_eq!(json["secrets"][0]["scope"], "all");
         assert_eq!(
             json["secrets"][1]["scope"]["repository"],
@@ -650,6 +672,12 @@ mod tests {
         // The real home folder is only read, never written.
         let expanded = Settings::default().hidden_paths();
         assert!(expanded.iter().all(|path| path.is_absolute()));
+        let mut settings = Settings::default();
+        settings.sandbox.writable_paths = strings(&["~/.gradle/caches", "relative", "/opt/cache"]);
+        let writable = settings.writable_paths();
+        assert_eq!(writable.len(), 2, "{writable:?}");
+        assert!(writable.iter().all(|path| path.is_absolute()));
+        assert_eq!(writable[1], PathBuf::from("/opt/cache"));
     }
 
     #[test]

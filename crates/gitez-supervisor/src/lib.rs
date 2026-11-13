@@ -12,6 +12,7 @@
 //! <data dir>/queue/slots/<n>.lock                        running-agent slots
 //! <data dir>/queue/tickets/<nanos>-<repo key>-<id>.ticket threads waiting
 //! <data dir>/tmp/<repo key>-<id>/                        the thread's TMPDIR
+//! <data dir>/caches/<repo key>-<id>/                     its toolchain caches
 //! ```
 //!
 //! The GUI uses [`launch`], [`is_running`], [`stop`] and [`reap_if_dead`];
@@ -26,6 +27,7 @@ mod pipeline;
 mod policy;
 mod queue;
 mod secrets;
+mod toolchains;
 
 pub use launch::{Launch, LaunchError, launch};
 pub use liveness::{StopError, is_running, reap_if_dead, stop};

@@ -27,6 +27,7 @@ use jiff::SignedDuration;
 use crate::liveness::SupervisorLock;
 use crate::policy::{self, Place};
 use crate::queue::{Queue, Slot, Waited};
+use crate::toolchains;
 use crate::{Command, Error, Result, Secrets};
 
 /// How long an interrupted agent may take to end its turn before it is
@@ -317,11 +318,9 @@ impl Pipeline<'_> {
             // A new folder needs preparing again.
             self.save(|thread| thread.prepared = false);
         }
-        let tmp_dir =
-            self.env
-                .data_dir
-                .join("tmp")
-                .join(format!("{}-{}", self.repository_key(), self.id));
+        let scratch =
+            gitez_agent_thread::scratch_dirs(&self.env.data_dir, &self.repository_key(), &self.id);
+        let tmp_dir = scratch.tmp;
         create_private_dir(&tmp_dir).map_err(|error| {
             failed(format!(
                 "GitEZ could not create {}: {error}",
@@ -334,6 +333,7 @@ impl Pipeline<'_> {
             worktree_git_dir,
             branch: self.thread.branch.clone(),
             tmp_dir,
+            caches_dir: scratch.caches,
             data_dir: self.env.data_dir.clone(),
         });
         self.worktree_ready = true;
@@ -391,7 +391,6 @@ impl Pipeline<'_> {
             .as_ref()
             .map(|agent| agent.needs(&context.config))
             .unwrap_or_default();
-        let network = self.network(NetworkProfile::Packages, &needs, &context.settings);
         let command = self.command(
             "/bin/sh",
             // Its errors go to the log too, in order with its output.
@@ -410,7 +409,7 @@ impl Pipeline<'_> {
             command,
             &needs,
             &context.settings,
-            network,
+            Some(NetworkProfile::Packages),
             |_, line| {
                 writeln!(log_file, "{line}").ok();
             },
@@ -469,7 +468,11 @@ impl Pipeline<'_> {
                 session_id: &session_id,
             }
         };
-        let system_prompt = system_prompt(&self.thread.branch, &self.thread.start.branch);
+        let system_prompt = system_prompt(
+            &self.thread.branch,
+            &self.thread.start.branch,
+            self.thread.network,
+        );
         let model = self
             .thread
             .model
@@ -489,7 +492,6 @@ impl Pipeline<'_> {
             .map_err(|error| failed(error.to_string()))?;
         let needs = agent.needs_for_run(&context.config, &spec);
         self.add_env(&mut command);
-        let network = self.network(self.thread.network, &needs, &context.settings);
 
         let started = Timestamp::now();
         let mut transcript = self
@@ -545,12 +547,13 @@ impl Pipeline<'_> {
         let mut pending_activity: Option<Activity> = None;
         let mut session_known = self.thread.session_id.is_some();
         let mut transcript_error = None;
+        let profile = self.thread.network;
         let ran = self.run_command(
             Kind::Agent,
             command,
             &needs,
             &context.settings,
-            network,
+            Some(profile),
             |this, line| {
                 if let Err(error) = transcript.append(line) {
                     transcript_error.get_or_insert(error);
@@ -829,7 +832,7 @@ impl Pipeline<'_> {
             command,
             &AgentNeeds::default(),
             &settings,
-            Network::Hosts(Vec::new()),
+            None,
             |_, line| push_tail(&mut output, line.to_owned()),
         );
         let tip_after = tip(&worktree);
@@ -910,16 +913,18 @@ impl Pipeline<'_> {
         Ok(())
     }
 
-    /// Runs `command` wrapped in the sandbox, in its own process group
-    /// recorded as `child_group`, passing each redacted output line to
-    /// `on_line`. What a stop does depends on `kind`.
+    /// Runs `command` wrapped in the sandbox with the network of `profile`
+    /// (`None`: no network), in its own process group recorded as
+    /// `child_group`, passing each redacted output line to `on_line`. The
+    /// command gets the thread's toolchain caches (see `toolchains`) unless
+    /// its own environment sets them. What a stop does depends on `kind`.
     fn run_command(
         &mut self,
         kind: Kind,
-        command: CommandSpec,
+        mut command: CommandSpec,
         needs: &AgentNeeds,
         settings: &Settings,
-        network: Network,
+        profile: Option<NetworkProfile>,
         mut on_line: impl FnMut(&mut Self, &str),
     ) -> Result<Ran, End> {
         let step = kind.step();
@@ -929,7 +934,30 @@ impl Pipeline<'_> {
                 "The worktree is not ready.".to_owned(),
             ));
         };
-        let policy = policy::policy(&place, needs, settings, network);
+        let network = match profile {
+            Some(profile) => self.network(profile, needs, settings),
+            None => Network::Hosts(Vec::new()),
+        };
+        let writable: Vec<PathBuf> = settings
+            .writable_paths()
+            .iter()
+            .map(|path| policy::real(path))
+            .collect();
+        let caches = toolchains::prepare(
+            &place.caches_dir,
+            policy::downloads(profile),
+            &writable,
+            &toolchains::Lookup::system(),
+        );
+        for line in &caches.log {
+            log(&self.id, line);
+        }
+        for (name, value) in caches.env {
+            if !command.env.iter().any(|(set, _)| *set == name) {
+                command.env.push((name, value));
+            }
+        }
+        let policy = policy::policy(&place, needs, settings, network, profile);
         let wrapped = self
             .env
             .sandbox
@@ -1227,15 +1255,37 @@ fn check_command(thread: &AgentThread, command: Command) -> Result<(), String> {
     ))
 }
 
-/// D.8.
-fn system_prompt(branch: &str, start_branch: &str) -> String {
-    format!(
+/// D.8, and what the sandbox does not allow that an agent would otherwise
+/// try first: `/tmp` and the system temporary folder (macOS `mktemp`
+/// without a template uses the latter), `git stash` (its ref is shared
+/// with every worktree), and, with less network, downloads.
+fn system_prompt(branch: &str, start_branch: &str, network: NetworkProfile) -> String {
+    let mut prompt = format!(
         "You are working in a git worktree that GitEZ created for this task, on the branch \
          {branch}, started from {start_branch}. Commit your work on this branch as you go, with \
          clear messages. Do not push, do not switch branches, do not create other branches or \
          tags, and do not change the git configuration. When you are done, reply with a short \
-         summary of what you did and anything left to do."
-    )
+         summary of what you did and anything left to do. \
+         You run in a sandbox. You can write only in this worktree and in $TMPDIR, which is \
+         yours: put temporary files there, not in /tmp, and give mktemp a template in it \
+         (mktemp \"$TMPDIR/name.XXXXXX\"). git stash does not work here; commit work in \
+         progress on your branch instead."
+    );
+    match network {
+        NetworkProfile::AgentOnly => prompt.push_str(
+            " The network reaches only your own API: package registries cannot be reached, and \
+             Cargo and Go run offline from the packages already on this computer. If the task \
+             needs a download, say so in your summary: the user can retry the thread with the \
+             Packages network profile.",
+        ),
+        NetworkProfile::Packages => prompt.push_str(
+            " The network reaches only package registries, GitHub and the repository's \
+             remotes. If the task needs another host, name it in your summary: the user can \
+             retry the thread with the Open network profile.",
+        ),
+        NetworkProfile::Open => {}
+    }
+    prompt
 }
 
 /// How a state, ending or turn kind is written in thread.json.
@@ -1335,8 +1385,26 @@ mod tests {
 
     #[test]
     fn the_system_prompt_names_the_branches() {
-        let prompt = system_prompt("agent/x", "main");
+        let prompt = system_prompt("agent/x", "main", NetworkProfile::Open);
         assert!(prompt.contains("on the branch agent/x, started from main."));
         assert!(prompt.contains("Do not push"));
+    }
+
+    #[test]
+    fn the_system_prompt_says_what_the_sandbox_refuses_and_what_fixes_it() {
+        for profile in NetworkProfile::ALL {
+            let prompt = system_prompt("agent/x", "main", profile);
+            assert!(
+                prompt.contains("mktemp \"$TMPDIR/name.XXXXXX\""),
+                "{prompt}"
+            );
+            assert!(prompt.contains("git stash does not work"), "{prompt}");
+        }
+        let offline = system_prompt("agent/x", "main", NetworkProfile::AgentOnly);
+        assert!(offline.contains("retry the thread with the Packages network profile"));
+        let packages = system_prompt("agent/x", "main", NetworkProfile::Packages);
+        assert!(packages.contains("retry the thread with the Open network profile"));
+        let open = system_prompt("agent/x", "main", NetworkProfile::Open);
+        assert!(!open.contains("network profile"));
     }
 }

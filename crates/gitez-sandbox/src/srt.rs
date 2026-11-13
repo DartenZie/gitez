@@ -17,6 +17,15 @@
 //!   `TMPDIR`, [`Srt::wrap`] passes it to srt as `CLAUDE_CODE_TMPDIR`, which
 //!   gives each command its own temporary folder. Claude Code reads the same
 //!   variable for its own temporary files. `/tmp/claude` stays writable.
+//! - srt keeps its own files in its own `TMPDIR` (`os.tmpdir()`): the Unix
+//!   socket of its proxy, `srt-mux-<pid>-<n>.sock`, and on Linux its
+//!   sockets and masked files. A socket path longer than the system allows
+//!   (about 253 bytes in Node.js on macOS, 107 on Linux) stops srt before
+//!   the command starts (`listen EINVAL`), and the command's own temporary
+//!   folder is writable inside the sandbox. srt therefore runs with its
+//!   `TMPDIR` set to the private run folder, kept short (see
+//!   [`run_dir`]); the command still gets its own through
+//!   `CLAUDE_CODE_TMPDIR`.
 //! - The **Open** network profile cannot be written in an srt settings file
 //!   (`allowedDomains` is required and `*` is refused). It runs under a
 //!   GitEZ-generated Seatbelt profile on macOS and under bubblewrap without
@@ -220,6 +229,10 @@ impl Srt {
 
         let mut spec = command;
         temp_dir_env(&mut spec, false)?;
+        proxy_env(&mut spec);
+        // srt's own files go to the run folder; the command's TMPDIR comes
+        // from CLAUDE_CODE_TMPDIR (or srt's shared folder) instead.
+        spec.env.push(("TMPDIR".to_owned(), text_of(run.path())));
         spec.env_remove.push("SRT_DEBUG".to_owned());
         let program = std::mem::take(&mut spec.program);
         let args = std::mem::take(&mut spec.args);
@@ -469,7 +482,7 @@ fn settings(policy: &Policy, hosts: &[String], os: Os) -> Value {
             .map(|path| path_entry(path))
             .collect(),
     };
-    json!({
+    let mut settings = json!({
         "network": {
             "allowedDomains": hosts,
             "deniedDomains": [],
@@ -479,7 +492,11 @@ fn settings(policy: &Policy, hosts: &[String], os: Os) -> Value {
             "allowWrite": allow_write,
             "denyWrite": policy.deny_write.iter().map(|path| path_entry(path)).collect::<Vec<_>>(),
         },
-    })
+    });
+    if policy.certificate_service && os == Os::Mac {
+        settings["enableWeakerNetworkIsolation"] = Value::Bool(true);
+    }
+    settings
 }
 
 /// A path as srt reads it: a pattern if it has `*`; a literal entry if it
@@ -536,6 +553,18 @@ fn temp_dir_env(spec: &mut CommandSpec, set_tmpdir: bool) -> Result<()> {
     Ok(())
 }
 
+/// srt sends every connection through its local proxy, named in the proxy
+/// variables it sets. Node.js's own `fetch` and `http` read those only
+/// with `NODE_USE_ENV_PROXY=1` (Node 22.21 and later; srt sets it only on
+/// Windows), so without it they reach no host at all: corepack's download
+/// of pnpm, for one. Set unless the command sets it.
+fn proxy_env(spec: &mut CommandSpec) {
+    const NODE_PROXY: &str = "NODE_USE_ENV_PROXY";
+    if !spec.env.iter().any(|(name, _)| name == NODE_PROXY) {
+        spec.env.push((NODE_PROXY.to_owned(), "1".to_owned()));
+    }
+}
+
 fn create_private_dir(path: &Path) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     if path.is_dir() {
@@ -559,13 +588,33 @@ fn create_write_dirs(policy: &Policy) -> Result<()> {
     Ok(())
 }
 
-/// A private folder for one run's files, removed when dropped.
+/// The longest folder srt's run folder is made in, so that srt's sockets in
+/// it (`<base>/gitez-sandbox-XXXXXX/srt-mux-<pid>-<n>.sock`, or on Linux
+/// `claude-http-<16 hex>.sock`) stay under Linux's 107-byte limit.
+const SHORT_BASE_MAX: usize = 50;
+
+/// A private folder for one run's files, removed when dropped. For srt it
+/// is also srt's own `TMPDIR`. It is made in the system's temporary folder
+/// when that path is short, otherwise in `/tmp`; either way only this user
+/// can enter it and the sandbox cannot write in it.
 fn run_dir() -> Result<tempfile::TempDir> {
+    run_dir_in(&short_base(std::env::temp_dir()))
+}
+
+fn short_base(temp: PathBuf) -> PathBuf {
+    if temp.as_os_str().len() <= SHORT_BASE_MAX {
+        temp
+    } else {
+        PathBuf::from("/tmp")
+    }
+}
+
+fn run_dir_in(base: &Path) -> Result<tempfile::TempDir> {
     tempfile::Builder::new()
         .prefix("gitez-sandbox-")
-        .tempdir()
+        .tempdir_in(base)
         .map_err(|source| Error::Profile {
-            path: std::env::temp_dir(),
+            path: base.to_path_buf(),
             source,
         })
 }
