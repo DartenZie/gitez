@@ -149,8 +149,13 @@ pub struct AgentThreads {
     pending_saves: usize,
     agents: gitez_agent::Registry,
     sandbox: Arc<dyn gitez_sandbox::Sandbox>,
-    /// Where secret values are read from to launch supervisors.
+    /// Where secret values are read from to launch supervisors, and
+    /// written to by Settings.
     secrets: Arc<dyn SecretStore>,
+    /// Counts changes to the agents' or the sandbox's installation that the
+    /// settings do not show, such as installing the sandbox, so views that
+    /// checked them check again.
+    environment: u64,
     /// The `gitez` program, started as `gitez supervise …`.
     exe: Result<PathBuf, String>,
     repositories: Vec<RepositoryThreads>,
@@ -243,6 +248,7 @@ impl AgentThreads {
             agents: options.agents,
             sandbox: options.sandbox,
             secrets: options.secrets,
+            environment: 0,
             exe: options.exe,
             repositories: Vec::new(),
             current: None,
@@ -260,7 +266,6 @@ impl AgentThreads {
         cx.global::<AgentThreadsGlobal>().0.clone()
     }
 
-    #[allow(dead_code, reason = "for the agent thread screens still to come")]
     pub fn data_dir(&self) -> Option<&Path> {
         self.data_dir.as_deref()
     }
@@ -324,7 +329,6 @@ impl AgentThreads {
     }
 
     /// Why the settings could not be read or saved, if so.
-    #[allow(dead_code, reason = "for the agent thread screens still to come")]
     pub fn settings_error(&self) -> Option<&SharedString> {
         self.settings_error.as_ref()
     }
@@ -337,7 +341,25 @@ impl AgentThreads {
         &self.sandbox
     }
 
-    #[allow(dead_code, reason = "for the agent thread screens still to come")]
+    /// Where secret values are kept. Every call may block (the OS
+    /// keychain): use it on the background executor.
+    pub fn secret_store(&self) -> &Arc<dyn SecretStore> {
+        &self.secrets
+    }
+
+    /// Changes when an agent or the sandbox may have been installed; see
+    /// [`AgentThreads::environment_changed`].
+    pub fn environment(&self) -> u64 {
+        self.environment
+    }
+
+    /// Says that what agents and the sandbox find may have changed (the
+    /// sandbox was installed), so views check them again.
+    pub fn environment_changed(&mut self, cx: &mut Context<Self>) {
+        self.environment += 1;
+        cx.notify();
+    }
+
     pub fn current_repository(&self) -> Option<&CurrentRepository> {
         self.current.as_ref()
     }
@@ -353,7 +375,6 @@ impl AgentThreads {
 
     /// Changes the settings, saves them in the background (after the
     /// previous save) and notifies.
-    #[allow(dead_code, reason = "for the agent thread screens still to come")]
     pub fn update_settings(&mut self, change: impl FnOnce(&mut Settings), cx: &mut Context<Self>) {
         let mut settings = (*self.settings).clone();
         change(&mut settings);

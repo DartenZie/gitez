@@ -2241,6 +2241,22 @@ impl Render for Workspace {
 }
 
 impl Workspace {
+    /// What the composer would start a thread with now: network profile,
+    /// secrets and model alias; `None` while it is not shown. For tests of
+    /// other modules (Settings) that cannot reach the composer.
+    #[cfg(test)]
+    pub(crate) fn composer_choices(
+        &self,
+        cx: &App,
+    ) -> Option<(gitez_sandbox::NetworkProfile, Vec<String>, String)> {
+        let composer = self.history.read(cx).composer()?.read(cx);
+        Some((
+            composer.network(cx),
+            composer.secrets(cx),
+            composer.model_alias(cx),
+        ))
+    }
+
     /// The history list, or what to show while no repository is open.
     fn render_history(&self, cx: &App) -> AnyElement {
         if self.snapshot.is_some() {

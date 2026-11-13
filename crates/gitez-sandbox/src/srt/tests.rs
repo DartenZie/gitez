@@ -232,6 +232,51 @@ fn without_srt_anywhere_it_is_missing() {
     ));
 }
 
+/// Installing is offered only when Node.js is new enough and srt is
+/// nowhere; installed, without Node.js or with an old one, it is not.
+#[cfg(target_os = "macos")]
+#[test]
+fn install_is_offered_only_when_it_is_the_fix() {
+    use std::os::unix::fs::PermissionsExt;
+    let node_of = |version: &str| {
+        let bin = tempfile::tempdir().expect("a temporary folder");
+        let node = bin.path().join("node");
+        std::fs::write(&node, format!("#!/bin/sh\necho {version}\n")).expect("node");
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        bin
+    };
+    let data = tempfile::tempdir().expect("a temporary folder");
+
+    let new_node = node_of("v22.12.0");
+    let srt = Srt::with_search(data.path(), Search::only(new_node.path()));
+    assert_eq!(
+        srt.status(),
+        Status::Missing {
+            fix: NOT_INSTALLED.to_owned()
+        }
+    );
+    assert!(srt.installable());
+
+    let old_node = node_of("v20.1.0");
+    let srt = Srt::with_search(data.path(), Search::only(old_node.path()));
+    let Status::Missing { fix } = srt.status() else {
+        panic!("an old Node.js cannot run srt");
+    };
+    assert!(fix.contains("22.12 or newer"), "{fix}");
+    assert!(!srt.installable());
+
+    let srt = Srt::with_search(data.path(), Search::only(""));
+    assert!(!srt.installable(), "no Node.js");
+
+    let fake = Fake::new();
+    assert!(!fake.srt().installable(), "already installed");
+    assert!(!crate::Passthrough.installable());
+    assert!(matches!(
+        crate::Passthrough.install(),
+        Err(Error::Install(_))
+    ));
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn an_installed_srt_is_ready() {

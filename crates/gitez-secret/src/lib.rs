@@ -36,6 +36,11 @@ pub trait SecretStore: Send + Sync {
     fn get(&self, account: &str) -> Result<Option<String>>;
     /// Deleting what is not there succeeds.
     fn delete(&self, account: &str) -> Result<()>;
+    /// Whether a value is stored for `account`. The value is not returned;
+    /// Settings uses this to show secrets whose value went missing.
+    fn contains(&self, account: &str) -> Result<bool> {
+        self.get(account).map(|value| value.is_some())
+    }
 }
 
 /// The OS keychain, under one service name: the login keychain on macOS,
@@ -84,6 +89,15 @@ impl SecretStore for Keychain {
     fn delete(&self, account: &str) -> Result<()> {
         match self.entry(account)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(err) => Err(convert(err)),
+        }
+    }
+
+    /// Looks the item up without copying its value out of the keychain.
+    fn contains(&self, account: &str) -> Result<bool> {
+        match self.entry(account)?.inner.get_credential() {
+            Ok(_) => Ok(true),
+            Err(keyring::Error::NoEntry) => Ok(false),
             Err(err) => Err(convert(err)),
         }
     }
@@ -161,7 +175,9 @@ mod tests {
     /// Set, get, replace, get, delete, get, delete again, on any store.
     fn round_trip(store: &dyn SecretStore, account: &str) {
         assert_eq!(store.get(account).expect("get before set"), None);
+        assert!(!store.contains(account).expect("contains before set"));
         store.set(account, "first value").expect("set");
+        assert!(store.contains(account).expect("contains after set"));
         assert_eq!(
             store.get(account).expect("get after set").as_deref(),
             Some("first value")
@@ -173,6 +189,7 @@ mod tests {
         );
         store.delete(account).expect("delete");
         assert_eq!(store.get(account).expect("get after delete"), None);
+        assert!(!store.contains(account).expect("contains after delete"));
         store.delete(account).expect("delete again");
     }
 

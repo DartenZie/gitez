@@ -129,8 +129,9 @@ pub struct Composer {
     /// `None`: the secrets given to new threads by default.
     secrets: Option<BTreeSet<String>>,
     environment: Option<Environment>,
-    /// The settings the environment was checked with.
-    checked_with: Option<Arc<Settings>>,
+    /// The settings the environment was checked with, and
+    /// [`AgentThreads::environment`] then.
+    checked_with: Option<(Arc<Settings>, u64)>,
     _checking: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -162,11 +163,10 @@ impl Composer {
             // Running counts, settings and secrets.
             cx.observe(&model, |this, model, cx| {
                 let settings = model.read(cx).settings().clone();
-                if this
-                    .checked_with
-                    .as_ref()
-                    .is_some_and(|checked| !Arc::ptr_eq(checked, &settings))
-                {
+                let environment = model.read(cx).environment();
+                if this.checked_with.as_ref().is_some_and(|(checked, known)| {
+                    !Arc::ptr_eq(checked, &settings) || *known != environment
+                }) {
                     this.check(cx);
                 }
                 cx.notify();
@@ -279,7 +279,7 @@ impl Composer {
         let settings = model.settings().clone();
         let agents = model.agents().clone();
         let sandbox = model.sandbox().clone();
-        self.checked_with = Some(settings.clone());
+        self.checked_with = Some((settings.clone(), model.environment()));
         let checked = cx.background_executor().spawn(async move {
             let statuses = agents.statuses(|id| settings.agent(id).config());
             let agents = statuses
@@ -370,7 +370,7 @@ impl Composer {
         })
     }
 
-    fn network(&self, cx: &App) -> NetworkProfile {
+    pub(crate) fn network(&self, cx: &App) -> NetworkProfile {
         self.network
             .unwrap_or_else(|| self.settings(cx).sandbox.default_network)
     }
@@ -395,7 +395,7 @@ impl Composer {
     }
 
     /// The secrets picked, of those that exist.
-    fn secrets(&self, cx: &App) -> Vec<String> {
+    pub(crate) fn secrets(&self, cx: &App) -> Vec<String> {
         self.secret_choices(cx)
             .into_iter()
             .filter(|(name, _, default)| match &self.secrets {

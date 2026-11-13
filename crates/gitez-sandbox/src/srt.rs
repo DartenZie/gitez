@@ -104,6 +104,30 @@ struct Found {
     version: Option<String>,
 }
 
+/// Why srt cannot run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Missing {
+    /// What the user must do.
+    fix: String,
+    /// Whether [`Srt::install`] is that fix.
+    install: bool,
+}
+
+impl From<String> for Missing {
+    fn from(fix: String) -> Self {
+        Self {
+            fix,
+            install: false,
+        }
+    }
+}
+
+impl From<&str> for Missing {
+    fn from(fix: &str) -> Self {
+        fix.to_owned().into()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Os {
     Mac,
@@ -138,6 +162,11 @@ impl Srt {
 
     /// The srt to run, or what the user must do first.
     fn locate(&self) -> std::result::Result<Found, String> {
+        self.find().map_err(|missing| missing.fix)
+    }
+
+    /// [`Srt::locate`], telling whether installing srt is the fix.
+    fn find(&self) -> std::result::Result<Found, Missing> {
         platform_requirements(&self.search)?;
         let node = self.search.find("node");
         let installed = Self::install_dir(&self.data_dir)
@@ -149,7 +178,10 @@ impl Srt {
             None => {
                 let node = node.ok_or(NO_NODE)?;
                 check_node(&node)?;
-                return Err(NOT_INSTALLED.to_owned());
+                return Err(Missing {
+                    fix: NOT_INSTALLED.to_owned(),
+                    install: true,
+                });
             }
         };
         let version = package_version(&program);
@@ -294,6 +326,17 @@ impl Sandbox for Srt {
             },
             Err(fix) => Status::Missing { fix },
         }
+    }
+
+    /// Node.js is new enough and srt is neither on the `PATH` nor in the
+    /// data folder.
+    fn installable(&self) -> bool {
+        self.find().is_err_and(|missing| missing.install)
+    }
+
+    /// [`Srt::install`] into this sandbox's data folder.
+    fn install(&self) -> Result<()> {
+        install(&self.data_dir, &self.search).map(drop)
     }
 
     /// See the module documentation for how signals, exit codes and the

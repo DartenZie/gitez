@@ -212,7 +212,6 @@ pub mod color {
     pub const THREAD_FAILED_TEXT: u32 = 0xf5_a8_9e;
     /// The border of a picker or option that is on; its background is
     /// [`SELECTED`].
-    #[allow(dead_code, reason = "for the agent thread screens still to come")]
     pub const PICKER_ON_BORDER: u32 = 0xe8_b0_4b_99;
     /// A selected option card, and a fresh row in Home.
     pub const OPTION_ON: u32 = 0x1f_1b_14;
@@ -223,12 +222,21 @@ pub mod color {
     pub const TOOL_CHIP_BORDER: u32 = 0x2e_2e_34;
     /// The square behind an agent's mark.
     pub const AGENT_MARK_BACKGROUND: u32 = 0x2a_24_18;
-    /// Host names in Settings.
-    #[allow(dead_code, reason = "for the agent thread screens still to come")]
+    /// Host names and hidden paths in Settings.
     pub const HOST_CHIP: u32 = 0x23_23_27;
     /// Text fields in Settings.
-    #[allow(dead_code, reason = "for the agent thread screens still to come")]
     pub const FIELD: u32 = 0x141416;
+    /// The Settings sheet and its border, as the command palette's.
+    pub const SHEET: u32 = PALETTE;
+    pub const SHEET_BORDER: u32 = PALETTE_BORDER;
+    /// The cards of the Settings sheet.
+    pub const CARD_BORDER: u32 = 0x29_29_2e;
+    /// The "Add secret" form at the foot of the secrets table.
+    pub const SHEET_FORM: u32 = 0x18_18_1b;
+    /// Paragraphs explaining a section of Settings.
+    pub const DESCRIPTION: u32 = AUTHOR_TEXT;
+    /// The border of an empty slot, such as "More agents later".
+    pub const PLACEHOLDER_BORDER: u32 = COMPOSER_BORDER;
     /// The step an agent is running now, in a thread's activity.
     pub const LIVE_ROW: u32 = 0x5f_a8_f5_12;
     /// Between the rows of the tables in Settings.

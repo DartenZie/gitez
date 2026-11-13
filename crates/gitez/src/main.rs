@@ -15,6 +15,7 @@ mod repository;
 // Screenshots of real views for agents; see the module.
 #[cfg(all(test, target_os = "macos"))]
 mod screenshot;
+mod settings_sheet;
 mod shell_path;
 mod theme;
 mod time;
@@ -54,6 +55,7 @@ fn main() -> ExitCode {
 
             recent::init(cx);
             agent_threads::init(cx);
+            settings_sheet::init(cx);
             menus::init(cx);
             cx.bind_keys(workspace::key_bindings());
             // One window per process for now, so closing it ends the app.

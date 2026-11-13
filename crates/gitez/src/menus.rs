@@ -2,6 +2,7 @@
 
 use gpui_kit::*;
 
+use crate::agent_threads::OpenSettings;
 use crate::recent;
 use crate::workspace::{
     CloneRepository, CloseRepository, InitRepository, OpenRecent, OpenRepository, RevealRepository,
@@ -55,7 +56,11 @@ pub fn set(cx: &mut App) {
     cx.set_menus([
         Menu {
             name: "GitEZ".into(),
-            items: vec![MenuItem::action("Quit GitEZ", Quit)],
+            items: vec![
+                MenuItem::action("Settings…", OpenSettings),
+                MenuItem::separator(),
+                MenuItem::action("Quit GitEZ", Quit),
+            ],
             disabled: false,
         },
         Menu {

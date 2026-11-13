@@ -49,6 +49,19 @@ pub trait Sandbox: Send + Sync {
     /// Shown in Settings, such as "srt (Anthropic sandbox runtime)".
     fn name(&self) -> &'static str;
     fn status(&self) -> Status;
+    /// Whether [`Sandbox::install`] is the fix for a missing sandbox: what
+    /// installing needs is there and nothing else is in the way.
+    fn installable(&self) -> bool {
+        false
+    }
+    /// Installs the sandbox where [`Sandbox::status`] finds it. Blocks for
+    /// up to minutes; never installs anything globally.
+    fn install(&self) -> Result<()> {
+        Err(Error::Install(format!(
+            "{} cannot be installed from GitEZ",
+            self.name()
+        )))
+    }
     /// `command` wrapped so that it runs under `policy`. The wrapped command
     /// keeps `command`'s env, cwd and stdin; it must run the whole process
     /// tree inside the sandbox, and an interrupt (SIGINT) or kill sent to its
