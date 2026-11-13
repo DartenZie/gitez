@@ -53,8 +53,8 @@ use gitez_git::{Affected, Head, Oid, RefKind, RefLabel, Watcher, WorkingTreeStat
 use gitez_review::{NewPullRequest as NewPullRequestFields, State, Timestamp, Tip};
 
 use crate::agent_threads::{
-    AgentThreadKey, AgentThreads, AgentThreadsEvent, CurrentRepository, OpenAgentThread,
-    StartRequest,
+    AgentThreadKey, AgentThreads, AgentThreadsEvent, CurrentRepository, OpenAgentPullRequest,
+    OpenAgentThread, StartRequest,
 };
 use crate::repository::Snapshot;
 use crate::theme::{self, color};
@@ -88,6 +88,7 @@ actions!(
         CloneRepository,
         InitRepository,
         CloseRepository,
+        ShowHome,
         RevealRepository,
         ReviewSelected,
         NewPullRequest,
@@ -212,6 +213,8 @@ pub struct Workspace {
     merge_dialog: Option<Subscription>,
     /// The local pull request to show after the next reload.
     open_after_reload: Option<u32>,
+    /// What to show once the repository being opened has loaded.
+    after_open: Option<AfterOpen>,
     sidebar: Entity<Sidebar>,
     history: Entity<History>,
     detail: Entity<DetailPane>,
@@ -376,8 +379,10 @@ impl Workspace {
             ),
             // The live lanes follow the threads' states and activity, and
             // their elapsed times the model's periodic redraws.
+            // The toolbar's Agents indicator counts them.
             cx.observe(&AgentThreads::global(cx), |this, _, cx| {
-                this.update_lanes(cx)
+                this.update_lanes(cx);
+                cx.notify();
             }),
         ];
         let mut workspace = Self {
@@ -415,6 +420,7 @@ impl Workspace {
             agent_thread: None,
             agent_thread_marks: HashMap::new(),
             open_after_reload: None,
+            after_open: None,
             sidebar,
             history,
             detail,
@@ -507,6 +513,14 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Home (the toolbar's Home button, "All threads"): closes the open
+    /// repository, so the window shows what it shows without one.
+    fn show_home(&mut self, _: &ShowHome, window: &mut Window, cx: &mut Context<Self>) {
+        if self.snapshot.is_some() || self.loading.is_some() {
+            self.close_repository(&CloseRepository, window, cx);
+        }
+    }
+
     /// Opens the repository containing `path` on a background thread. The
     /// current repository stays on screen until the new one has loaded.
     pub fn open(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
@@ -521,9 +535,19 @@ impl Workspace {
                 match result {
                     Ok(snapshot) => {
                         crate::recent::opened(&snapshot.path, cx);
-                        this.show(Arc::new(snapshot), window, cx)
+                        this.show(Arc::new(snapshot), window, cx);
+                        match this.after_open.take() {
+                            Some(AfterOpen::Thread(key)) => this.show_agent_thread(key, window, cx),
+                            Some(AfterOpen::PullRequest(number)) => {
+                                this.open_thread_pull_request(number, window, cx)
+                            }
+                            None => {}
+                        }
                     }
-                    Err(error) => this.show_error(error, window, cx),
+                    Err(error) => {
+                        this.after_open = None;
+                        this.show_error(error, window, cx)
+                    }
                 }
             })
             .ok();
@@ -1772,7 +1796,50 @@ impl Workspace {
             common_dir: action.common_dir.clone(),
             id: action.id.clone(),
         };
+        if !self.is_open(&action.common_dir, cx) {
+            self.open_then(&action.common_dir, AfterOpen::Thread(key), window, cx);
+            return;
+        }
         self.show_agent_thread(key, window, cx);
+    }
+
+    /// Whether the repository at `common_dir` is the open one, perhaps
+    /// named through a symlink.
+    fn is_open(&self, common_dir: &Path, cx: &App) -> bool {
+        let Some(snapshot) = &self.snapshot else {
+            return false;
+        };
+        let open = snapshot.repository.common_dir();
+        let threads = AgentThreads::global(cx).read(cx);
+        open == common_dir
+            || threads
+                .repository(common_dir)
+                .zip(threads.repository(&open))
+                .is_some_and(|(asked, open)| asked.common_dir == open.common_dir)
+    }
+
+    /// Opens the repository of agent threads at `common_dir`, then shows
+    /// `after` in it.
+    fn open_then(
+        &mut self,
+        common_dir: &Path,
+        after: AfterOpen,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let work_dir = AgentThreads::global(cx)
+            .read(cx)
+            .repository(common_dir)
+            .map(|repository| repository.work_dir.clone());
+        let Some(work_dir) = work_dir else {
+            window.push_notification(
+                crate::toast::error("GitEZ does not know this thread’s repository."),
+                cx,
+            );
+            return;
+        };
+        self.after_open = Some(after);
+        self.open(work_dir, window, cx);
     }
 
     /// Shows agent thread `key` in place of the commit detail, closing a
@@ -1799,31 +1866,57 @@ impl Workspace {
             return;
         }
         let thread = cx.new(|cx| ThreadView::new(key, false, window, cx));
-        let subscription = cx.subscribe_in(&thread, window, |this, _, event, window, cx| {
-            match event {
+        let subscription =
+            cx.subscribe_in(&thread, window, |this, _, event, window, cx| match event {
                 ThreadViewEvent::OpenPullRequest { number, .. } => {
-                    let known = this.snapshot.as_ref().is_some_and(|snapshot| {
-                        snapshot
-                            .pull_requests
-                            .iter()
-                            .any(|pull_request| pull_request.number == *number)
-                    });
-                    if known {
-                        this.open_pull_request(*number, window, cx);
-                    } else {
-                        // Created after the refs were read.
-                        this.open_after_reload = Some(*number);
-                        this.reload(window, cx);
-                    }
+                    this.open_thread_pull_request(*number, window, cx)
                 }
                 ThreadViewEvent::OpenRepository { work_dir } => {
                     this.open(work_dir.clone(), window, cx)
                 }
-            }
-        });
+            });
         let selected = self.selected(cx);
         self.agent_thread = Some((thread, subscription, selected));
         cx.notify();
+    }
+
+    /// Opens local pull request `number`, which an agent thread created,
+    /// reading the pull requests again first if it is newer than they are.
+    fn open_thread_pull_request(
+        &mut self,
+        number: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let known = self.snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot
+                .pull_requests
+                .iter()
+                .any(|pull_request| pull_request.number == number)
+        });
+        if known {
+            self.open_pull_request(number, window, cx);
+        } else {
+            // Created after the refs were read.
+            self.open_after_reload = Some(number);
+            self.reload(window, cx);
+        }
+    }
+
+    /// The Agents popover's "Review": the pull request of an agent thread,
+    /// in its repository, opened first if it is not the open one.
+    fn open_agent_pull_request(
+        &mut self,
+        action: &OpenAgentPullRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_open(&action.common_dir, cx) {
+            let after = AfterOpen::PullRequest(action.number);
+            self.open_then(&action.common_dir, after, window, cx);
+            return;
+        }
+        self.open_thread_pull_request(action.number, window, cx);
     }
 
     /// ⌘⇧A: opens the composer under the history's "Ask an agent…" row,
@@ -1986,9 +2079,11 @@ impl Render for Workspace {
                 this.on_action(cx.listener(Self::reveal_repository))
             })
             .on_action(cx.listener(Self::review_selected))
+            .on_action(cx.listener(Self::show_home))
+            .on_action(cx.listener(Self::open_agent_thread))
+            .on_action(cx.listener(Self::open_agent_pull_request))
             .when(snapshot.is_some(), |this| {
-                this.on_action(cx.listener(Self::open_agent_thread))
-                    .on_action(cx.listener(Self::ask_agent))
+                this.on_action(cx.listener(Self::ask_agent))
             })
             .on_action(cx.listener(Self::new_pull_request))
             .on_action(cx.listener(Self::open_palette))
@@ -2029,6 +2124,10 @@ impl Render for Workspace {
                     .next_step(Direction::Redo, cx)
                     .filter(|_| self.stepping.is_none())
                     .map(|step| step.label),
+                agents: snapshot.as_ref().map(|snapshot| toolbar::agents::AgentsScope {
+                    common_dir: snapshot.repository.common_dir(),
+                    name: snapshot.name.clone(),
+                }),
             })
             .when_some(
                 snapshot
@@ -2181,6 +2280,15 @@ impl Workspace {
 }
 
 /// The start buttons, and the recent repositories below them.
+/// What to show once a repository being opened has loaded: an agent
+/// thread or a local pull request of it, asked for from the Agents popover
+/// while another repository (or none) was open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AfterOpen {
+    PullRequest(u32),
+    Thread(AgentThreadKey),
+}
+
 /// What the history has selected, to tell when it changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Selected {

@@ -35,7 +35,9 @@ fn row(index: usize) -> gpui_kit::Point<gpui_kit::Pixels> {
 }
 
 /// The fake `claude`: answers `auth status` as signed in unless
-/// `FAKE_SIGNED_IN=false`, and acts on a keyword in the prompt.
+/// `FAKE_SIGNED_IN=false`, and acts on a keyword in the prompt: WORK
+/// commits and waits for `release`, FAIL exits without a result, SLEEP
+/// waits until interrupted; anything else is answered.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 if [ "$1" = auth ]; then printf '{"loggedIn": %s}\n' "${FAKE_SIGNED_IN:-true}"; exit 0; fi
 log="$FAKE_LOG"
@@ -58,6 +60,8 @@ case "$prompt" in
     tool "sleep until released"
     while [ ! -e "$log/release" ]; do sleep 0.1; done
     result "Wrote agent.txt and committed it." ;;
+  *FAIL*)
+    init; say "the fake agent fails" >&2; exit 1 ;;
   *SLEEP*)
     init; tool "sleep"
     trap 'say "{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"result\":\"\",\"session_id\":\"$sid\"}"; exit 0' INT
@@ -67,13 +71,13 @@ case "$prompt" in
 esac
 "#;
 
-fn write_script(path: &Path, body: &str) {
+pub(crate) fn write_script(path: &Path, body: &str) {
     std::fs::write(path, body).expect("write script");
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 }
 
 /// Settings with Claude Code run as `program`, and two secrets.
-fn save_settings(data_dir: &Path, common_dir: &Path, agent: AgentEntry) {
+pub(crate) fn save_settings(data_dir: &Path, common_dir: &Path, agent: AgentEntry) {
     let settings = Settings {
         agents: BTreeMap::from([(gitez_agent::ClaudeCode::ID.to_owned(), agent)]),
         secrets: vec![
@@ -96,7 +100,7 @@ fn save_settings(data_dir: &Path, common_dir: &Path, agent: AgentEntry) {
 }
 
 /// The fake agent in `base/bin`, logging to `base/fake log`.
-fn fake_agent(base: &Path, signed_in: bool) -> AgentEntry {
+pub(crate) fn fake_agent(base: &Path, signed_in: bool) -> AgentEntry {
     let bin = base.join("bin");
     let log = base.join("fake log");
     std::fs::create_dir_all(&bin).expect("bin folder");
@@ -116,7 +120,7 @@ fn fake_agent(base: &Path, signed_in: bool) -> AgentEntry {
 
 /// A repository in `dir` with a few commits and a second branch, the
 /// sample's author, and nothing uncommitted.
-fn repository(dir: &Path) -> PathBuf {
+pub(crate) fn repository(dir: &Path) -> PathBuf {
     let work_dir = dir.join("repo");
     crate::screenshot::sample_repository(&work_dir);
     std::fs::remove_file(work_dir.join("notes.txt")).expect("clean");
@@ -136,7 +140,7 @@ fn repository(dir: &Path) -> PathBuf {
     work_dir
 }
 
-fn common_dir_of(work_dir: &Path) -> PathBuf {
+pub(crate) fn common_dir_of(work_dir: &Path) -> PathBuf {
     gitez_git::Repository::open(work_dir)
         .expect("open")
         .common_dir()
@@ -235,7 +239,7 @@ fn screenshot_u2_composer_problems() {
 
 /// Creates a thread in `work_dir` for `prompt` and changes it with
 /// `change`.
-fn thread(
+pub(crate) fn thread(
     work_dir: &Path,
     data_dir: &Path,
     prompt: &str,
@@ -276,7 +280,7 @@ fn thread(
         .expect("update")
 }
 
-fn minutes_ago(minutes: i64) -> Timestamp {
+pub(crate) fn minutes_ago(minutes: i64) -> Timestamp {
     Timestamp::now() - jiff::SignedDuration::from_mins(minutes)
 }
 
@@ -359,7 +363,7 @@ fn screenshot_u2_lanes() {
 }
 
 /// `target/debug/gitez`, built before the test, to run supervisors.
-fn gitez_binary() -> Option<PathBuf> {
+pub(crate) fn gitez_binary() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     // target/debug/deps/gitez-… → target/debug/gitez
     let binary = exe.parent()?.parent()?.join("gitez");
@@ -368,7 +372,12 @@ fn gitez_binary() -> Option<PathBuf> {
 
 /// A script that runs the supervisor of `binary` with `data_dir` and the
 /// sandbox `GITEZ_TEST_SANDBOX` names, if any.
-fn supervisor_script(dir: &Path, binary: &Path, data_dir: &Path, passthrough: bool) -> PathBuf {
+pub(crate) fn supervisor_script(
+    dir: &Path,
+    binary: &Path,
+    data_dir: &Path,
+    passthrough: bool,
+) -> PathBuf {
     let script = dir.join("supervise");
     let sandbox = if passthrough {
         "export GITEZ_TEST_SANDBOX=passthrough\n"
@@ -388,7 +397,7 @@ fn supervisor_script(dir: &Path, binary: &Path, data_dir: &Path, passthrough: bo
 
 /// Settles the app and waits, in real time, until `done` holds for the
 /// model's threads of `common_dir`, or `timeout` passes.
-fn wait_until(
+pub(crate) fn wait_until(
     shots: &mut Shots,
     common_dir: &Path,
     timeout: Duration,

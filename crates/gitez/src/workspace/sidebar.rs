@@ -25,6 +25,12 @@ const COLLAPSE_TAGS_OVER: usize = 30;
 /// Text size of sidebar rows.
 const ROW_TEXT_SIZE: Pixels = px(12.5);
 
+/// The branches of agent threads, listed in Branches as one folder.
+const AGENT_FOLDER: &str = "agent/";
+
+/// How far the branches in a folder are indented, beyond a row's padding.
+const FOLDER_INDENT: Pixels = px(14.);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Section {
     LocalPullRequests,
@@ -97,6 +103,8 @@ pub struct Sidebar {
     collapsed: HashSet<Section>,
     /// Remotes whose branches are listed.
     expanded_remotes: HashSet<String>,
+    /// Branch folders (such as `agent/`) whose branches are listed.
+    expanded_folders: HashSet<String>,
     /// The local branch being dragged, here or in the history.
     dragging: Option<SharedString>,
 }
@@ -108,6 +116,7 @@ impl Sidebar {
             changed_files: None,
             collapsed: HashSet::new(),
             expanded_remotes: HashSet::new(),
+            expanded_folders: HashSet::new(),
             dragging: None,
         }
     }
@@ -129,6 +138,7 @@ impl Sidebar {
         if !same_repository {
             self.collapsed.clear();
             self.expanded_remotes.clear();
+            self.expanded_folders.clear();
             if snapshot.refs.tags.len() > COLLAPSE_TAGS_OVER {
                 self.collapsed.insert(Section::Tags);
             }
@@ -140,6 +150,13 @@ impl Sidebar {
     fn toggle_remote(&mut self, remote: &str, cx: &mut Context<Self>) {
         if !self.expanded_remotes.remove(remote) {
             self.expanded_remotes.insert(remote.to_owned());
+        }
+        cx.notify();
+    }
+
+    fn toggle_folder(&mut self, folder: &str, cx: &mut Context<Self>) {
+        if !self.expanded_folders.remove(folder) {
+            self.expanded_folders.insert(folder.to_owned());
         }
         cx.notify();
     }
@@ -317,15 +334,39 @@ impl Render for Sidebar {
                     .iter()
                     .map(|stash| stash_row(stash, now, cx).into_any_element())
                     .collect::<Vec<_>>();
-                let branch_rows = refs
+                // Agent threads' branches go in one folder, after the others.
+                let (agent_branches, other_branches): (Vec<&Branch>, Vec<&Branch>) = refs
                     .branches
                     .iter()
-                    .map(|branch| {
+                    .partition(|branch| branch.name.starts_with(AGENT_FOLDER));
+                let branch_row_of =
+                    |branch: &Branch, in_folder: Option<&str>, cx: &mut Context<Self>| {
                         let lifted = dragging.as_deref() == Some(branch.name.as_str());
-                        branch_row(branch, snapshot.tracking.get(&branch.name), lifted, cx)
-                            .into_any_element()
-                    })
-                    .collect::<Vec<_>>();
+                        branch_row(
+                            branch,
+                            in_folder,
+                            snapshot.tracking.get(&branch.name),
+                            lifted,
+                            cx,
+                        )
+                        .into_any_element()
+                    };
+                let mut branch_rows = Vec::with_capacity(refs.branches.len() + 1);
+                for branch in &other_branches {
+                    branch_rows.push(branch_row_of(branch, None, cx));
+                }
+                if !agent_branches.is_empty() {
+                    let expanded = self.expanded_folders.contains(AGENT_FOLDER);
+                    branch_rows.push(
+                        folder_row(AGENT_FOLDER, agent_branches.len(), expanded, cx)
+                            .into_any_element(),
+                    );
+                    if expanded {
+                        for branch in &agent_branches {
+                            branch_rows.push(branch_row_of(branch, Some(AGENT_FOLDER), cx));
+                        }
+                    }
+                }
                 this.child(self.section(
                     Section::LocalPullRequests,
                     "Local pull requests",
@@ -440,11 +481,47 @@ fn trailing(text: impl Into<SharedString>) -> Div {
         .child(text.into())
 }
 
+/// A folder of branches, such as `agent/`, with how many it holds; a click
+/// lists them under it or hides them.
+fn folder_row(
+    folder: &'static str,
+    count: usize,
+    expanded: bool,
+    cx: &mut Context<Sidebar>,
+) -> impl IntoElement {
+    row()
+        .id(SharedString::from(format!("branch-folder-{folder}")))
+        .debug_selector(move || format!("branch-folder-{folder}"))
+        .gap(px(5.))
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, _, _, cx| this.toggle_folder(folder, cx)))
+        .child(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .size(px(14.))
+                .child(
+                    Icon::new(if expanded {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .size(px(12.)),
+                ),
+        )
+        .child(label(folder))
+        .child(trailing(count.to_string()))
+}
+
 /// A local branch: double-click checks it out, right-click shows what else
 /// can be done with it. It can be dragged onto another branch, here or in the
-/// history, to merge it there; `lifted` while it is.
+/// history, to merge it there; `lifted` while it is. In `folder`, it is
+/// indented under the folder's row and named without the folder.
 fn branch_row(
     branch: &Branch,
+    folder: Option<&str>,
     tracking: Option<&Tracking>,
     lifted: bool,
     cx: &mut Context<Sidebar>,
@@ -476,18 +553,27 @@ fn branch_row(
         })
         .filter(|text| !text.is_empty());
 
+    let name = folder
+        .and_then(|folder| branch.name.strip_prefix(folder))
+        .unwrap_or(&branch.name)
+        .to_owned();
     row()
         .gap(px(5.))
+        .when(folder.is_some(), |this| this.pl(px(14.) + FOLDER_INDENT))
         .when(branch.is_head, |this| {
             this.text_color(rgb(color::TEXT))
                 .font_weight(FontWeight::MEDIUM)
         })
         .child(marker)
-        .child(label(branch.name.clone()))
+        .child(label(name))
         .when_some(ahead_behind, |this, text| {
             this.child(trailing(text).font_weight(FontWeight::NORMAL))
         })
         .id(SharedString::from(format!("branch-{}", branch.name)))
+        .debug_selector({
+            let name = branch.name.clone();
+            move || format!("branch-{name}")
+        })
         .when(lifted, |this| this.opacity(0.35))
         .on_drag(
             DraggedBranch::new(branch.name.clone(), branch.target),
@@ -835,4 +921,95 @@ fn stash_row(stash: &Stash, now: i64, cx: &mut Context<Sidebar>) -> impl IntoEle
                     .item(item("Drop", SidebarEvent::DropStash(index)))
             }
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use gpui_kit::{Entity, Modifiers, TestAppContext, VisualTestContext, px, size};
+
+    use super::Sidebar;
+    use crate::repository::Snapshot;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?}");
+    }
+
+    fn open(work_dir: &Path, cx: &mut TestAppContext) -> (Entity<Sidebar>, VisualTestContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+        });
+        let snapshot = Arc::new(Snapshot::load(work_dir).expect("the repository loads"));
+        let window = cx.open_window(size(px(260.), px(900.)), |_, _| Sidebar::new());
+        let sidebar = window
+            .update(cx, |_, _, cx| cx.entity())
+            .expect("window open");
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        sidebar.update(&mut cx, |sidebar, cx| sidebar.set_snapshot(snapshot, cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        (sidebar, cx)
+    }
+
+    #[gpui_kit::test]
+    fn agent_branches_are_one_folder_that_expands(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let work_dir = dir.path();
+        git(work_dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(work_dir.join("a.txt"), "a\n").expect("write");
+        git(work_dir, &["add", "."]);
+        git(work_dir, &["commit", "-qm", "base"]);
+        for branch in ["agent/fix-the-parser", "agent/blame-view", "feature/x"] {
+            git(work_dir, &["branch", branch]);
+        }
+        let (sidebar, mut cx) = open(work_dir, cx);
+        let folder = cx
+            .debug_bounds("branch-folder-agent/")
+            .expect("one row for the agent/ folder");
+        assert!(cx.debug_bounds("branch-main").is_some());
+        assert!(cx.debug_bounds("branch-feature/x").is_some());
+        assert!(
+            cx.debug_bounds("branch-agent/fix-the-parser").is_none(),
+            "the folder starts collapsed"
+        );
+        assert!(cx.debug_bounds("branch-agent/blame-view").is_none());
+
+        cx.simulate_click(folder.center(), Modifiers::none());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let first = cx
+            .debug_bounds("branch-agent/blame-view")
+            .expect("expanded, the folder lists its branches");
+        let second = cx
+            .debug_bounds("branch-agent/fix-the-parser")
+            .expect("both of them");
+        assert!(first.top() > folder.top() && second.top() > first.top());
+        // Another repository starts with the folder collapsed again.
+        let other = tempfile::tempdir().expect("temp dir");
+        git(other.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(other.path().join("b.txt"), "b\n").expect("write");
+        git(other.path(), &["add", "."]);
+        git(other.path(), &["commit", "-qm", "base"]);
+        git(other.path(), &["branch", "agent/other"]);
+        let snapshot = Arc::new(Snapshot::load(other.path()).expect("the repository loads"));
+        sidebar.update(&mut cx, |sidebar, cx| sidebar.set_snapshot(snapshot, cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("branch-folder-agent/").is_some());
+        assert!(cx.debug_bounds("branch-agent/other").is_none());
+    }
 }

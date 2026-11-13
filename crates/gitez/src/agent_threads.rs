@@ -39,6 +39,15 @@ pub struct OpenAgentThread {
     pub id: AgentThreadId,
 }
 
+/// Opens local pull request `number`, which an agent thread of the
+/// repository at `common_dir` created (the workspace handles it).
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = agent_threads, no_json)]
+pub struct OpenAgentPullRequest {
+    pub common_dir: PathBuf,
+    pub number: u32,
+}
+
 /// Names an agent thread across repositories.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AgentThreadKey {

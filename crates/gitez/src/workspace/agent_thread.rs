@@ -518,6 +518,47 @@ fn can_reply(thread: &AgentThread) -> bool {
     thread.state == State::Finished && thread.session_id.is_some()
 }
 
+/// Whether `thread` is finished without a pull request, so Complete is
+/// offered; one with a pull request completes when it is merged or closed.
+pub fn can_complete(thread: &AgentThread) -> bool {
+    thread.state == State::Finished && thread.pull_request.is_none()
+}
+
+/// The hosts the sandbox refused in `thread`'s last run that ended.
+pub fn blocked_hosts(thread: &AgentThread) -> &[String] {
+    thread
+        .turns
+        .iter()
+        .rev()
+        .find_map(|turn| turn.result.as_ref())
+        .map_or(&[], |result| result.blocked_hosts.as_slice())
+}
+
+/// The network a retry of `thread` should use: Packages when Agent API only
+/// blocked hosts in its last run, otherwise the thread's own.
+pub fn suggested_retry(thread: &AgentThread) -> NetworkProfile {
+    if !blocked_hosts(thread).is_empty() && thread.network == NetworkProfile::AgentOnly {
+        NetworkProfile::Packages
+    } else {
+        thread.network
+    }
+}
+
+/// When `thread` last stopped: its newest turn's end, else its last change.
+pub fn finished_at(thread: &AgentThread) -> Timestamp {
+    thread
+        .turns
+        .iter()
+        .rev()
+        .find_map(|turn| turn.ended)
+        .unwrap_or(thread.updated)
+}
+
+/// "12 min ago", "yesterday": when `time` was, from `now`.
+pub fn ago(time: Timestamp, now: Timestamp) -> String {
+    crate::time::relative(git_time(time), now.as_second())
+}
+
 /// What `thread` is doing, or how it ended: "Running", "Waiting until
 /// 14:30", "Ready for review", "No changes", "Failed".
 pub fn state_label(thread: &AgentThread) -> String {
@@ -636,13 +677,7 @@ fn summary(thread: &AgentThread, now: Timestamp) -> String {
         State::Queued => vec!["Waits for a free slot".to_owned()],
         State::Preparing | State::Running | State::Waiting => vec![run, steps],
         State::Finished | State::Completed => {
-            let ended = thread
-                .turns
-                .iter()
-                .rev()
-                .find_map(|turn| turn.ended)
-                .unwrap_or(thread.updated);
-            let when = crate::time::relative(git_time(ended), now.as_second());
+            let when = ago(finished_at(thread), now);
             let mut parts = Vec::new();
             if thread.state == State::Completed {
                 parts.push(ending_label(thread.ending).to_owned());
@@ -745,7 +780,7 @@ impl ThreadView {
     ) -> Div {
         let busy = self.busy.as_ref().map(|(busy, _)| *busy);
         let active = thread.state.is_active();
-        let can_complete = thread.state == State::Finished && thread.pull_request.is_none();
+        let can_complete = can_complete(thread);
         let has_transcript = self.newest_run(thread).is_some();
         let summary = div()
             .min_w_0()
@@ -1459,18 +1494,7 @@ impl ThreadView {
             return None;
         }
         let busy = self.busy.as_ref().map(|(busy, _)| *busy);
-        let blocked = thread
-            .turns
-            .iter()
-            .rev()
-            .find_map(|turn| turn.result.as_ref())
-            .is_some_and(|result| !result.blocked_hosts.is_empty());
-        let suggested = if blocked && thread.network == NetworkProfile::AgentOnly {
-            NetworkProfile::Packages
-        } else {
-            thread.network
-        };
-        let network = self.retry_network.unwrap_or(suggested);
+        let network = self.retry_network.unwrap_or(suggested_retry(thread));
         let label = if network != thread.network && self.retry_network.is_none() {
             format!("Retry with {}", network.label())
         } else {

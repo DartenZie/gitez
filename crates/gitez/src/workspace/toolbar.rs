@@ -1,5 +1,9 @@
 //! The toolbar across the top of the window.
 
+pub(crate) mod agents;
+#[cfg(all(test, target_os = "macos"))]
+mod agents_shots;
+
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::*;
 use gpui_kit::component::kbd::Kbd;
@@ -12,9 +16,10 @@ use super::palette::lowercase_first;
 use super::remote::{RemoteActions, RemoteOp};
 use super::{
     Fetch, NewBranch, NewPullRequest, OpenPalette, OpenRecent, OpenRepository, Pull, Push,
-    RedoStep, StashChanges, UndoStep,
+    RedoStep, ShowHome, StashChanges, UndoStep,
 };
 use crate::theme::{self, color};
+use agents::{AgentsScope, agents_indicator};
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -38,9 +43,9 @@ const RECENT_TEXT_WIDTH: Pixels = px(348.);
 /// Hover group of a row in the repository menu.
 const RECENT_ROW_GROUP: &str = "recent-repository-row";
 
-/// Repository switcher, undo and redo, remote operations, branch and stash,
-/// the command palette entry and "New local PR".
-///
+/// Home, the repository switcher, undo and redo, remote operations, branch
+/// and stash, the command palette entry, "New local PR" and the Agents
+/// indicator.
 #[derive(IntoElement)]
 pub struct Toolbar {
     /// Name of the open repository.
@@ -64,10 +69,14 @@ pub struct Toolbar {
     /// What undo and redo would do next, such as "Commit “Fix the parser”".
     pub undo: Option<String>,
     pub redo: Option<String>,
+    /// The open repository, whose agent threads the Agents indicator
+    /// counts and lists; `None` without one.
+    pub agents: Option<AgentsScope>,
 }
 
 impl RenderOnce for Toolbar {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let home = self.repository_name.is_none() && !self.loading;
         let repository_label = self
             .repository_name
             .clone()
@@ -81,6 +90,7 @@ impl RenderOnce for Toolbar {
             .bg(rgb(color::PANEL))
             .border_b_1()
             .border_color(rgb(color::BORDER))
+            .child(home_button(home))
             .child(
                 div()
                     .h_flex()
@@ -170,6 +180,7 @@ impl RenderOnce for Toolbar {
                     .disabled(self.repository_name.is_none())
                     .on_click(|_, window, cx| window.dispatch_action(Box::new(NewPullRequest), cx)),
             )
+            .child(agents_indicator(self.agents, self.focus, window, cx))
     }
 }
 
@@ -249,7 +260,7 @@ impl Toolbar {
 
 /// The recent repositories, the open one ticked and each with a remove
 /// button on hover, then "Open repository…".
-fn repository_menu(
+pub(crate) fn repository_menu(
     menu: PopupMenu,
     current: Option<&Path>,
     focus: &FocusHandle,
@@ -355,7 +366,7 @@ fn repository_menu(
 
 /// The icon of the repository called `name`, or the badge with its initial
 /// if it has none or the icon cannot be decoded.
-fn logo(icon: Option<Arc<Image>>, name: Option<&str>) -> AnyElement {
+pub(crate) fn logo(icon: Option<Arc<Image>>, name: Option<&str>) -> AnyElement {
     let letter = initial(name);
     match icon {
         Some(icon) => img(icon)
@@ -390,6 +401,26 @@ fn badge(letter: SharedString) -> impl IntoElement {
 fn initial(name: Option<&str>) -> SharedString {
     name.and_then(|name| name.chars().find(|c| c.is_alphanumeric()))
         .map_or("G".into(), |c| c.to_uppercase().collect::<String>().into())
+}
+
+/// The Home button at the left end: back to Home, where every
+/// repository's agent threads are; shown as the current place while no
+/// repository is open (`home`).
+fn home_button(home: bool) -> Button {
+    Button::new("home")
+        .debug_selector(|| "toolbar-home".into())
+        .size(BUTTON_HEIGHT)
+        .icon(Icon::new(IconName::House).size(px(16.)))
+        .accessibility_label("Home")
+        .tooltip("Home")
+        .map(|this| {
+            if home {
+                this.selected(true)
+            } else {
+                this.ghost()
+            }
+        })
+        .on_click(|_, window, cx| window.dispatch_action(Box::new(ShowHome), cx))
 }
 
 fn separator() -> impl IntoElement {
