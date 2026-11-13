@@ -138,6 +138,9 @@ pub struct Sidebar {
     expanded_remotes: HashSet<String>,
     /// Branch folders (such as `agent/`) whose branches are listed.
     expanded_folders: HashSet<String>,
+    /// Whether the merged and closed pull requests are listed under the
+    /// open ones; collapsed by default, like a folder.
+    finished_expanded: bool,
     /// The local branch being dragged, here or in the history.
     dragging: Option<SharedString>,
     /// The fetch, pull or push running, shown on its row.
@@ -155,6 +158,7 @@ impl Sidebar {
             collapsed: HashSet::new(),
             expanded_remotes: HashSet::new(),
             expanded_folders: HashSet::new(),
+            finished_expanded: false,
             dragging: None,
             running: None,
             thread_branches: HashSet::new(),
@@ -197,6 +201,7 @@ impl Sidebar {
             self.collapsed.clear();
             self.expanded_remotes.clear();
             self.expanded_folders.clear();
+            self.finished_expanded = false;
             if snapshot.refs.tags.len() > COLLAPSE_TAGS_OVER {
                 self.collapsed.insert(Section::Tags);
             }
@@ -216,6 +221,11 @@ impl Sidebar {
         if !self.expanded_folders.remove(folder) {
             self.expanded_folders.insert(folder.to_owned());
         }
+        cx.notify();
+    }
+
+    fn toggle_finished(&mut self, cx: &mut Context<Self>) {
+        self.finished_expanded = !self.finished_expanded;
         cx.notify();
     }
 
@@ -287,10 +297,13 @@ impl Sidebar {
                     ),
             )
             .when(!collapsed, |this| {
-                if count == 0 {
+                // Not by `count`: Local pull requests counts only the open
+                // ones, and may still have a row for the finished ones.
+                let rows = rows();
+                if rows.is_empty() {
                     this.child(row().text_color(rgb(color::TEXT_FAINT)).child(empty))
                 } else {
-                    this.children(rows())
+                    this.children(rows)
                 }
             })
     }
@@ -386,11 +399,25 @@ impl Render for Sidebar {
                 }
                 let now = time::now();
 
-                let pull_request_rows = snapshot
-                    .pull_requests
+                // Only the pull requests in review; the merged and closed
+                // ones behind one row at the end.
+                let split = PullRequests::split(&snapshot.pull_requests);
+                let mut pull_request_rows = split
+                    .open
                     .iter()
                     .map(|pull_request| pull_request_row(pull_request, cx).into_any_element())
                     .collect::<Vec<_>>();
+                if !split.finished.is_empty() {
+                    let expanded = self.finished_expanded;
+                    pull_request_rows.push(
+                        finished_row(split.finished_label(), expanded, cx).into_any_element(),
+                    );
+                    if expanded {
+                        pull_request_rows.extend(split.finished.iter().map(|pull_request| {
+                            pull_request_row(pull_request, cx).into_any_element()
+                        }));
+                    }
+                }
                 let stash_rows = refs
                     .stashes
                     .iter()
@@ -438,7 +465,7 @@ impl Render for Sidebar {
                 this.child(self.section(
                     Section::LocalPullRequests,
                     "Local pull requests",
-                    snapshot.pull_requests.len(),
+                    split.open.len(),
                     "No local pull requests",
                     || pull_request_rows,
                     cx,
@@ -547,6 +574,69 @@ fn trailing(text: impl Into<SharedString>) -> Div {
         .text_size(theme::SMALL_TEXT_SIZE)
         .text_color(rgb(color::TEXT_FAINT))
         .child(text.into())
+}
+
+/// The pull requests of the sidebar's Local pull requests section: those in
+/// review, listed and counted, and the merged and closed ones, which are
+/// finished and listed only on request. Each keeps the order it was given.
+#[derive(Debug, Default)]
+struct PullRequests<'a> {
+    open: Vec<&'a PullRequest>,
+    finished: Vec<&'a PullRequest>,
+}
+
+impl<'a> PullRequests<'a> {
+    fn split(pull_requests: &'a [PullRequest]) -> Self {
+        let (open, finished) = pull_requests
+            .iter()
+            .partition(|pull_request| pull_request.state == State::Open);
+        Self { open, finished }
+    }
+
+    /// "2 merged", "1 closed", "2 merged, 1 closed".
+    fn finished_label(&self) -> String {
+        let merged = self
+            .finished
+            .iter()
+            .filter(|pull_request| pull_request.state == State::Merged)
+            .count();
+        let closed = self.finished.len() - merged;
+        match (merged, closed) {
+            (merged, 0) => format!("{merged} merged"),
+            (0, closed) => format!("{closed} closed"),
+            (merged, closed) => format!("{merged} merged, {closed} closed"),
+        }
+    }
+}
+
+/// The muted row at the end of Local pull requests that stands for the
+/// merged and closed ones, `label` saying how many; a click lists them
+/// under it or hides them.
+fn finished_row(label: String, expanded: bool, cx: &mut Context<Sidebar>) -> impl IntoElement {
+    row()
+        .id("sidebar-finished-pull-requests")
+        .debug_selector(|| "sidebar-finished-pull-requests".into())
+        .gap(px(5.))
+        .text_color(rgb(color::TEXT_FAINT))
+        .cursor_pointer()
+        .on_click(cx.listener(|this, _, _, cx| this.toggle_finished(cx)))
+        .child(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .size(px(14.))
+                .child(
+                    Icon::new(if expanded {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .size(px(12.)),
+                ),
+        )
+        .child(self::label(label))
 }
 
 /// A folder of branches, such as `agent/`, with how many it holds; a click
@@ -828,6 +918,7 @@ fn pull_request_row(pull_request: &PullRequest, cx: &mut Context<Sidebar>) -> im
     let number = pull_request.number;
     div()
         .id(("sidebar-pull-request", number as usize))
+        .debug_selector(move || format!("sidebar-pull-request-{number}"))
         .h_flex()
         .items_start()
         .gap(px(8.))
@@ -1073,7 +1164,10 @@ mod tests {
         assert!(status.success(), "git {args:?}");
     }
 
-    fn open(work_dir: &Path, cx: &mut TestAppContext) -> (Entity<Sidebar>, VisualTestContext) {
+    fn open_sidebar(
+        work_dir: &Path,
+        cx: &mut TestAppContext,
+    ) -> (Entity<Sidebar>, VisualTestContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
             crate::theme::init(cx);
@@ -1101,7 +1195,7 @@ mod tests {
         for branch in ["agent/fix-the-parser", "agent/blame-view", "feature/x"] {
             git(work_dir, &["branch", branch]);
         }
-        let (sidebar, mut cx) = open(work_dir, cx);
+        let (sidebar, mut cx) = open_sidebar(work_dir, cx);
         let folder = cx
             .debug_bounds("branch-folder-agent/")
             .expect("one row for the agent/ folder");
@@ -1216,5 +1310,140 @@ mod tests {
         assert!(on_remote.top() > button.top());
         cx.simulate_click(on_remote.center(), Modifiers::default());
         assert_eq!(cancels.get(), 2);
+    }
+
+    /// A pull request #`number` of `branch` into `main` in `state`.
+    fn pull_request(store: &gitez_review::Store, branch: &str, state: gitez_review::State) -> u32 {
+        let tip = |branch: &str| gitez_review::Tip {
+            branch: branch.into(),
+            commit: "0".repeat(40),
+        };
+        let mut created = store
+            .create(
+                gitez_review::NewPullRequest {
+                    title: format!("Review {branch}"),
+                    description: String::new(),
+                    base: tip("main"),
+                    head: tip(branch),
+                },
+                gitez_review::Timestamp::now(),
+            )
+            .expect("create a pull request");
+        created.state = state;
+        store.save(&created).expect("save it");
+        created.number
+    }
+
+    fn pull_requests_of(states: &[gitez_review::State]) -> Vec<gitez_review::PullRequest> {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = gitez_review::Store::new(dir.path());
+        for (n, state) in states.iter().enumerate() {
+            pull_request(&store, &format!("b{n}"), *state);
+        }
+        store
+            .numbers()
+            .expect("numbers")
+            .into_iter()
+            .map(|number| store.load(number).expect("load"))
+            .collect()
+    }
+
+    #[test]
+    fn only_open_pull_requests_are_listed_and_counted() {
+        use gitez_review::State::{Closed, Merged, Open};
+        let all = pull_requests_of(&[Merged, Open, Closed, Merged, Open]);
+        let split = super::PullRequests::split(&all);
+        let numbers = |list: &[&gitez_review::PullRequest]| {
+            list.iter().map(|pr| pr.number).collect::<Vec<_>>()
+        };
+        assert_eq!(numbers(&split.open), [2, 5], "the open ones, in order");
+        assert_eq!(numbers(&split.finished), [1, 3, 4]);
+        assert_eq!(split.finished_label(), "2 merged, 1 closed");
+
+        assert_eq!(
+            super::PullRequests::split(&pull_requests_of(&[Merged, Merged])).finished_label(),
+            "2 merged"
+        );
+        assert_eq!(
+            super::PullRequests::split(&pull_requests_of(&[Closed, Open])).finished_label(),
+            "1 closed"
+        );
+        let none = super::PullRequests::split(&[]);
+        assert!(none.open.is_empty() && none.finished.is_empty());
+    }
+
+    #[gpui_kit::test]
+    fn merged_and_closed_pull_requests_wait_behind_one_row(cx: &mut TestAppContext) {
+        use gitez_review::State::{Closed, Merged, Open};
+        let dir = tempfile::tempdir().expect("temp dir");
+        let work_dir = dir.path();
+        git(work_dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(work_dir.join("a.txt"), "a\n").expect("write");
+        git(work_dir, &["add", "."]);
+        git(work_dir, &["commit", "-qm", "base"]);
+        let store = gitez_review::Store::new(&work_dir.join(".git"));
+        let merged = pull_request(&store, "one", Merged);
+        let closed = pull_request(&store, "two", Closed);
+        let open = pull_request(&store, "three", Open);
+        let (sidebar, mut cx) = open_sidebar(work_dir, cx);
+        let shown = |number: u32, cx: &mut VisualTestContext| {
+            let selector: &'static str =
+                Box::leak(format!("sidebar-pull-request-{number}").into_boxed_str());
+            cx.debug_bounds(selector)
+        };
+        let finished = cx
+            .debug_bounds("sidebar-finished-pull-requests")
+            .expect("one row for the finished ones");
+        let open_row = shown(open, &mut cx).expect("the open one is listed");
+        assert!(finished.top() > open_row.top(), "after the open ones");
+        assert_eq!(shown(merged, &mut cx), None, "collapsed by default");
+        assert_eq!(shown(closed, &mut cx), None);
+
+        cx.simulate_click(finished.center(), Modifiers::none());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let merged_row = shown(merged, &mut cx).expect("expanded, it lists them");
+        assert!(merged_row.top() > finished.top());
+        assert!(shown(closed, &mut cx).is_some());
+
+        // Reopened: back in the list, and the row goes with the last one.
+        for number in [merged, closed] {
+            let mut pull_request = store.load(number).expect("load");
+            pull_request.state = Open;
+            store.save(&pull_request).expect("save");
+        }
+        let snapshot = Arc::new(Snapshot::load(work_dir).expect("the repository loads"));
+        sidebar.update(&mut cx, |sidebar, cx| sidebar.set_snapshot(snapshot, cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(cx.debug_bounds("sidebar-finished-pull-requests"), None);
+        for number in [merged, closed, open] {
+            assert!(shown(number, &mut cx).is_some(), "#{number} is open");
+        }
+    }
+
+    #[gpui_kit::test]
+    fn with_only_finished_pull_requests_the_row_stands_alone(cx: &mut TestAppContext) {
+        use gitez_review::State::Merged;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let work_dir = dir.path();
+        git(work_dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(work_dir.join("a.txt"), "a\n").expect("write");
+        git(work_dir, &["add", "."]);
+        git(work_dir, &["commit", "-qm", "base"]);
+        let store = gitez_review::Store::new(&work_dir.join(".git"));
+        let (sidebar, mut cx) = open_sidebar(work_dir, cx);
+        assert_eq!(
+            cx.debug_bounds("sidebar-finished-pull-requests"),
+            None,
+            "nothing at all: the section's empty text"
+        );
+        for branch in ["one", "two"] {
+            pull_request(&store, branch, Merged);
+        }
+        let snapshot = Arc::new(Snapshot::load(work_dir).expect("the repository loads"));
+        sidebar.update(&mut cx, |sidebar, cx| sidebar.set_snapshot(snapshot, cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("sidebar-finished-pull-requests").is_some());
+        assert_eq!(cx.debug_bounds("sidebar-pull-request-1"), None);
     }
 }

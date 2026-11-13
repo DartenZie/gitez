@@ -25,6 +25,8 @@ mod motion_shots;
 mod motion_tests;
 mod new_pull_request;
 mod palette;
+#[cfg(all(test, target_os = "macos"))]
+mod prs_shots;
 mod remote;
 mod remotes;
 mod reset;
