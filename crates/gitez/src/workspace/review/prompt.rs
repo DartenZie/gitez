@@ -1039,7 +1039,16 @@ impl Review {
                             .turns
                             .last()
                             .and_then(|turn| turn.result.as_ref())
-                            .map(|result| result.message.trim().to_owned())
+                            .map(|result| {
+                                // Not the `# Title` line that named the
+                                // thread: its title is above.
+                                gitez_agent_thread::message_without_title(
+                                    &result.message,
+                                    &thread.title,
+                                )
+                                .trim()
+                                .to_owned()
+                            })
                             .filter(|message| !message.is_empty())
                         {
                             body.push(

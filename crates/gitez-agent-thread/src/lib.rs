@@ -35,7 +35,10 @@ pub use model::{
     NewAgentThread, RetryPlan, Start, State, Step, SupervisorInfo, Turn, TurnKind, TurnResult,
     Uncommitted, WorktreeRecord,
 };
-pub use names::{repository_key, slug, title_from_prompt};
+pub use names::{
+    clean_title, message_without_title, repository_key, slug, split_title, title_from_message,
+    title_from_prompt,
+};
 pub use prepare::{CACHE_DIRS, PrepareReport, PrepareStep, clone_tree, prepare};
 pub use store::{Run, RunHeader, Store};
 pub use watch::{Watcher, watch};

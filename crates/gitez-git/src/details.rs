@@ -94,6 +94,15 @@ impl Repository {
         Ok(Some(message.to_str_lossy().trim_end().to_owned()))
     }
 
+    /// The full message of commit `id`, as written, without trailing
+    /// whitespace; invalid UTF-8 is replaced.
+    pub fn commit_message(&self, id: Oid) -> Result<String> {
+        let repo = self.local();
+        let commit = repo.find_commit(id)?;
+        let message = commit.message_raw()?;
+        Ok(message.to_str_lossy().trim_end().to_owned())
+    }
+
     /// Reads the message and changed files of commit `id`. Merges are compared
     /// with their first parent, like the history's first-parent line.
     pub fn commit_details(&self, id: Oid) -> Result<CommitDetails> {

@@ -38,6 +38,20 @@ text() { say '{"type":"assistant","message":{"content":[{"type":"text","text":"'
 result() { say '{"type":"result","subtype":"success","is_error":false,"result":"'"$1"'","session_id":"'"$sid"'","num_turns":1,"duration_ms":5,"total_cost_usd":0.01}'; }
 once() { if [ -e "$log/once-$1" ]; then return 1; fi; : > "$log/once-$1"; return 0; }
 case "$prompt" in
+  *TITLED*)
+    init; tool "git commit"
+    echo hello > greeting.txt && git add greeting.txt && git commit --quiet -m "Agent: greet" >&2
+    echo left > left.txt
+    result '# Make the greeting friendlier\n\nThe greeting is warmer now.' ;;
+  *TWO-COMMITS*)
+    init; tool "git commit"
+    echo one > one.txt && git add one.txt && git commit --quiet -m "  \"Add one.txt.\"  " >&2
+    echo two > two.txt && git add two.txt && git commit --quiet -m "Add two.txt" >&2
+    result "Added two files." ;;
+  *RETITLE*)
+    init; tool "git commit"
+    echo third >> agent.txt && git add agent.txt && git commit --quiet -m "Agent: third line" >&2
+    result '# Rename everything\n\nAdded a third line.' ;;
   *COMMIT-AGAIN*)
     init; tool "git commit"
     echo second >> agent.txt && git add agent.txt && git commit --quiet -m "Agent: second line" >&2

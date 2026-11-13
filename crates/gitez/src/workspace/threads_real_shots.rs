@@ -57,6 +57,18 @@ fn real(
     secrets: impl FnOnce(&Path) -> Vec<SecretEntry>,
     store: Option<Arc<dyn SecretStore>>,
 ) -> Real {
+    real_with(name, limit, secrets, store, |_| {})
+}
+
+/// [`real`], with `prepare` run on the repository's working directory
+/// before its window opens.
+fn real_with(
+    name: &str,
+    limit: u32,
+    secrets: impl FnOnce(&Path) -> Vec<SecretEntry>,
+    store: Option<Arc<dyn SecretStore>>,
+    prepare: impl FnOnce(&Path),
+) -> Real {
     let binary = gitez_binary().expect("build target/debug/gitez first: cargo build -p gitez");
     let scratch = PathBuf::from(std::env::var_os("GITEZ_E2E_SCRATCH").expect("a scratch folder"));
     let sandbox = PathBuf::from(std::env::var_os("GITEZ_E2E_SANDBOX").expect("an srt install"));
@@ -64,6 +76,7 @@ fn real(
     std::fs::create_dir_all(&base).expect("scratch folder");
     let base = base.canonicalize().expect("canonical");
     let work_dir = repository(&base);
+    prepare(&work_dir);
     let common_dir = common_dir_of(&work_dir);
     let data_dir = base.join("data");
     std::fs::create_dir_all(&data_dir).expect("data folder");
@@ -612,4 +625,89 @@ pub(crate) fn open_pull_request(
             .and_then(|(review, _)| review.read(cx).pull_request_number())
     });
     assert_eq!(shown, Some(number), "the pull request opens");
+}
+
+/// The agent names the pull request: vague prompts, as people write them,
+/// each changing a file. Reports the titles the agent gave (or did not
+/// give) and what GitEZ made of them; asserts only that the pull request
+/// and the thread share the title, since the agent may ignore the rule.
+#[test]
+fn e2e_final_agent_names_the_pull_request() {
+    if !wanted() {
+        return;
+    }
+    let mut real = real_with(
+        "final-title",
+        3,
+        |_| Vec::new(),
+        None,
+        |work_dir| {
+            std::fs::write(
+                work_dir.join("greet.sh"),
+                "#!/bin/sh\necho \"Hello.\"\necho \"Goodbye.\"\n",
+            )
+            .expect("write");
+            for args in [
+                &["add", "greet.sh"][..],
+                &["commit", "--quiet", "-m", "Add the greeting script"],
+            ] {
+                let status = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(work_dir)
+                    .status()
+                    .expect("git runs");
+                assert!(status.success(), "git {args:?}");
+            }
+        },
+    );
+    let started = Instant::now();
+    let prompts = [
+        "Can you look into the greeting and make it friendlier?",
+        "Please change the goodbye in greet.sh, it sounds too cold",
+        "look into this: greet.sh should greet the user by name when one is given",
+    ];
+    let keys: Vec<AgentThreadKey> = prompts.iter().map(|prompt| real.ask(prompt)).collect();
+    let mut problems = Vec::new();
+    for (index, (key, prompt)) in keys.iter().zip(prompts).enumerate() {
+        let done = real.finished(key, "the change");
+        report("title", started, &done);
+        let message = last_message(&done);
+        let heading = gitez_agent_thread::title_from_message(&message);
+        eprintln!(
+            "TITLE prompt {prompt:?}\n  first line: {:?}\n  heading: {heading:?}\n  \
+             thread title: {:?}\n  pull request: {:?}",
+            message.lines().find(|line| !line.trim().is_empty()),
+            done.title,
+            done.pull_request,
+        );
+        let Some(number) = done.pull_request else {
+            problems.push(format!("{prompt:?} opened no pull request: {done:#?}"));
+            continue;
+        };
+        let pull_request = gitez_review::Store::new(&real.common_dir)
+            .load(number)
+            .expect("load the pull request");
+        eprintln!(
+            "  pull request title: {:?}\n  description starts: {:?}",
+            pull_request.title,
+            pull_request.description.lines().next()
+        );
+        if pull_request.title != done.title {
+            problems.push(format!(
+                "{prompt:?}: pull request {:?} but thread {:?}",
+                pull_request.title, done.title
+            ));
+        }
+        real.open(key);
+        real.save(&format!("final-title-{}-thread", index + 1));
+        open_pull_request(
+            &mut real.shots,
+            real.window,
+            &real.workspace.clone(),
+            &real.common_dir.clone(),
+            number,
+        );
+        real.save(&format!("final-title-{}-pull-request", index + 1));
+    }
+    assert!(problems.is_empty(), "{problems:#?}");
 }

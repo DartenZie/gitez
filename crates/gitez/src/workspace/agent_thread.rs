@@ -1875,7 +1875,8 @@ impl ThreadView {
         if !matches!(thread.state, State::Finished | State::Completed) {
             return None;
         }
-        let message = thread.final_message()?.to_owned();
+        // The `# Title` line that named the thread is its title above.
+        let message = thread.final_message_body()?.to_owned();
         let what = if thread.ending == Some(Ending::Answer) {
             "Answer"
         } else {

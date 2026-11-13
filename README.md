@@ -120,7 +120,10 @@ inside your repository, and runs in a [sandbox](#the-agent-sandbox).
 - When the agent stops, GitEZ commits what it left uncommitted on the
   thread's branch. If the branch has commits of its own, GitEZ opens a
   **local pull request** against the starting branch, with the agent's final
-  message as its description.
+  message as its description. The agent names the change: the title is the
+  heading its final message starts with, else the subject of its first
+  commit, else the first sentence of your prompt. The thread takes the same
+  title; its branch keeps the name it got from the prompt.
 - **Review loop**: on a pull request that a thread opened, **Send to Claude
   Code** sends your review comments back to that thread, which continues in
   its own worktree. The head branch does not have to be checked out. Merging

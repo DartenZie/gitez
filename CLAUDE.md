@@ -127,8 +127,10 @@ Decided 2026-10-23; change only with the owner's agreement.
   coding agent that works in the background, and the conversation that
   follows. Claude Code is the only agent; others come behind the `Agent`
   trait and the `Registry` of `gitez-agent`.
-  - One thread is one branch, `agent/<id>` (the id is a slug of the title,
-    with `-2`, `-3`… when taken), and one linked worktree at
+  - One thread is one branch, `agent/<id>` (the id is a slug of the title
+    taken from the prompt, with `-2`, `-3`… when taken; the title, not the
+    id, becomes the pull request's when the supervisor creates it), and one
+    linked worktree at
     `<data folder>/worktrees/<repository name>-<8 hex digits of a hash of the
     common dir>/<id>`, never inside the repository. GitEZ makes it with `git
     worktree add`, never `claude --worktree`. The data folder is

@@ -86,8 +86,11 @@ fn start_creates_the_worktree_runs_setup_and_the_agent_and_opens_a_pull_request(
     assert_eq!(reviews.numbers().expect("numbers"), [1]);
     assert_eq!(thread.pull_request, Some(1));
     let pull_request = reviews.load(1).expect("load");
+    // No heading in the final message: the agent's commit names it, and
+    // the thread takes the name; its id and branch stay.
     assert_eq!(pull_request.title, thread.title);
-    assert_eq!(pull_request.title, "COMMIT a file for me");
+    assert_eq!(pull_request.title, "Agent: first line");
+    assert_eq!(thread.id, id);
     assert_eq!(
         pull_request.description,
         "Wrote agent.txt and committed it."
@@ -96,6 +99,91 @@ fn start_creates_the_worktree_runs_setup_and_the_agent_and_opens_a_pull_request(
     assert_eq!(pull_request.base.commit, start);
     assert_eq!(pull_request.head.branch, thread.branch);
     assert_eq!(pull_request.head.commit, fixture.tip(&thread.branch));
+}
+
+#[test]
+fn the_heading_of_the_final_message_names_the_pull_request_and_the_thread() {
+    let fixture = Fixture::new();
+    let created = fixture.create("TITLED: can you look into the greeting and make it friendlier?");
+    assert_eq!(created.title, "TITLED");
+    let id = created.id.clone();
+    let thread = fixture.run(&id, Command::Start);
+    assert_eq!(thread.ending, Some(Ending::PullRequest), "{thread:#?}");
+    let pull_request = gitez_review::Store::new(&fixture.common_dir())
+        .load(1)
+        .expect("load");
+    assert_eq!(pull_request.title, "Make the greeting friendlier");
+    assert_eq!(pull_request.description, "The greeting is warmer now.");
+    // The thread takes the same name; its id, branch and worktree stay.
+    assert_eq!(thread.title, "Make the greeting friendlier");
+    assert_eq!(thread.id, id);
+    assert_eq!(thread.branch, created.branch);
+    assert_eq!(thread.worktree, created.worktree);
+    assert_eq!(fixture.load(&id).title, "Make the greeting friendlier");
+    // The final message keeps its heading; it is shown apart.
+    assert_eq!(
+        thread.final_message(),
+        Some("# Make the greeting friendlier\n\nThe greeting is warmer now.")
+    );
+    assert_eq!(
+        thread.final_message_body(),
+        Some("The greeting is warmer now.")
+    );
+    // GitEZ's commit of the leftovers already uses the agent's title.
+    assert_eq!(
+        git(&fixture.root, &["log", "-1", "--format=%B", &thread.branch]),
+        "Make the greeting friendlier\n\nChanges the agent left uncommitted, committed by GitEZ."
+    );
+}
+
+#[test]
+fn without_a_heading_the_oldest_commit_names_the_pull_request() {
+    let fixture = Fixture::new();
+    let id = fixture.create("TWO-COMMITS please").id;
+    let thread = fixture.run(&id, Command::Start);
+    assert_eq!(thread.ending, Some(Ending::PullRequest), "{thread:#?}");
+    // Cleaned: no quotes, no trailing period, no surrounding spaces.
+    assert_eq!(thread.title, "Add one.txt");
+    let pull_request = gitez_review::Store::new(&fixture.common_dir())
+        .load(1)
+        .expect("load");
+    assert_eq!(pull_request.title, "Add one.txt");
+    assert_eq!(pull_request.description, "Added two files.");
+}
+
+#[test]
+fn a_later_turn_does_not_rename_the_pull_request() {
+    let fixture = Fixture::new();
+    let id = fixture.create("COMMIT a file for me").id;
+    let first = fixture.run(&id, Command::Start);
+    assert_eq!(first.title, "Agent: first line");
+    fixture
+        .store()
+        .update(&id, |thread| {
+            thread.request_turn(
+                TurnKind::Reply,
+                "RETITLE and add a third line".to_owned(),
+                Timestamp::now(),
+            )
+        })
+        .expect("reply");
+    let thread = fixture.run(&id, Command::Reply);
+    assert_eq!(thread.ending, Some(Ending::PullRequest), "{thread:#?}");
+    assert_eq!(thread.title, "Agent: first line");
+    let pull_request = gitez_review::Store::new(&fixture.common_dir())
+        .load(1)
+        .expect("load");
+    assert_eq!(pull_request.title, "Agent: first line");
+    assert_eq!(
+        pull_request.description,
+        "Wrote agent.txt and committed it."
+    );
+    // The new heading is not the thread's title, so it stays in the
+    // message shown.
+    assert_eq!(
+        thread.final_message_body(),
+        Some("# Rename everything\n\nAdded a third line.")
+    );
 }
 
 #[test]
@@ -133,6 +221,13 @@ fn changes_the_agent_left_are_committed_by_gitez() {
     );
     assert_eq!(git(&thread.worktree, &["status", "--porcelain"]), "");
     assert_eq!(thread.pull_request, Some(1));
+    // GitEZ's own commit does not name the pull request: the prompt does.
+    assert_eq!(thread.title, "LEAVE a file uncommitted");
+    let pull_request = gitez_review::Store::new(&fixture.common_dir())
+        .load(1)
+        .expect("load");
+    assert_eq!(pull_request.title, "LEAVE a file uncommitted");
+    assert_eq!(pull_request.description, "Left a file for GitEZ.");
     // The supervisor recorded that nothing is left uncommitted.
     let uncommitted = thread.uncommitted.expect("the worktree was checked");
     assert_eq!(uncommitted.count, 0);

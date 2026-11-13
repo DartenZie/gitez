@@ -27,19 +27,151 @@ pub fn title_from_prompt(prompt: &str) -> String {
             break;
         }
     }
-    let sentence = line[..end]
-        .trim_end_matches(['.', ':'])
-        .trim_end()
-        .to_owned();
+    let sentence = line[..end].trim_end_matches(['.', ':']).trim_end();
     if sentence.is_empty() {
         return "Untitled thread".to_owned();
     }
-    if sentence.chars().count() <= MAX_TITLE {
-        return sentence;
+    shorten(sentence)
+}
+
+/// A title the agent gave its work: its final message starts with a
+/// level-1 ATX heading (`# Title`; up to three spaces before it, blank
+/// lines before it allowed). Cleaned with [`clean_title`]; `None` when the
+/// message does not start so or nothing is left.
+pub fn title_from_message(message: &str) -> Option<String> {
+    split_title(message).0
+}
+
+/// The title of [`title_from_message`] and the rest of the message: what
+/// follows the heading line and the blank lines after it. Without a title
+/// the rest is the whole message.
+pub fn split_title(message: &str) -> (Option<String>, &str) {
+    let mut offset = 0;
+    for line in message.split_inclusive('\n') {
+        offset += line.len();
+        let text = line.trim_end_matches(['\n', '\r']);
+        if text.trim().is_empty() {
+            continue;
+        }
+        let Some(title) = heading(text).and_then(clean_title) else {
+            return (None, message);
+        };
+        let rest = &message[offset..];
+        let mut body = rest.len();
+        let mut skipped = 0;
+        for line in rest.split_inclusive('\n') {
+            if !line.trim().is_empty() {
+                body = skipped;
+                break;
+            }
+            skipped += line.len();
+        }
+        return (Some(title), &rest[body..]);
+    }
+    (None, message)
+}
+
+/// `message` as shown under a thread titled `title`: without its first
+/// line when that line is a heading that gave the thread its title, so the
+/// title is not shown twice.
+pub fn message_without_title<'a>(message: &'a str, title: &str) -> &'a str {
+    match split_title(message) {
+        (Some(heading), body) if heading == title => body,
+        _ => message,
+    }
+}
+
+/// The text of `line` if it is a level-1 ATX heading (CommonMark: up to
+/// three spaces of indentation, `#`, then a space, a tab or the end), its
+/// closing `#`s left out.
+fn heading(line: &str) -> Option<&str> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return None;
+    }
+    let rest = line[indent..].strip_prefix('#')?;
+    if !(rest.is_empty() || rest.starts_with([' ', '\t'])) {
+        return None;
+    }
+    let text = rest.trim();
+    // An optional closing sequence: `#`s after a space, or only `#`s.
+    let without = text.trim_end_matches('#');
+    if without.is_empty() {
+        return Some("");
+    }
+    if without.len() < text.len() && without.ends_with([' ', '\t']) {
+        return Some(without.trim_end());
+    }
+    Some(text)
+}
+
+/// A title from untrusted text (the agent's heading, a commit subject): one
+/// line, whitespace collapsed, control and bidirectional-override
+/// characters removed, surrounding quotes or backticks and a trailing
+/// period dropped, and at most 72 characters as [`title_from_prompt`]
+/// cuts them. `None` when nothing is left.
+pub fn clean_title(raw: &str) -> Option<String> {
+    let plain: String = raw
+        .chars()
+        .map(|char| if char.is_whitespace() { ' ' } else { char })
+        .filter(|&char| !char.is_control() && !is_bidi_control(char))
+        .collect();
+    let mut title = plain.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Again until nothing changes: `"Title."` or ``` ``Title`` ```.
+    loop {
+        let before = title.len();
+        title = unquote(&title)
+            .trim_end_matches(['.', '。'])
+            .trim()
+            .to_owned();
+        if title.len() == before {
+            break;
+        }
+    }
+    (!title.is_empty()).then(|| shorten(&title))
+}
+
+/// `text` without one pair of quotes or backticks around all of it.
+fn unquote(text: &str) -> &str {
+    const PAIRS: [(char, char); 9] = [
+        ('"', '"'),
+        ('\'', '\''),
+        ('`', '`'),
+        ('“', '”'),
+        ('‘', '’'),
+        ('„', '“'),
+        ('«', '»'),
+        ('「', '」'),
+        ('『', '』'),
+    ];
+    for (open, close) in PAIRS {
+        if let Some(inner) = text
+            .strip_prefix(open)
+            .and_then(|rest| rest.strip_suffix(close))
+        {
+            return inner.trim();
+        }
+    }
+    text
+}
+
+/// Characters that reorder the text around them when shown.
+fn is_bidi_control(char: char) -> bool {
+    matches!(
+        char,
+        '\u{200e}' | '\u{200f}' | '\u{061c}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// `text` (trimmed, not empty) at most 72 characters, cut at a word
+/// boundary with "…".
+fn shorten(text: &str) -> String {
+    if text.chars().count() <= MAX_TITLE {
+        return text.to_owned();
     }
     // Room for the "…".
-    let cut: String = sentence.chars().take(MAX_TITLE - 1).collect();
-    let next_is_space = sentence
+    let cut: String = text.chars().take(MAX_TITLE - 1).collect();
+    let next_is_space = text
         .chars()
         .nth(MAX_TITLE - 1)
         .is_some_and(char::is_whitespace);
@@ -205,6 +337,125 @@ mod tests {
         // Exactly 72 characters stay whole.
         let exact = "a".repeat(72);
         assert_eq!(title_from_prompt(&exact), exact);
+    }
+
+    #[test]
+    fn a_title_is_a_level_one_heading_on_the_first_line() {
+        let message = "# Make the greeting friendlier\n\nThe greeting now says hello.\n";
+        assert_eq!(
+            split_title(message),
+            (
+                Some("Make the greeting friendlier".to_owned()),
+                "The greeting now says hello.\n"
+            )
+        );
+        // Blank lines (and up to three spaces) before it.
+        assert_eq!(
+            split_title("\n  \r\n   # Fix the parser #\r\n\r\n\r\nBody\r\nmore"),
+            (Some("Fix the parser".to_owned()), "Body\r\nmore")
+        );
+        // A heading alone.
+        assert_eq!(
+            split_title("# Rename the module"),
+            (Some("Rename the module".to_owned()), "")
+        );
+        assert_eq!(
+            split_title("# Rename the module\n\n  \n"),
+            (Some("Rename the module".to_owned()), "")
+        );
+        // A closing sequence must follow a space; `#` inside stays.
+        assert_eq!(
+            title_from_message("# Use C# 12 #").as_deref(),
+            Some("Use C# 12")
+        );
+        assert_eq!(title_from_message("# Fix #42").as_deref(), Some("Fix #42"));
+        assert_eq!(title_from_message("#\tTabbed").as_deref(), Some("Tabbed"));
+    }
+
+    #[test]
+    fn anything_else_is_not_a_title() {
+        for message in [
+            "",
+            "   \n\n",
+            "Changed the greeting.\n\n# Make the greeting friendlier",
+            "## Summary\n\nChanged the greeting.",
+            "### Summary",
+            "#Hashtag",
+            "    # Indented code",
+            "#",
+            "#   #",
+            "# \"\"",
+            "# ``",
+            "# .",
+            "# \u{7}\u{1b}",
+        ] {
+            assert_eq!(split_title(message), (None, message), "{message:?}");
+        }
+    }
+
+    #[test]
+    fn titles_are_cleaned() {
+        let clean = |message: &str| title_from_message(message).expect(message);
+        assert_eq!(clean("# \"Add a dark theme.\""), "Add a dark theme");
+        assert_eq!(clean("# `Add a dark theme`"), "Add a dark theme");
+        assert_eq!(clean("# “Add a dark theme”."), "Add a dark theme");
+        assert_eq!(clean("# Add   a\tdark  theme..."), "Add a dark theme");
+        // Quotes inside the title stay.
+        assert_eq!(clean("# Rename `foo` to 'bar'"), "Rename `foo` to 'bar'");
+        assert_eq!(clean("# Don't panic"), "Don't panic");
+        // Control and direction-changing characters go; nothing but one
+        // plain line is left.
+        let title = clean("# Fix\u{1b}[31m red\u{7}\u{0} text\u{202e}evil\u{2066}\u{85}x\u{2028}y");
+        assert_eq!(title, "Fix[31m red textevil x y");
+        assert!(!title.chars().any(|c| c.is_control() || is_bidi_control(c)));
+        assert!(!title.contains(['\n', '\r']));
+    }
+
+    #[test]
+    fn long_headings_are_cut_like_prompts() {
+        let long = "Refactor the commit graph renderer so that lanes are allocated lazily and reused across rows";
+        let title = title_from_message(&format!("# {long}\n\nBody")).expect("title");
+        assert_eq!(title, title_from_prompt(long));
+        assert_eq!(
+            title,
+            "Refactor the commit graph renderer so that lanes are allocated lazily…"
+        );
+        let word = format!("# {}", "x".repeat(500));
+        assert_eq!(
+            title_from_message(&word).expect("title").chars().count(),
+            72
+        );
+    }
+
+    #[test]
+    fn titles_in_other_languages_are_kept() {
+        assert_eq!(
+            title_from_message("# Přidej přátelštější pozdrav\n\nPozdrav je teď vlídnější.")
+                .as_deref(),
+            Some("Přidej přátelštější pozdrav")
+        );
+        assert_eq!(
+            title_from_message("# 「挨拶をもっと親しみやすくする」。\n\n本文").as_deref(),
+            Some("挨拶をもっと親しみやすくする")
+        );
+        // No spaces to cut at: cut inside, by characters, not bytes.
+        let japanese = title_from_message(&format!("# {}", "挨拶".repeat(60))).expect("title");
+        assert_eq!(japanese.chars().count(), 72);
+        assert!(japanese.ends_with('…'));
+    }
+
+    #[test]
+    fn the_title_line_is_left_out_only_when_it_is_the_title() {
+        let message = "# Make the greeting friendlier\n\nDone.";
+        assert_eq!(
+            message_without_title(message, "Make the greeting friendlier"),
+            "Done."
+        );
+        assert_eq!(
+            message_without_title(message, "Can you look into it"),
+            message
+        );
+        assert_eq!(message_without_title("Done.", "Done"), "Done.");
     }
 
     #[test]

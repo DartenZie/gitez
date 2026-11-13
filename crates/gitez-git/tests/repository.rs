@@ -1072,6 +1072,11 @@ fn head_message_is_the_full_message_of_head() {
         repo.head_message().expect("message").as_deref(),
         Some("Summary line\n\nBody, with # a hash.")
     );
+    let head = repo.resolve_commit("HEAD").expect("read").expect("head");
+    assert_eq!(
+        repo.commit_message(head).expect("message"),
+        "Summary line\n\nBody, with # a hash."
+    );
 }
 
 #[test]

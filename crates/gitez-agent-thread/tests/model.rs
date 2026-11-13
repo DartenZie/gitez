@@ -203,6 +203,21 @@ fn a_reply_queues_a_finished_thread_that_has_a_conversation() {
 }
 
 #[test]
+fn the_final_message_body_leaves_out_the_title_heading() {
+    let mut thread = finished(Ending::PullRequest);
+    let message = "# Add a blame view\n\nAdded the blame view.";
+    thread.turns[0].result.as_mut().expect("result").message = message.to_owned();
+    // The heading is not the title (yet): it is part of the message.
+    assert_eq!(thread.final_message_body(), Some(message));
+    thread.title = "Add a blame view".to_owned();
+    assert_eq!(thread.final_message_body(), Some("Added the blame view."));
+    assert_eq!(thread.final_message(), Some(message));
+    // A heading alone leaves nothing to show.
+    thread.turns[0].result.as_mut().expect("result").message = "# Add a blame view\n".to_owned();
+    assert_eq!(thread.final_message_body(), None);
+}
+
+#[test]
 fn only_a_failed_or_stopped_thread_can_be_retried() {
     let now = at("2026-11-13T10:05:00Z");
     for ending in [Ending::Answer, Ending::PullRequest] {

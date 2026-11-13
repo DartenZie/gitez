@@ -18,6 +18,7 @@ use gitez_agent::{
 use gitez_agent_thread::{
     Activity, AgentThread, AgentThreadId, CONTINUE_PROMPT, Ending, PrepareStep, RunHeader, State,
     Step, Store, SupervisorInfo, Timestamp, Turn, TurnKind, TurnResult, Uncommitted,
+    title_from_message,
 };
 use gitez_git::{RefState, Repository};
 use gitez_sandbox::{Network, NetworkProfile, Sandbox as _, Status};
@@ -49,6 +50,8 @@ const SETUP_LOG: &str = "setup.log";
 const SETUP_COMMAND_KEY: &str = "gitez.setupCommand";
 const PASSTHROUGH_WARNING: &str = "Ran without a sandbox (GITEZ_TEST_SANDBOX)";
 const USAGE_LIMIT: &str = "The agent's usage limit was reached. Retry when it has reset.";
+/// The body of GitEZ's commit of the agent's leftovers, which marks it.
+const LEFTOVERS_NOTE: &str = "Changes the agent left uncommitted, committed by GitEZ.";
 
 pub struct Environment {
     pub data_dir: std::path::PathBuf,
@@ -875,10 +878,16 @@ impl Pipeline<'_> {
         let branch = self.thread.branch.clone();
         let checked = Timestamp::now();
         self.set_activity_detail("committing leftovers");
-        let message = format!(
-            "{}\n\nChanges the agent left uncommitted, committed by GitEZ.\n",
-            self.thread.title
-        );
+        // Before the pull request exists, the title the agent gave its
+        // work is the one the pull request will take.
+        let title = self
+            .thread
+            .pull_request
+            .is_none()
+            .then(|| self.thread.final_message().and_then(title_from_message))
+            .flatten()
+            .unwrap_or_else(|| self.thread.title.clone());
+        let message = format!("{title}\n\n{LEFTOVERS_NOTE}\n");
         // One sandboxed shell run: status, commit if on the branch and
         // dirty, status again. Sentinels mark the sections; the status
         // lines are `git status --porcelain` output, untrusted here.
@@ -1030,11 +1039,18 @@ status\n";
             .resolve_commit(&format!("refs/heads/{}", self.thread.start.branch))
             .map_err(read)?
             .map_or_else(|| self.thread.start.commit.clone(), |oid| oid.to_string());
+        // The title the agent gave its work, else its first commit's
+        // subject, else the thread's title (from the prompt).
+        let (heading, description) =
+            gitez_agent_thread::split_title(self.thread.final_message().unwrap_or_default());
+        let found = heading.or_else(|| first_commit_title(&main, head, start));
+        let title = found.clone().unwrap_or_else(|| self.thread.title.clone());
+        let description = description.to_owned();
         let pull_request = gitez_review::Store::new(&self.common_dir)
             .create(
                 gitez_review::NewPullRequest {
-                    title: self.thread.title.clone(),
-                    description: self.thread.final_message().unwrap_or_default().to_owned(),
+                    title,
+                    description,
                     base: gitez_review::Tip {
                         branch: self.thread.start.branch.clone(),
                         commit: base,
@@ -1051,8 +1067,14 @@ status\n";
             &self.id,
             &format!("created local pull request #{}", pull_request.number),
         );
-        self.try_save(|thread| thread.pull_request = Some(pull_request.number))
-            .map_err(|error| failed(error.to_string()))?;
+        // The thread takes the pull request's name; its id and branch stay.
+        self.try_save(|thread| {
+            thread.pull_request = Some(pull_request.number);
+            if let Some(title) = found {
+                thread.title = title;
+            }
+        })
+        .map_err(|error| failed(error.to_string()))?;
         Ok(())
     }
 
@@ -1553,6 +1575,38 @@ fn check_command(thread: &AgentThread, command: Command) -> Result<(), String> {
     ))
 }
 
+/// The cleaned subject of the oldest commit from `start` to `head` that is
+/// not GitEZ's commit of the agent's leftovers, if one has a subject. Read
+/// failures leave the title to the caller's fallback.
+fn first_commit_title(
+    main: &Repository,
+    head: gitez_git::Oid,
+    start: gitez_git::Oid,
+) -> Option<String> {
+    let commits: Vec<gitez_git::Commit> = main
+        .walk_excluding([head], [start], gitez_git::Order::Topo)
+        .ok()?
+        .collect::<std::result::Result<_, _>>()
+        .ok()?;
+    // Newest first: parents come after their children.
+    commits.iter().rev().find_map(|commit| {
+        let message = main.commit_message(commit.id).ok()?;
+        if is_leftovers_commit(&message) {
+            return None;
+        }
+        gitez_agent_thread::clean_title(message.lines().next().unwrap_or_default())
+    })
+}
+
+/// Whether `message` is GitEZ's commit of the agent's leftovers: a line of
+/// its body is [`LEFTOVERS_NOTE`] (hooks may add trailers after it).
+fn is_leftovers_commit(message: &str) -> bool {
+    message
+        .lines()
+        .skip(1)
+        .any(|line| line.trim() == LEFTOVERS_NOTE)
+}
+
 /// D.8, and what the sandbox does not allow that an agent would otherwise
 /// try first: `/tmp` and the system temporary folder (macOS `mktemp`
 /// without a template uses the latter), `git stash` (its ref is shared
@@ -1563,7 +1617,12 @@ fn system_prompt(branch: &str, start_branch: &str, network: NetworkProfile) -> S
          {branch}, started from {start_branch}. Commit your work on this branch as you go, with \
          clear messages. Do not push, do not switch branches, do not create other branches or \
          tags, and do not change the git configuration. When you are done, reply with a short \
-         summary of what you did and anything left to do. \
+         summary of what you did and anything left to do. If you changed files, begin that reply \
+         with a title for your change as a level-1 Markdown heading (\"# <title>\") and a blank \
+         line: GitEZ names the pull request with it. The title says what the change does, not \
+         what was asked, in the imperative mood like a good commit subject (\"Cache parsed \
+         config files\"), about 60 characters at most, with no trailing period and no quotes or \
+         backticks around it. If you changed nothing, answer without a heading. \
          You run in a sandbox. You can write only in this worktree and in $TMPDIR, which is \
          yours: put temporary files there, not in /tmp, and give mktemp a template in it \
          (mktemp \"$TMPDIR/name.XXXXXX\"). git stash does not work here; commit work in \
@@ -1729,6 +1788,29 @@ mod tests {
         let prompt = system_prompt("agent/x", "main", NetworkProfile::Open);
         assert!(prompt.contains("on the branch agent/x, started from main."));
         assert!(prompt.contains("Do not push"));
+    }
+
+    #[test]
+    fn the_system_prompt_asks_for_a_title_only_for_changes() {
+        let prompt = system_prompt("agent/x", "main", NetworkProfile::Open);
+        assert!(
+            prompt.contains("If you changed files, begin that reply with a title"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("level-1 Markdown heading (\"# <title>\")"));
+        assert!(prompt.contains("If you changed nothing, answer without a heading."));
+    }
+
+    #[test]
+    fn the_leftovers_commit_is_recognised_by_its_body() {
+        assert!(is_leftovers_commit(&format!(
+            "Make the greeting friendlier\n\n{LEFTOVERS_NOTE}"
+        )));
+        assert!(is_leftovers_commit(&format!(
+            "Title\n\n{LEFTOVERS_NOTE}\n\nSigned-off-by: A <a@example.com>"
+        )));
+        assert!(!is_leftovers_commit(LEFTOVERS_NOTE));
+        assert!(!is_leftovers_commit("Make the greeting friendlier"));
     }
 
     #[test]

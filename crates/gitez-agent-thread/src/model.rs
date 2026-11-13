@@ -258,6 +258,8 @@ pub struct DeletedBranch {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentThread {
     pub id: AgentThreadId,
+    /// From the prompt ([`crate::title_from_prompt`]) until the supervisor
+    /// creates the thread's pull request, then the pull request's title.
     pub title: String,
     pub agent: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -356,6 +358,15 @@ impl AgentThread {
             .filter_map(|turn| turn.result.as_ref())
             .map(|result| result.message.as_str())
             .find(|message| !message.is_empty())
+    }
+
+    /// [`final_message`](Self::final_message) as shown apart from the
+    /// transcript: without the `# Title` line that gave the thread its
+    /// title (see [`crate::message_without_title`]). `None` when nothing
+    /// else is left.
+    pub fn final_message_body(&self) -> Option<&str> {
+        let body = crate::message_without_title(self.final_message()?, &self.title);
+        (!body.trim().is_empty()).then_some(body)
     }
 
     /// Whether the worktree had uncommitted changes at the end of the last
