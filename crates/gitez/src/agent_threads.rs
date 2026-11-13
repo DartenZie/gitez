@@ -20,7 +20,7 @@ use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gitez_agent_thread::{
     AgentThread, AgentThreadId, CompleteReport, Ending, IfUncommitted, Index, IndexReport,
-    IndexedRepository, Kept, NewAgentThread, State, Step, Store, Timestamp, TurnKind,
+    IndexedRepository, Kept, Merged, NewAgentThread, State, Step, Store, Timestamp, TurnKind,
 };
 use gitez_sandbox::NetworkProfile;
 use gitez_secret::SecretStore;
@@ -800,8 +800,10 @@ impl AgentThreads {
                 // Refused unless it is finished; checked before anything is
                 // removed.
                 thread.clone().mark_completed(Timestamp::now())?;
-                let report = gitez_agent_thread::complete(&work_dir, thread, uncommitted)?;
-                thread.mark_completed(Timestamp::now())?;
+                let report = gitez_agent_thread::complete(&work_dir, thread, uncommitted, None)?;
+                let now = Timestamp::now();
+                thread.record_completion(&report, now);
+                thread.mark_completed(now)?;
                 Ok(report)
             });
             changes.unbounded_send(vec![thread_file(&key)]).ok();
@@ -811,7 +813,9 @@ impl AgentThreads {
     }
 
     /// Removes the worktree a completed thread kept (it had uncommitted
-    /// changes): the user agreed to discard them. Refuses a worktree GitEZ
+    /// changes): the user agreed to discard them. The branch goes by the
+    /// rule of [`gitez_agent_thread::complete`], as if the pull request,
+    /// when merged, had just completed the thread. Refuses a worktree GitEZ
     /// no longer trusts ([`gitez_agent_thread::Error::Tampered`]).
     pub fn remove_worktree(
         &mut self,
@@ -833,13 +837,22 @@ impl AgentThreads {
                         "Only a completed thread’s kept worktree is removed this way.".into(),
                     ));
                 }
-                let report =
-                    gitez_agent_thread::complete(&work_dir, thread, IfUncommitted::Discard)?;
+                // A merged pull request's branch goes with the worktree when
+                // nothing on it is left unmerged, as when the merge
+                // completed the thread.
+                let merged = merged_pull_request(&key.common_dir, thread);
+                let report = gitez_agent_thread::complete(
+                    &work_dir,
+                    thread,
+                    IfUncommitted::Discard,
+                    merged.as_ref(),
+                )?;
                 // What was said about the kept worktree is no longer true.
                 let worktree = thread.worktree.display().to_string();
                 thread
                     .warnings
                     .retain(|warning| !warning.contains(&worktree));
+                thread.record_completion(&report, Timestamp::now());
                 Ok(report)
             });
             changes.unbounded_send(vec![thread_file(&key)]).ok();
@@ -1814,8 +1827,10 @@ fn completes_with(thread: &AgentThread, state: gitez_review::State) -> bool {
 }
 
 /// Completes the thread `key` if pull request `number`, which it created,
-/// is merged or closed: removes its worktree (and its branch when it has no
-/// commits of its own) and marks it completed. A worktree folder already
+/// is merged or closed: removes its worktree and marks it completed. After
+/// a merge its branch is deleted too when nothing on it is left unmerged
+/// (see [`gitez_agent_thread::complete`]); after a close it stays unless it
+/// has no commits of its own. A worktree folder already
 /// gone, or one git cannot remove, does not keep the thread from
 /// completing; the thread says what happened. Returns whether it
 /// completed. Blocks.
@@ -1839,6 +1854,9 @@ fn complete_for_pull_request(
     } else {
         "closed"
     };
+    // Merged: the branch goes too when nothing on it is left unmerged.
+    // Closed: its commits are nowhere else, so it stays.
+    let merged = merged_from(&pull_request);
     // Under the thread's lock, so it cannot be continued between the check
     // and the removal of its worktree.
     Store::new(&key.common_dir)
@@ -1849,16 +1867,42 @@ fn complete_for_pull_request(
             // Automatic completion after a merge or close keeps a worktree
             // that has uncommitted changes (or that GitEZ no longer trusts)
             // rather than destroying work: the user removes it later.
-            let removed = gitez_agent_thread::complete(work_dir, thread, IfUncommitted::Keep);
+            let removed = gitez_agent_thread::complete(
+                work_dir,
+                thread,
+                IfUncommitted::Keep,
+                merged.as_ref(),
+            );
             if let Some(warning) = completion_warning(&removed, thread, number, how)
                 && !thread.warnings.contains(&warning)
             {
                 thread.warnings.push(warning);
             }
+            if let Ok(report) = &removed {
+                thread.record_completion(report, now);
+            }
             thread.mark_completed(now)?;
             Ok(true)
         })
         .map_err(anyhow::Error::from)
+}
+
+/// What [`gitez_agent_thread::complete`] needs of `pull_request` when it is
+/// merged; `None` when it is not.
+fn merged_from(pull_request: &gitez_review::PullRequest) -> Option<Merged> {
+    (pull_request.state == gitez_review::State::Merged).then(|| Merged {
+        number: pull_request.number,
+        head: pull_request.head.commit.clone(),
+        base: pull_request.base.branch.clone(),
+    })
+}
+
+/// The merge of the pull request `thread` created, if it is merged and can
+/// be read. Blocks.
+fn merged_pull_request(common_dir: &Path, thread: &AgentThread) -> Option<Merged> {
+    let number = thread.pull_request?;
+    let pull_request = gitez_review::Store::new(common_dir).load(number).ok()?;
+    merged_from(&pull_request)
 }
 
 /// What the thread says after its pull request (`number`, `how`: merged or
@@ -1874,13 +1918,13 @@ fn completion_warning(
         Ok(report) => match &report.kept {
             Some(Kept::Uncommitted { .. }) => Some(format!(
                 "Pull request #{number} was {how}; GitEZ completed the thread but kept its \
-                 worktree at {} because it has uncommitted changes. Remove it when you have \
-                 saved what you need.",
+                 worktree at {} and its branch because the worktree has uncommitted changes. \
+                 Remove the worktree when you have saved what you need.",
                 thread.worktree.display()
             )),
             Some(Kept::Untrusted(problem)) => Some(format!(
                 "Pull request #{number} was {how}; GitEZ completed the thread but kept its \
-                 worktree at {}: {problem} Remove it yourself.",
+                 worktree at {} and its branch: {problem} Remove the worktree yourself.",
                 thread.worktree.display()
             )),
             None if !report.worktree_removed => Some(format!(
@@ -1956,6 +2000,7 @@ mod tests {
             completed: None,
             worktree_record: None,
             uncommitted: None,
+            deleted_branch: None,
         }
     }
 
@@ -2217,9 +2262,21 @@ mod tests {
         assert_eq!(thread.completed, Some(now));
         assert!(thread.warnings.is_empty(), "{:?}", thread.warnings);
         assert!(!worktree.exists());
-        // The branch has a commit of its own, so it stays; git forgets the
-        // worktree.
-        git(&main, &["rev-parse", "--verify", &thread.branch]);
+        // The branch is where the pull request was merged, so it goes too,
+        // and the thread says where it was; git forgets the worktree.
+        let head = gitez_review::Store::new(&key.common_dir)
+            .load(number)
+            .expect("load")
+            .head
+            .commit;
+        assert_eq!(
+            thread
+                .deleted_branch
+                .as_ref()
+                .map(|deleted| &deleted.commit),
+            Some(&head)
+        );
+        assert_eq!(git(&main, &["branch", "--list", &thread.branch]), "");
         assert_eq!(git(&main, &["worktree", "list"]).lines().count(), 1);
 
         // Reopened: the completed thread stays as it is.
@@ -2228,6 +2285,23 @@ mod tests {
         set_state(&key, number, gitez_review::State::Closed);
         assert!(!complete_for_pull_request(&main, &key, number, now).expect("checked"));
         assert_eq!(store.load(&key.id).expect("load"), thread);
+    }
+
+    /// Closed without merging: its commits are nowhere else, so the branch
+    /// stays.
+    #[test]
+    fn closing_its_pull_request_keeps_the_branch() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (main, key, number) = finished_thread(dir.path());
+        set_state(&key, number, gitez_review::State::Closed);
+        assert!(complete_for_pull_request(&main, &key, number, Timestamp::now()).expect("done"));
+        let thread = gitez_agent_thread::Store::new(&key.common_dir)
+            .load(&key.id)
+            .expect("load");
+        assert_eq!(thread.state, State::Completed);
+        assert_eq!(thread.deleted_branch, None);
+        assert!(thread.warnings.is_empty(), "{:?}", thread.warnings);
+        git(&main, &["rev-parse", "--verify", &thread.branch]);
     }
 
     #[test]

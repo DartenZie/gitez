@@ -276,9 +276,10 @@ fn gitez_command_output(dir: &Path, args: &[&str]) -> String {
         .to_owned()
 }
 
-/// How the end of the loop looks: completed, worktree gone, branch kept,
-/// git's list of worktrees only the main one.
-fn assert_completed(work_dir: &Path, thread: &AgentThread) {
+/// How the end of the loop looks: completed, worktree gone, git's list of
+/// worktrees only the main one, and the branch deleted after a merge (where
+/// the thread recorded it) or kept after a close.
+fn assert_completed(work_dir: &Path, thread: &AgentThread, merged: bool) {
     assert_eq!(thread.state, State::Completed, "{thread:#?}");
     assert!(thread.completed.is_some());
     assert!(!thread.worktree.exists(), "the worktree folder is gone");
@@ -291,8 +292,19 @@ fn assert_completed(work_dir: &Path, thread: &AgentThread) {
         1,
         "{worktrees}"
     );
-    // The branch has commits of its own: kept.
-    gitez_command_output(work_dir, &["rev-parse", "--verify", &thread.branch]);
+    let branches = gitez_command_output(work_dir, &["branch", "--list", &thread.branch]);
+    if merged {
+        assert_eq!(branches, "", "the merged branch is deleted");
+        let deleted = thread.deleted_branch.as_ref().expect("recorded");
+        assert_eq!(
+            gitez_command_output(work_dir, &["cat-file", "-t", &deleted.commit]),
+            "commit"
+        );
+    } else {
+        // Closed: its commits are nowhere else, so it stays.
+        assert!(!branches.is_empty(), "the branch is kept");
+        assert_eq!(thread.deleted_branch, None);
+    }
 }
 
 /// Case 1: a thread commits → its pull request; a comment on a line is
@@ -424,7 +436,7 @@ fn e2e_u5_review_loop_and_merge() {
         "the thread to complete",
         |thread| thread.state == State::Completed,
     );
-    assert_completed(&work_dir, &completed);
+    assert_completed(&work_dir, &completed, true);
     let merged = gitez_review::Store::new(&common_dir)
         .load(number)
         .expect("load");
@@ -495,10 +507,20 @@ fn e2e_u5_close_completes() {
         "the thread to complete",
         |thread| thread.state == State::Completed,
     );
-    assert_completed(&work_dir, &completed);
+    assert_completed(&work_dir, &completed, false);
     let (_, pull_request) = reviewed(&mut shots, &workspace).expect("shown");
     assert_eq!(pull_request.state, gitez_review::State::Closed);
     shots.save(window, "u5-7-closed");
+    // The thread, in another window, says its branch is kept.
+    let (other, _) = shots.open_workspace(&work_dir);
+    shots.dispatch(
+        other,
+        crate::agent_threads::OpenAgentThread {
+            common_dir: common_dir.clone(),
+            id: key.id.clone(),
+        },
+    );
+    shots.save_region(other, thread_card_region(), "branch-closed-thread-card");
     // Reopen: Close's place now says Reopen.
     shots.click(window, close_button());
     let (_, pull_request) = reviewed(&mut shots, &workspace).expect("shown");
@@ -599,7 +621,7 @@ fn e2e_u5_merged_while_closed() {
         "the thread to complete",
         |thread| thread.state == State::Completed,
     );
-    assert_completed(&work_dir, &completed);
+    assert_completed(&work_dir, &completed, true);
     let (window, _) = shots.open_workspace(&work_dir);
     shots.dispatch(
         window,
@@ -981,7 +1003,7 @@ fn e2e_u5_real_haiku() {
         "completed",
         |thread| thread.state == State::Completed,
     );
-    assert_completed(&work_dir, &completed);
+    assert_completed(&work_dir, &completed, true);
     eprintln!("completed after {:?} in all", started.elapsed());
     shots.save(window, "u5-real-3-merged");
     assert_eq!(ahead, Some(2));
@@ -1242,6 +1264,9 @@ fn e2e_c1_merge_keeps_leftovers() {
         "{:?}",
         completed.warnings
     );
+    // The kept worktree sits on the branch: it stays with it.
+    gitez_command_output(&work_dir, &["rev-parse", "--verify", &completed.branch]);
+    assert_eq!(completed.deleted_branch, None);
     let merged = gitez_review::Store::new(&common_dir)
         .load(number)
         .expect("load");
@@ -1250,4 +1275,196 @@ fn e2e_c1_merge_keeps_leftovers() {
     assert!(shots.has_id(window, "thread-remove-worktree"));
     shots.save(window, "fix-c1-8-merged-kept");
     shots.save_region(window, detail_region(), "fix-c1-8-merged-kept-panel");
+}
+
+/// The sidebar of the main window: branches (the `agent/` folder among
+/// them), remotes, tags, stashes and local pull requests.
+fn sidebar_region() -> Bounds<Pixels> {
+    Bounds {
+        origin: point(px(0.), px(48.)),
+        size: size(px(240.), px(824.)),
+    }
+}
+
+/// The thread view's card of its pull request, at the top of the detail
+/// panel.
+fn thread_card_region() -> Bounds<Pixels> {
+    Bounds {
+        origin: point(px(1080.), px(48.)),
+        size: size(px(360.), px(420.)),
+    }
+}
+
+/// A thread → its pull request → merged from the review with the merge
+/// dialog's `option` (`merge-commit`, `merge-squash`, `merge-rebase`) →
+/// the thread is completed, its worktree and its branch are gone, and the
+/// merged pull request still opens with its diff, read from the commits
+/// it recorded. Shots `branch-<name>-…`.
+fn merge_deletes_the_branch(option: &'static str, name: &str) {
+    if !crate::screenshot::enabled() || std::env::var_os("GITEZ_E2E").is_none() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let base = dir.path().canonicalize().expect("canonical");
+    let work_dir = repository(&base);
+    let (mut shots, common_dir) = app(&base, &work_dir, review_agent(&base), None);
+    let (window, _) = shots.open_workspace(&work_dir);
+    let key = start(
+        &mut shots,
+        &work_dir,
+        &common_dir,
+        "Write agent.txt with three lines and commit it.",
+        None,
+    );
+    let finished = wait_for(
+        &mut shots,
+        &key,
+        Duration::from_secs(30),
+        "a pull request",
+        |thread| thread.state == State::Finished && thread.pull_request.is_some(),
+    );
+    let number = finished.pull_request.expect("a pull request");
+    let agent_commit = gitez_command_output(&work_dir, &["rev-parse", &finished.branch]);
+    // main moves on, so the merge is a real merge, squash or rebase.
+    std::fs::write(work_dir.join("main.txt"), "main\n").expect("write");
+    git(&work_dir, &["add", "main.txt"]);
+    git(&work_dir, &["commit", "-qm", "Meanwhile on main"]);
+
+    shots.dispatch(
+        window,
+        OpenAgentPullRequest {
+            common_dir: common_dir.clone(),
+            number,
+        },
+    );
+    // Loaded, so Merge is enabled; then the dialog compares the branches
+    // and slides in, in real time.
+    shots.settle();
+    shots.click_id(window, "pull-request-merge");
+    std::thread::sleep(Duration::from_millis(1500));
+    shots.settle();
+    shots.save(window, &format!("branch-{name}-0-merge-dialog"));
+    // The dialog's options are drawn in a layer `click_id` does not
+    // see: their places in the settled dialog, read off the `-0-` shot.
+    let y = match option {
+        "merge-commit" => 206.,
+        "merge-squash" => 271.,
+        _ => 335.,
+    };
+    shots.click(window, at(option, 714., y));
+    let completed = wait_for(
+        &mut shots,
+        &key,
+        Duration::from_secs(30),
+        "the thread to complete",
+        |thread| thread.state == State::Completed,
+    );
+    assert_completed(&work_dir, &completed, true);
+    assert_eq!(
+        completed.branch_kept_warning(),
+        None,
+        "{:?}",
+        completed.warnings
+    );
+    let merged = gitez_review::Store::new(&common_dir)
+        .load(number)
+        .expect("load");
+    assert_eq!(merged.state, gitez_review::State::Merged);
+    let deleted = completed.deleted_branch.as_ref().expect("recorded");
+    assert_eq!(deleted.commit, merged.head.commit, "deleted where merged");
+    let parents = gitez_command_output(&work_dir, &["log", "-1", "--format=%P", "main"]);
+    let in_main = |commit: &str| {
+        std::process::Command::new("git")
+            .args(["merge-base", "--is-ancestor", commit, "main"])
+            .current_dir(&work_dir)
+            .status()
+            .expect("git runs")
+            .success()
+    };
+    match option {
+        "merge-commit" => {
+            assert_eq!(parents.split(' ').count(), 2, "a merge commit");
+            assert_eq!(deleted.commit, agent_commit);
+        }
+        "merge-squash" => {
+            assert_eq!(parents.split(' ').count(), 1, "one new commit");
+            assert!(!in_main(&agent_commit), "git does not see it merged");
+            assert_eq!(deleted.commit, agent_commit);
+        }
+        _ => {
+            assert_ne!(deleted.commit, agent_commit, "rebased");
+            assert!(in_main(&deleted.commit));
+        }
+    }
+    shots.save(window, &format!("branch-{name}-1-merged"));
+
+    // The thread opens in the history's detail panel; the sidebar and the
+    // graph beside it follow: no agent/ branch is left.
+    shots.dispatch(
+        window,
+        crate::agent_threads::OpenAgentThread {
+            common_dir: common_dir.clone(),
+            id: key.id.clone(),
+        },
+    );
+    shots.save_region(
+        window,
+        sidebar_region(),
+        &format!("branch-{name}-2-sidebar"),
+    );
+    shots.save(window, &format!("branch-{name}-3-completed-thread"));
+    shots.save_region(
+        window,
+        thread_card_region(),
+        &format!("branch-{name}-3-thread-card"),
+    );
+    shots.save_region(
+        window,
+        detail_region(),
+        &format!("branch-{name}-3-completed-thread-panel"),
+    );
+
+    // The merged pull request opens in a new window, with no branch to
+    // read: its diff comes from the commits it recorded.
+    let (again, workspace) = shots.open_workspace(&work_dir);
+    shots.dispatch(
+        again,
+        OpenAgentPullRequest {
+            common_dir: common_dir.clone(),
+            number,
+        },
+    );
+    shots.settle();
+    let (ahead, pull_request) = reviewed(&mut shots, &workspace).expect("the review shows it");
+    assert_eq!(pull_request.state, gitez_review::State::Merged);
+    assert_eq!(ahead, Some(1));
+    let files = shots.update(|cx| {
+        let (review, _) = workspace.read(cx).review.as_ref()?;
+        match &review.read(cx).files {
+            Some(Ok(files)) => Some(
+                files
+                    .iter()
+                    .map(|file| file.path.clone())
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        }
+    });
+    assert_eq!(files, Some(vec!["agent.txt".to_owned()]), "its diff");
+    shots.save(again, &format!("branch-{name}-4-merged-pull-request"));
+}
+
+#[test]
+fn e2e_branch_merge_commit() {
+    merge_deletes_the_branch("merge-commit", "merge");
+}
+
+#[test]
+fn e2e_branch_squash() {
+    merge_deletes_the_branch("merge-squash", "squash");
+}
+
+#[test]
+fn e2e_branch_rebase() {
+    merge_deletes_the_branch("merge-rebase", "rebase");
 }

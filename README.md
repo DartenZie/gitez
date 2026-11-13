@@ -115,11 +115,19 @@ inside your repository, and runs in a [sandbox](#the-agent-sandbox).
   Code** sends your review comments back to that thread, which continues in
   its own worktree. The head branch does not have to be checked out. Merging
   or closing the pull request completes the thread.
+- **Merging** a thread's pull request (merge commit, squash or rebase) also
+  deletes the thread's branch, `agent/<name>`, once its worktree is removed,
+  unless the branch has commits that were not merged or is checked out
+  somewhere; the thread then says why it kept it. The thread records the
+  commit the branch was at (`git branch agent/<name> <commit>` brings it
+  back), and the merged pull request still shows its changes. **Closing** a
+  pull request keeps the branch: its commits are nowhere else.
 - **Complete** removes the thread's worktree, and its branch if the branch
   has no commits of its own. The thread stays readable. If the worktree has
   uncommitted changes, GitEZ asks first: discard them, or complete and keep
   the worktree to remove later. A merge or close that completes a thread
-  always keeps a worktree with uncommitted changes.
+  always keeps a worktree with uncommitted changes, and its branch with it;
+  **Remove worktree** removes them later, the branch by the rule above.
 - **Agents indicator**: the toolbar shows how many threads run and how many
   wait for you. Click it for this repository's threads, grouped by what they
   need, each with the action that fits (review, stop, retry, complete), and a

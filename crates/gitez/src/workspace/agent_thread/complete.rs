@@ -312,10 +312,23 @@ pub fn remove_worktree(key: AgentThreadKey, busy: Busy, window: &mut Window, cx:
         Some(count) if count > 0 => format!("its {}", changes(count)),
         _ => "what is in it".to_owned(),
     };
-    let text = format!(
-        "This deletes the worktree at {} and {what}. The thread stays readable.",
-        thread.worktree.display()
-    );
+    // A merged pull request's branch goes with the worktree, as when the
+    // merge completed the thread.
+    let merged = AgentThreads::global(cx).read(cx).facts(&key).pull_request
+        == Some(gitez_review::State::Merged);
+    let text = if merged {
+        format!(
+            "This deletes the worktree at {} and {what}, and the branch {} unless it has commits \
+             that the pull request did not merge. The thread stays readable.",
+            thread.worktree.display(),
+            thread.branch
+        )
+    } else {
+        format!(
+            "This deletes the worktree at {} and {what}. The thread stays readable.",
+            thread.worktree.display()
+        )
+    };
     window.open_dialog(cx, move |dialog, _, cx| {
         let paths = paths(&thread, cx);
         let (key, busy) = (key.clone(), busy.clone());
@@ -358,6 +371,11 @@ pub fn remove_worktree(key: AgentThreadKey, busy: Busy, window: &mut Window, cx:
                                         cx.update(|window, cx| {
                                             busy(false, window, cx);
                                             let toast = match result {
+                                                Ok(report) if report.branch_deleted => {
+                                                    crate::toast::success(
+                                                        "The worktree and its branch are removed",
+                                                    )
+                                                }
                                                 Ok(_) => {
                                                     crate::toast::success("The worktree is removed")
                                                 }

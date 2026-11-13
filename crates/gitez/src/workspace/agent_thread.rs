@@ -372,7 +372,12 @@ impl ThreadView {
             .read(cx)
             .repository(&self.key.common_dir)
             .map(|repository| repository.work_dir.clone());
-        let (base, branch) = (thread.start.commit.clone(), thread.branch.clone());
+        let base = thread.start.commit.clone();
+        // A deleted branch is read where it was deleted.
+        let branch = match &thread.deleted_branch {
+            Some(deleted) => deleted.commit.clone(),
+            None => format!("refs/heads/{}", thread.branch),
+        };
         let number = thread.pull_request;
         let common_dir = self.key.common_dir.clone();
         let read = cx.background_executor().spawn(async move {
@@ -380,13 +385,18 @@ impl ThreadView {
             else {
                 return Details::default();
             };
-            let pull_request = number.and_then(|_| branch_stats(&repository, &base, &branch));
-            let pull_request_state = number.and_then(|number| {
-                gitez_review::Store::new(&common_dir)
-                    .load(number)
-                    .ok()
-                    .map(|pull_request| pull_request.state)
-            });
+            let read =
+                number.and_then(|number| gitez_review::Store::new(&common_dir).load(number).ok());
+            // A merged or closed pull request keeps the changes it had then,
+            // as its review shows them: from the commits it recorded (the
+            // branch may be gone, or rebased onto the base).
+            let pull_request = match &read {
+                Some(read) if read.state != gitez_review::State::Open => {
+                    branch_stats(&repository, &read.base.commit, &read.head.commit)
+                }
+                _ => number.and_then(|_| branch_stats(&repository, &base, &branch)),
+            };
+            let pull_request_state = read.map(|pull_request| pull_request.state);
             Details {
                 user_name: repository.user_name(),
                 pull_request,
@@ -534,15 +544,9 @@ impl ThreadView {
 }
 
 /// The commits and line counts of `branch` since `base`, if both are there.
-fn branch_stats(
-    repository: &gitez_git::Repository,
-    base: &str,
-    branch: &str,
-) -> Option<BranchStats> {
+fn branch_stats(repository: &gitez_git::Repository, base: &str, head: &str) -> Option<BranchStats> {
     let base = Oid::from_hex(base.as_bytes()).ok()?;
-    let head = repository
-        .resolve_commit(&format!("refs/heads/{branch}"))
-        .ok()??;
+    let head = repository.resolve_commit(head).ok()??;
     let diff = repository
         .branch_diff(base, head, DiffOptions::default())
         .ok()?;
@@ -559,6 +563,28 @@ fn branch_stats(
         added,
         removed,
     })
+}
+
+/// What became of completed `thread`'s worktree and branch, for its pull
+/// request's card: "The thread is completed, its worktree removed and its
+/// branch deleted (it was at 1a2b3c4)." `worktree_present`: its worktree
+/// folder is still there (kept, and the branch with it).
+fn completion_note(thread: &AgentThread, worktree_present: bool) -> String {
+    if worktree_present {
+        return "The thread is completed; its worktree and branch are kept (see above).".into();
+    }
+    match &thread.deleted_branch {
+        Some(deleted) => format!(
+            "The thread is completed, its worktree removed and its branch deleted (it was at \
+             {}).",
+            deleted.commit.chars().take(7).collect::<String>()
+        ),
+        None if thread.branch_kept_warning().is_some() => {
+            "The thread is completed and its worktree removed; its branch is kept (see below)."
+                .into()
+        }
+        None => "The thread is completed and its worktree removed; its branch is kept.".into(),
+    }
 }
 
 /// Whether a reply can continue `thread`'s conversation now.
@@ -1185,7 +1211,9 @@ impl ThreadView {
                     .into_any_element(),
             ));
         }
-        if thread.ending == Some(Ending::Answer) {
+        // A thread without a branch now (an answer, or a branch deleted
+        // when it was completed) shows where it started.
+        if thread.ending == Some(Ending::Answer) || thread.deleted_branch.is_some() {
             rows = rows.child(row(
                 "Started from",
                 from(div().h_flex().gap(px(6.)).min_w_0()).into_any_element(),
@@ -1426,26 +1454,24 @@ impl ThreadView {
         let common_dir = self.key.common_dir.clone();
         let completed = thread.state == State::Completed;
         // How the pull request ended, once read, for a completed thread.
-        let worktree = if self.model.read(cx).facts(&self.key).worktree_present {
-            "its worktree kept (see above)"
-        } else {
-            "its worktree removed"
-        };
+        let completion = completion_note(
+            thread,
+            self.model.read(cx).facts(&self.key).worktree_present,
+        );
         let note = match (completed, self.details.pull_request_state) {
             (false, _) => "Review comments go back to this thread and run in its worktree.".into(),
-            (true, Some(gitez_review::State::Merged)) => format!(
-                "Merged into {}. The thread is completed and {worktree}.",
-                thread.start.branch
-            ),
+            (true, Some(gitez_review::State::Merged)) => {
+                format!("Merged into {}. {completion}", thread.start.branch)
+            }
             (true, Some(gitez_review::State::Closed)) => {
-                format!("Closed without merging. The thread is completed and {worktree}.")
+                format!("Closed without merging. {completion}")
             }
             (true, Some(gitez_review::State::Open)) => {
                 "Reopened after the thread was completed; it is reviewed like any other pull \
                  request."
                     .into()
             }
-            (true, None) => format!("The thread is completed and {worktree}."),
+            (true, None) => completion,
         };
         let button = Button::new("thread-open-pull-request")
             .h(px(34.))

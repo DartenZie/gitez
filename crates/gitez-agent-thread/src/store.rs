@@ -226,6 +226,7 @@ impl Store {
             completed: None,
             worktree_record: None,
             uncommitted: None,
+            deleted_branch: None,
         };
         let lock = Lock::take(&self.thread_dir(&thread.id).join(LOCK_FILE))?;
         self.write(lock, &thread)?;

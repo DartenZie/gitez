@@ -95,7 +95,10 @@ Decided 2026-10-23; change only with the owner's agreement.
   thread created (and that thread is not completed), whose review comments
   continue that thread (`--resume`) in its own worktree, sandboxed, whatever
   is checked out; merging or closing such a pull request completes the
-  thread.
+  thread, and merging it (any method) also deletes the thread's branch once
+  its worktree is removed, unless its tip is neither the merged head nor in
+  the base, or it is checked out (`deleted_branch` in `thread.json` records
+  the tip).
 - **Review storage** (decided 2026-10-24). Local pull requests live in
   `<git common dir>/gitez/reviews/`, so linked worktrees share them and
   nothing reaches the working tree, a commit or a push. The `gitez-review`

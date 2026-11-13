@@ -244,6 +244,15 @@ pub struct Uncommitted {
     pub commit_error: Option<String>,
 }
 
+/// The thread's branch, deleted when the thread was completed: where it
+/// was, so that `git branch <branch> <commit>` brings it back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeletedBranch {
+    /// Full hexadecimal id of the branch's tip when it was deleted.
+    pub commit: String,
+    pub at: Timestamp,
+}
+
 /// A prompt given to a coding agent working on its own branch in its own
 /// worktree, and the conversation that follows: one `thread.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -300,6 +309,10 @@ pub struct AgentThread {
     /// `None` when unknown (never checked, or the check failed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uncommitted: Option<Uncommitted>,
+    /// Set when completing the thread deleted its branch; `None` while the
+    /// branch is kept (and for threads from before GitEZ recorded it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_branch: Option<DeletedBranch>,
 }
 
 /// What a new agent thread starts with (the GUI fills it in).

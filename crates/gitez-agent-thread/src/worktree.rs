@@ -467,6 +467,32 @@ pub enum Kept {
     Untrusted(String),
 }
 
+/// The thread's local pull request, merged: what [`complete`] needs to
+/// delete a branch that git does not see as merged (after "Squash and
+/// merge" or "Rebase and merge").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Merged {
+    /// The pull request's number, for what the thread says.
+    pub number: u32,
+    /// The commit the pull request records as its head now that it is
+    /// merged (full hexadecimal id): the branch's tip when it was merged,
+    /// after the rebase of "Rebase and merge".
+    pub head: String,
+    /// The branch it was merged into.
+    pub base: String,
+}
+
+/// Why [`complete`] kept the branch of a thread whose pull request was
+/// merged, although it removed the worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchKept {
+    /// It has commits that were not merged: its tip is neither the merged
+    /// commit nor in the base branch.
+    Unmerged,
+    /// It is checked out in this worktree.
+    CheckedOut(PathBuf),
+}
+
 /// What [`complete`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompleteReport {
@@ -474,14 +500,66 @@ pub struct CompleteReport {
     /// Set when the worktree was left in place ([`IfUncommitted::Keep`]).
     pub kept: Option<Kept>,
     pub branch_deleted: bool,
+    /// The deleted branch's tip (full id), when `branch_deleted`.
+    pub deleted_at: Option<String>,
+    /// Why a merged thread's branch was kept, when the worktree was not.
+    pub branch_kept: Option<BranchKept>,
+}
+
+impl AgentThread {
+    /// Records on the thread what [`complete`] did to its branch: the
+    /// deleted branch's tip ([`AgentThread::deleted_branch`]), or a
+    /// warning saying why the branch of a merged pull request was kept.
+    pub fn record_completion(&mut self, report: &CompleteReport, at: jiff::Timestamp) {
+        if let Some(commit) = &report.deleted_at {
+            self.deleted_branch = Some(crate::DeletedBranch {
+                commit: commit.clone(),
+                at,
+            });
+        }
+        let warning = match &report.branch_kept {
+            None => return,
+            Some(BranchKept::Unmerged) => format!(
+                "GitEZ kept the branch {} because it has commits that its pull request did not \
+                 merge.",
+                self.branch
+            ),
+            Some(BranchKept::CheckedOut(path)) => format!(
+                "GitEZ kept the branch {} because it is checked out in {}.",
+                self.branch,
+                path.display()
+            ),
+        };
+        if !self.warnings.contains(&warning) {
+            self.warnings.push(warning);
+        }
+    }
+
+    /// The warning [`AgentThread::record_completion`] wrote about a kept
+    /// branch, if any.
+    pub fn branch_kept_warning(&self) -> Option<&str> {
+        let prefix = format!("GitEZ kept the branch {} because", self.branch);
+        self.warnings
+            .iter()
+            .map(String::as_str)
+            .find(|warning| warning.starts_with(&prefix))
+    }
 }
 
 /// Completes `thread`: removes its worktree with `git worktree remove
 /// --force` (skipped when the folder is gone), `git worktree prune`, and
-/// deletes the branch when its tip is still `thread.start.commit` (no
-/// commits of its own) and it is not checked out in the main worktree;
-/// then removes the thread's [`ScratchDirs`] (best effort). Does not change
-/// thread.json; the caller then calls `mark_completed`.
+/// deletes the branch when nothing on it can be lost; then removes the
+/// thread's [`ScratchDirs`] (best effort). Does not change thread.json;
+/// the caller records the report ([`AgentThread::record_completion`]) and
+/// calls `mark_completed`.
+///
+/// The branch is deleted only once the worktree is gone (not kept), only
+/// when no worktree has it checked out, and only when its tip is still
+/// `thread.start.commit` (no commits of its own) or, with `merged` (its
+/// pull request was merged), the commit merged ([`Merged::head`]) or a
+/// commit already in the base branch. It is deleted with `git update-ref`
+/// against the tip it was checked at, so a branch that moves meanwhile
+/// stays.
 ///
 /// A worktree with uncommitted changes, or whose state is not known, is
 /// handled as `uncommitted` says; nothing here looks into the worktree
@@ -494,11 +572,13 @@ pub struct CompleteReport {
 /// hook, filter or submodule command; it deletes without following links.
 ///
 /// Called again for a completed thread whose worktree was kept, with
-/// [`IfUncommitted::Discard`], it removes the worktree then.
+/// [`IfUncommitted::Discard`], it removes the worktree then, and the branch
+/// by the same rule.
 pub fn complete(
     main_work_dir: &Path,
     thread: &AgentThread,
     uncommitted: IfUncommitted,
+    merged: Option<&Merged>,
 ) -> Result<CompleteReport> {
     let git = Git::new(main_work_dir);
     let exists = match fs::symlink_metadata(&thread.worktree) {
@@ -557,21 +637,13 @@ pub fn complete(
             worktree_removed: false,
             kept: Some(kept),
             branch_deleted: false,
+            deleted_at: None,
+            branch_kept: None,
         });
     }
     git.worktree_prune()?;
 
-    let main = Repository::open(main_work_dir)?;
-    let tip = main.resolve_commit(&format!("refs/heads/{}", thread.branch))?;
-    let start = gitez_git::Oid::from_hex(thread.start.commit.as_bytes()).ok();
-    let own_commits = tip.is_none() || tip != start;
-    let checked_out = checked_out_branch(main_work_dir)?.as_deref() == Some(thread.branch.as_str());
-    let branch_deleted = if own_commits || checked_out {
-        false
-    } else {
-        git.delete_branch(&thread.branch, true)?;
-        true
-    };
+    let (deleted_at, branch_kept) = delete_branch_if_safe(main_work_dir, &git, thread, merged)?;
     if let Some(dirs) = scratch_dirs_of(thread) {
         remove_scratch(&dirs.tmp);
         remove_scratch(&dirs.caches);
@@ -579,6 +651,65 @@ pub fn complete(
     Ok(CompleteReport {
         worktree_removed: exists,
         kept: None,
-        branch_deleted,
+        branch_deleted: deleted_at.is_some(),
+        deleted_at,
+        branch_kept,
     })
+}
+
+/// Deletes `thread`'s branch, its worktree being gone, if nothing on it
+/// can be lost (the rule of [`complete`]). Returns the tip it deleted, or,
+/// for a merged pull request, why it kept the branch.
+fn delete_branch_if_safe(
+    main_work_dir: &Path,
+    git: &Git,
+    thread: &AgentThread,
+    merged: Option<&Merged>,
+) -> Result<(Option<String>, Option<BranchKept>)> {
+    let main = Repository::open(main_work_dir)?;
+    let Some(tip) = main.resolve_commit(&format!("refs/heads/{}", thread.branch))? else {
+        // Already gone.
+        return Ok((None, None));
+    };
+    let commit = |hex: &str| gitez_git::Oid::from_hex(hex.as_bytes()).ok();
+    let empty = commit(&thread.start.commit) == Some(tip);
+    let merged_tip = match merged {
+        None => false,
+        Some(merged) if commit(&merged.head) == Some(tip) => true,
+        Some(merged) => match main.resolve_commit(&format!("refs/heads/{}", merged.base))? {
+            // In the base: no commit of the branch is missing from it.
+            Some(base) => main.ahead_behind(tip, base)?.0 == 0,
+            None => false,
+        },
+    };
+    // Only a merged pull request's branch is worth a word when it stays;
+    // one with commits after a close or by hand is kept as always.
+    let say = |why: BranchKept| merged.map(|_| why);
+    if !empty && !merged_tip {
+        return Ok((None, say(BranchKept::Unmerged)));
+    }
+    if let Some(place) = checked_out_in(main_work_dir, &main, &thread.branch)? {
+        return Ok((None, say(BranchKept::CheckedOut(place))));
+    }
+    let tip = tip.to_string();
+    git.update_refs(&[gitez_command::RefUpdate {
+        name: format!("refs/heads/{}", thread.branch),
+        old: Some(tip.clone()),
+        new: None,
+    }])?;
+    Ok((Some(tip), None))
+}
+
+/// The worktree that has `branch` checked out, if one has: the main
+/// worktree at `main_work_dir` or a linked one (its folder may be gone
+/// while git still records it).
+fn checked_out_in(
+    main_work_dir: &Path,
+    main: &Repository,
+    branch: &str,
+) -> Result<Option<PathBuf>> {
+    if checked_out_branch(main_work_dir)?.as_deref() == Some(branch) {
+        return Ok(Some(main_work_dir.to_owned()));
+    }
+    Ok(main.linked_worktree_of(branch)?)
 }

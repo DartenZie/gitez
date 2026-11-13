@@ -186,11 +186,13 @@ fn completing_removes_the_worktree_and_a_branch_without_commits() {
     fs::create_dir_all(&other.caches).expect("create other caches");
 
     assert_eq!(
-        complete(&fixture.root, &idle, IfUncommitted::Refuse).expect("complete"),
+        complete(&fixture.root, &idle, IfUncommitted::Refuse, None).expect("complete"),
         CompleteReport {
             worktree_removed: true,
             kept: None,
             branch_deleted: true,
+            deleted_at: Some(idle.start.commit.clone()),
+            branch_kept: None,
         }
     );
     assert!(!idle.worktree.exists());
@@ -198,21 +200,25 @@ fn completing_removes_the_worktree_and_a_branch_without_commits() {
     assert!(!scratch.caches.exists(), "the caches are removed");
     assert!(other.caches.exists(), "another thread's caches stay");
     assert_eq!(
-        complete(&fixture.root, &busy, IfUncommitted::Refuse).expect("complete"),
+        complete(&fixture.root, &busy, IfUncommitted::Refuse, None).expect("complete"),
         CompleteReport {
             worktree_removed: true,
             kept: None,
             branch_deleted: false,
+            deleted_at: None,
+            branch_kept: None,
         }
     );
     assert!(!busy.worktree.exists());
     // A folder that is gone has nothing to lose, whatever is recorded.
     assert_eq!(
-        complete(&fixture.root, &gone, IfUncommitted::Refuse).expect("complete"),
+        complete(&fixture.root, &gone, IfUncommitted::Refuse, None).expect("complete"),
         CompleteReport {
             worktree_removed: false,
             kept: None,
             branch_deleted: true,
+            deleted_at: Some(gone.start.commit.clone()),
+            branch_kept: None,
         }
     );
 
@@ -231,11 +237,13 @@ fn completing_removes_the_worktree_and_a_branch_without_commits() {
     );
     // Completing twice changes nothing more.
     assert_eq!(
-        complete(&fixture.root, &idle, IfUncommitted::Refuse).expect("complete again"),
+        complete(&fixture.root, &idle, IfUncommitted::Refuse, None).expect("complete again"),
         CompleteReport {
             worktree_removed: false,
             kept: None,
             branch_deleted: false,
+            deleted_at: None,
+            branch_kept: None,
         }
     );
 }
@@ -268,8 +276,8 @@ fn uncommitted_changes_are_never_removed_silently() {
     // The supervisor recorded uncommitted changes (a failed leftover commit).
     let thread = made(&fixture, "Left work", Some(2));
     fs::write(thread.worktree.join("work.txt"), "unsaved\n").expect("write");
-    let error =
-        complete(&fixture.root, &thread, IfUncommitted::Refuse).expect_err("refused by default");
+    let error = complete(&fixture.root, &thread, IfUncommitted::Refuse, None)
+        .expect_err("refused by default");
     assert!(
         matches!(&error, Error::Uncommitted { count: Some(2), .. }),
         "{error}"
@@ -277,20 +285,22 @@ fn uncommitted_changes_are_never_removed_silently() {
     assert!(thread.worktree.join("work.txt").exists(), "nothing removed");
 
     // Completing it after a merge keeps the folder and its branch.
-    let report = complete(&fixture.root, &thread, IfUncommitted::Keep).expect("kept");
+    let report = complete(&fixture.root, &thread, IfUncommitted::Keep, None).expect("kept");
     assert_eq!(
         report,
         CompleteReport {
             worktree_removed: false,
             kept: Some(Kept::Uncommitted { count: Some(2) }),
             branch_deleted: false,
+            deleted_at: None,
+            branch_kept: None,
         }
     );
     assert!(thread.worktree.join("work.txt").exists());
     assert_eq!(fixture.tip(&thread.branch), thread.start.commit);
 
     // Removed later when the user says so.
-    let report = complete(&fixture.root, &thread, IfUncommitted::Discard).expect("discarded");
+    let report = complete(&fixture.root, &thread, IfUncommitted::Discard, None).expect("discarded");
     assert!(
         report.worktree_removed && report.branch_deleted,
         "{report:?}"
@@ -301,7 +311,7 @@ fn uncommitted_changes_are_never_removed_silently() {
     // so the worktree is removed as before.
     let unknown = made(&fixture, "No record", None);
     assert!(unknown.uncommitted.is_none());
-    let report = complete(&fixture.root, &unknown, IfUncommitted::Refuse).expect("removed");
+    let report = complete(&fixture.root, &unknown, IfUncommitted::Refuse, None).expect("removed");
     assert!(report.worktree_removed, "{report:?}");
 }
 
@@ -361,7 +371,8 @@ fn a_redirected_git_file_is_never_followed() {
         assert!(matches!(error, Error::Tampered { .. }), "{error}");
     }
     // Neither a confirmed removal nor a reuse runs git there.
-    let error = complete(&fixture.root, &thread, IfUncommitted::Discard).expect_err("untrusted");
+    let error =
+        complete(&fixture.root, &thread, IfUncommitted::Discard, None).expect_err("untrusted");
     assert!(matches!(error, Error::Tampered { .. }), "{error}");
     let error = create_worktree(
         &fixture.root,
@@ -371,7 +382,7 @@ fn a_redirected_git_file_is_never_followed() {
     )
     .expect_err("untrusted");
     assert!(matches!(error, Error::Tampered { .. }), "{error}");
-    let report = complete(&fixture.root, &thread, IfUncommitted::Keep).expect("kept");
+    let report = complete(&fixture.root, &thread, IfUncommitted::Keep, None).expect("kept");
     assert!(
         matches!(report.kept, Some(Kept::Untrusted(_))),
         "{report:?}"
@@ -599,7 +610,7 @@ fn completing_follows_no_link_and_runs_nothing_in_the_worktree() {
     );
     fs::remove_file(marks.join("ran")).expect("reset the marks");
 
-    let report = complete(&fixture.root, &thread, IfUncommitted::Discard).expect("complete");
+    let report = complete(&fixture.root, &thread, IfUncommitted::Discard, None).expect("complete");
     assert!(report.worktree_removed, "{report:?}");
     assert!(!worktree.exists());
     assert!(
