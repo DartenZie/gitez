@@ -22,6 +22,10 @@ would review a PR, but on your own machine. You comment on lines of the diff,
 and GitEZ turns the comments into a prompt for the agent. You can copy the
 prompt, or send it straight to [Claude Code](https://docs.claude.com/en/docs/claude-code).
 
+GitEZ can also start that work: **agent threads** run Claude Code in the
+background, each on its own branch and worktree and inside a sandbox, and
+bring the result back as a local pull request.
+
 > [!WARNING]
 > GitEZ is in early development. Expect missing features and breaking changes.
 
@@ -51,6 +55,134 @@ prompt, or send it straight to [Claude Code](https://docs.claude.com/en/docs/cla
 
 Review data is stored in `.git/gitez/reviews`. It is never in the working
 tree, so it cannot be committed or pushed by accident. Linked worktrees share it.
+
+### Agent threads
+
+A thread is a prompt you give a coding agent (Claude Code, for now) and the
+conversation that follows. Each thread works on its own branch,
+`agent/<name>`, in its own linked worktree in GitEZ's data folder, never
+inside your repository, and runs in a [sandbox](#the-agent-sandbox).
+
+- **Start a thread** from the "Ask an agent…" row under the uncommitted
+  changes in the history (`⌘⇧A`, or File > Ask an Agent…), or from Home.
+  Write the prompt, and pick the agent, the model, the branch to start from,
+  the sandbox's network profile and the secrets the thread gets. The thread
+  starts from the branch's last commit; your uncommitted changes are not
+  included. GitEZ returns at once and the agent works in the background.
+- Before the agent starts, GitEZ prepares the worktree: it copies the ignored
+  files that `.worktreeinclude` lists from your working tree, clones
+  `target/` and `node_modules/` copy-on-write where the file system can
+  (APFS on macOS, reflinks on Linux), and runs the repository's setup command
+  if you set one in Settings.
+- **Live lanes**: a thread that is preparing or running is a dashed lane at
+  the top of the history, with what its agent does now, joined to the commit
+  its branch is at. In the sidebar, the `agent/` branches are one folder
+  under Branches.
+- **Thread view**: click a thread to open it in the detail panel: the
+  prompt, the agent's steps (collapsed to one row), its final message, and
+  its branch and pull request. **Reply** continues the same conversation in
+  the same worktree. **Stop** ends the agent's turn. **Retry** runs a failed
+  or stopped thread again, with another network profile if you choose one.
+  **Open transcript** shows the agent's transcript in Finder.
+- At most three agents run at once across all repositories (you can change
+  the limit in Settings); other threads wait as Queued. A thread that reaches
+  the agent's usage limit waits and continues by itself after the reset.
+- When the agent stops, GitEZ commits what it left uncommitted on the
+  thread's branch. If the branch has commits of its own, GitEZ opens a
+  **local pull request** against the starting branch, with the agent's final
+  message as its description.
+- **Review loop**: on a pull request that a thread opened, **Send to Claude
+  Code** sends your review comments back to that thread, which continues in
+  its own worktree. The head branch does not have to be checked out. Merging
+  or closing the pull request completes the thread.
+- **Complete** removes the thread's worktree, and its branch if the branch
+  has no commits of its own. The thread stays readable. If the worktree has
+  uncommitted changes, GitEZ asks first: discard them, or complete and keep
+  the worktree to remove later. A merge or close that completes a thread
+  always keeps a worktree with uncommitted changes.
+- **Agents indicator**: the toolbar shows how many threads run and how many
+  wait for you. Click it for this repository's threads, grouped by what they
+  need, each with the action that fits (review, stop, retry, complete), and a
+  link to all threads in Home. The Home button at the left end of the
+  toolbar, and File > Show All Agent Threads, close the repository and show
+  Home.
+- **Home** is shown when no repository is open. It has a launcher that starts
+  a thread in any repository (`⌘N`), the recent repositories with Open, Clone
+  and New repository, and a sidebar with the threads of every repository:
+  finished threads first, newest first, and the active, waiting and completed
+  ones in a section below. A finished thread with a pull request opens as a
+  thread, or opens its pull request in its repository.
+- **Settings** (`⌘,`, the app menu, or the gear in the Agents popover):
+  - Claude Code's binary, configuration folder, environment variables,
+    launch arguments and default model, and whether it is signed in.
+  - How many agents run at once.
+  - The sandbox: whether it is installed, the network profile new threads
+    start with, the hosts the Packages profile adds, the paths hidden from
+    the agent, and extra folders the agent may write in every thread.
+  - Secrets: named environment variables whose values are kept in the OS
+    keychain (Keychain on macOS, the Secret Service on Linux), never in a
+    file. A value is not shown again after you enter it. A secret is for all
+    repositories or one, and can be given to new threads by default; the
+    composer picks them per thread. In the transcripts and logs that GitEZ
+    writes, each value is replaced with `[secret NAME]`.
+  - The repository's setup command, kept as `gitez.setupCommand` in its git
+    config.
+
+Thread data is stored in `.git/gitez/threads`, beside the reviews.
+
+### The agent sandbox
+
+Every agent thread runs in a sandbox, and there is no option to turn it off.
+The sandbox wraps the agent's whole process, so it also applies to every
+command the agent runs. GitEZ uses Anthropic's sandbox runtime
+([`srt`](https://github.com/anthropics/sandbox-runtime)); for the
+Open network profile, which `srt` cannot express, it uses a `sandbox-exec`
+profile of its own on macOS and bubblewrap on Linux, with the same file rules.
+The setup command, and GitEZ's own commit of what the agent left uncommitted,
+run in the same sandbox.
+
+- **Writes**: the agent can write its worktree, the repository's objects and
+  its own branch, its own temporary folder and caches in GitEZ's data folder,
+  the per-project and per-session files Claude Code keeps in its
+  configuration folder, and the folders you add in Settings. It cannot write
+  anywhere else: not your home folder, not your main worktree, not other
+  branches, and not the repository's `.git/hooks` or `.git/config`. Files in
+  the worktree that make other tools run code (`.gitmodules`, `.gitconfig`,
+  `.vscode/`, `.idea/`, `.mcp.json`, `.claude/commands`, `.claude/agents` and
+  shell startup files) are read-only too. `git stash` does not work in a
+  thread.
+- **Hidden paths**: by default the agent cannot read `~/.ssh`, `~/.aws`,
+  `~/.gnupg`, `~/.config/gh`, `~/.netrc`, `~/.kube`, `~/.docker/config.json`,
+  `~/.git-credentials`, `~/.config/git/credentials`, `~/.npmrc`, `~/.pypirc`,
+  `~/.cargo/credentials` and `~/.cargo/credentials.toml`. You can change the
+  list in Settings.
+- **git**: the agent's commits are not signed, because it cannot reach your
+  signing keys, and git credential helpers are off for every command of a
+  thread.
+- **Network**: each thread has one of three profiles.
+
+  | Profile | Allows |
+  | --- | --- |
+  | Agent API only (default) | The agent's own API (`api.anthropic.com`, `platform.claude.com`). Downloads fail; Cargo and Go run offline. |
+  | Packages | Also package registries and code hosts (crates.io, npm, PyPI, GitHub, the Go module proxy and others, editable in Settings), and the hosts of the repository's remotes. The setup command always runs with this profile. |
+  | Open | Any host. |
+
+> [!CAUTION]
+> Know the limits of the sandbox:
+>
+> - Apart from the hidden paths, the agent can read everything you can. The
+>   sandbox cannot separate the agent from the commands it runs, so with the
+>   Packages or Open profile an agent could send out anything it can read,
+>   including its own Claude login and the secrets you gave the thread.
+> - With Packages or Open, a thread gets its own copy-on-write copy of your
+>   package caches (Cargo, npm and others), so that it never writes the
+>   caches your own builds use. Cargo then builds the dependencies again once
+>   per thread. To share a cache instead, which is faster but lets the agent
+>   write files your own builds use, add it in Settings (for example
+>   `~/.cargo/registry` and `~/.cargo/git`).
+> - The agent writes the thread's worktree. Treat it as an untrusted checkout
+>   when you open it in an editor, a terminal or another tool. GitEZ checks
+>   the worktree's git files before it runs git there.
 
 ### Everything else you expect from a git client
 
@@ -92,9 +224,9 @@ tree, so it cannot be committed or pushed by accident. Linked worktrees share it
   a conflicted file over 1 MB is not highlighted.
 - **Command palette** (`⌘K`): find actions, commits, branches and files, or
   run any `git` command and see its output stream in.
-- **Clone or create** a repository from the start screen, the File menu or the palette.
+- **Clone or create** a repository from Home, the File menu or the palette.
 - **Project icon**: the top left of the window shows the open repository's favicon, app icon (`.icns` included) or logo if a tracked file looks like one, and otherwise a badge with the first letter of its name.
-- **Reopen where you left off**: GitEZ opens the repository that was open when it last quit, and the start screen, File > Open Recent and the repository name at the top left list the last ten; click the name to switch repository or open another, and hover a repository in that list to remove it with its × button. File also has Reveal in Finder, Close Repository and Close Window.
+- **Reopen where you left off**: GitEZ opens the repository that was open when it last quit, and Home, File > Open Recent and the repository name at the top left list the last ten; click the name to switch repository or open another, and hover a repository in that list to remove it with its × button. File also has Reveal in Finder, Close Repository and Close Window.
 
 > [!NOTE]
 > GitEZ reads the repository with [gitoxide](https://github.com/GitoxideLabs/gitoxide),
@@ -111,11 +243,26 @@ tree, so it cannot be committed or pushed by accident. Linked worktrees share it
 - Optional: [Claude Code](https://docs.claude.com/en/docs/claude-code), to send
   prompts to an agent. GitEZ looks for `claude` on the `PATH` and in the
   installers' default locations, such as `~/.local/bin`.
+- For agent threads:
+  - Claude Code, signed in (`claude auth login`). GitEZ runs your own
+    `claude` with your own login and configuration, and never reads or
+    stores the login. A thread can instead get an `ANTHROPIC_API_KEY` secret.
+  - [Node.js](https://nodejs.org) 22.12 or newer, with `npm`, for the
+    sandbox. Settings installs the sandbox runtime
+    (`@anthropic-ai/sandbox-runtime@0.0.82`) into GitEZ's own data folder
+    with `npm install --prefix`, never globally. An `srt` already on the
+    `PATH` is used instead.
+  - On Linux, also `bubblewrap`, `socat` and `ripgrep`.
 - Optional: the [Geist](https://vercel.com/font) and
   [JetBrains Mono](https://www.jetbrains.com/lp/mono/) fonts. Without them,
   GitEZ uses the system UI and monospace fonts.
 
 Windows is not supported yet.
+
+> [!NOTE]
+> Agent threads have been tested on macOS only. Their Linux code (the
+> bubblewrap sandbox for the Open profile, `srt` on Linux, and secrets in the
+> Secret Service) is untested.
 
 ### macOS
 
@@ -164,7 +311,7 @@ You need a Vulkan-capable GPU driver. Wayland and X11 are both supported.
 ```sh
 git clone https://github.com/miroslavpasek/gitez.git
 cd gitez
-cargo run                          # reopen the last repository, or start from the start screen
+cargo run                          # reopen the last repository, or start from Home
 cargo run -- <path-to-repository>  # open a repository directly
 ```
 
@@ -189,7 +336,20 @@ For an optimised build, run `cargo build --release`. The binary is
 > **Send to Claude Code** runs `claude -p` with `--permission-mode bypassPermissions`,
 > because a headless run cannot ask for permission. It starts only when the
 > pull request's head branch is checked out. Click **Checkout branch** first if
-> necessary.
+> necessary. A pull request that an agent thread opened is the exception: its
+> comments go back to that thread, which runs sandboxed in its own worktree,
+> whatever is checked out.
+
+### Run an agent thread
+
+1. Open Settings (`⌘,`). Check that Claude Code is signed in and that the
+   sandbox is ready; click **Install** if it is not.
+2. In a repository, press `⌘⇧A`, or in Home, press `⌘N`.
+3. Write the prompt, pick the branch to start from and the network profile,
+   and press `⌘↵`.
+4. Follow the thread in its lane or in the Agents popover. When it has
+   finished, review its local pull request, reply in the thread, or click
+   **Complete**.
 
 ### Keyboard shortcuts
 
@@ -200,12 +360,14 @@ On Linux, use `Ctrl` instead of `⌘`.
 | `⌘O` | Open a repository |
 | `⌘W` | Close the window |
 | `⌘K` | Open the command palette |
+| `⌘⇧A` or `⌘N` | Ask an agent: the composer in a repository, the launcher in Home |
+| `⌘,` | Open Settings for agents, the sandbox and secrets |
 | `⌘Z` / `⇧⌘Z` | Undo / redo |
 | `↑` `↓` or `k` `j` | Move through the history |
 | `Enter` | Show the selected commit's full diff |
 | `[` / `]` | Step to the newer / older commit in a diff |
-| `Esc` | Go back, or cancel a drag |
-| `⌘↵` | Commit, or run the typed `git` command in the palette |
+| `Esc` | Go back, cancel a drag, or close the agent composer |
+| `⌘↵` | Commit, run the typed `git` command in the palette, or send a prompt or reply to an agent |
 | `Tab` | In the palette, fill in the selected item as the next argument |
 | `⌘`-click / `⇧`-click | Select several commits / a range of commits |
 
@@ -224,6 +386,50 @@ working-tree status of a repository:
 cargo run --release -p gitez-git --example history -- <path-to-repository>
 ```
 
+### How an agent thread runs
+
+GitEZ runs each thread in a separate process,
+`gitez supervise start|reply|retry --git-dir <git common dir> --thread <id>`,
+started detached from the window with the thread's secret values on its
+standard input. The process waits for a free slot, prepares the worktree,
+runs the agent in the sandbox, writes the transcript, commits what the agent
+left and opens the pull request. A thread therefore keeps running after you
+close the window or quit GitEZ. GitEZ starts this command itself; it is not
+meant to be run by hand.
+
+Where the data is:
+
+| Path | Contents |
+| --- | --- |
+| `<git common dir>/gitez/threads/<id>/` | `thread.json`, one transcript per run in `runs/`, and the logs `supervisor.log` and `setup.log` |
+| `<data folder>/settings.json` | Settings, with the names of secrets but never their values |
+| `<data folder>/threads.json` | The repositories that have threads, so Home can list them |
+| `<data folder>/worktrees/<repository>-<hash>/<id>/` | The threads' worktrees |
+| `<data folder>/tmp/`, `<data folder>/caches/` | Each thread's temporary folder and package caches |
+| `<data folder>/sandbox/` | The sandbox runtime that Settings installs |
+| `<data folder>/queue/` | The lock files that limit how many agents run at once |
+
+The data folder is `~/Library/Application Support/GitEZ` on macOS and
+`$XDG_STATE_HOME/gitez` (`~/.local/state/gitez`) on Linux. It also holds
+`recent.json`, the recent repositories.
+
+### Environment variables
+
+| Variable | Effect |
+| --- | --- |
+| `GITEZ_DATA_DIR` | Use this folder as the data folder, for tests and trial runs |
+| `GITEZ_KEYCHAIN_SERVICE` | Keep secret values under this keychain service instead of `GitEZ` |
+| `GITEZ_DEBUG_THREADS` | Log what the app does with agent threads to standard error |
+| `GITEZ_TEST_SANDBOX=passthrough` | Debug builds only: run threads without a sandbox, for tests. The thread shows a warning. Release builds ignore it. |
+| `GITEZ_SCREENSHOTS` | A folder: run the `screenshot_` and `e2e_` tests, which render views to PNG files there (macOS only). Without it they return at once. |
+| `GITEZ_E2E=1` | With `GITEZ_SCREENSHOTS`: run the end-to-end tests with a fake agent and a real supervisor. Build `target/debug/gitez` first. |
+| `GITEZ_E2E_REAL=1` | With `GITEZ_SCREENSHOTS`: run the end-to-end tests with the real Claude Code (model `haiku`, on your own account) in the real sandbox. They also need `GITEZ_E2E_SCRATCH` (a folder for the test repositories), `GITEZ_E2E_SANDBOX` (a `sandbox` folder with `srt` installed) and `GITEZ_E2E_CLAUDE` (the path of `claude`). |
+
+```sh
+cargo build -p gitez
+GITEZ_SCREENSHOTS=/tmp/gitez-shots GITEZ_E2E=1 cargo test -p gitez e2e_
+```
+
 ### Project layout
 
 | Path | Contents |
@@ -234,6 +440,11 @@ cargo run --release -p gitez-git --example history -- <path-to-repository>
 | `crates/gitez-review` | Local pull requests, comment threads and agent transcripts in `.git/gitez/reviews` |
 | `crates/gitez-agent` | Coding agents: Claude Code run as `claude -p` with its streamed events parsed, and test command detection |
 | `crates/gitez-highlight` | Syntax highlighting without GPUI: language detection and per-line token spans from syntect and bat's grammars |
+| `crates/gitez-sandbox` | The sandboxes agents run in: `srt` (finding and installing it), the Seatbelt and bubblewrap profiles for the Open network profile, and the file and network policy |
+| `crates/gitez-secret` | Secret values in the OS keychain |
+| `crates/gitez-settings` | GitEZ's data folder and `settings.json`: agent entries, secret names and scopes, sandbox defaults, the running-agent limit |
+| `crates/gitez-agent-thread` | Agent threads in `.git/gitez/threads`, the index of repositories with threads, and the threads' worktrees: creating, preparing, checking and removing them |
+| `crates/gitez-supervisor` | The `gitez supervise` process that runs one thread: the queue, the run, the sandbox policy and environment, the commit of leftovers and the pull request |
 
 The UI uses [gpui-kit](https://gpui-kit.com), which pins the matching GPUI
 release. [CLAUDE.md](CLAUDE.md) describes the architecture decisions, the

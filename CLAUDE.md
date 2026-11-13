@@ -11,7 +11,10 @@ reviewer comments on lines of the diff, and GitEZ turns the comments into a
 prompt for a coding agent (Claude Code in v1) that can be copied or sent
 directly. Review data is stored under the repository's `.git` directory
 (`.git/gitez/reviews`, see "Review storage" below), never in the working
-tree.
+tree. GitEZ also runs **agent threads**: a coding agent works in the
+background on its own `agent/<slug>` branch and linked worktree, inside a
+sandbox, and its result is reviewed as a local pull request (see "Agent
+threads" below).
 
 The reference design is a Design canvas at
 <https://claude.ai/artifact/ELtu5gwJExRfcVQHVNCGs8>. Read it with the Artifact
@@ -28,6 +31,20 @@ screen. Artboards:
 | `CherryPick.dc.html` | Cherry-pick selection |
 | `Rewrite.dc.html` | Reword and rewrite history |
 | `Conflicts.dc.html` | Merge conflict editor |
+
+The screens of agent threads follow a separate prototype canvas at
+<https://claude.ai/artifact/2zzcufhPFe5WNNfmUUwwuw>, read the same way. Only
+the `C` boards apply (the `A`, `B` and `D` concepts were rejected); their file
+names still say "Session", and their sample data are placeholders:
+
+| Board | Screen |
+| --- | --- |
+| `C-1-Start.dc.html` | "Ask an agent…" composer in the commit graph |
+| `C-2-Sessions.dc.html` | Active threads as live lanes; toolbar Agents popover |
+| `C-3-Session.dc.html` | One thread in the detail panel |
+| `C-4-Sandbox.dc.html` | Settings: sandbox and secrets |
+| `C-5-Home.dc.html` | Home: launcher and all threads |
+| `C-6-Thread.dc.html` | Home: a finished thread |
 
 ### Design tokens (dark theme)
 
@@ -74,7 +91,11 @@ Decided 2026-10-23; change only with the owner's agreement.
   agent behind a trait so other agents can be added later. It runs with
   `--permission-mode bypassPermissions` (decided 2026-10-24), since a
   headless run cannot ask for permission; it starts only when the pull
-  request's head branch is checked out.
+  request's head branch is checked out — except for a pull request an agent
+  thread created (and that thread is not completed), whose review comments
+  continue that thread (`--resume`) in its own worktree, sandboxed, whatever
+  is checked out; merging or closing such a pull request completes the
+  thread.
 - **Review storage** (decided 2026-10-24). Local pull requests live in
   `<git common dir>/gitez/reviews/`, so linked worktrees share them and
   nothing reaches the working tree, a commit or a push. The `gitez-review`
@@ -99,6 +120,96 @@ Decided 2026-10-23; change only with the owner's agreement.
     `review.json`, as git does with its own files. A newer `version` than
     GitEZ knows is refused, never overwritten.
   - Plain file I/O, not the git CLI: git has no command for this data.
+- **Agent threads** (decided 2026-11-13). A thread is a prompt given to a
+  coding agent that works in the background, and the conversation that
+  follows. Claude Code is the only agent; others come behind the `Agent`
+  trait and the `Registry` of `gitez-agent`.
+  - One thread is one branch, `agent/<id>` (the id is a slug of the title,
+    with `-2`, `-3`… when taken), and one linked worktree at
+    `<data folder>/worktrees/<repository name>-<8 hex digits of a hash of the
+    common dir>/<id>`, never inside the repository. GitEZ makes it with `git
+    worktree add`, never `claude --worktree`. The data folder is
+    `gitez_settings::data_dir()`: `$GITEZ_DATA_DIR`, else
+    `~/Library/Application Support/GitEZ` on macOS and
+    `$XDG_STATE_HOME/gitez` elsewhere. Tests use a data folder of their own,
+    never the owner's.
+  - Storage: `<git common dir>/gitez/threads/<id>/thread.json` (one JSON
+    document with a `version` field) and `runs/<UTC time>.jsonl` (one
+    transcript per turn: a GitEZ header line, then the agent's events), with
+    the same lock-and-rename writes and refusal of a newer `version` as
+    review storage. The `gitez-agent-thread` crate owns the format and the
+    worktrees; nothing else reads or writes these files.
+    `<data folder>/threads.json` indexes the repositories that have threads,
+    so Home lists threads of repositories that are not open.
+  - Every run (start, reply, review comments, retry) goes through a detached
+    `gitez supervise <start|reply|retry> --git-dir <common dir> --thread
+    <id>` process in its own session, so a thread outlives the window and
+    GitEZ itself. The GUI writes the thread's record and its pending turn,
+    launches the supervisor, watches the thread files and can stop the
+    supervisor (SIGTERM; the supervisor then sends SIGINT to the
+    agent's process group, and SIGKILL after 20 s). Success is read from the
+    agent's `result` event, never from an exit code. At most
+    `threads.max_running` agents (default 3) run at once across all
+    repositories; the rest wait as Queued, coordinated through lock files in
+    `<data folder>/queue/`.
+  - Every run is sandboxed: the agent, the setup command (`gitez.setupCommand`
+    in the repository's git config, run with the Packages network), the
+    checkout of a branch the agent already wrote, and GitEZ's commit of the
+    agent's leftovers (no network). There is no unsandboxed option in the UI
+    or in release builds; `GITEZ_TEST_SANDBOX=passthrough` works only in
+    debug builds, for tests. The sandbox is behind the `Sandbox` trait of
+    `gitez-sandbox`: Anthropic's `srt`, pinned to
+    `@anthropic-ai/sandbox-runtime@0.0.82` (Node.js 22.12 or newer), taken
+    from the `PATH` or installed by Settings with `npm install --prefix
+    <data folder>/sandbox`, never globally. Network profiles: `agent_only`
+    (the default, "Agent API only"), `packages` (adds the hosts in Settings
+    and the hosts of the repository's remotes) and `open`. `srt` cannot
+    express Open, so Open runs under a GitEZ-generated `sandbox-exec`
+    profile with the same file rules on macOS (bubblewrap without a network
+    namespace on Linux, untested). Claude Code's own Bash sandbox is turned
+    off (`--settings '{"sandbox":{"enabled":false}}'`): it cannot nest. No
+    JavaScript ships with GitEZ; `srt` is an external program.
+  - A thread's worktree is hostile once the agent has run in it. The policy
+    lets the agent write its worktree, the object store, its own branch's
+    ref, reflog and lock, `packed-refs.lock`, its own `tmp/` and `caches/`
+    folders in the data folder, the per-project and per-session paths of its
+    configuration folder, and the folders the user adds in Settings. It
+    denies the common dir's `hooks`, `config` and `gitez/`, the object
+    store's alternates and commit graphs, the worktree's `.git` file, the
+    `commondir`, `gitdir`, `config`, `config.worktree` and `locked` files of
+    the worktree's git dir, and GitEZ's `settings.json` and `threads.json`;
+    a writable path that is itself a symbolic link is left out. The user's
+    package caches stay read-only: commands that may download get
+    copy-on-write clones in the thread's `caches/`. Before GitEZ runs git in
+    a worktree outside the sandbox it checks the `.git` pointer and the git
+    dir's files against what it recorded when it made the worktree
+    (`check_worktree`; on a mismatch it runs nothing there). Status and the
+    commit of leftovers run inside the sandbox. The rebase of a thread's
+    branch ("Rebase and merge") runs with hooks, fsmonitor, submodule
+    recursion and credential helpers off (`Git::rebase_onto_untrusted`).
+    Every command run for a thread gets `commit.gpgsign=false`, an empty
+    `credential.helper`, `gc.auto=0` and `maintenance.auto=false` through
+    `GIT_CONFIG_*`.
+  - Secrets: values only in the OS keychain (`gitez-secret`, service
+    `GitEZ`, or `GITEZ_KEYCHAIN_SERVICE` in tests); names, scope and the
+    default switch in `settings.json`; names only in `thread.json`. The GUI
+    passes the values to the supervisor as JSON on standard input, never on
+    a command line. The supervisor puts them in the agent's environment and
+    replaces each value with `[secret NAME]` in every transcript, log and
+    message it writes; values shorter than 4 characters are refused.
+  - The agent uses the user's own Claude Code login and configuration.
+    GitEZ starts the user's unmodified `claude`, lets the sandbox reach its
+    login, and asks `claude auth status --json` only whether it is signed
+    in. GitEZ never reads, stores or forwards the credential, and never
+    makes the whole configuration folder writable.
+  - Naming, in the UI and in code: the noun is "thread" (never "session",
+    "task" or "job"); the verb is "Complete" (never "archive" or
+    "dismiss"); the states are one word each: Queued, Preparing, Running,
+    Waiting, Finished, Completed, and a finished thread ended as a pull
+    request, an answer, failed or stopped. In code an agent thread is
+    always `AgentThread…` (`AgentThread`, `AgentThreadId`, `AgentThreadKey`,
+    `AgentThreads`), so it is never confused with `gitez_review::Thread`, a
+    review comment thread.
 - **Milestone 1: open a repository and show its history.** Repository picker,
   sidebar (branches, remotes, tags, stashes) and a virtualised commit graph.
   Local PR review and the working-tree commit flow follow.
@@ -140,6 +251,32 @@ cargo fmt --all
 cargo clippy --all-targets --workspace
 cargo test --workspace
 ```
+
+`cargo test --workspace` never calls the real `claude` (tests use a fake agent
+program); the `gitez-secret` tests use the OS keychain under a service of
+their own (`GitEZ-test-<pid>-<n>`) and remove what they add. Gated tests
+return at once unless their variables are set:
+
+```sh
+# Render real views to PNG (macOS; GPUI's test platform and Metal, no window).
+# Look at the PNGs with the Read tool. Helpers: crates/gitez/src/screenshot.rs.
+GITEZ_SCREENSHOTS=<folder> cargo test -p gitez screenshot_
+
+# End to end with a fake agent and a real supervisor, without a sandbox.
+cargo build -p gitez
+GITEZ_SCREENSHOTS=<folder> GITEZ_E2E=1 cargo test -p gitez e2e_
+
+# The real srt and Seatbelt, and real toolchains inside them (srt installed in
+# <data>/sandbox; `real_install` installs it with npm).
+GITEZ_SANDBOX_TEST_DATA_DIR=<data> cargo test -p gitez-sandbox -- --ignored --test-threads=1
+GITEZ_SANDBOX_TEST_DATA_DIR=<data> cargo test -p gitez-supervisor --test toolchains -- --ignored --nocapture
+```
+
+`GITEZ_E2E_REAL=1` (with `GITEZ_E2E_SCRATCH`, `GITEZ_E2E_SANDBOX`,
+`GITEZ_E2E_CLAUDE` and optionally `GITEZ_E2E_CLAUDE_CONFIG`) runs the `e2e_`
+tests with the real Claude Code on the owner's account; run it only when asked,
+with the `haiku` model, in throwaway repositories. `GITEZ_DEBUG_THREADS=1`
+logs the app's agent-thread events to standard error.
 
 ## Updating GPUI
 
