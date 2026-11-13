@@ -756,11 +756,8 @@ impl Pipeline<'_> {
                 Some(code) => format!("The agent exited with code {code}."),
                 None => "The agent was ended by a signal.".to_owned(),
             });
-        if !ran.blocked_hosts.is_empty() {
-            message.push_str(&format!(
-                "\n\nThe sandbox refused connections to: {}.",
-                ran.blocked_hosts.join(", ")
-            ));
+        if let Some(hint) = refused_hint(agent.as_ref(), &ran.blocked_hosts) {
+            message.push_str(&hint);
         }
         Err(failed(message))
     }
@@ -1585,6 +1582,20 @@ fn last_lines(text: &str, count: usize) -> String {
     lines[lines.len().saturating_sub(count)..].join("\n")
 }
 
+/// The sentence a failure message ends with when the sandbox refused hosts
+/// the run may have needed. Hosts the agent contacts on its own and does
+/// not need ([`Agent::optional_hosts`]) are no reason for a failure, so
+/// they are left out; `None` when only those were refused.
+fn refused_hint(agent: &dyn Agent, blocked_hosts: &[String]) -> Option<String> {
+    let blocked = gitez_agent::BlockedHosts::classify(Some(agent), blocked_hosts);
+    (!blocked.problems.is_empty()).then(|| {
+        format!(
+            "\n\nThe sandbox refused connections to: {}.",
+            blocked.problems.join(", ")
+        )
+    })
+}
+
 /// Makes `path` a private folder of the thread's own, if it is not one: a
 /// link or file the agent put in its place (it may write in the folder's
 /// parent's entry for it) is removed, never followed. The sandbox makes
@@ -1628,6 +1639,32 @@ mod tests {
             [("a".into(), 1), ("b".into(), 3), ("c".into(), 1)].into();
         assert_eq!(changed(&before, &after), ["b", "c"]);
         assert_eq!(changed(&after, &before), ["b", "c"]);
+    }
+
+    #[test]
+    fn the_failure_hint_leaves_out_optional_hosts() {
+        let agent = gitez_agent::ClaudeCode;
+        let hosts = |hosts: &[&str]| -> Vec<String> {
+            hosts.iter().map(|host| (*host).to_owned()).collect()
+        };
+        let optional = hosts(&[
+            "mcp-proxy.anthropic.com",
+            "http-intake.logs.us5.datadoghq.com",
+        ]);
+        assert_eq!(refused_hint(&agent, &optional), None);
+        assert_eq!(refused_hint(&agent, &[]), None);
+        assert_eq!(
+            refused_hint(
+                &agent,
+                &hosts(&[
+                    "mcp-proxy.anthropic.com",
+                    "static.crates.io",
+                    "http-intake.logs.us5.datadoghq.com",
+                ])
+            )
+            .as_deref(),
+            Some("\n\nThe sandbox refused connections to: static.crates.io.")
+        );
     }
 
     #[test]

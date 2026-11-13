@@ -1134,14 +1134,26 @@ impl AgentThreads {
         if dirs == self.watched && self._watchers.is_some() {
             return;
         }
+        // Read again once watched: a supervisor may have written them
+        // between their last read and the start of the watch, which raises
+        // no event.
+        let unwatched: Vec<PathBuf> = dirs
+            .iter()
+            .filter(|dir| self._watchers.is_none() || !self.watched.contains(dir))
+            .cloned()
+            .collect();
         self.watched = dirs.clone();
         let data_dir = self.data_dir.clone();
         let changes = self.changes.clone();
+        let reread = self.changes.clone();
         let start = cx
             .background_executor()
             .spawn(async move { Watchers::start(&dirs, data_dir.as_deref(), changes) });
         self._rewatch = cx.spawn(async move |this, cx| {
             let (watchers, problems) = start.await;
+            if !unwatched.is_empty() {
+                reread.unbounded_send(unwatched).ok();
+            }
             this.update(cx, |this, cx| {
                 this._watchers = Some(watchers);
                 if this.watch_problems != problems {

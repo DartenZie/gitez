@@ -412,3 +412,55 @@ fn the_first_model_is_the_agent_default() {
             .any(|(alias, _)| *alias == "haiku")
     );
 }
+
+/// Claude Code's connectors proxy and telemetry intake, which real runs
+/// try every time, are optional and never among the hosts the sandbox
+/// allows; any other blocked host is a problem.
+#[test]
+fn claude_codes_own_extra_hosts_are_optional() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let needs = ClaudeCode.needs(&config(&dir));
+    for optional in ClaudeCode.optional_hosts() {
+        assert!(
+            !needs.hosts.iter().any(|host| host == optional.host),
+            "{} stays blocked",
+            optional.host
+        );
+    }
+    let blocked: Vec<String> = [
+        "mcp-proxy.anthropic.com",
+        "static.crates.io",
+        "HTTP-INTAKE.logs.us5.datadoghq.com",
+        "logs.us5.datadoghq.com",
+        "anthropic.com",
+    ]
+    .map(str::to_owned)
+    .into();
+    let split = crate::BlockedHosts::classify(Some(&ClaudeCode), &blocked);
+    assert_eq!(
+        split.problems,
+        [
+            "static.crates.io",
+            "logs.us5.datadoghq.com",
+            "anthropic.com"
+        ],
+        "exact hosts only: no parent domain or wildcard"
+    );
+    assert_eq!(
+        split.optional,
+        [
+            (
+                "mcp-proxy.anthropic.com",
+                "Claude Code's claude.ai connectors, not needed"
+            ),
+            (
+                "HTTP-INTAKE.logs.us5.datadoghq.com",
+                "Claude Code's telemetry, not needed"
+            ),
+        ]
+    );
+    // An agent GitEZ does not know: every host is a problem.
+    let unknown = crate::BlockedHosts::classify(None, &blocked);
+    assert_eq!(unknown.problems.len(), blocked.len());
+    assert!(unknown.optional.is_empty());
+}

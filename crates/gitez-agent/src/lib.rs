@@ -119,6 +119,46 @@ pub enum LoginStatus {
 /// "Agent default".
 pub type ModelChoice = (&'static str, &'static str);
 
+/// A host an agent contacts on its own that it does not need to do its
+/// work. The sandbox keeps blocking it; a blocked request to it is recorded
+/// but is not a problem ([`BlockedHosts`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OptionalHost {
+    /// The exact host name, such as `mcp-proxy.anthropic.com`.
+    pub host: &'static str,
+    /// What the agent uses it for, in a few words for the user, such as
+    /// "Claude Code's telemetry, not needed".
+    pub purpose: &'static str,
+}
+
+/// The hosts a sandbox refused in a run, split into those that may have
+/// mattered and those the agent does not need ([`Agent::optional_hosts`]).
+/// Every count, colour, suggestion and hint about blocked requests uses
+/// [`BlockedHosts::problems`] only.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlockedHosts<'a> {
+    /// Hosts the run may have needed, in the order they were blocked.
+    pub problems: Vec<&'a str>,
+    /// Hosts the agent contacts on its own and does not need, each with
+    /// what it is for.
+    pub optional: Vec<(&'a str, &'static str)>,
+}
+
+impl<'a> BlockedHosts<'a> {
+    /// Splits `hosts` by `agent`'s [`Agent::optional_hosts`]. With no
+    /// agent (one GitEZ no longer knows) every host counts as a problem.
+    pub fn classify(agent: Option<&dyn Agent>, hosts: &'a [String]) -> Self {
+        let mut blocked = Self::default();
+        for host in hosts {
+            match agent.and_then(|agent| agent.optional_host(host)) {
+                Some(optional) => blocked.optional.push((host, optional.purpose)),
+                None => blocked.problems.push(host),
+            }
+        }
+        blocked
+    }
+}
+
 /// A coding agent GitEZ can run.
 pub trait Agent: Send + Sync {
     /// Stored in thread.json and settings, such as `claude-code`.
@@ -139,6 +179,20 @@ pub trait Agent: Send + Sync {
     fn needs_for_run(&self, config: &AgentConfig, run: &RunSpec<'_>) -> AgentNeeds {
         let _ = run;
         self.needs(config)
+    }
+    /// Hosts the agent contacts on its own that it does not need to do its
+    /// work, such as its own telemetry. They are never allowed by the
+    /// sandbox: a blocked request to one is recorded, shown apart and
+    /// muted, and never counted as a problem. Exact host names only.
+    fn optional_hosts(&self) -> &'static [OptionalHost] {
+        &[]
+    }
+    /// The entry of [`Agent::optional_hosts`] that is `host`, if any.
+    /// Host names are compared without regard to ASCII case.
+    fn optional_host(&self, host: &str) -> Option<&'static OptionalHost> {
+        self.optional_hosts()
+            .iter()
+            .find(|optional| optional.host.eq_ignore_ascii_case(host))
     }
     /// What a line of the agent's output reports, if anything.
     fn parse(&self, line: &str) -> Option<AgentEvent>;

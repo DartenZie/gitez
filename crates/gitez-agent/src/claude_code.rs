@@ -20,7 +20,7 @@ use crate::login_shell::{join_path, login_shell_var};
 use crate::process::find_program;
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentNeeds, CommandSpec, Conversation, Error, Finished,
-    LoginStatus, ModelChoice, Result, RunSpec, UsageLimit,
+    LoginStatus, ModelChoice, OptionalHost, Result, RunSpec, UsageLimit,
 };
 
 const PROGRAM: &str = "claude";
@@ -57,6 +57,21 @@ const TMPDIR_VAR: &str = "CLAUDE_CODE_TMPDIR";
 
 /// Hosts every run needs: the API, and the login refresh.
 const HOSTS: [&str; 2] = ["api.anthropic.com", "platform.claude.com"];
+
+/// Hosts Claude Code contacts in every run that a thread does not need,
+/// as seen in real sandboxed runs: the proxy for claude.ai connectors (MCP
+/// servers such as Gmail or Drive, its `MCP_PROXY_URL`) and the log intake
+/// its telemetry is sent to. Both stay blocked.
+const OPTIONAL_HOSTS: [OptionalHost; 2] = [
+    OptionalHost {
+        host: "mcp-proxy.anthropic.com",
+        purpose: "Claude Code's claude.ai connectors, not needed",
+    },
+    OptionalHost {
+        host: "http-intake.logs.us5.datadoghq.com",
+        purpose: "Claude Code's telemetry, not needed",
+    },
+];
 
 /// How long `claude auth status` may take.
 const LOGIN_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -243,6 +258,10 @@ impl Agent for ClaudeCode {
             write_files: Vec::new(),
             hosts: HOSTS.map(str::to_owned).into(),
         }
+    }
+
+    fn optional_hosts(&self) -> &'static [OptionalHost] {
+        &OPTIONAL_HOSTS
     }
 
     /// Adds, for the run's folder: its transcripts (`projects/<folder>`,

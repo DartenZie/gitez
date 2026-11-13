@@ -561,13 +561,11 @@ impl Review {
         let Some(thread) = self.agent_thread_for_pull_request(cx) else {
             return;
         };
+        let model = AgentThreads::global(cx).read(cx);
         let network = agent_thread::suggested_retry(
             &thread,
-            &AgentThreads::global(cx)
-                .read(cx)
-                .settings()
-                .sandbox
-                .package_hosts,
+            model.agents(),
+            &model.settings().sandbox.package_hosts,
         );
         self.ask_thread(ThreadAction::Retry, cx, move |model, key, cx| {
             model.retry(key, network, cx)

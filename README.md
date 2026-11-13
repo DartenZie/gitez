@@ -83,7 +83,27 @@ inside your repository, and runs in a [sandbox](#the-agent-sandbox).
   its branch and pull request. **Reply** continues the same conversation in
   the same worktree. **Stop** ends the agent's turn. **Retry** runs a failed
   or stopped thread again, with another network profile if you choose one.
+  What it does depends on where the thread stopped; its tooltip says which:
+  - If the agent never started (for example, the setup command failed),
+    the first prompt runs again in a new conversation.
+  - If the agent ran, it continues the same conversation: with your reply or
+    review comments if they never reached it, otherwise with a request to
+    continue where it left off.
+  - If the agent finished but GitEZ could not commit its work or create the
+    pull request, GitEZ does those steps again and the agent does not run.
+
   **Open transcript** shows the agent's transcript in Finder.
+- **Blocked requests**: below the thread's title, the sandbox line shows the
+  network profile and how many hosts the sandbox blocked in the last run, in
+  red. Click the count to show or hide the hosts; the list is open when the
+  count is not zero. Claude Code contacts two hosts in every
+  run that a thread does not need: `mcp-proxy.anthropic.com` (its claude.ai
+  connectors) and `http-intake.logs.us5.datadoghq.com` (its telemetry). The
+  sandbox blocks them too, but they are not counted: they are listed apart,
+  muted, as "not needed", and they never suggest a wider network. A red
+  count means that the agent or a command could not reach a host that it
+  probably needed, such as a package registry; **Retry with Packages** is
+  then offered when the Packages profile allows that host.
 - At most three agents run at once across all repositories (you can change
   the limit in Settings); other threads wait as Queued. A thread that reaches
   the agent's usage limit waits and continues by itself after the reset.
@@ -112,6 +132,13 @@ inside your repository, and runs in a [sandbox](#the-agent-sandbox).
   finished threads first, newest first, and the active, waiting and completed
   ones in a section below. A finished thread with a pull request opens as a
   thread, or opens its pull request in its repository.
+- **Moved or deleted repositories**: if a repository's folder is gone, Home's
+  recent repositories and the launcher's Repository picker show it muted, as
+  "Moved or deleted", and you cannot open or pick it. **Remove from list**
+  beside it takes it off the recent repositories. If the repository had
+  threads, Home's sidebar also says that its threads are not listed;
+  **Remove from list** there stops GitEZ looking for them. Open the
+  repository where it is now to list its threads again.
 - **Settings** (`⌘,`, the app menu, or the gear in the Agents popover):
   - Claude Code's binary, configuration folder, environment variables,
     launch arguments and default model, and whether it is signed in.

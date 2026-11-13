@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use gpui_kit::{App, Global, Task};
+use gpui_kit::{App, Global, SharedString, Task};
 use serde::{Deserialize, Serialize};
 
 /// How many repositories Open Recent lists.
@@ -35,6 +35,11 @@ pub struct Recent {
     data: File,
     /// The save in flight; the next one waits for it.
     saving: Option<Task<()>>,
+    /// The listed repositories whose folder was gone when [`check`] last
+    /// looked: moved or deleted.
+    missing: Vec<PathBuf>,
+    /// The check in flight, if any.
+    checking: Option<Task<()>>,
 }
 
 impl Global for Recent {}
@@ -57,7 +62,10 @@ pub fn init(cx: &mut App) {
         file,
         data,
         saving: None,
+        missing: Vec::new(),
+        checking: None,
     });
+    check(cx);
 }
 
 /// An empty list that is never saved, for tests that open a window
@@ -68,6 +76,8 @@ pub fn init_in_memory(cx: &mut App) {
         file: None,
         data: File::default(),
         saving: None,
+        missing: Vec::new(),
+        checking: None,
     });
 }
 
@@ -85,9 +95,59 @@ pub fn paths(cx: &App) -> &[PathBuf] {
     &cx.global::<Recent>().data.recent
 }
 
+/// Looks again, in the background, which recent repositories' folders are
+/// gone; [`unavailable`] says so once it knows. Observers of [`Recent`]
+/// are told when the answer changes.
+pub fn check(cx: &mut App) {
+    let paths = paths(cx).to_vec();
+    let checked = cx
+        .background_executor()
+        .spawn(async move { paths.into_iter().filter(|path| !path.is_dir()).collect() });
+    let task = cx.spawn(async move |cx| {
+        let missing: Vec<PathBuf> = checked.await;
+        cx.update(|cx| {
+            // Borrowing it mutably tells its observers, so only on a change.
+            if cx.global::<Recent>().missing != missing {
+                cx.global_mut::<Recent>().missing = missing;
+            }
+        });
+    });
+    cx.global_mut::<Recent>().checking = Some(task);
+}
+
+/// Text shown for a repository that was moved or deleted.
+const MOVED_OR_DELETED: &str = "Moved or deleted";
+
+/// Why the repository whose main worktree is `work_dir` cannot be opened
+/// or picked, if it cannot: its folder is gone, as last checked in the
+/// background, by [`check`] for a recent repository and by the list of
+/// repositories with threads (`threads`) for the others. Never touches the
+/// disk, so views call it while drawing. Home's recent repositories and
+/// its launcher's Repository picker both use it.
+pub fn unavailable(
+    work_dir: &Path,
+    threads: &crate::agent_threads::AgentThreads,
+    cx: &App,
+) -> Option<SharedString> {
+    let gone = cx
+        .global::<Recent>()
+        .missing
+        .iter()
+        .any(|path| path == work_dir)
+        || threads
+            .missing_repositories()
+            .iter()
+            .any(|repository| repository.work_dir == work_dir);
+    gone.then(|| SharedString::from(MOVED_OR_DELETED))
+}
+
 /// Records that the repository at `path` was opened.
 pub fn opened(path: &Path, cx: &mut App) {
     cx.add_recent_document(path);
+    // Opened, so it is there.
+    cx.global_mut::<Recent>()
+        .missing
+        .retain(|missing| missing != path);
     update(cx, |data| {
         data.recent.retain(|recent| recent != path);
         data.recent.insert(0, path.to_owned());

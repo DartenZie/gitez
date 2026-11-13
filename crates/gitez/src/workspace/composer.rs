@@ -378,12 +378,7 @@ impl Composer {
     fn repository_choices(&self, cx: &App) -> Vec<RepositoryChoice> {
         let model = self.model.read(cx);
         let missing = model.missing_repositories();
-        let unavailable = |path: &Path| {
-            missing
-                .iter()
-                .any(|repository| repository.work_dir == path)
-                .then(|| SharedString::from("Moved or deleted"))
-        };
+        let unavailable = |path: &Path| crate::recent::unavailable(path, model, cx);
         let mut choices: Vec<RepositoryChoice> = crate::recent::paths(cx)
             .iter()
             .map(|path| RepositoryChoice {
@@ -1780,13 +1775,15 @@ mod tests {
     }
 
     /// Finding 9: Home's Repository picker shows a repository that was
-    /// moved or deleted as unavailable, and never picks it.
+    /// moved or deleted as unavailable, and never picks it: one with
+    /// threads, and a recent one.
     #[gpui_kit::test]
     fn a_moved_repository_cannot_be_picked(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().expect("temp dir");
         let data_dir = dir.path().join("data");
         let gone = dir.path().join("gone");
         let here = dir.path().join("here");
+        let lost = dir.path().join("lost");
         std::fs::create_dir_all(here.join(".git")).expect("a git folder");
         let index = gitez_agent_thread::Index::new(&data_dir);
         for (work_dir, name) in [(&gone, "gone"), (&here, "here")] {
@@ -1802,8 +1799,11 @@ mod tests {
             gpui_kit::init(cx);
             crate::theme::init(cx);
             crate::recent::init_in_memory(cx);
-            // Opened last, so first among the recent ones.
             crate::recent::opened(&gone, cx);
+            // A recent one without threads, moved since: the same check.
+            // Opened last, so first among the recent ones.
+            crate::recent::opened(&lost, cx);
+            crate::recent::check(cx);
             init_with(
                 Options {
                     data_dir: Some(data_dir.clone()),
@@ -1832,7 +1832,14 @@ mod tests {
                 .map(|choice| (choice.name.as_ref(), choice.unavailable.as_deref()))
                 .collect();
             // Those that can be picked first; the gone one says why.
-            assert_eq!(shown, [("here", None), ("gone", Some("Moved or deleted"))]);
+            assert_eq!(
+                shown,
+                [
+                    ("here", None),
+                    ("lost", Some("Moved or deleted")),
+                    ("gone", Some("Moved or deleted"))
+                ]
+            );
         });
     }
 

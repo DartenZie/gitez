@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gitez_agent::AgentEvent;
+use gitez_agent::{AgentEvent, BlockedHosts, Registry};
 use gitez_agent_thread::{AgentThread, Ending, State, Store, Timestamp, TurnKind};
 use gitez_git::{DiffOptions, Oid};
 use gitez_sandbox::NetworkProfile;
@@ -97,6 +97,9 @@ pub struct ThreadView {
     reply: Entity<TextareaState>,
     /// The network profile picked for a retry; the thread's own by default.
     retry_network: Option<NetworkProfile>,
+    /// Whether the list of blocked hosts is shown; see
+    /// [`ThreadView::blocked_shown`].
+    blocked_open: Option<bool>,
     /// Whether the activity is shown; by default while the thread runs.
     activity_open: Option<bool>,
     /// Collapsed runs of steps the user expanded, by their first entry.
@@ -165,6 +168,7 @@ impl ThreadView {
             model,
             reply,
             retry_network: None,
+            blocked_open: None,
             activity_open: None,
             expanded: HashSet::new(),
             runs: Vec::new(),
@@ -567,29 +571,48 @@ pub fn can_complete(thread: &AgentThread) -> bool {
     thread.state == State::Finished && thread.pull_request.is_none()
 }
 
-/// The hosts the sandbox refused in `thread`'s last run that ended.
-pub fn blocked_hosts(thread: &AgentThread) -> &[String] {
-    thread
+/// The hosts the sandbox refused in `thread`'s last run that ended, split
+/// by its agent's [`gitez_agent::Agent::optional_hosts`]: only
+/// [`BlockedHosts::problems`] count, colour a line or change a suggestion.
+pub fn blocked_hosts<'a>(thread: &'a AgentThread, agents: &Registry) -> BlockedHosts<'a> {
+    let hosts = thread
         .turns
         .iter()
         .rev()
         .find_map(|turn| turn.result.as_ref())
-        .map_or(&[], |result| result.blocked_hosts.as_slice())
+        .map_or(&[][..], |result| result.blocked_hosts.as_slice());
+    BlockedHosts::classify(agents.get(&thread.agent).as_deref(), hosts)
 }
 
 /// The network a retry of `thread` should use: Packages when Agent API only
 /// blocked a host in its last run that Packages allows (one of
 /// `package_hosts`, the Settings list), otherwise the thread's own. Hosts
-/// Packages would block as well, such as the agent's own telemetry, which
-/// the real Claude Code tries in every run, never widen the network.
-pub fn suggested_retry(thread: &AgentThread, package_hosts: &[String]) -> NetworkProfile {
-    let packages_help = blocked_hosts(thread)
+/// the agent does not need ([`blocked_hosts`]), such as Claude Code's own
+/// telemetry, never widen the network, nor do hosts Packages blocks too.
+pub fn suggested_retry(
+    thread: &AgentThread,
+    agents: &Registry,
+    package_hosts: &[String],
+) -> NetworkProfile {
+    let packages_help = blocked_hosts(thread, agents)
+        .problems
         .iter()
         .any(|host| package_host(package_hosts, host));
     if packages_help && thread.network == NetworkProfile::AgentOnly {
         NetworkProfile::Packages
     } else {
         thread.network
+    }
+}
+
+/// The strip's count of blocked requests: only the hosts the run may have
+/// needed count; "No blocked requests" when the agent's optional hosts
+/// were the only ones blocked.
+pub fn blocked_summary(blocked: &BlockedHosts<'_>) -> String {
+    match blocked.problems.len() {
+        0 => "No blocked requests".to_owned(),
+        1 => "1 blocked request".to_owned(),
+        count => format!("{count} blocked requests"),
     }
 }
 
@@ -1210,28 +1233,62 @@ impl ThreadView {
         rows
     }
 
-    /// Sandbox profile, secrets and blocked requests.
-    fn render_strip(&self, thread: &AgentThread, cx: &App) -> Div {
+    /// Whether the list of blocked hosts is shown: by default when a host
+    /// the run may have needed was blocked.
+    fn blocked_shown(&self, blocked: &BlockedHosts<'_>) -> bool {
+        self.blocked_open.unwrap_or(!blocked.problems.is_empty())
+    }
+
+    /// Sandbox profile, secrets and blocked requests. Only the hosts the
+    /// run may have needed are counted, in the warning colour; the hosts
+    /// the agent contacts on its own and does not need are listed apart,
+    /// muted, with what they are for.
+    fn render_strip(&self, thread: &AgentThread, cx: &mut Context<Self>) -> Div {
         let mono = cx.theme().mono_font_family.clone();
-        let blocked = thread
-            .turns
-            .iter()
-            .rev()
-            .find_map(|turn| turn.result.as_ref())
-            .map_or(0, |result| result.blocked_hosts.len());
-        div()
+        let model = self.model.read(cx);
+        let blocked = blocked_hosts(thread, model.agents());
+        let open = self.blocked_shown(&blocked);
+        let any = !blocked.problems.is_empty() || !blocked.optional.is_empty();
+        let summary = div()
+            .id("thread-blocked")
+            .debug_selector(|| "thread-blocked".into())
+            .h_flex()
+            .gap(px(5.))
+            .text_color(rgb(if blocked.problems.is_empty() {
+                color::TEXT_MUTED
+            } else {
+                color::THREAD_FAILED_TEXT
+            }))
+            .child(blocked_summary(&blocked))
+            .when(!blocked.optional.is_empty(), |this| {
+                this.child(
+                    div()
+                        .text_color(rgb(color::TEXT_FAINT))
+                        .child(format!("· {} not needed", blocked.optional.len())),
+                )
+            })
+            .when(any, |this| {
+                this.cursor_pointer()
+                    .hover(|style| style.text_color(rgb(color::TEXT)))
+                    .child(
+                        Icon::new(if open {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(px(12.))
+                        .text_color(rgb(color::TEXT_FAINT)),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.blocked_open = Some(!open);
+                        cx.notify();
+                    }))
+            });
+        let row = div()
             .h_flex()
             .flex_wrap()
             .gap_x(px(14.))
             .gap_y(px(6.))
-            .py(px(10.))
-            // In the panel, the section above draws the line over it.
-            .when(!self.wide, |this| this.px(px(18.)))
-            .when(self.wide, |this| this.border_t_1())
-            .border_b_1()
-            .border_color(rgb(color::ROW_DIVIDER))
-            .text_size(px(12.))
-            .text_color(rgb(color::TEXT_SECONDARY))
             .child(
                 div()
                     .h_flex()
@@ -1259,18 +1316,56 @@ impl ThreadView {
                     }),
                 ))
             })
-            .child(match blocked {
-                0 => div()
-                    .text_color(rgb(color::TEXT_MUTED))
-                    .child("No blocked requests"),
-                count => div()
-                    .text_color(rgb(color::THREAD_FAILED_TEXT))
-                    .child(if count == 1 {
-                        "1 blocked request".to_owned()
-                    } else {
-                        format!("{count} blocked requests")
-                    }),
-            })
+            .child(summary);
+        let host = |host: &str, hex: u32| {
+            div()
+                .flex_none()
+                .font_family(mono.clone())
+                .text_size(px(11.5))
+                .text_color(rgb(hex))
+                .child(host.to_owned())
+        };
+        let list = (any && open).then(|| {
+            div()
+                .id("thread-blocked-hosts")
+                .v_flex()
+                .gap(px(4.))
+                .pl(px(19.))
+                .children(blocked.problems.iter().map(|name| {
+                    div()
+                        .h_flex()
+                        .flex_wrap()
+                        .gap_x(px(8.))
+                        .child(host(name, color::THREAD_FAILED_TEXT))
+                        .child(
+                            div()
+                                .text_color(rgb(color::TEXT_MUTED))
+                                .child(format!("blocked by {}", thread.network.label())),
+                        )
+                }))
+                .children(blocked.optional.iter().map(|(name, purpose)| {
+                    div()
+                        .h_flex()
+                        .flex_wrap()
+                        .gap_x(px(8.))
+                        .text_color(rgb(color::TEXT_FAINT))
+                        .child(host(name, color::TEXT_FAINT))
+                        .child(*purpose)
+                }))
+        });
+        div()
+            .v_flex()
+            .gap(px(8.))
+            .py(px(10.))
+            // In the panel, the section above draws the line over it.
+            .when(!self.wide, |this| this.px(px(18.)))
+            .when(self.wide, |this| this.border_t_1())
+            .border_b_1()
+            .border_color(rgb(color::ROW_DIVIDER))
+            .text_size(px(12.))
+            .text_color(rgb(color::TEXT_SECONDARY))
+            .child(row)
+            .children(list)
     }
 
     fn render_pull_request(
@@ -1776,14 +1871,14 @@ impl ThreadView {
             return None;
         }
         let busy = self.busy.as_ref().map(|(busy, _)| *busy);
-        let package_hosts = &AgentThreads::global(cx)
-            .read(cx)
-            .settings()
-            .sandbox
-            .package_hosts;
-        let network = self
-            .retry_network
-            .unwrap_or_else(|| suggested_retry(thread, package_hosts));
+        let model = AgentThreads::global(cx).read(cx);
+        let network = self.retry_network.unwrap_or_else(|| {
+            suggested_retry(
+                thread,
+                model.agents(),
+                &model.settings().sandbox.package_hosts,
+            )
+        });
         let label = if network != thread.network && self.retry_network.is_none() {
             format!("Retry with {}", network.label())
         } else {
@@ -2628,6 +2723,16 @@ mod tests {
     /// Shoots the main window with the thread `finish` leaves open in the
     /// detail panel, whole and the panel alone.
     fn shoot(name: &str, pull_request: bool, finish: impl FnOnce(&mut AgentThread)) {
+        shoot_then(name, pull_request, finish, |_, _| {});
+    }
+
+    /// [`shoot`], then `then` with the window, to change and save more.
+    fn shoot_then(
+        name: &str,
+        pull_request: bool,
+        finish: impl FnOnce(&mut AgentThread),
+        then: impl FnOnce(&mut crate::screenshot::Shots, gpui_kit::AnyWindowHandle),
+    ) {
         if !crate::screenshot::enabled() {
             return;
         }
@@ -2700,6 +2805,75 @@ mod tests {
             });
             shots.save(wide, "thread-pull-request-wide");
         }
+        then(&mut shots, window);
+    }
+
+    /// The detail panel, at its default width.
+    fn panel() -> gpui_kit::Bounds<gpui_kit::Pixels> {
+        gpui_kit::Bounds {
+            origin: gpui_kit::point(px(1080.), px(48.)),
+            size: size(px(360.), px(824.)),
+        }
+    }
+
+    /// Hosts the real Claude Code contacts in every run and does not need.
+    const OPTIONAL_HOSTS: [&str; 2] = [
+        "mcp-proxy.anthropic.com",
+        "http-intake.logs.us5.datadoghq.com",
+    ];
+
+    /// Every real run: only Claude Code's optional hosts were blocked. No
+    /// count in the warning colour; expanded, they are listed muted with
+    /// what they are for.
+    #[test]
+    fn screenshot_thread_optional_hosts() {
+        shoot_then(
+            "optional-hosts",
+            false,
+            |thread| {
+                thread.state = State::Finished;
+                thread.ending = Some(Ending::Answer);
+                thread.session_id = Some("session".into());
+                let turn = &mut thread.turns[0];
+                turn.started = Some(minutes_ago(30));
+                turn.ended = Some(minutes_ago(27));
+                let mut done = result(ANSWER, true);
+                done.steps = 9;
+                done.blocked_hosts = OPTIONAL_HOSTS.map(str::to_owned).into();
+                turn.result = Some(done);
+            },
+            |shots, window| {
+                // "No blocked requests · 2 not needed", in the panel.
+                shots.click(window, gpui_kit::point(px(1150.), px(265.)));
+                shots.save_region(window, panel(), "thread-optional-hosts-open-panel");
+            },
+        );
+    }
+
+    /// A host the build needed was blocked besides the optional ones: the
+    /// count in the warning colour is that one only, and the list is open.
+    #[test]
+    fn screenshot_thread_blocked_and_optional_hosts() {
+        shoot("blocked-and-optional", false, |thread| {
+            let turn = &mut thread.turns[0];
+            turn.started = Some(minutes_ago(12));
+            turn.ended = None;
+            thread.fail(
+                Step::Agent,
+                "cargo could not download the crates it needs.\n\nThe sandbox refused \
+                 connections to: static.crates.io.",
+                minutes_ago(5),
+            );
+            let mut failed = result("", false);
+            failed.steps = 9;
+            failed.exit_code = Some(1);
+            failed.blocked_hosts = vec![
+                OPTIONAL_HOSTS[0].into(),
+                "static.crates.io".into(),
+                OPTIONAL_HOSTS[1].into(),
+            ];
+            thread.turns[0].result = Some(failed);
+        });
     }
 
     fn minutes_ago(minutes: i64) -> Timestamp {

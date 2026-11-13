@@ -288,6 +288,8 @@ impl Home {
     /// repository are read again, and the cursor goes to the prompt unless
     /// a thread is shown.
     pub fn shown(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A recent repository may have been moved or deleted since.
+        crate::recent::check(cx);
         self.composer.update(cx, |composer, cx| {
             composer.check(cx);
             composer.refresh(cx);
@@ -1053,17 +1055,21 @@ impl Home {
         let mut buttons = Vec::new();
         match kind {
             Kind::Finished | Kind::Completed => {
-                let limit = self.model.read(cx).settings().threads.max_running as usize;
-                let spans = status_line(thread, &item.facts, None, limit, now);
+                let model = self.model.read(cx);
+                let limit = model.settings().threads.max_running as usize;
+                let spans = status_line(thread, model.agents(), &item.facts, None, limit, now);
                 second = second
                     .min_h(px(22.))
                     .child(dot())
                     .child(status_line_element(spans, cx).flex_1().min_w_0());
                 if kind == Kind::Finished {
-                    let package_hosts = &self.model.read(cx).settings().sandbox.package_hosts;
-                    for (index, action) in
-                        row_actions(thread, package_hosts).into_iter().enumerate()
-                    {
+                    let model = self.model.read(cx);
+                    let actions = row_actions(
+                        thread,
+                        model.agents(),
+                        &model.settings().sandbox.package_hosts,
+                    );
+                    for (index, action) in actions.into_iter().enumerate() {
                         buttons.push(self.row_button(action, index, thread, &key, busy, cx));
                     }
                 }
@@ -1108,8 +1114,9 @@ impl Home {
                 );
             }
             Kind::Waiting => {
-                let limit = self.model.read(cx).settings().threads.max_running as usize;
-                let spans = status_line(thread, &item.facts, None, limit, now);
+                let model = self.model.read(cx);
+                let limit = model.settings().threads.max_running as usize;
+                let spans = status_line(thread, model.agents(), &item.facts, None, limit, now);
                 second = second
                     .child(dot())
                     .child(status_line_element(spans, cx).flex_1().min_w_0());
@@ -1117,9 +1124,11 @@ impl Home {
         }
         // Retry and Complete go under the line, as in the popover: beside
         // them the state would not fit.
+        let model = self.model.read(cx);
         let wide_buttons = row_actions(
             thread,
-            &self.model.read(cx).settings().sandbox.package_hosts,
+            model.agents(),
+            &model.settings().sandbox.package_hosts,
         )
         .iter()
         .any(|action| matches!(action, RowAction::Retry(_)));
@@ -1383,7 +1392,19 @@ impl Home {
                 .repository_by_work_dir(path)
                 .map(|repository| badges(&repository.threads))
                 .unwrap_or_default();
+            // Moved or deleted: muted, cannot be opened, can be removed.
+            let unavailable = crate::recent::unavailable(path, model, cx);
             let open = path.clone();
+            let remove = unavailable.is_some().then(|| {
+                let path = path.clone();
+                Button::new(("home-recent-remove", index))
+                    .debug_selector(move || format!("home-recent-remove-{index}"))
+                    .compact()
+                    .h(px(24.))
+                    .text_size(px(11.5))
+                    .label("Remove from list")
+                    .on_click(move |_, _, cx| crate::recent::remove(&path, cx))
+            });
             section = section.child(
                 div()
                     .id(("home-recent", index))
@@ -1394,19 +1415,40 @@ impl Home {
                     .px(px(10.))
                     .py(px(6.))
                     .rounded(px(8.))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(color::ROW_HOVER)))
-                    .on_click(cx.listener(move |_, _, _, cx| {
-                        cx.emit(HomeEvent::OpenRepository(open.clone()))
-                    }))
-                    .child(initial_square(&name, px(28.), index == 0))
+                    .when(unavailable.is_none(), |this| {
+                        this.cursor_pointer()
+                            .hover(|style| style.bg(rgb(color::ROW_HOVER)))
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.emit(HomeEvent::OpenRepository(open.clone()))
+                            }))
+                    })
+                    .child(
+                        div()
+                            .flex_none()
+                            .when(unavailable.is_some(), |this| this.opacity(0.55))
+                            .child(initial_square(&name, px(28.), index == 0)),
+                    )
                     .child(
                         div()
                             .v_flex()
                             .flex_1()
                             .min_w_0()
                             .gap(px(2.))
-                            .child(div().font_weight(FontWeight::MEDIUM).child(name))
+                            .when(unavailable.is_some(), |this| this.opacity(0.55))
+                            .child(
+                                div()
+                                    .h_flex()
+                                    .gap(px(8.))
+                                    .child(div().font_weight(FontWeight::MEDIUM).child(name))
+                                    .when_some(unavailable, |this, why| {
+                                        this.child(
+                                            div()
+                                                .text_size(px(11.5))
+                                                .text_color(rgb(color::TEXT_MUTED))
+                                                .child(why),
+                                        )
+                                    }),
+                            )
                             .child(
                                 div()
                                     .overflow_hidden()
@@ -1439,7 +1481,8 @@ impl Home {
                                     })
                                     .child(text)
                             })),
-                    ),
+                    )
+                    .children(remove),
             );
         }
         let button = |id: &'static str, icon: IconName, label: &'static str| {
@@ -1538,7 +1581,10 @@ mod tests {
     use gitez_settings::{AgentEntry, Settings};
     use gpui_kit::{Entity, TestAppContext, VisualTestContext, px, size};
 
-    use super::{Home, list};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use super::{Home, HomeEvent, list};
     use crate::agent_threads::{AgentThreads, Options, init_with};
 
     fn git(dir: &Path, args: &[&str]) {
@@ -1739,6 +1785,62 @@ mod tests {
     fn redraw(cx: &mut VisualTestContext) {
         cx.run_until_parked();
         cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
+    /// Home's recent repositories show one that was moved or deleted
+    /// muted with "Moved or deleted", as the launcher's picker does (the
+    /// same check): it does not open, and "Remove from list" takes it off.
+    #[gpui_kit::test]
+    fn a_moved_recent_repository_is_marked_and_cannot_be_opened(cx: &mut TestAppContext) {
+        let (fixture, home, mut cx) = home(cx);
+        let here = fixture.alpha.parent().expect("a work dir").to_owned();
+        let gone = here.with_file_name("gone");
+        let opened: Rc<RefCell<Vec<PathBuf>>> = Rc::default();
+        cx.update(|_, cx| {
+            let opened = opened.clone();
+            cx.subscribe(&home, move |_, event: &HomeEvent, _| {
+                if let HomeEvent::OpenRepository(path) = event {
+                    opened.borrow_mut().push(path.clone());
+                }
+            })
+            .detach();
+            // Listed first: `here` was opened last.
+            crate::recent::opened(&gone, cx);
+            crate::recent::opened(&here, cx);
+            crate::recent::check(cx);
+        });
+        redraw(&mut cx);
+        cx.update(|_, cx| {
+            let model = AgentThreads::global(cx).read(cx);
+            assert_eq!(
+                crate::recent::unavailable(&gone, model, cx).as_deref(),
+                Some("Moved or deleted")
+            );
+            assert_eq!(crate::recent::unavailable(&here, model, cx), None);
+        });
+        assert!(cx.debug_bounds("home-recent-remove-0").is_none());
+        let remove = cx
+            .debug_bounds("home-recent-remove-1")
+            .expect("the moved one can be removed");
+        for index in [1, 0] {
+            let selector: &'static str = if index == 1 {
+                "home-recent-1"
+            } else {
+                "home-recent-0"
+            };
+            let row = cx.debug_bounds(selector).expect("a row");
+            cx.simulate_click(
+                gpui_kit::point(row.origin.x + px(40.), row.center().y),
+                gpui_kit::Modifiers::none(),
+            );
+        }
+        assert_eq!(
+            *opened.borrow(),
+            std::slice::from_ref(&here),
+            "only the one still there opens"
+        );
+        cx.simulate_click(remove.center(), gpui_kit::Modifiers::none());
+        cx.update(|_, cx| assert_eq!(crate::recent::paths(cx), std::slice::from_ref(&here)));
     }
 
     /// Times drawing Home with 2,000 and 20,000 finished threads (the

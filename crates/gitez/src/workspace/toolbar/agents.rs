@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use gitez_agent::Registry;
 use gitez_agent_thread::{AgentThread, Ending, State, Timestamp};
 use gitez_sandbox::NetworkProfile;
 use gpui_kit::assets::IconName;
@@ -205,14 +206,22 @@ pub(crate) enum RowAction {
 }
 
 /// The actions a row of `thread` offers, in the order shown.
-pub(crate) fn row_actions(thread: &AgentThread, package_hosts: &[String]) -> Vec<RowAction> {
+pub(crate) fn row_actions(
+    thread: &AgentThread,
+    agents: &Registry,
+    package_hosts: &[String],
+) -> Vec<RowAction> {
     let mut actions = Vec::new();
     match thread.state {
         State::Queued => actions.push(RowAction::Cancel),
         State::Preparing | State::Running | State::Waiting => actions.push(RowAction::Stop),
         State::Finished => {
             if matches!(thread.ending, Some(Ending::Failed | Ending::Stopped)) {
-                actions.push(RowAction::Retry(suggested_retry(thread, package_hosts)));
+                actions.push(RowAction::Retry(suggested_retry(
+                    thread,
+                    agents,
+                    package_hosts,
+                )));
             }
             if let Some(number) = thread.pull_request {
                 actions.push(RowAction::PullRequest(number));
@@ -316,10 +325,12 @@ impl Span {
 /// A row's second line: its state in the state's colour, then when and
 /// what, as "Running · Bash cargo test", "PR #12 · finished 1 h ago",
 /// "Failed after 6 min · 40 min ago · static.crates.io blocked by Agent API
-/// only". `repository` leads it when the popover lists every repository;
-/// `limit` is how many agents may run at once.
+/// only" (the hosts `thread`'s agent does not need are left out).
+/// `repository` leads it when the popover lists every repository; `limit`
+/// is how many agents may run at once.
 pub(crate) fn status_line(
     thread: &AgentThread,
+    agents: &Registry,
     facts: &ThreadFacts,
     repository: Option<&str>,
     limit: usize,
@@ -376,10 +387,13 @@ pub(crate) fn status_line(
                 Some(Ending::Failed) => {
                     spans.push(Span::new(after("Failed"), Look::Failed.text()));
                     spans.push(Span::new(format!(" · {when}"), muted));
-                    if let Some(host) = blocked_hosts(thread).first() {
-                        let more = blocked_hosts(thread).len() - 1;
+                    // Only hosts the run may have needed: the agent's
+                    // optional ones are no reason for the failure.
+                    let blocked = blocked_hosts(thread, agents);
+                    if let Some(host) = blocked.problems.first() {
+                        let more = blocked.problems.len() - 1;
                         spans.push(Span::new(" · ", muted));
-                        spans.push(Span::mono(host.clone(), muted));
+                        spans.push(Span::mono(*host, muted));
                         let more = if more > 0 {
                             format!(" and {more} more")
                         } else {
@@ -892,16 +906,14 @@ fn render_row(
     let thread = &item.thread;
     let key = item.key();
     let completed = thread.state == State::Completed;
+    let model = AgentThreads::global(cx).read(cx);
     let actions = row_actions(
         thread,
-        &AgentThreads::global(cx)
-            .read(cx)
-            .settings()
-            .sandbox
-            .package_hosts,
+        model.agents(),
+        &model.settings().sandbox.package_hosts,
     );
     let repository = all_repositories.then_some(item.repository.as_ref());
-    let spans = status_line(thread, &item.facts, repository, limit, now);
+    let spans = status_line(thread, model.agents(), &item.facts, repository, limit, now);
     let failed = group_of(thread) == Group::NeedsAttention;
     let id = SharedString::from(format!("agents-row-{}", thread.id.as_str()));
 
@@ -1149,6 +1161,11 @@ mod tests {
         row_actions, status_line,
     };
     use crate::agent_threads::Counts;
+    use crate::workspace::agent_thread::{blocked_hosts, blocked_summary};
+
+    fn agents() -> gitez_agent::Registry {
+        gitez_agent::Registry::builtin()
+    }
 
     fn thread(state: State, ending: Option<Ending>) -> AgentThread {
         let json = r#"{
@@ -1206,38 +1223,53 @@ mod tests {
     #[test]
     fn rows_offer_the_action_that_fits_the_state() {
         assert_eq!(
-            row_actions(&thread(State::Queued, None), &[]),
+            row_actions(&thread(State::Queued, None), &agents(), &[]),
             [RowAction::Cancel]
         );
         assert_eq!(
-            row_actions(&thread(State::Running, None), &[]),
+            row_actions(&thread(State::Running, None), &agents(), &[]),
             [RowAction::Stop]
         );
         assert_eq!(
-            row_actions(&thread(State::Preparing, None), &[]),
+            row_actions(&thread(State::Preparing, None), &agents(), &[]),
             [RowAction::Stop]
         );
         assert_eq!(
-            row_actions(&thread(State::Finished, Some(Ending::Answer)), &[]),
+            row_actions(
+                &thread(State::Finished, Some(Ending::Answer)),
+                &agents(),
+                &[]
+            ),
             [RowAction::Complete]
         );
         let mut pull_request = thread(State::Finished, Some(Ending::PullRequest));
         pull_request.pull_request = Some(12);
         assert_eq!(
-            row_actions(&pull_request, &[]),
+            row_actions(&pull_request, &agents(), &[]),
             [RowAction::PullRequest(12)]
         );
         assert_eq!(
-            row_actions(&thread(State::Finished, Some(Ending::Failed)), &[]),
+            row_actions(
+                &thread(State::Finished, Some(Ending::Failed)),
+                &agents(),
+                &[]
+            ),
             [
                 RowAction::Retry(NetworkProfile::AgentOnly),
                 RowAction::Complete
             ]
         );
-        assert!(row_actions(&thread(State::Completed, Some(Ending::Answer)), &[]).is_empty());
+        assert!(
+            row_actions(
+                &thread(State::Completed, Some(Ending::Answer)),
+                &agents(),
+                &[]
+            )
+            .is_empty()
+        );
         pull_request.state = State::Completed;
         assert_eq!(
-            row_actions(&pull_request, &[]),
+            row_actions(&pull_request, &agents(), &[]),
             [RowAction::PullRequest(12)]
         );
     }
@@ -1268,7 +1300,7 @@ mod tests {
             .iter()
             .map(|host| (*host).to_owned())
             .collect();
-        let actions = row_actions(&failed, &package_hosts);
+        let actions = row_actions(&failed, &agents(), &package_hosts);
         assert_eq!(actions[0], RowAction::Retry(NetworkProfile::Packages));
         assert_eq!(
             actions[0].label(failed.network),
@@ -1276,7 +1308,7 @@ mod tests {
             "the label names the network it changes to"
         );
         let now: Timestamp = "2026-11-13T10:46:00Z".parse().expect("a time");
-        let line: String = status_line(&failed, &ThreadFacts::default(), None, 3, now)
+        let line: String = status_line(&failed, &agents(), &ThreadFacts::default(), None, 3, now)
             .into_iter()
             .map(|span| span.text)
             .collect();
@@ -1286,9 +1318,10 @@ mod tests {
         );
     }
 
-    /// The real Claude Code tries its own telemetry and MCP hosts in every
-    /// run; Packages would block them too, so they never make Retry widen
-    /// the network. A host Packages allows still does, also by `*.` rule.
+    /// The real Claude Code tries its own telemetry and connectors hosts in
+    /// every run; they are its optional hosts, so they never make Retry
+    /// widen the network, even when the Packages list would allow them. A
+    /// host Packages allows still does, also by `*.` rule.
     #[test]
     fn only_hosts_packages_allows_suggest_packages() {
         let mut stopped = thread(State::Finished, Some(Ending::Stopped));
@@ -1310,20 +1343,98 @@ mod tests {
             .map(|host| (*host).to_owned())
             .collect();
         assert_eq!(
-            super::suggested_retry(&stopped, &package_hosts),
+            super::suggested_retry(&stopped, &agents(), &package_hosts),
             NetworkProfile::AgentOnly
+        );
+        assert_eq!(
+            super::suggested_retry(
+                &stopped,
+                &agents(),
+                &["*.anthropic.com".to_owned(), "*.datadoghq.com".to_owned()]
+            ),
+            NetworkProfile::AgentOnly,
+            "the agent's optional hosts never count, whatever Packages allows"
         );
         if let Some(result) = turn.result.as_mut() {
             result.blocked_hosts.push("cdn.example.org".into());
         }
         stopped.turns[0] = turn;
         assert_eq!(
-            super::suggested_retry(&stopped, &["*.example.org".to_owned()]),
+            super::suggested_retry(&stopped, &agents(), &["*.example.org".to_owned()]),
             NetworkProfile::Packages
         );
         assert_eq!(
-            super::suggested_retry(&stopped, &["*.ample.org".to_owned()]),
+            super::suggested_retry(&stopped, &agents(), &["*.ample.org".to_owned()]),
             NetworkProfile::AgentOnly
+        );
+    }
+
+    /// A failed row names only the hosts the run may have needed; with
+    /// only the agent's optional hosts blocked it names none.
+    #[test]
+    fn a_failed_row_leaves_out_the_agents_optional_hosts() {
+        let failed = |blocked: &[&str]| {
+            let mut failed = thread(State::Finished, Some(Ending::Failed));
+            let mut turn: gitez_agent_thread::Turn = serde_json::from_str(
+                r#"{
+                    "kind": "start", "prompt": "Fix it", "requested": "2026-11-13T10:00:00Z",
+                    "resume": false, "started": "2026-11-13T10:00:00Z",
+                    "ended": "2026-11-13T10:06:00Z", "transcript": null,
+                    "result": {
+                        "success": false, "message": "", "cost_usd": null, "duration_ms": null,
+                        "steps": 3, "exit_code": 1, "stopped": false, "blocked_hosts": []
+                    }
+                }"#,
+            )
+            .expect("a turn");
+            if let Some(result) = turn.result.as_mut() {
+                result.blocked_hosts = blocked.iter().map(|host| (*host).to_owned()).collect();
+            }
+            failed.turns.push(turn);
+            failed
+        };
+        let now: Timestamp = "2026-11-13T10:46:00Z".parse().expect("a time");
+        let line = |thread: &AgentThread| -> String {
+            status_line(thread, &agents(), &ThreadFacts::default(), None, 3, now)
+                .into_iter()
+                .map(|span| span.text)
+                .collect()
+        };
+        let optional = [
+            "mcp-proxy.anthropic.com",
+            "http-intake.logs.us5.datadoghq.com",
+        ];
+        // The thread view's count: only the other hosts.
+        let count = |thread: &AgentThread| blocked_summary(&blocked_hosts(thread, &agents()));
+        assert_eq!(count(&failed(&[])), "No blocked requests");
+        assert_eq!(count(&failed(&optional)), "No blocked requests");
+        assert_eq!(
+            count(&failed(&[optional[0], "static.crates.io", optional[1]])),
+            "1 blocked request"
+        );
+        assert_eq!(
+            count(&failed(&[
+                "static.crates.io",
+                "index.crates.io",
+                optional[1]
+            ])),
+            "2 blocked requests"
+        );
+        let only_optional = failed(&optional);
+        let split = blocked_hosts(&only_optional, &agents());
+        assert!(split.problems.is_empty());
+        assert_eq!(
+            split
+                .optional
+                .iter()
+                .map(|(host, _)| *host)
+                .collect::<Vec<_>>(),
+            optional
+        );
+        assert_eq!(line(&failed(&optional)), "Failed after 6 min · 40 min ago");
+        assert_eq!(
+            line(&failed(&[optional[0], "static.crates.io", optional[1]])),
+            "Failed after 6 min · 40 min ago · static.crates.io blocked by Agent API only"
         );
     }
 
@@ -1378,6 +1489,7 @@ mod tests {
         let now = Timestamp::now();
         let line: String = status_line(
             &thread(State::Queued, None),
+            &agents(),
             &ThreadFacts::default(),
             Some("gitez"),
             3,
@@ -1398,7 +1510,7 @@ mod tests {
     fn uncommitted_changes_are_said_on_every_row() {
         let now: Timestamp = "2026-11-13T10:46:00Z".parse().expect("a time");
         let line = |thread: &AgentThread, facts: &ThreadFacts| -> String {
-            status_line(thread, facts, None, 3, now)
+            status_line(thread, &agents(), facts, None, 3, now)
                 .into_iter()
                 .map(|span| span.text)
                 .collect()
