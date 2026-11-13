@@ -46,6 +46,9 @@ pub enum Error {
         worktree: PathBuf,
         count: Option<u32>,
     },
+    /// An image that cannot be sent, said for the user.
+    #[error(transparent)]
+    Image(#[from] crate::ImageError),
     #[error(transparent)]
     Git(#[from] gitez_command::Error),
     #[error(transparent)]

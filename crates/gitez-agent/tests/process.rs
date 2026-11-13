@@ -38,6 +38,7 @@ fn command(dir: &TempDir, script: &Path, prompt: &str) -> CommandSpec {
             &config(dir, script),
             &RunSpec {
                 prompt,
+                images: &[],
                 cwd: dir.path(),
                 model: None,
                 conversation: Conversation::New { session_id: "s-1" },
@@ -335,6 +336,7 @@ fn another_agent_runs_through_the_registry() {
     let dir = TempDir::new().expect("create temp dir");
     let run = RunSpec {
         prompt: "hello",
+        images: &[],
         cwd: dir.path(),
         model: None,
         conversation: Conversation::New { session_id: "s-1" },

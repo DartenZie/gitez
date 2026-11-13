@@ -23,8 +23,12 @@ pub struct TurnEvents<'a> {
 /// Something in the activity list.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Entry {
-    /// The prompt of a later turn: a reply, or review comments.
-    Prompt { kind: TurnKind, text: String },
+    /// The prompt of later turn `turn`: a reply, or review comments.
+    Prompt {
+        kind: TurnKind,
+        text: String,
+        turn: usize,
+    },
     /// GitEZ continued the conversation: a retry, or after the usage limit.
     Continued(TurnKind),
     /// The agent wrote this.
@@ -44,6 +48,8 @@ pub enum Row<'a> {
     Prompt {
         kind: TurnKind,
         text: &'a str,
+        /// The turn's index, for its images.
+        turn: usize,
     },
     Continued(TurnKind),
     Text(&'a str),
@@ -75,6 +81,7 @@ pub fn entries(turns: &[TurnEvents<'_>]) -> Vec<Entry> {
                 TurnKind::Reply | TurnKind::Review | TurnKind::Start => Entry::Prompt {
                     kind: turn.kind,
                     text: turn.prompt.to_owned(),
+                    turn: index,
                 },
                 TurnKind::Retry | TurnKind::Resume => Entry::Continued(turn.kind),
             });
@@ -194,7 +201,11 @@ pub fn plan(entries: &[Entry], expanded: &HashSet<usize>, live: bool) -> Vec<Pla
 pub fn row_of<'a>(entries: &'a [Entry], planned: &Planned) -> Row<'a> {
     match planned {
         Planned::Entry { index, live } => match entries.get(*index) {
-            Some(Entry::Prompt { kind, text }) => Row::Prompt { kind: *kind, text },
+            Some(Entry::Prompt { kind, text, turn }) => Row::Prompt {
+                kind: *kind,
+                text,
+                turn: *turn,
+            },
             Some(Entry::Continued(kind)) => Row::Continued(*kind),
             Some(Entry::Text(text)) => Row::Text(text),
             Some(Entry::Tool {
@@ -334,7 +345,8 @@ mod tests {
                 },
                 Entry::Prompt {
                     kind: TurnKind::Reply,
-                    text: "And the tests".into()
+                    text: "And the tests".into(),
+                    turn: 1,
                 },
                 Entry::Tool {
                     name: "Edit".into(),

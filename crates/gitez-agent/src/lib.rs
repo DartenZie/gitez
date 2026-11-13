@@ -23,6 +23,8 @@ pub use test_command::detect_test_command;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("{name} cannot be given images")]
+    NoImages { name: &'static str },
     #[error(
         "{name} is not installed: no program named {program} was found on the PATH or in {searched}"
     )]
@@ -77,10 +79,23 @@ impl<'a> Conversation<'a> {
     }
 }
 
+/// An image given to the agent with the prompt: its bytes as they are sent,
+/// in a format [`Agent::accepts_images`] promised the model reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageInput<'a> {
+    /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`.
+    pub media_type: &'a str,
+    pub data: &'a [u8],
+}
+
 /// One run of an agent.
 #[derive(Debug, Clone, Copy)]
 pub struct RunSpec<'a> {
+    /// May be empty when the run has images.
     pub prompt: &'a str,
+    /// Sent with the prompt, in order. Empty for most runs, which are then
+    /// exactly as they were before agents took images.
+    pub images: &'a [ImageInput<'a>],
     /// Where the agent works: the thread's worktree.
     pub cwd: &'a std::path::Path,
     /// A model alias such as `haiku`; `None`: the agent's default.
@@ -193,6 +208,20 @@ pub trait Agent: Send + Sync {
         self.optional_hosts()
             .iter()
             .find(|optional| optional.host.eq_ignore_ascii_case(host))
+    }
+    /// Whether `model` (an alias as in [`Agent::models`]; `None` or empty:
+    /// the agent's default) reads images given with the prompt
+    /// ([`RunSpec::images`]). The UI asks this before it takes an image;
+    /// an agent that says no is never given one.
+    fn accepts_images(&self, model: Option<&str>) -> bool {
+        let _ = model;
+        false
+    }
+    /// A line of the agent's output as GitEZ keeps it in the transcript:
+    /// the line itself, or a copy without bulky data such as the bytes of
+    /// an image the agent echoes. Lines are parsed before this is applied.
+    fn transcript_line<'l>(&self, line: &'l str) -> std::borrow::Cow<'l, str> {
+        std::borrow::Cow::Borrowed(line)
     }
     /// What a line of the agent's output reports, if anything.
     fn parse(&self, line: &str) -> Option<AgentEvent>;

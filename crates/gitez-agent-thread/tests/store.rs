@@ -340,6 +340,7 @@ fn header(started: &str) -> RunHeader {
         resume: false,
         model: Some("sonnet".to_owned()),
         network: NetworkProfile::Packages,
+        images: Vec::new(),
     }
 }
 
@@ -520,4 +521,126 @@ fn the_index_reports_what_it_leaves_out_and_forgets_on_request() {
         Err(Error::TooNew { version: 9, .. })
     ));
     assert_eq!(fs::read_to_string(index.path()).expect("read"), newer);
+}
+
+fn prepared(width: u32, height: u32) -> gitez_agent_thread::PreparedImage {
+    let image = image::RgbImage::from_pixel(width, height, image::Rgb([200, 30, 30]));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image)
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .expect("encode");
+    gitez_agent_thread::prepare_image(&bytes.into_inner()).expect("prepared")
+}
+
+#[test]
+fn images_are_kept_beside_the_thread_and_listed_in_its_turns() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let images = [prepared(30, 20), prepared(8, 8)];
+    let created = store
+        .create_with_images(
+            fixture.new_thread(""),
+            &images,
+            &fixture.data_dir,
+            "my repo",
+            |_| false,
+            at("2026-11-13T09:41:07Z"),
+        )
+        .expect("create");
+    // No words: a title from the images.
+    assert_eq!(created.title, "Pasted images");
+    assert_eq!(created.id.as_str(), "pasted-images");
+    let first = &created.turns[0];
+    let names: Vec<&str> = first
+        .images
+        .iter()
+        .map(|image| image.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["2026-11-13T09-41-07Z-1.png", "2026-11-13T09-41-07Z-2.png"]
+    );
+    assert_eq!((first.images[0].width, first.images[0].height), (30, 20));
+    assert_eq!(first.images[0].size, images[0].bytes.len() as u64);
+    for (listed, image) in first.images.iter().zip(&images) {
+        assert_eq!(
+            store.read_image(&created.id, listed).expect("read"),
+            image.bytes
+        );
+        assert_eq!(
+            store.image_path(&created.id, listed).expect("path"),
+            store
+                .thread_dir(&created.id)
+                .join("images")
+                .join(&listed.name)
+        );
+    }
+    // Read back as written.
+    assert_eq!(store.load(&created.id).expect("load"), created);
+
+    // A reply's images in the same second get the next numbers.
+    let added = store
+        .add_images(&created.id, &[prepared(5, 5)], at("2026-11-13T09:41:07Z"))
+        .expect("add");
+    assert_eq!(added[0].name, "2026-11-13T09-41-07Z-3.png");
+    store.remove_images(&created.id, &added);
+    assert!(
+        !store
+            .image_path(&created.id, &added[0])
+            .expect("path")
+            .exists()
+    );
+}
+
+#[test]
+fn an_image_name_gitez_would_not_make_is_refused() {
+    let (_dir, store, id) = example_store();
+    let mut image = gitez_agent_thread::TurnImage {
+        name: "../../config".to_owned(),
+        media_type: gitez_agent_thread::ImageType::Png,
+        size: 4,
+        width: 1,
+        height: 1,
+    };
+    for name in ["../../config", "", ".hidden", "a/b.png", "a b.png"] {
+        image.name = name.to_owned();
+        assert!(
+            matches!(store.image_path(&id, &image), Err(Error::Refused(_))),
+            "{name}"
+        );
+    }
+    // A file of another size than listed, or a link, is not read.
+    image.name = "x-1.png".to_owned();
+    let dir = store.thread_dir(&id).join("images");
+    fs::create_dir_all(&dir).expect("create");
+    fs::write(dir.join("x-1.png"), b"12345").expect("write");
+    assert!(matches!(
+        store.read_image(&id, &image),
+        Err(Error::Refused(_))
+    ));
+    image.size = 5;
+    assert_eq!(store.read_image(&id, &image).expect("read"), b"12345");
+    std::os::unix::fs::symlink(dir.join("x-1.png"), dir.join("y-1.png")).expect("link");
+    image.name = "y-1.png".to_owned();
+    assert!(matches!(
+        store.read_image(&id, &image),
+        Err(Error::Refused(_))
+    ));
+}
+
+#[test]
+fn a_header_lists_the_images_by_name_only() {
+    let (_dir, store, id) = example_store();
+    let mut with_images = header("2026-11-13T09:41:31Z");
+    with_images.images = vec!["2026-11-13T09-41-31Z-1.png".to_owned()];
+    let run = store
+        .start_run(&id, with_images.clone())
+        .expect("start run");
+    let text = fs::read_to_string(run.path()).expect("read");
+    assert!(
+        text.ends_with(",\"images\":[\"2026-11-13T09-41-31Z-1.png\"]}\n"),
+        "{text}"
+    );
+    let (read, _) = store.read_run(run.path()).expect("read run");
+    assert_eq!(read, with_images);
 }

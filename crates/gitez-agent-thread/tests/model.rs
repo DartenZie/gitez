@@ -399,3 +399,85 @@ fn steps_and_run_time_add_up_the_turns() {
     );
     assert_eq!(thread.pending_turn(), None);
 }
+
+fn image(name: &str) -> gitez_agent_thread::TurnImage {
+    gitez_agent_thread::TurnImage {
+        name: name.to_owned(),
+        media_type: gitez_agent_thread::ImageType::Png,
+        size: 10,
+        width: 4,
+        height: 3,
+    }
+}
+
+#[test]
+fn a_retry_sends_the_images_of_the_prompt_it_sends_again() {
+    let now = at("2026-11-13T10:05:00Z");
+
+    // The agent never started: the first prompt again, with its images.
+    let mut thread = finished(Ending::Failed);
+    thread.session_id = None;
+    thread.turns[0].images = vec![image("a-1.png"), image("a-2.png")];
+    assert_eq!(
+        thread
+            .request_retry(NetworkProfile::AgentOnly, now)
+            .expect("retry"),
+        RetryPlan::RunAgain
+    );
+    let retry = thread.turns.last().expect("a turn");
+    assert_eq!(retry.kind, TurnKind::Retry);
+    assert_eq!(retry.images, thread.turns[0].images);
+
+    // A reply with an image that never ran: sent again with it.
+    let mut thread = finished(Ending::Answer);
+    thread
+        .request_turn_with_images(
+            TurnKind::Reply,
+            "What is this?".to_owned(),
+            vec![image("b-1.png")],
+            now,
+        )
+        .expect("reply");
+    assert_eq!(thread.turns[1].images, [image("b-1.png")]);
+    thread.fail(Step::Sandbox, "The sandbox is not installed.", now);
+    thread
+        .request_retry(NetworkProfile::AgentOnly, now)
+        .expect("retry");
+    let retry = thread.turns.last().expect("a turn");
+    assert_eq!(retry.prompt, "What is this?");
+    assert_eq!(retry.images, [image("b-1.png")]);
+
+    // A turn the agent ran is continued; the images are in its
+    // conversation already.
+    let mut thread = finished(Ending::Stopped);
+    thread.turns[0].images = vec![image("c-1.png")];
+    thread
+        .request_retry(NetworkProfile::AgentOnly, now)
+        .expect("retry");
+    let retry = thread.turns.last().expect("a turn");
+    assert_eq!(retry.prompt, CONTINUE_PROMPT);
+    assert!(retry.images.is_empty());
+}
+
+#[test]
+fn a_turn_without_images_has_no_images_field() {
+    let thread = example();
+    assert!(thread.turns.iter().all(|turn| turn.images.is_empty()));
+    let text = serde_json::to_string(&thread).expect("json");
+    assert!(!text.contains("\"images\""), "{text}");
+    let mut with = thread.clone();
+    with.turns[0].images = vec![image("2026-11-13T09-41-31Z-1.png")];
+    let value = serde_json::to_value(&with).expect("json");
+    assert_eq!(
+        value["turns"][0]["images"],
+        serde_json::json!([{
+            "name": "2026-11-13T09-41-31Z-1.png",
+            "media_type": "image/png",
+            "size": 10,
+            "width": 4,
+            "height": 3,
+        }])
+    );
+    let back: AgentThread = serde_json::from_value(value).expect("parses");
+    assert_eq!(back, with);
+}

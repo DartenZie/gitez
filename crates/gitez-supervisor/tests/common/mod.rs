@@ -20,7 +20,8 @@ use gitez_settings::{AgentEntry, Settings};
 use gitez_supervisor::{Command, Environment, Launch, Secrets};
 
 /// The fake agent. It logs its arguments to `$FAKE_LOG/calls` (one line
-/// per run), reads the prompt from stdin and acts on a keyword in it.
+/// per run) and its standard input to `$FAKE_LOG/stdin-<run>` (from 1),
+/// reads the prompt from stdin and acts on a keyword in it.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 log="$FAKE_LOG"
 sid=""
@@ -31,6 +32,8 @@ for arg in "$@"; do
 done
 printf '%s\n' "$*" >> "$log/calls"
 prompt=$(cat)
+run=$(wc -l < "$log/calls" | tr -d ' ')
+printf '%s' "$prompt" > "$log/stdin-$run"
 say() { printf '%s\n' "$1"; }
 init() { say '{"type":"system","subtype":"init","session_id":"'"$sid"'","model":"fake-model"}'; }
 tool() { say '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"'"$1"'"}}]}}'; }
@@ -83,6 +86,12 @@ case "$prompt" in
       exit 1
     fi
     init; result "Continued after the limit." ;;
+  *SEE-IMAGE*)
+    # Echoes the message it was given, as Claude Code does with
+    # --replay-user-messages, and an image a tool read.
+    init; say "$prompt"
+    say '{"type":"user","message":{"content":[{"type":"tool_result","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"'"$(head -c 3000 /dev/zero | tr '\0' 'Q')"'"}}]}]}}'
+    result "I see the image." ;;
   *SECRET*)
     init; text "The secret is $DEMO_SECRET"
     result "Saw $DEMO_SECRET in my environment." ;;
@@ -218,8 +227,26 @@ impl Fixture {
     }
 
     pub fn create_with_secrets(&self, prompt: &str, secrets: &[&str]) -> AgentThread {
+        self.create_with(prompt, secrets, &[])
+    }
+
+    /// A queued agent thread for `prompt` with `images`, from `main`.
+    pub fn create_with_images(
+        &self,
+        prompt: &str,
+        images: &[gitez_agent_thread::PreparedImage],
+    ) -> AgentThread {
+        self.create_with(prompt, &[], images)
+    }
+
+    fn create_with(
+        &self,
+        prompt: &str,
+        secrets: &[&str],
+        images: &[gitez_agent_thread::PreparedImage],
+    ) -> AgentThread {
         self.store()
-            .create(
+            .create_with_images(
                 NewAgentThread {
                     prompt: prompt.to_owned(),
                     agent: ClaudeCode::ID.to_owned(),
@@ -231,6 +258,7 @@ impl Fixture {
                     network: Default::default(),
                     secrets: secrets.iter().map(|name| (*name).to_owned()).collect(),
                 },
+                images,
                 &self.data_dir,
                 "my repo",
                 |_| false,
@@ -265,6 +293,12 @@ impl Fixture {
 
     pub fn load(&self, id: &AgentThreadId) -> AgentThread {
         self.store().load(id).expect("load thread")
+    }
+
+    /// What the fake agent read on standard input in run `run` (from 1).
+    pub fn stdin(&self, run: usize) -> String {
+        std::fs::read_to_string(self.fake_log.join(format!("stdin-{run}")))
+            .unwrap_or_else(|error| panic!("no standard input of run {run}: {error}"))
     }
 
     /// The fake agent's command lines, one per run.

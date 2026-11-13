@@ -436,7 +436,7 @@ impl Review {
         if let Some(thread) = self.agent_thread_for_pull_request(cx) {
             let sent_at = thread.updated;
             self.ask_thread(ThreadAction::Send, cx, move |model, key, cx| {
-                model.reply(key, TurnKind::Review, prompt, cx)
+                model.reply(key, TurnKind::Review, prompt, Vec::new(), cx)
             });
             if let Subject::PullRequest(subject) = &mut self.subject {
                 subject.panel.sent_at = Some(sent_at);
@@ -1646,6 +1646,7 @@ fn start(
         config,
         &RunSpec {
             prompt,
+            images: &[],
             cwd: dir,
             model,
             conversation: Conversation::New {

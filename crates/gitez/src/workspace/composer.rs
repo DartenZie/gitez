@@ -5,14 +5,15 @@
 //! launcher (`C-5-Home`), with a Repository picker in front.
 //!
 //! The composer only gathers a [`StartRequest`] and emits it; whoever shows
-//! it starts the thread with [`AgentThreads::start`].
+//! it starts the thread with [`AgentThreads::start`]. Images pasted or
+//! dropped into it go with the prompt ([`PromptImages`]).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gitez_agent::{AgentStatus, Availability, LoginStatus};
-use gitez_agent_thread::{Start, slug, title_from_prompt};
+use gitez_agent_thread::{PreparedImage, Start, slug, title_from_request};
 use gitez_git::Oid;
 use gitez_sandbox::NetworkProfile;
 use gitez_settings::{SecretScope, Settings};
@@ -28,6 +29,7 @@ use gpui_kit::*;
 
 use super::agent_thread::{agent_mark, branch_chip, on_accent};
 use super::labels;
+use super::prompt_images::{self, Accepts, PromptImages};
 use crate::agent_threads::{AgentThreads, OpenSettings, StartRequest};
 use crate::theme::{self, color};
 
@@ -165,6 +167,8 @@ pub struct Composer {
     target_error: Option<SharedString>,
     model: Entity<AgentThreads>,
     prompt: Entity<TextareaState>,
+    /// Images pasted or dropped into the prompt.
+    images: Entity<PromptImages>,
     focus_handle: FocusHandle,
     agent: String,
     /// `None`: the agent entry's default.
@@ -199,7 +203,9 @@ impl Composer {
                 .auto_grow(3, 10)
                 .placeholder(placeholder)
         });
+        let images = cx.new(|_| PromptImages::new("composer"));
         let subscriptions = vec![
+            cx.observe(&images, |_, _, cx| cx.notify()),
             cx.subscribe_in(&prompt, window, |this, _, event, window, cx| match event {
                 InputEvent::PressEnter {
                     secondary: true, ..
@@ -230,6 +236,7 @@ impl Composer {
             target_error: None,
             model,
             prompt,
+            images,
             focus_handle: cx.focus_handle(),
             agent,
             model_alias: None,
@@ -321,6 +328,30 @@ impl Composer {
         self.prompt
             .update(cx, |prompt, cx| prompt.set_value(text, window, cx));
         cx.notify();
+    }
+
+    /// Puts back the images of a thread that could not start.
+    pub fn restore_images(
+        &mut self,
+        images: Vec<Arc<PreparedImage>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.images
+            .update(cx, |attached, cx| attached.restore(images, window, cx));
+    }
+
+    /// The images attached to the prompt.
+    #[cfg(test)]
+    pub(crate) fn images(&self) -> &Entity<PromptImages> {
+        &self.images
+    }
+
+    /// Whether the agent and model picked take images, as the agent says.
+    pub(crate) fn accepts_images(&self, cx: &App) -> Accepts {
+        let model = self.model_alias(cx);
+        let agent = self.model.read(cx).agents().get(&self.agent);
+        prompt_images::accepts(agent.as_deref(), Some(&model))
     }
 
     /// The branch new threads start from, if one is picked or checked out.
@@ -654,7 +685,24 @@ impl Composer {
                 }
             }
         }
-        if self.prompt.read(cx).value().trim().is_empty() {
+        let images = self.images.read(cx);
+        if !images.is_empty()
+            && let Err(why) = self.accepts_images(cx)
+        {
+            add(
+                Severity::Blocking,
+                format!("{why} Remove the images, or pick another model.").into(),
+                false,
+            );
+        }
+        if images.preparing() {
+            add(
+                Severity::Hint,
+                "Preparing the images…".to_owned().into(),
+                false,
+            );
+        }
+        if self.prompt.read(cx).value().trim().is_empty() && images.is_empty() {
             add(
                 Severity::Hint,
                 "Write what the agent should do, then send it."
@@ -690,6 +738,7 @@ impl Composer {
         };
         let prompt = self.prompt.read(cx).value().trim().to_owned();
         let model = self.model_alias(cx);
+        let images = self.images.update(cx, |images, cx| images.take(cx));
         let request = StartRequest {
             work_dir: target.work_dir,
             common_dir: target.common_dir,
@@ -703,6 +752,7 @@ impl Composer {
             },
             network: self.network(cx),
             secrets: self.secrets(cx),
+            images,
         };
         self.prompt
             .update(cx, |prompt, cx| prompt.set_value("", window, cx));
@@ -717,21 +767,23 @@ impl Composer {
     /// "agent/<slug>" the prompt would get, skipping branches that exist.
     fn branch_preview(&self, cx: &App) -> Option<String> {
         let prompt = self.prompt.read(cx).value();
-        if prompt.trim().is_empty() {
+        let images = self.images.read(cx).len();
+        if prompt.trim().is_empty() && images == 0 {
             return None;
         }
         let branches = self
             .target
             .as_ref()
             .map_or(&[][..], |target| &target.branches[..]);
-        Some(preview_branch(&prompt, branches))
+        Some(preview_branch(&prompt, images, branches))
     }
 }
 
-/// The branch a thread for `prompt` gets: `agent/<slug>`, with `-2`, `-3`, …
-/// when such a branch exists, as the thread store picks it.
-pub fn preview_branch(prompt: &str, branches: &[(String, Oid)]) -> String {
-    let base = slug(&title_from_prompt(prompt));
+/// The branch a thread for `prompt` and `images` images gets:
+/// `agent/<slug>`, with `-2`, `-3`, … when such a branch exists, as the
+/// thread store picks it.
+pub fn preview_branch(prompt: &str, images: usize, branches: &[(String, Oid)]) -> String {
+    let base = slug(&title_from_request(prompt, images));
     let taken = |name: &str| branches.iter().any(|(branch, _)| branch == name);
     let mut attempt = 1;
     loop {
@@ -1496,6 +1548,20 @@ fn sentence_text(problem: &Problem, mono: &SharedString) -> StyledText {
         .with_font_family_overrides(fonts)
 }
 
+/// The paste handler of a prompt with `images`: an image (or a copied image
+/// file) is attached instead of inserted; text pastes as before.
+pub(crate) fn paste_into(
+    images: &Entity<PromptImages>,
+    accepts: Accepts,
+) -> impl Fn(&ClipboardItem, &mut Window, &mut App) -> bool + 'static {
+    let images = images.downgrade();
+    move |item, window, cx| {
+        images
+            .update(cx, |images, cx| images.paste(item, &accepts, window, cx))
+            .unwrap_or(false)
+    }
+}
+
 /// A rounded square with the first letter of `name`, for a repository.
 fn initial_square(name: &str, size: Pixels) -> Div {
     let letter: String = name
@@ -1607,8 +1673,19 @@ impl Render for Composer {
                     .disabled(!can_send)
                     .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
             );
+        let accepts = self.accepts_images(cx);
+        let dropped = self.images.downgrade();
+        let accepts_drop = accepts.clone();
         let card = div()
             .debug_selector(|| "composer".into())
+            // Image files dropped on the card are attached too.
+            .on_drop(move |paths: &ExternalPaths, window, cx| {
+                dropped
+                    .update(cx, |images, cx| {
+                        images.drop_paths(paths.paths(), &accepts_drop, window, cx)
+                    })
+                    .ok();
+            })
             .v_flex()
             .gap(px(if home { 10. } else { 8. }))
             .px(px(14.))
@@ -1636,10 +1713,13 @@ impl Render for Composer {
             ])
             .children(header)
             .child(
-                div()
-                    .text_size(px(if home { 14. } else { 13. }))
-                    .child(Textarea::new(&self.prompt).appearance(false)),
+                div().text_size(px(if home { 14. } else { 13. })).child(
+                    Textarea::new(&self.prompt)
+                        .appearance(false)
+                        .on_paste(paste_into(&self.images, accepts.clone())),
+                ),
             )
+            .children(self.images.update(cx, |images, cx| images.render(cx)))
             .child(pickers)
             .child(footer)
             .children(self.render_problems(cx));
@@ -1669,7 +1749,7 @@ mod tests {
     use gitez_git::Oid;
     use gitez_sandbox::NetworkProfile;
     use gitez_settings::{AgentEntry, SecretEntry, SecretScope, Settings};
-    use gpui_kit::{Entity, TestAppContext, VisualTestContext, px, size};
+    use gpui_kit::{AppContext as _, Entity, TestAppContext, VisualTestContext, px, size};
 
     use super::{Composer, ComposerEvent, ComposerMode, preview_branch};
     use crate::agent_threads::{Options, StartRequest, init_with};
@@ -1686,11 +1766,11 @@ mod tests {
             ("agent/add-a-blame-view-2".to_owned(), oid(3)),
         ];
         assert_eq!(
-            preview_branch("Add a blame view. Reuse the diff list.", &branches),
+            preview_branch("Add a blame view. Reuse the diff list.", 0, &branches),
             "agent/add-a-blame-view-3"
         );
         assert_eq!(
-            preview_branch("Fix the typo in README", &branches),
+            preview_branch("Fix the typo in README", 0, &branches),
             "agent/fix-the-typo-in-readme"
         );
     }
@@ -1698,6 +1778,14 @@ mod tests {
     /// A repository window's composer with two branches, `feature`
     /// checked out, and settings with three secrets, one given by default.
     fn composer(cx: &mut TestAppContext) -> (Entity<Composer>, VisualTestContext) {
+        composer_with(cx, gitez_agent::Registry::builtin())
+    }
+
+    /// [`composer`] with the agents of `agents`.
+    fn composer_with(
+        cx: &mut TestAppContext,
+        agents: gitez_agent::Registry,
+    ) -> (Entity<Composer>, VisualTestContext) {
         let dir = tempfile::tempdir().expect("temp dir");
         let data_dir = dir.path().join("data");
         let common_dir = Path::new("/repo/.git");
@@ -1742,7 +1830,7 @@ mod tests {
                 Options {
                     data_dir: Some(data_dir),
                     sandbox: Arc::new(gitez_sandbox::Passthrough),
-                    agents: gitez_agent::Registry::builtin(),
+                    agents,
                     secrets: Arc::new(gitez_secret::Memory::default()),
                     exe: Err("no supervisor in tests".into()),
                     watch: false,
@@ -1761,13 +1849,15 @@ mod tests {
             current: Some("feature".into()),
             bare: false,
         };
-        let window = cx.open_window(size(px(900.), px(600.)), |window, cx| {
-            Composer::new(mode, window, cx)
-        });
-        let composer = window
-            .update(cx, |_, _, cx| cx.entity())
+        // In gpui-kit's Root, as in the app: notices need it.
+        let (window, composer) = cx
+            .update(|cx| {
+                gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| Composer::new(mode, window, cx))
+                })
+            })
             .expect("window open");
-        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let mut cx = VisualTestContext::from_window(window, cx);
         // As opening it does.
         composer.update(&mut cx, |composer, cx| composer.check(cx));
         cx.run_until_parked();
@@ -1987,6 +2077,217 @@ mod tests {
             assert!(composer.problems(cx).iter().any(|problem| {
                 problem.severity == super::Severity::Blocking
                     && problem.text.contains("bare repository")
+            }));
+        });
+    }
+
+    /// As if the agent were installed and signed in, and the sandbox ready.
+    fn ready(composer: &mut Composer, agent: &'static str) {
+        composer.environment = Some(super::Environment {
+            agents: vec![super::AgentCheck {
+                status: gitez_agent::AgentStatus {
+                    id: agent,
+                    name: "Agent",
+                    availability: gitez_agent::Availability::Installed {
+                        program: "/bin/true".into(),
+                    },
+                },
+                login: Some(gitez_agent::LoginStatus::SignedIn),
+            }],
+            sandbox: gitez_sandbox::Status::Ready {
+                program: "/bin/true".into(),
+                version: None,
+            },
+        });
+    }
+
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let pixels = image::RgbImage::from_pixel(width, height, image::Rgb([40, 120, 220]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(pixels)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .expect("encode");
+        bytes.into_inner()
+    }
+
+    fn clipboard_image(bytes: Vec<u8>) -> gpui_kit::ClipboardItem {
+        gpui_kit::ClipboardItem {
+            entries: vec![gpui_kit::ClipboardEntry::Image(
+                gpui_kit::Image::from_bytes(gpui_kit::ImageFormat::Png, bytes),
+            )],
+        }
+    }
+
+    /// `⌘V` (`ctrl-v` elsewhere) in the composer's prompt.
+    fn paste(composer: &Entity<Composer>, cx: &mut VisualTestContext) {
+        composer.update_in(cx, |composer, window, cx| composer.focus(window, cx));
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-v"
+        } else {
+            "ctrl-v"
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui_kit::test]
+    fn a_pasted_image_is_attached_and_sent_with_the_prompt(cx: &mut TestAppContext) {
+        let (composer, mut cx) = composer(cx);
+        let sent: Arc<std::sync::Mutex<Vec<StartRequest>>> = Arc::default();
+        cx.update(|_, cx| {
+            let sent = sent.clone();
+            cx.subscribe(&composer, move |_, event: &ComposerEvent, _| {
+                if let ComposerEvent::Submit(request) = event {
+                    sent.lock().expect("lock").push((**request).clone());
+                }
+            })
+            .detach();
+        });
+        let bytes = png(40, 30);
+        cx.write_to_clipboard(clipboard_image(bytes.clone()));
+        paste(&composer, &mut cx);
+        composer.read_with(&cx, |composer, cx| {
+            let images = composer.images().read(cx);
+            assert_eq!(images.len(), 1);
+            assert!(!images.preparing());
+            // Nothing was typed into the prompt.
+            assert!(composer.prompt.read(cx).value().is_empty());
+            // An image alone is a prompt: the thread is named after it.
+            assert_eq!(
+                composer.branch_preview(cx).as_deref(),
+                Some("agent/pasted-image")
+            );
+        });
+        assert!(cx.debug_bounds("composer-images").is_some());
+        composer.update_in(&mut cx, |composer, window, cx| {
+            ready(composer, gitez_agent::ClaudeCode::ID);
+            assert!(composer.can_send(cx), "{:?}", composer.problems(cx));
+            composer.send(window, cx);
+        });
+        let sent = sent.lock().expect("lock");
+        let [request] = &sent[..] else {
+            panic!("one request, got {}", sent.len());
+        };
+        assert_eq!(request.prompt, "");
+        assert_eq!(request.images.len(), 1);
+        assert_eq!(request.images[0].bytes, bytes);
+        assert_eq!(
+            request.images[0].media_type,
+            gitez_agent_thread::ImageType::Png
+        );
+        composer.read_with(&cx, |composer, cx| {
+            assert!(composer.images().read(cx).is_empty());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn pasting_text_inserts_it_as_before(cx: &mut TestAppContext) {
+        let (composer, mut cx) = composer(cx);
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+            "Fix the typo".to_owned(),
+        ));
+        paste(&composer, &mut cx);
+        composer.read_with(&cx, |composer, cx| {
+            assert_eq!(composer.prompt.read(cx).value(), "Fix the typo");
+            assert!(composer.images().read(cx).is_empty());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_message_takes_at_most_five_images(cx: &mut TestAppContext) {
+        let (composer, mut cx) = composer(cx);
+        for side in 10..17 {
+            cx.write_to_clipboard(clipboard_image(png(side, side)));
+            paste(&composer, &mut cx);
+        }
+        composer.read_with(&cx, |composer, cx| {
+            assert_eq!(
+                composer.images().read(cx).len(),
+                gitez_agent_thread::MAX_IMAGES
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn what_is_not_an_image_is_refused_with_a_notice(cx: &mut TestAppContext) {
+        let (composer, mut cx) = composer(cx);
+        cx.write_to_clipboard(clipboard_image(b"not an image at all".to_vec()));
+        paste(&composer, &mut cx);
+        composer.read_with(&cx, |composer, cx| {
+            assert!(composer.images().read(cx).is_empty());
+            assert!(composer.prompt.read(cx).value().is_empty());
+        });
+    }
+
+    /// An agent whose models read no images.
+    struct TextOnly;
+
+    impl gitez_agent::Agent for TextOnly {
+        fn id(&self) -> &'static str {
+            "text-only"
+        }
+        fn name(&self) -> &'static str {
+            "Text Only"
+        }
+        fn models(&self) -> &'static [gitez_agent::ModelChoice] {
+            &[("", "Agent default")]
+        }
+        fn locate(&self, _: &gitez_agent::AgentConfig) -> gitez_agent::Result<std::path::PathBuf> {
+            Ok("/bin/true".into())
+        }
+        fn command(
+            &self,
+            _: &gitez_agent::AgentConfig,
+            _: &gitez_agent::RunSpec<'_>,
+        ) -> gitez_agent::Result<gitez_agent::CommandSpec> {
+            Ok(gitez_agent::CommandSpec::default())
+        }
+        fn needs(&self, _: &gitez_agent::AgentConfig) -> gitez_agent::AgentNeeds {
+            gitez_agent::AgentNeeds::default()
+        }
+        fn parse(&self, _: &str) -> Option<gitez_agent::AgentEvent> {
+            None
+        }
+        fn login_status(&self, _: &gitez_agent::AgentConfig) -> gitez_agent::LoginStatus {
+            gitez_agent::LoginStatus::SignedIn
+        }
+    }
+
+    /// The trait decides: an agent that reads no images gets none, and the
+    /// paste says so; Claude Code's do.
+    #[gpui_kit::test]
+    fn an_agent_that_reads_no_images_gets_none(cx: &mut TestAppContext) {
+        let agents = gitez_agent::Registry::with(vec![
+            Arc::new(TextOnly),
+            Arc::new(gitez_agent::ClaudeCode),
+        ]);
+        let (composer, mut cx) = composer_with(cx, agents);
+        composer.read_with(&cx, |composer, cx| {
+            assert_eq!(composer.agent, "text-only");
+            assert!(composer.accepts_images(cx).is_err());
+        });
+        cx.write_to_clipboard(clipboard_image(png(20, 20)));
+        paste(&composer, &mut cx);
+        composer.read_with(&cx, |composer, cx| {
+            assert!(composer.images().read(cx).is_empty());
+            assert!(composer.prompt.read(cx).value().is_empty());
+        });
+        // Claude Code takes them.
+        composer.update(&mut cx, |composer, cx| {
+            composer.agent = gitez_agent::ClaudeCode::ID.to_owned();
+            cx.notify();
+        });
+        paste(&composer, &mut cx);
+        composer.read_with(&cx, |composer, cx| {
+            assert_eq!(composer.images().read(cx).len(), 1);
+        });
+        // Picking the other agent again keeps Send off while it has them.
+        composer.update(&mut cx, |composer, cx| {
+            composer.agent = "text-only".to_owned();
+            ready(composer, "text-only");
+            assert!(!composer.can_send(cx));
+            assert!(composer.problems(cx).iter().any(|problem| {
+                problem.severity == super::Severity::Blocking
+                    && problem.text.contains("does not take images")
             }));
         });
     }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::ImageInput;
 
 #[test]
 fn events_of_a_run_are_parsed() {
@@ -138,6 +139,7 @@ fn config(dir: &tempfile::TempDir) -> AgentConfig {
 fn run<'a>(conversation: Conversation<'a>, cwd: &'a Path) -> RunSpec<'a> {
     RunSpec {
         prompt: "Fix the bug",
+        images: &[],
         cwd,
         model: Some("haiku"),
         conversation,
@@ -463,4 +465,133 @@ fn claude_codes_own_extra_hosts_are_optional() {
     let unknown = crate::BlockedHosts::classify(None, &blocked);
     assert_eq!(unknown.problems.len(), blocked.len());
     assert!(unknown.optional.is_empty());
+}
+
+#[test]
+fn claude_code_accepts_images_with_every_model() {
+    for (alias, _) in ClaudeCode.models() {
+        assert!(ClaudeCode.accepts_images(Some(alias)), "{alias}");
+    }
+    assert!(ClaudeCode.accepts_images(None));
+    assert!(ClaudeCode.accepts_images(Some("claude-some-future-model")));
+}
+
+#[test]
+fn a_run_with_images_sends_one_stream_json_message() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let config = config(&dir);
+    let plain = ClaudeCode
+        .command(
+            &config,
+            &run(Conversation::Resume { session_id: "s-1" }, dir.path()),
+        )
+        .expect("command");
+    let images = [
+        ImageInput {
+            media_type: "image/png",
+            data: b"\x89PNG one",
+        },
+        ImageInput {
+            media_type: "image/jpeg",
+            data: b"\xff\xd8 two",
+        },
+    ];
+    let with_images = RunSpec {
+        images: &images,
+        ..run(Conversation::Resume { session_id: "s-1" }, dir.path())
+    };
+    let command = ClaudeCode.command(&config, &with_images).expect("command");
+    // The same arguments, with the input format after GitEZ's own.
+    let at = ARGS.len() + SANDBOX_OFF.len();
+    assert_eq!(command.args[..at], plain.args[..at]);
+    assert_eq!(command.args[at..at + 2], ["--input-format", "stream-json"]);
+    assert_eq!(command.args[at + 2..], plain.args[at..]);
+    assert!(
+        command
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--resume", "s-1"])
+    );
+
+    let stdin = command.stdin.expect("standard input");
+    assert!(stdin.ends_with('\n'));
+    assert_eq!(stdin.lines().count(), 1);
+    let message: Value = serde_json::from_str(stdin.trim_end()).expect("JSON");
+    assert_eq!(message["type"], "user");
+    assert_eq!(message["parent_tool_use_id"], Value::Null);
+    assert_eq!(message["message"]["role"], "user");
+    let content = message["message"]["content"]
+        .as_array()
+        .expect("content blocks");
+    assert_eq!(content.len(), 3);
+    let engine = base64::engine::general_purpose::STANDARD;
+    for (block, image) in content.iter().zip(&images) {
+        assert_eq!(block["type"], "image");
+        assert_eq!(block["source"]["type"], "base64");
+        assert_eq!(block["source"]["media_type"], image.media_type);
+        let data = block["source"]["data"].as_str().expect("data");
+        assert_eq!(engine.decode(data).expect("base64"), image.data);
+    }
+    assert_eq!(content[2], json!({"type": "text", "text": "Fix the bug"}));
+}
+
+#[test]
+fn an_image_without_words_has_no_text_block() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let images = [ImageInput {
+        media_type: "image/gif",
+        data: b"GIF89a",
+    }];
+    let run = RunSpec {
+        prompt: "  \n",
+        images: &images,
+        ..run(Conversation::New { session_id: "s-1" }, dir.path())
+    };
+    let command = ClaudeCode.command(&config(&dir), &run).expect("command");
+    let message: Value =
+        serde_json::from_str(command.stdin.as_deref().expect("stdin").trim()).expect("JSON");
+    let content = message["message"]["content"].as_array().expect("content");
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0]["type"], "image");
+}
+
+#[test]
+fn a_transcript_keeps_no_image_data() {
+    let data = "iVBORw0KGgo".repeat(100);
+    let line = format!(
+        r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","content":[{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{data}"}}}}]}}]}}}}"#
+    );
+    let kept = ClaudeCode.transcript_line(&line);
+    assert!(!kept.contains(&data[..OMIT_FROM]), "{kept}");
+    let event: Value = serde_json::from_str(&kept).expect("still JSON");
+    assert_eq!(
+        event["message"]["content"][0]["content"][0]["source"]["data"],
+        IMAGE_OMITTED
+    );
+    // Cut short by the line limit, it loses the data too.
+    let cut = &line[..line.len() - 40];
+    let kept = ClaudeCode.transcript_line(cut);
+    assert!(!kept.contains(&data[..OMIT_FROM]));
+    assert!(kept.starts_with(r#"{"type":"user""#));
+
+    // A small image is left out too; other data stays.
+    let small = r#"{"source":{"type":"base64","media_type":"image/gif","data":"R0lGOD"}}"#;
+    // (The order of its keys depends on serde_json's features in the
+    // build, so the line is compared as JSON.)
+    let kept: Value = serde_json::from_str(&ClaudeCode.transcript_line(small)).expect("JSON");
+    assert_eq!(
+        kept,
+        serde_json::json!({"source": {"type": "base64", "media_type": "image/gif", "data": IMAGE_OMITTED}})
+    );
+    // Lines without image data stay as they are, borrowed.
+    for plain in [
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"\"data\":\"short\""}]}}"#,
+        r#"{"type":"user","data":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#,
+        r#"{"type":"result","result":"Done."}"#,
+    ] {
+        assert!(
+            matches!(ClaudeCode.transcript_line(plain), Cow::Borrowed(_)),
+            "{plain}"
+        );
+    }
 }

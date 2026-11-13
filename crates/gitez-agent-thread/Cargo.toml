@@ -13,6 +13,7 @@ publish = false
 gitez-sandbox.workspace = true
 gitez-git.workspace = true
 gitez-command.workspace = true
+image.workspace = true
 jiff.workspace = true
 notify.workspace = true
 reflink-copy.workspace = true

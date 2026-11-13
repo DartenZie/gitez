@@ -7,7 +7,7 @@ use gitez_sandbox::NetworkProfile;
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, Result};
+use crate::{Error, Result, TurnImage};
 
 /// An agent thread's id: its slug, unique in its repository. Also its
 /// folder name, its branch `agent/<id>` and its worktree folder name.
@@ -144,6 +144,11 @@ pub struct Turn {
     /// File name in `runs/`.
     pub transcript: Option<String>,
     pub result: Option<TurnResult>,
+    /// Sent with the prompt, in order; files in `images/`
+    /// ([`crate::Store::image_path`]). A retry that sends the prompt again
+    /// lists them again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<TurnImage>,
 }
 
 /// How a turn's run ended.
@@ -404,6 +409,18 @@ impl AgentThread {
     /// `session_id` is set; sets state Queued, clears `ending`, `error`,
     /// `waiting_until`. Err(Refused) otherwise.
     pub fn request_turn(&mut self, kind: TurnKind, prompt: String, at: Timestamp) -> Result<()> {
+        self.request_turn_with_images(kind, prompt, Vec::new(), at)
+    }
+
+    /// [`request_turn`](Self::request_turn) with images sent along, whose
+    /// files [`crate::Store::add_images`] wrote.
+    pub fn request_turn_with_images(
+        &mut self,
+        kind: TurnKind,
+        prompt: String,
+        images: Vec<TurnImage>,
+        at: Timestamp,
+    ) -> Result<()> {
         if !matches!(kind, TurnKind::Reply | TurnKind::Review) {
             return Err(Error::refused(
                 "Only a reply or review comments can continue a thread.",
@@ -413,7 +430,9 @@ impl AgentThread {
         if self.session_id.is_none() {
             return Err(Error::refused(NEVER_STARTED));
         }
-        self.turns.push(Turn::requested(kind, prompt, true, at));
+        let mut turn = Turn::requested(kind, prompt, true, at);
+        turn.images = images;
+        self.turns.push(turn);
         self.queue();
         Ok(())
     }
@@ -423,7 +442,8 @@ impl AgentThread {
     /// adds a Retry turn unless the plan is Finish (RunAgain: the first
     /// prompt, resume false; Continue: CONTINUE_PROMPT, resume true — or,
     /// when the last turn is a reply or review that never started, that
-    /// turn's prompt, so the user's words are not lost).
+    /// turn's prompt, so the user's words are not lost). A prompt sent again
+    /// takes its images along.
     pub fn request_retry(&mut self, network: NetworkProfile, at: Timestamp) -> Result<RetryPlan> {
         self.check_finished()?;
         if !matches!(self.ending, Some(Ending::Failed | Ending::Stopped)) {
@@ -446,26 +466,28 @@ impl AgentThread {
         match plan {
             RetryPlan::Finish => {}
             RetryPlan::RunAgain => {
-                let prompt = self
+                let (prompt, images) = self
                     .turns
                     .first()
-                    .map(|turn| turn.prompt.clone())
+                    .map(|turn| (turn.prompt.clone(), turn.images.clone()))
                     .unwrap_or_default();
-                self.turns
-                    .push(Turn::requested(TurnKind::Retry, prompt, false, at));
+                let mut turn = Turn::requested(TurnKind::Retry, prompt, false, at);
+                turn.images = images;
+                self.turns.push(turn);
             }
             RetryPlan::Continue => {
-                let prompt = match self.turns.last() {
+                let (prompt, images) = match self.turns.last() {
                     Some(turn)
                         if turn.started.is_none()
                             && matches!(turn.kind, TurnKind::Reply | TurnKind::Review) =>
                     {
-                        turn.prompt.clone()
+                        (turn.prompt.clone(), turn.images.clone())
                     }
-                    _ => CONTINUE_PROMPT.to_owned(),
+                    _ => (CONTINUE_PROMPT.to_owned(), Vec::new()),
                 };
-                self.turns
-                    .push(Turn::requested(TurnKind::Retry, prompt, true, at));
+                let mut turn = Turn::requested(TurnKind::Retry, prompt, true, at);
+                turn.images = images;
+                self.turns.push(turn);
             }
         }
         self.network = network;
@@ -548,6 +570,7 @@ impl Turn {
             ended: None,
             transcript: None,
             result: None,
+            images: Vec::new(),
         }
     }
 

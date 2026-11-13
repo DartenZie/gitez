@@ -1,5 +1,9 @@
 //! Claude Code, run headless: `claude --print` with the prompt on standard
-//! input and its stream-JSON events on standard output.
+//! input and its stream-JSON events on standard output. A prompt with
+//! images goes in as one stream-JSON user message instead
+//! (`--input-format stream-json`), whose content holds the images as base64
+//! blocks and then the text; standard input is closed after it, so the run
+//! ends with that turn as a plain prompt's does.
 //!
 //! What a sandbox must let it write was measured with `claude` 2.1.323
 //! under `srt` on macOS: per-project and per-session folders inside its
@@ -8,13 +12,15 @@
 //! hooks, commands, plugins and shell snapshots there run code in the
 //! user's own later sessions.
 
+use std::borrow::Cow;
 use std::ffi::OsString;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use base64::Engine as _;
+use serde_json::{Value, json};
 
 use crate::login_shell::{join_path, login_shell_var};
 use crate::process::find_program;
@@ -41,6 +47,14 @@ const ARGS: [&str; 6] = [
 /// (nested Seatbelt fails), so every run turns it off. Flag settings win
 /// over the user's settings.
 const SANDBOX_OFF: [&str; 2] = ["--settings", r#"{"sandbox":{"enabled":false}}"#];
+
+/// Only for a run with images: the prompt is one stream-JSON message.
+const STREAM_INPUT: [&str; 2] = ["--input-format", "stream-json"];
+
+/// What an image's base64 data is replaced with in a transcript.
+const IMAGE_OMITTED: &str = "[image omitted by GitEZ]";
+/// Shorter runs of base64 after `"data":"` are kept in a transcript.
+const OMIT_FROM: usize = 256;
 
 /// Variables a Claude Code session sets for the commands it runs. GitEZ
 /// may itself have been started from one; the agent must not think it is
@@ -215,6 +229,9 @@ impl Agent for ClaudeCode {
     fn command(&self, config: &AgentConfig, run: &RunSpec<'_>) -> Result<CommandSpec> {
         let program = self.locate(config)?;
         let mut args: Vec<String> = ARGS.iter().chain(&SANDBOX_OFF).map(|&a| a.into()).collect();
+        if !run.images.is_empty() {
+            args.extend(STREAM_INPUT.map(String::from));
+        }
         if let Some(model) = run.model.filter(|model| !model.is_empty()) {
             args.extend(["--model".into(), model.into()]);
         }
@@ -236,7 +253,11 @@ impl Agent for ClaudeCode {
             args,
             env_remove: ENV_REMOVE.map(str::to_owned).into(),
             cwd: run.cwd.to_owned(),
-            stdin: Some(run.prompt.to_owned()),
+            stdin: Some(if run.images.is_empty() {
+                run.prompt.to_owned()
+            } else {
+                user_message(run)
+            }),
         })
     }
 
@@ -300,6 +321,17 @@ impl Agent for ClaudeCode {
                 .push(config_dir.join("file-history").join(session_id));
         }
         needs
+    }
+
+    /// Every Claude model reads images.
+    fn accepts_images(&self, _model: Option<&str>) -> bool {
+        true
+    }
+
+    /// Without the base64 data of images: the ones it reads with its tools,
+    /// and any it echoes.
+    fn transcript_line<'l>(&self, line: &'l str) -> Cow<'l, str> {
+        omit_image_data(line)
     }
 
     fn parse(&self, line: &str) -> Option<AgentEvent> {
@@ -380,6 +412,112 @@ impl Agent for ClaudeCode {
             None => LoginStatus::Unknown("Claude Code did not report its login status".to_owned()),
         }
     }
+}
+
+/// The prompt and images of `run` as one stream-JSON user message, on one
+/// line: the images first, then the text (left out when empty, as the API
+/// refuses an empty text block).
+fn user_message(run: &RunSpec<'_>) -> String {
+    let mut content: Vec<Value> = run
+        .images
+        .iter()
+        .map(|image| {
+            json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": image.media_type,
+                    "data": base64::engine::general_purpose::STANDARD.encode(image.data),
+                },
+            })
+        })
+        .collect();
+    if !run.prompt.trim().is_empty() {
+        content.push(json!({ "type": "text", "text": run.prompt }));
+    }
+    let message = json!({
+        "type": "user",
+        "message": { "role": "user", "content": content },
+        "parent_tool_use_id": null,
+    });
+    let mut line = message.to_string();
+    line.push('\n');
+    line
+}
+
+/// `line` without the data of images: in an event that is JSON, every
+/// base64 `source` (`{"type":"base64","data":…}`) gets [`IMAGE_OMITTED`]
+/// as its data; in a line that is not (cut short at the line limit), every
+/// long run of base64 after `"data":"` is replaced. Lines with no `"data"`
+/// key stay as they are.
+fn omit_image_data(line: &str) -> Cow<'_, str> {
+    if !line.contains("\"data\"") {
+        return Cow::Borrowed(line);
+    }
+    match serde_json::from_str::<Value>(line) {
+        Ok(mut event) => {
+            if omit_base64_sources(&mut event) {
+                Cow::Owned(event.to_string())
+            } else {
+                Cow::Borrowed(line)
+            }
+        }
+        Err(_) => omit_long_data(line),
+    }
+}
+
+/// Replaces the data of every base64 source inside `value`; whether any.
+fn omit_base64_sources(value: &mut Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            let mut changed = false;
+            if map.get("type").and_then(Value::as_str) == Some("base64")
+                && let Some(data) = map.get_mut("data")
+                && data.is_string()
+            {
+                *data = Value::String(IMAGE_OMITTED.to_owned());
+                changed = true;
+            }
+            for (_, child) in map.iter_mut() {
+                changed |= omit_base64_sources(child);
+            }
+            changed
+        }
+        Value::Array(items) => items
+            .iter_mut()
+            .fold(false, |changed, item| omit_base64_sources(item) | changed),
+        _ => false,
+    }
+}
+
+/// `line` with every run of at least [`OMIT_FROM`] base64 characters after
+/// `"data":"` replaced by [`IMAGE_OMITTED`]; the rest stays byte for byte.
+fn omit_long_data(line: &str) -> Cow<'_, str> {
+    const KEY: &str = "\"data\":\"";
+    let is_base64 = |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=');
+    let bytes = line.as_bytes();
+    let mut out = String::new();
+    let mut copied = 0;
+    let mut from = 0;
+    while let Some(found) = line[from..].find(KEY) {
+        let start = from + found + KEY.len();
+        let end = start
+            + bytes[start..]
+                .iter()
+                .position(|&byte| !is_base64(byte))
+                .unwrap_or(bytes.len() - start);
+        if end - start >= OMIT_FROM {
+            out.push_str(&line[copied..start]);
+            out.push_str(IMAGE_OMITTED);
+            copied = end;
+        }
+        from = end;
+    }
+    if copied == 0 {
+        return Cow::Borrowed(line);
+    }
+    out.push_str(&line[copied..]);
+    Cow::Owned(out)
 }
 
 /// The configuration folder, from the first of these that is set.

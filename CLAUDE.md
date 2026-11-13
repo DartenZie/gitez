@@ -144,6 +144,17 @@ Decided 2026-10-23; change only with the owner's agreement.
     the same lock-and-rename writes and refusal of a newer `version` as
     review storage. The `gitez-agent-thread` crate owns the format and the
     worktrees; nothing else reads or writes these files.
+  - Images (decided 2026-11-13): pasted or dropped into a prompt or reply,
+    made fit to send by `gitez_agent_thread::prepare_image` (at most 5 a
+    turn, long side 2,576 px, 3,932,160 bytes, else scaled down to PNG or
+    JPEG), kept in `threads/<id>/images/` under names GitEZ makes
+    (`<UTC time>-<n>.<ext>`, never the clipboard's), and listed by name in
+    the turn (`images`) and in the transcript's header line. Only a turn
+    with images changes the agent's input: Claude Code gets
+    `--input-format stream-json` and one user message on standard input,
+    the images first. Transcripts never keep image data:
+    `Agent::transcript_line` replaces it with `[image omitted by GitEZ]`.
+    Whether a model takes images is `Agent::accepts_images`.
     `<data folder>/threads.json` indexes the repositories that have threads,
     so Home lists threads of repositories that are not open.
   - Every run (start, reply, review comments, retry) goes through a detached

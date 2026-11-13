@@ -2273,6 +2273,7 @@ dependencies = [
 name = "gitez-agent"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "rustix",
  "serde_json",
  "tempfile",
@@ -2286,6 +2287,7 @@ dependencies = [
  "gitez-command",
  "gitez-git",
  "gitez-sandbox",
+ "image",
  "jiff",
  "notify",
  "reflink-copy",
@@ -2370,6 +2372,7 @@ dependencies = [
 name = "gitez-supervisor"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "gitez-agent",
  "gitez-agent-thread",
  "gitez-command",
@@ -2377,6 +2380,7 @@ dependencies = [
  "gitez-review",
  "gitez-sandbox",
  "gitez-settings",
+ "image",
  "jiff",
  "rustix",
  "serde",

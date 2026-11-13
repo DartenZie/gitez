@@ -34,6 +34,18 @@ pub fn title_from_prompt(prompt: &str) -> String {
     shorten(sentence)
 }
 
+/// The title of a new thread asked for with `prompt` and `images` images:
+/// [`title_from_prompt`], or "Pasted image" ("Pasted images") when the
+/// prompt has no words but images.
+pub fn title_from_request(prompt: &str, images: usize) -> String {
+    match images {
+        0 => title_from_prompt(prompt),
+        _ if !prompt.trim().is_empty() => title_from_prompt(prompt),
+        1 => "Pasted image".to_owned(),
+        _ => "Pasted images".to_owned(),
+    }
+}
+
 /// A title the agent gave its work: its final message starts with a
 /// level-1 ATX heading (`# Title`; up to three spaces before it, blank
 /// lines before it allowed). Cleaned with [`clean_title`]; `None` when the

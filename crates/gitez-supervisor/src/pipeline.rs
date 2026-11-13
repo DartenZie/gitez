@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use gitez_agent::{
     Agent, AgentConfig, AgentEvent, AgentNeeds, AgentProcess, CommandSpec, Conversation, Finished,
-    RunSpec, Stopper,
+    ImageInput, RunSpec, Stopper,
 };
 use gitez_agent_thread::{
     Activity, AgentThread, AgentThreadId, CONTINUE_PROMPT, Ending, PrepareStep, RunHeader, State,
@@ -571,8 +571,38 @@ impl Pipeline<'_> {
             .filter(|model| !model.is_empty())
             .or_else(|| context.model.clone());
         let worktree = self.thread.worktree.clone();
+        // The images go with the prompt, read from the thread's folder.
+        if !turn.images.is_empty() && !agent.accepts_images(model.as_deref()) {
+            return Err(failed(format!(
+                "{} cannot be given images with this model. Reply without them, or pick \
+                 another model.",
+                agent.name()
+            )));
+        }
+        let image_bytes = turn
+            .images
+            .iter()
+            .map(|image| {
+                self.store.read_image(&self.id, image).map_err(|error| {
+                    failed(format!(
+                        "GitEZ could not read the image {}: {error}",
+                        image.name
+                    ))
+                })
+            })
+            .collect::<Result<Vec<Vec<u8>>, End>>()?;
+        let images: Vec<ImageInput<'_>> = turn
+            .images
+            .iter()
+            .zip(&image_bytes)
+            .map(|(image, data)| ImageInput {
+                media_type: image.media_type.media_type(),
+                data,
+            })
+            .collect();
         let spec = RunSpec {
             prompt: &turn.prompt,
+            images: &images,
             cwd: &worktree,
             model: model.as_deref(),
             conversation,
@@ -598,6 +628,7 @@ impl Pipeline<'_> {
                     resume: turn.resume,
                     model: model.clone(),
                     network: self.thread.network,
+                    images: turn.images.iter().map(|image| image.name.clone()).collect(),
                 },
             )
             .map_err(|error| failed(format!("GitEZ could not start the transcript: {error}")))?;
@@ -646,7 +677,7 @@ impl Pipeline<'_> {
             &context.settings,
             Some(profile),
             |this, line| {
-                if let Err(error) = transcript.append(line) {
+                if let Err(error) = transcript.append(&agent.transcript_line(line)) {
                     transcript_error.get_or_insert(error);
                 }
                 let Some(event) = agent.parse(line) else {
@@ -802,13 +833,14 @@ impl Pipeline<'_> {
         let now = Timestamp::now();
         self.save(|thread| {
             let resume = thread.session_id.is_some();
-            let prompt = if resume {
-                CONTINUE_PROMPT.to_owned()
+            // A prompt sent again takes its images along.
+            let (prompt, images) = if resume {
+                (CONTINUE_PROMPT.to_owned(), Vec::new())
             } else {
                 thread
                     .turns
                     .last()
-                    .map(|turn| turn.prompt.clone())
+                    .map(|turn| (turn.prompt.clone(), turn.images.clone()))
                     .unwrap_or_default()
             };
             thread.turns.push(Turn {
@@ -820,6 +852,7 @@ impl Pipeline<'_> {
                 ended: None,
                 transcript: None,
                 result: None,
+                images,
             });
             thread.waiting_until = None;
             thread.state = State::Queued;

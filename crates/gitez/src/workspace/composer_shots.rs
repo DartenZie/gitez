@@ -179,6 +179,49 @@ fn screenshot_u2_composer() {
     }
 }
 
+/// The composer with two pasted screenshots, at the window's opening size
+/// and in a narrow one, and with a text-only prompt's notice.
+#[test]
+fn screenshot_composer_images() {
+    if !crate::screenshot::enabled() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let work_dir = repository(dir.path());
+    let data_dir = dir.path().join("data");
+    save_settings(
+        &data_dir,
+        &common_dir_of(&work_dir),
+        fake_agent(dir.path(), true),
+    );
+    let mut shots = Shots::from_env(&data_dir).expect("enabled");
+    for (name, size) in [
+        ("composer-images", crate::screenshot::window_size()),
+        ("composer-images-narrow", size(px(900.), px(700.))),
+    ] {
+        let (window, _) = shots.open_workspace_sized(&work_dir, size);
+        shots.keys(window, "cmd-shift-a");
+        shots.type_text(
+            window,
+            "The sidebar overlaps the graph at this width, see the screenshots.",
+        );
+        shots.paste_image(
+            window,
+            crate::screenshot::sample_image(1600, 1000, [95, 168, 245]),
+        );
+        shots.paste_image(
+            window,
+            crate::screenshot::sample_image(600, 1400, [232, 176, 75]),
+        );
+        shots.save(window, name);
+        if name == "composer-images" {
+            // The first thumbnail's tooltip.
+            shots.hover(window, point(px(291.), px(300.)));
+            shots.save(window, "composer-images-hover");
+        }
+    }
+}
+
 /// Where each picker of the open composer is, in window coordinates,
 /// from `U2_PICKERS` ("agent=327:325,…") or the places found on
 /// `u2-composer-filled`, where the secrets picker wraps to a second row.

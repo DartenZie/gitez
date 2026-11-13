@@ -196,6 +196,7 @@ fn start(
         },
         network: NetworkProfile::AgentOnly,
         secrets: Vec::new(),
+        images: Vec::new(),
     };
     let task = shots
         .update(|cx| AgentThreads::global(cx).update(cx, |model, cx| model.start(request, cx)));
@@ -775,6 +776,7 @@ fn screenshot_u5_thread_states() {
                 ended: None,
                 transcript: None,
                 result: Some(result("", false)),
+                images: Vec::new(),
             });
             thread.fail(
                 Step::Agent,

@@ -79,6 +79,16 @@ inside your repository, and runs in a [sandbox](#the-agent-sandbox).
   the sandbox's network profile and the secrets the thread gets. The thread
   starts from the branch's last commit; your uncommitted changes are not
   included. GitEZ returns at once and the agent works in the background.
+- **Images**: paste images (`⌘V`) or drop image files into the prompt or a
+  reply to show them to the agent, for example a screenshot of a bug. A
+  prompt takes up to five images, as PNG, JPEG, GIF or WebP; GitEZ converts
+  BMP and TIFF to PNG. It scales down an image whose long side is over
+  2,576 pixels or whose data is too large for the agent (about 3.9 MB) and
+  says so in the thumbnail's tooltip. An image can be the whole prompt. The
+  thread keeps the images it sent beside its record, shows them under the
+  prompt, and opens one in your image viewer when you click it. GitEZ
+  attaches an image only if the agent and model take images; Claude Code
+  takes them with every model.
 - Before the agent starts, GitEZ prepares the worktree: it copies the ignored
   files that `.worktreeinclude` lists from your working tree, clones
   `target/` and `node_modules/` copy-on-write where the file system can

@@ -273,6 +273,20 @@ impl Shots {
         }
     }
 
+    /// Puts the PNG `bytes` on the clipboard and presses `⌘V`, as pasting a
+    /// screenshot does.
+    pub fn paste_image(&mut self, window: AnyWindowHandle, bytes: Vec<u8>) {
+        self.cx.update(|cx| {
+            cx.write_to_clipboard(ClipboardItem {
+                entries: vec![ClipboardEntry::Image(Image::from_bytes(
+                    ImageFormat::Png,
+                    bytes,
+                ))],
+            })
+        });
+        self.keys(window, "cmd-v");
+    }
+
     /// Types `text` into the focused text field.
     pub fn type_text(&mut self, window: AnyWindowHandle, text: &str) {
         self.update_window(window, |window, cx| window.input(text, cx));
@@ -535,6 +549,30 @@ pub fn sample_repository(dir: &Path) {
     commit("README.md", "# Sample\n\nA sample!\n", "Fix a typo");
     git(dir, &["checkout", "-q", "main"]);
     std::fs::write(dir.join("notes.txt"), "draft\n").expect("write");
+}
+
+/// A PNG of `width` × `height` that reads as a screenshot: a dark window
+/// with a title bar, a sidebar and lines of text in `accent`.
+pub fn sample_image(width: u32, height: u32, accent: [u8; 3]) -> Vec<u8> {
+    let image = image::RgbImage::from_fn(width, height, |x, y| {
+        let bar = height / 12;
+        let sidebar = width / 4;
+        let line = height / 16;
+        if y < bar {
+            image::Rgb([38, 38, 43])
+        } else if x < sidebar {
+            image::Rgb([24, 24, 28])
+        } else if (y - bar) % line < line / 3 && x < width - (y % 5 + 2) * width / 14 {
+            image::Rgb(accent)
+        } else {
+            image::Rgb([236, 233, 226])
+        }
+    });
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image)
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .expect("the sample image encodes");
+    bytes.into_inner()
 }
 
 #[cfg(test)]

@@ -25,6 +25,7 @@ mod motion_shots;
 mod motion_tests;
 mod new_pull_request;
 mod palette;
+mod prompt_images;
 #[cfg(all(test, target_os = "macos"))]
 mod prs_shots;
 mod remote;
@@ -2106,8 +2107,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let title = gitez_agent_thread::title_from_prompt(&request.prompt);
+        let title = gitez_agent_thread::title_from_request(&request.prompt, request.images.len());
         let prompt = request.prompt.clone();
+        let images = request.images.clone();
         // Every slot taken: the thread waits in the queue, which the toast
         // says rather than "Started".
         let full = {
@@ -2136,7 +2138,10 @@ impl Workspace {
                     );
                     let composer = this.history.read(cx).composer().cloned();
                     if let Some(composer) = composer {
-                        composer.update(cx, |composer, cx| composer.set_prompt(prompt, window, cx));
+                        composer.update(cx, |composer, cx| {
+                            composer.set_prompt(prompt, window, cx);
+                            composer.restore_images(images, window, cx);
+                        });
                         this.history
                             .update(cx, |history, cx| history.open_composer(window, cx));
                     }

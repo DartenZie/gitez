@@ -171,6 +171,8 @@ pub struct StartRequest {
     pub start: gitez_agent_thread::Start,
     pub network: NetworkProfile,
     pub secrets: Vec<String>,
+    /// Sent with the prompt, made fit to send.
+    pub images: Vec<Arc<gitez_agent_thread::PreparedImage>>,
 }
 
 /// The repository open in the window, for Settings' "In this repository".
@@ -650,7 +652,7 @@ impl AgentThreads {
                 data_dir.context("GitEZ has no data folder to keep the thread's worktree in")?;
             let repository = gitez_git::Repository::open(&request.work_dir)?;
             let store = Store::new(&request.common_dir);
-            let thread = store.create(
+            let thread = store.create_with_images(
                 NewAgentThread {
                     prompt: request.prompt,
                     agent: request.agent,
@@ -659,6 +661,7 @@ impl AgentThreads {
                     network: request.network,
                     secrets: request.secrets,
                 },
+                &request.images,
                 &data_dir,
                 &request.repository_name,
                 |branch| {
@@ -698,13 +701,15 @@ impl AgentThreads {
         })
     }
 
-    /// Adds a reply or review turn (`request_turn`), then continues the
-    /// agent thread with `gitez supervise reply`.
+    /// Adds a reply or review turn (`request_turn`) with `images` (written
+    /// beside the thread first), then continues the agent thread with
+    /// `gitez supervise reply`.
     pub fn reply(
         &mut self,
         key: &AgentThreadKey,
         kind: TurnKind,
         prompt: String,
+        images: Vec<Arc<gitez_agent_thread::PreparedImage>>,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<()>> {
         let launcher = self.launcher();
@@ -712,10 +717,19 @@ impl AgentThreads {
         let key = key.clone();
         cx.background_executor().spawn(async move {
             let store = Store::new(&key.common_dir);
-            let thread = store.update(&key.id, |thread| {
-                thread.request_turn(kind, prompt, Timestamp::now())?;
+            let now = Timestamp::now();
+            let listed = store.add_images(&key.id, &images, now)?;
+            let requested = store.update(&key.id, |thread| {
+                thread.request_turn_with_images(kind, prompt, listed.clone(), now)?;
                 Ok(thread.clone())
-            })?;
+            });
+            let thread = match requested {
+                Ok(thread) => thread,
+                Err(error) => {
+                    store.remove_images(&key.id, &listed);
+                    return Err(error.into());
+                }
+            };
             changes.unbounded_send(vec![thread_file(&key)]).ok();
             launcher.launch(&store, Command::Reply, &key, &thread)
         })
@@ -1991,6 +2005,7 @@ mod tests {
                 ended: None,
                 transcript: None,
                 result: None::<TurnResult>,
+                images: Vec::new(),
             }],
             activity: None,
             waiting_until: None,

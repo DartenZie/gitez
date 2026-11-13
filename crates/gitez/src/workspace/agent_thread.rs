@@ -6,12 +6,12 @@
 pub mod activity;
 pub mod complete;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use gitez_agent::{AgentEvent, BlockedHosts, Registry};
-use gitez_agent_thread::{AgentThread, Ending, State, Store, Timestamp, TurnKind};
+use gitez_agent_thread::{AgentThread, Ending, State, Store, Timestamp, TurnImage, TurnKind};
 use gitez_git::{DiffOptions, Oid};
 use gitez_sandbox::NetworkProfile;
 use gpui_kit::assets::IconName;
@@ -24,6 +24,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::labels;
+use super::prompt_images::{self, Accepts, PromptImages};
 use crate::agent_threads::{AgentThreadKey, AgentThreads, AgentThreadsEvent};
 use crate::motion;
 use crate::theme::{self, color};
@@ -61,6 +62,14 @@ enum Busy {
     Retrying,
 }
 
+/// The thumbnail of an image a turn sent, by its file name.
+enum TurnThumbnail {
+    Loading,
+    Ready(Arc<RenderImage>),
+    /// The file could not be read, with why.
+    Failed(SharedString),
+}
+
 /// The transcript of one turn, as read so far.
 #[derive(Default)]
 struct RunEvents {
@@ -96,6 +105,11 @@ pub struct ThreadView {
     wide: bool,
     model: Entity<AgentThreads>,
     reply: Entity<TextareaState>,
+    /// Images pasted or dropped into the reply box.
+    reply_images: Entity<PromptImages>,
+    /// Thumbnails of the images the turns sent, read in the background.
+    thumbnails: HashMap<String, TurnThumbnail>,
+    _thumbnails_task: Option<Task<()>>,
     /// The network profile picked for a retry; the thread's own by default.
     retry_network: Option<NetworkProfile>,
     /// Whether the list of blocked hosts is shown; see
@@ -146,7 +160,9 @@ impl ThreadView {
                 .auto_grow(2, 10)
                 .placeholder("Reply to continue this thread")
         });
+        let reply_images = cx.new(|_| PromptImages::new("reply"));
         let subscriptions = vec![
+            cx.observe(&reply_images, |_, _, cx| cx.notify()),
             cx.observe(&model, |this, _, cx| this.thread_changed(cx)),
             cx.subscribe(&model, |this, _, event, cx| {
                 if let AgentThreadsEvent::Transcript(key) = event
@@ -168,6 +184,9 @@ impl ThreadView {
             wide,
             model,
             reply,
+            reply_images,
+            thumbnails: HashMap::new(),
+            _thumbnails_task: None,
             retry_network: None,
             blocked_open: None,
             activity_open: None,
@@ -210,6 +229,7 @@ impl ThreadView {
         };
         if self.seen != Some(thread.updated) {
             self.seen = Some(thread.updated);
+            self.read_thumbnails(&thread, cx);
             if self.activity_shown(&thread) {
                 self.read_transcripts(cx);
             }
@@ -222,6 +242,128 @@ impl ThreadView {
             }
         }
         cx.notify();
+    }
+
+    /// Makes thumbnails of the turns' images not read yet, in the
+    /// background: small copies only, never the images themselves.
+    fn read_thumbnails(&mut self, thread: &AgentThread, cx: &mut Context<Self>) {
+        if self._thumbnails_task.is_some() {
+            return;
+        }
+        let wanted: Vec<TurnImage> = thread
+            .turns
+            .iter()
+            .flat_map(|turn| &turn.images)
+            .filter(|image| !self.thumbnails.contains_key(&image.name))
+            .cloned()
+            .collect();
+        if wanted.is_empty() {
+            return;
+        }
+        for image in &wanted {
+            self.thumbnails
+                .insert(image.name.clone(), TurnThumbnail::Loading);
+        }
+        let store = Store::new(&self.key.common_dir);
+        let id = self.key.id.clone();
+        let read = cx.background_executor().spawn(async move {
+            wanted
+                .into_iter()
+                .map(|image| {
+                    let thumbnail = store
+                        .read_image(&id, &image)
+                        .map_err(|error| format!("{:#}", anyhow::Error::from(error)))
+                        .and_then(|bytes| {
+                            gitez_agent_thread::thumbnail(&bytes, prompt_images::THUMBNAIL_PIXELS)
+                                .map_err(|error| error.to_string())
+                        });
+                    (image.name, thumbnail)
+                })
+                .collect::<Vec<_>>()
+        });
+        self._thumbnails_task = Some(cx.spawn(async move |this, cx| {
+            let read = read.await;
+            this.update(cx, |this, cx| {
+                this._thumbnails_task = None;
+                for (name, thumbnail) in read {
+                    this.thumbnails.insert(
+                        name,
+                        match thumbnail {
+                            Ok(thumbnail) => {
+                                TurnThumbnail::Ready(prompt_images::render_image(thumbnail))
+                            }
+                            Err(why) => TurnThumbnail::Failed(why.into()),
+                        },
+                    );
+                }
+                // Images of turns added meanwhile.
+                if let Some(thread) = this.thread(cx) {
+                    this.read_thumbnails(&thread, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// The thumbnails of `images`, which a turn sent: a click opens the
+    /// image in the system's viewer.
+    fn render_turn_images(&self, turn: usize, images: &[TurnImage]) -> Option<Div> {
+        if images.is_empty() {
+            return None;
+        }
+        let store = Store::new(&self.key.common_dir);
+        let tiles = images.iter().enumerate().map(|(index, image)| {
+            let (thumbnail, mut tooltip) = match self.thumbnails.get(&image.name) {
+                Some(TurnThumbnail::Ready(thumbnail)) => (Some(thumbnail.clone()), None),
+                Some(TurnThumbnail::Failed(why)) => (None, Some(why.to_string())),
+                _ => (None, None),
+            };
+            let failed = tooltip.is_some();
+            let described = format!(
+                "{} · {} × {} · {}",
+                image.media_type.label(),
+                image.width,
+                image.height,
+                gitez_agent_thread::size_text(image.size)
+            );
+            let tooltip: SharedString = tooltip
+                .take()
+                .unwrap_or_else(|| format!("{described} · click to open"))
+                .into();
+            let path = store.image_path(&self.key.id, image).ok();
+            let id = ElementId::Name(format!("turn-{turn}-image-{index}").into());
+            prompt_images::image_tile(id, thumbnail, tooltip, None)
+                .when(failed, |this| {
+                    this.child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                Icon::new(IconName::TriangleAlert)
+                                    .size(px(14.))
+                                    .text_color(rgb(color::WARNING_TEXT)),
+                            ),
+                    )
+                })
+                .when_some(path.filter(|_| !failed), |this, path| {
+                    this.cursor_pointer()
+                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                            cx.open_with_system(&path)
+                        })
+                })
+        });
+        Some(
+            div()
+                .debug_selector(move || format!("turn-{turn}-images"))
+                .h_flex()
+                .flex_wrap()
+                .gap(px(8.))
+                .children(tiles),
+        )
     }
 
     fn activity_shown(&self, thread: &AgentThread) -> bool {
@@ -497,15 +639,43 @@ impl ThreadView {
         );
     }
 
+    /// Whether the thread's agent and model take images, as the agent
+    /// says.
+    fn accepts_images(&self, thread: &AgentThread, cx: &App) -> Accepts {
+        let model = self.model.read(cx);
+        let agent = model.agents().get(&thread.agent);
+        let alias = thread
+            .model
+            .clone()
+            .or_else(|| model.settings().agent(&thread.agent).model)
+            .unwrap_or_default();
+        prompt_images::accepts(agent.as_deref(), Some(&alias))
+    }
+
+    /// Why the reply cannot be sent now, if not for its being empty.
+    fn reply_blocked(&self, thread: &AgentThread, cx: &App) -> Option<SharedString> {
+        let images = self.reply_images.read(cx);
+        if images.is_empty() {
+            return None;
+        }
+        if images.preparing() {
+            return Some("Preparing the images…".into());
+        }
+        self.accepts_images(thread, cx)
+            .err()
+            .map(|why| format!("{why} Remove the images to send the reply.").into())
+    }
+
     fn send_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(thread) = self.thread(cx) else {
             return;
         };
-        if !can_reply(&thread) {
+        if !can_reply(&thread) || self.reply_blocked(&thread, cx).is_some() {
             return;
         }
         let text = self.reply.read(cx).value().trim().to_owned();
-        if text.is_empty() {
+        let images = self.reply_images.read(cx).ready();
+        if text.is_empty() && images.is_empty() {
             return;
         }
         self.activity_open = None;
@@ -513,10 +683,12 @@ impl ThreadView {
             Busy::Replying,
             window,
             cx,
-            move |model, key, cx| model.reply(key, TurnKind::Reply, text, cx),
+            move |model, key, cx| model.reply(key, TurnKind::Reply, text, images, cx),
             |this, window, cx| {
                 this.reply
                     .update(cx, |reply, cx| reply.set_value("", window, cx));
+                this.reply_images
+                    .update(cx, |images, cx| images.clear(window, cx));
             },
         );
     }
@@ -1026,10 +1198,13 @@ fn who(avatar: impl IntoElement, name: impl Into<SharedString>, what: &'static s
         .child(div().text_color(rgb(color::TEXT_MUTED)).child(what))
 }
 
-/// A message the user sent, in a bubble.
-fn bubble(text: String, indent: bool) -> Div {
+/// A message the user sent, in a bubble: its images, then its text.
+fn bubble(text: String, images: Option<Div>, indent: bool) -> Div {
+    let has_text = !text.trim().is_empty();
     div()
         .when(indent, |this| this.ml(px(28.)))
+        .v_flex()
+        .gap(px(8.))
         .px(px(14.))
         .py(px(10.))
         .bg(rgb(color::PANEL))
@@ -1038,7 +1213,8 @@ fn bubble(text: String, indent: bool) -> Div {
         .rounded(px(8.))
         .text_size(px(13.))
         .line_height(relative(1.6))
-        .child(text)
+        .children(images.map(|images| images.py(px(2.))))
+        .when(has_text, |this| this.child(text))
 }
 
 impl ThreadView {
@@ -1553,7 +1729,9 @@ impl ThreadView {
     }
 
     fn render_prompt(&self, thread: &AgentThread) -> Option<Div> {
-        let prompt = thread.turns.first()?.prompt.clone();
+        let first = thread.turns.first()?;
+        let prompt = first.prompt.clone();
+        let images = self.render_turn_images(0, &first.images);
         let name = self
             .details
             .user_name
@@ -1568,7 +1746,7 @@ impl ThreadView {
                     name,
                     "Prompt",
                 ))
-                .child(bubble(prompt, true)),
+                .child(bubble(prompt, images, true)),
         )
     }
 
@@ -1836,8 +2014,12 @@ impl ThreadView {
                     cx.notify();
                 }))
                 .into_any_element(),
-            Row::Prompt { kind, text } => {
+            Row::Prompt { kind, text, turn } => {
                 let name = user.unwrap_or("You").to_owned();
+                let images = self.thread(cx).and_then(|thread| {
+                    let images = thread.turns.get(turn)?.images.clone();
+                    self.render_turn_images(turn, &images)
+                });
                 let what = match kind {
                     TurnKind::Review => "Review comments",
                     _ => "Reply",
@@ -1852,7 +2034,7 @@ impl ThreadView {
                         name,
                         what,
                     ))
-                    .child(bubble(text.to_owned(), false))
+                    .child(bubble(text.to_owned(), images, false))
                     .into_any_element()
             }
             Row::Continued(kind) => div()
@@ -2224,7 +2406,12 @@ impl ThreadView {
             return None;
         }
         let busy = self.busy.as_ref().map(|(busy, _)| *busy);
-        let empty = self.reply.read(cx).value().trim().is_empty();
+        let empty =
+            self.reply.read(cx).value().trim().is_empty() && self.reply_images.read(cx).is_empty();
+        let blocked = self.reply_blocked(thread, cx);
+        let accepts = self.accepts_images(thread, cx);
+        let dropped = self.reply_images.downgrade();
+        let accepts_drop = accepts.clone();
         let (continues, highlight) = match thread.pull_request {
             Some(number) => {
                 let prefix = "Continues on ";
@@ -2272,11 +2459,26 @@ impl ThreadView {
                                 .text_color(rgb(color::TEXT_SECONDARY))
                                 .child("Reply"),
                         )
+                        .on_drop(move |paths: &ExternalPaths, window, cx| {
+                            dropped
+                                .update(cx, |images, cx| {
+                                    images.drop_paths(paths.paths(), &accepts_drop, window, cx)
+                                })
+                                .ok();
+                        })
                         .child(
                             Textarea::new(&self.reply)
                                 .appearance(false)
-                                .disabled(busy.is_some()),
+                                .disabled(busy.is_some())
+                                .on_paste(super::composer::paste_into(&self.reply_images, accepts)),
                         )
+                        .children(self.reply_images.update(cx, |images, cx| images.render(cx)))
+                        .children(blocked.clone().map(|why| {
+                            div()
+                                .text_size(px(11.5))
+                                .text_color(rgb(color::WARNING_TEXT))
+                                .child(why)
+                        }))
                         .child(
                             div().h_flex().gap(px(10.)).child(continues).child(
                                 Button::new("thread-send")
@@ -2295,7 +2497,7 @@ impl ThreadView {
                                             .child(on_accent(labels::key_cap("↵", cx))),
                                     )
                                     .loading(busy == Some(Busy::Replying))
-                                    .disabled(empty || busy.is_some())
+                                    .disabled(empty || blocked.is_some() || busy.is_some())
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.send_reply(window, cx)
                                     })),
@@ -2526,6 +2728,7 @@ mod tests {
                     resume: false,
                     model: None,
                     network: NetworkProfile::AgentOnly,
+                    images: Vec::new(),
                 },
             )
             .expect("run");
@@ -3022,6 +3225,97 @@ mod tests {
         });
     }
 
+    /// A thread whose first prompt and reply sent screenshots, and an image
+    /// pasted into the reply box.
+    #[test]
+    fn screenshot_thread_images() {
+        if !crate::screenshot::enabled() {
+            return;
+        }
+        let lines = transcript(STEPS);
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let (dir, common_dir, id) = repository_with(PROMPT, &lines, |thread| {
+            thread.state = State::Finished;
+            thread.ending = Some(Ending::Answer);
+            thread.session_id = Some("session".into());
+            let turn = &mut thread.turns[0];
+            turn.started = Some(minutes_ago(30));
+            turn.ended = Some(minutes_ago(27));
+            turn.result = Some(result(ANSWER, true));
+        });
+        let store = Store::new(&common_dir);
+        let add = |images: &[Vec<u8>]| {
+            let prepared: Vec<_> = images
+                .iter()
+                .map(|bytes| gitez_agent_thread::prepare_image(bytes).expect("prepared"))
+                .collect();
+            store
+                .add_images(&id, &prepared, minutes_ago(30))
+                .expect("images added")
+        };
+        let first = add(&[
+            crate::screenshot::sample_image(1600, 1000, [95, 168, 245]),
+            crate::screenshot::sample_image(600, 1400, [232, 176, 75]),
+        ]);
+        let second = add(&[crate::screenshot::sample_image(1200, 800, [79, 198, 176])]);
+        store
+            .update(&id, |thread| {
+                thread.turns[0].images = first;
+                thread.request_turn_with_images(
+                    TurnKind::Reply,
+                    "The blame column is cut off here.".into(),
+                    second,
+                    minutes_ago(20),
+                )?;
+                let turn = &mut thread.turns[1];
+                turn.started = Some(minutes_ago(20));
+                turn.ended = Some(minutes_ago(18));
+                turn.result = Some(result("Widened the column; it fits now.", true));
+                thread.state = State::Finished;
+                thread.ending = Some(Ending::Answer);
+                Ok(())
+            })
+            .expect("update");
+        let work_dir = dir.path().join("repo");
+        let thread = store.load(&id).expect("the thread is read");
+        gitez_agent_thread::create_worktree(
+            &work_dir,
+            &thread.worktree,
+            &thread.branch,
+            &thread.start.commit,
+        )
+        .expect("worktree");
+        let mut shots =
+            crate::screenshot::Shots::from_env(&dir.path().join("data")).expect("enabled");
+        let (window, _) = shots.open_workspace(&work_dir);
+        shots.dispatch(
+            window,
+            crate::agent_threads::OpenAgentThread {
+                common_dir: common_dir.clone(),
+                id: id.clone(),
+            },
+        );
+        shots.save_region(window, panel(), "thread-images-panel");
+        // The reply's text, then the activity with the reply's image.
+        shots.click(window, gpui_kit::point(px(1200.), px(781.)));
+        shots.paste_image(
+            window,
+            crate::screenshot::sample_image(900, 900, [192, 140, 240]),
+        );
+        shots.save_region(window, panel(), "thread-images-reply-panel");
+        shots.click(window, gpui_kit::point(px(1200.), px(535.)));
+        shots.save_region(window, panel(), "thread-images-activity-panel");
+        // The wide layout of Home.
+        let key = AgentThreadKey { common_dir, id };
+        let (wide, _) = shots.open(crate::screenshot::window_size(), |window, cx| {
+            gpui_kit::AppContext::new(cx, |cx| ThreadView::new(key, true, window, cx))
+        });
+        shots.save(wide, "thread-images-wide");
+        shots.click(wide, gpui_kit::point(px(720.), px(455.)));
+        shots.scroll(wide, gpui_kit::point(px(720.), px(500.)), 40.);
+        shots.save(wide, "thread-images-wide-activity");
+    }
+
     #[test]
     fn screenshot_thread_answer() {
         shoot("answer", false, |thread| {
@@ -3154,6 +3448,149 @@ mod tests {
                 eprintln!("activity {steps} steps ({rows} rows), {name}: {each:?} a frame");
             }
         }
+    }
+
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let pixels = image::RgbImage::from_pixel(width, height, image::Rgb([200, 90, 40]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(pixels)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .expect("encode");
+        bytes.into_inner()
+    }
+
+    /// [`open`], in gpui-kit's Root as in the app: a failed reply shows a
+    /// notice, which needs it.
+    fn open_in_root(
+        dir: &Path,
+        key: AgentThreadKey,
+        cx: &mut TestAppContext,
+    ) -> (Entity<ThreadView>, VisualTestContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+            init_with(
+                Options {
+                    data_dir: Some(dir.join("data")),
+                    sandbox: Arc::new(gitez_sandbox::Passthrough),
+                    agents: gitez_agent::Registry::builtin(),
+                    secrets: Arc::new(gitez_secret::Memory::default()),
+                    exe: Err("no supervisor in tests".into()),
+                    watch: false,
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let options = gpui_kit::WindowOptions {
+            window_bounds: Some(gpui_kit::WindowBounds::Windowed(gpui_kit::Bounds {
+                origin: gpui_kit::point(px(0.), px(0.)),
+                size: size(px(400.), px(900.)),
+            })),
+            ..gpui_kit::WindowOptions::default()
+        };
+        let (window, view) = cx
+            .update(|cx| {
+                gpui_kit::open_window(options, cx, |window, cx| {
+                    gpui_kit::AppContext::new(cx, |cx| ThreadView::new(key, false, window, cx))
+                })
+            })
+            .expect("window open");
+        let cx = VisualTestContext::from_window(window, cx);
+        cx.run_until_parked();
+        (view, cx)
+    }
+
+    /// The images a turn sent are shown as thumbnails under its prompt,
+    /// read in the background from the thread's folder.
+    #[gpui_kit::test]
+    fn a_turn_shows_the_images_it_sent(cx: &mut TestAppContext) {
+        let (dir, common_dir, id) = repository_with_thread(|thread| {
+            thread.state = State::Finished;
+            thread.ending = Some(Ending::Answer);
+            thread.session_id = Some("session".into());
+            thread.turns[0].result = Some(result("A red square.", true));
+        });
+        let store = Store::new(&common_dir);
+        let prepared = gitez_agent_thread::prepare_image(&png(300, 200)).expect("prepared");
+        let listed = store
+            .add_images(&id, &[prepared], Timestamp::now())
+            .expect("images added");
+        store
+            .update(&id, |thread| {
+                thread.turns[0].images = listed.clone();
+                Ok(())
+            })
+            .expect("update");
+        let key = AgentThreadKey { common_dir, id };
+        let (view, mut cx) = open(dir.path(), key, cx);
+        assert!(cx.debug_bounds("turn-0-images").is_some());
+        view.read_with(&cx, |view, _| {
+            assert!(matches!(
+                view.thumbnails.get(&listed[0].name),
+                Some(super::TurnThumbnail::Ready(_))
+            ));
+        });
+    }
+
+    /// An image pasted into the reply box is attached, not typed; Send
+    /// records the reply with it, and with no text.
+    #[gpui_kit::test]
+    fn a_pasted_image_is_sent_with_the_reply(cx: &mut TestAppContext) {
+        let (dir, common_dir, id) = repository_with_thread(|thread| {
+            thread.state = State::Finished;
+            thread.ending = Some(Ending::Answer);
+            thread.session_id = Some("session".into());
+            thread.turns[0].result = Some(result("Done.", true));
+        });
+        let key = AgentThreadKey {
+            common_dir: common_dir.clone(),
+            id: id.clone(),
+        };
+        let (view, mut cx) = open_in_root(dir.path(), key, cx);
+        let bytes = png(40, 30);
+        cx.write_to_clipboard(gpui_kit::ClipboardItem {
+            entries: vec![gpui_kit::ClipboardEntry::Image(
+                gpui_kit::Image::from_bytes(gpui_kit::ImageFormat::Png, bytes.clone()),
+            )],
+        });
+        view.update_in(&mut cx, |view, window, cx| {
+            view.reply.update(cx, |reply, cx| reply.focus(window, cx));
+        });
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-v"
+        } else {
+            "ctrl-v"
+        });
+        cx.run_until_parked();
+        view.read_with(&cx, |view, cx| {
+            assert_eq!(view.reply_images.read(cx).len(), 1);
+            assert!(view.reply.read(cx).value().is_empty());
+            let thread = view.thread(cx).expect("the thread is read");
+            assert_eq!(view.reply_blocked(&thread, cx), None);
+        });
+        assert!(cx.debug_bounds("reply-images").is_some());
+        view.update_in(&mut cx, |view, window, cx| view.send_reply(window, cx));
+        cx.run_until_parked();
+        // Tests have no supervisor to launch: the reply is recorded, then
+        // fails at that step.
+        let thread = Store::new(&common_dir).load(&id).expect("load");
+        let [_, reply] = &thread.turns[..] else {
+            panic!("two turns, got {}", thread.turns.len());
+        };
+        assert_eq!(reply.kind, TurnKind::Reply);
+        assert_eq!(reply.prompt, "");
+        let [image] = &reply.images[..] else {
+            panic!("one image, got {}", reply.images.len());
+        };
+        assert_eq!(image.media_type, gitez_agent_thread::ImageType::Png);
+        assert_eq!((image.width, image.height), (40, 30));
+        assert_eq!(
+            Store::new(&common_dir)
+                .read_image(&id, image)
+                .expect("the image is kept"),
+            bytes
+        );
     }
 
     #[test]

@@ -55,6 +55,11 @@ reflink-copy = "0.1.32"
 rustix = { version = "1.1.6", features = ["process"] }
 # SIGTERM to the supervisor ends the agent's turn cleanly.
 signal-hook = "0.4.6"
+# Images given to an agent: base64 in Claude Code's stream-JSON input, and
+# decoding, downscaling and converting pasted images. Both are already built
+# for GPUI; `image` with the formats GitEZ reads (GPUI enables more).
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
 # Claude Code session ids.
 uuid = { version = "1.29.2", features = ["v4"] }
 

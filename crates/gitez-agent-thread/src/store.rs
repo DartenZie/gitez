@@ -6,8 +6,10 @@
 //!   add-a-blame-view/thread.json                       the agent thread
 //!   add-a-blame-view/thread.json.lock                  only while it is saved
 //!   add-a-blame-view/runs/2026-11-13T09-41-31Z.jsonl   one turn's transcript
+//!   add-a-blame-view/images/2026-11-13T09-41-31Z-1.png an image sent with a turn
 //! ```
 
+use std::borrow::Borrow;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead as _, BufReader, ErrorKind, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
@@ -18,11 +20,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::lock::Lock;
 use crate::model::{AgentThread, AgentThreadId, NewAgentThread, State, Turn, TurnKind};
-use crate::{Error, Result, VERSION, slug, title_from_prompt, worktree_path};
+use crate::{
+    Error, MAX_INPUT_BYTES, PreparedImage, Result, TurnImage, VERSION, slug, title_from_request,
+    worktree_path,
+};
 
 const THREAD_FILE: &str = "thread.json";
 const LOCK_FILE: &str = "thread.json.lock";
 const RUNS_DIR: &str = "runs";
+const IMAGES_DIR: &str = "images";
+/// The longest image file name GitEZ makes and reads.
+const MAX_IMAGE_NAME: usize = 64;
 /// How many ids `create` tries (`<slug>`, `<slug>-2`, …) before giving up.
 const MAX_ID_ATTEMPTS: u32 = 1000;
 
@@ -43,6 +51,9 @@ pub struct RunHeader {
     pub resume: bool,
     pub model: Option<String>,
     pub network: NetworkProfile,
+    /// The names of the images sent with the prompt (never their data).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
 }
 
 /// A transcript being written.
@@ -169,9 +180,26 @@ impl Store {
         taken: impl Fn(&str) -> bool,
         at: Timestamp,
     ) -> Result<AgentThread> {
+        let images: &[PreparedImage] = &[];
+        self.create_with_images(new, images, data_dir, repository_name, taken, at)
+    }
+
+    /// [`create`](Self::create), with `images` sent with the first prompt:
+    /// written to the thread's `images/` before its `thread.json`, and
+    /// listed in its Start turn. A prompt with no words but images gets the
+    /// title of [`title_from_request`].
+    pub fn create_with_images(
+        &self,
+        new: NewAgentThread,
+        images: &[impl Borrow<PreparedImage>],
+        data_dir: &Path,
+        repository_name: &str,
+        taken: impl Fn(&str) -> bool,
+        at: Timestamp,
+    ) -> Result<AgentThread> {
         fs::create_dir_all(&self.dir).map_err(Error::io(&self.dir))?;
         let common_dir = self.common_dir();
-        let title = title_from_prompt(&new.prompt);
+        let title = title_from_request(&new.prompt, images.len());
         let base = slug(&title);
         let mut attempt = 1u32;
         let (id, worktree) = loop {
@@ -200,6 +228,17 @@ impl Store {
                 Err(error) => return Err(Error::io(dir)(error)),
             }
         };
+        let turn_images = match self.write_images(&id, images, at) {
+            Ok(written) => written,
+            Err(error) => {
+                // The folder claimed the id; with no thread.json it is not a
+                // thread, and the id is free again.
+                fs::remove_dir_all(self.thread_dir(&id)).ok();
+                return Err(error);
+            }
+        };
+        let mut first = Turn::first(new.prompt, at);
+        first.images = turn_images;
         let thread = AgentThread {
             branch: id.branch(),
             id,
@@ -217,7 +256,7 @@ impl Store {
             secrets: new.secrets,
             session_id: None,
             pull_request: None,
-            turns: vec![Turn::first(new.prompt, at)],
+            turns: vec![first],
             activity: None,
             waiting_until: None,
             error: None,
@@ -284,6 +323,118 @@ impl Store {
         })?;
         text.push('\n');
         lock.write_and_commit(&text, &path)
+    }
+
+    /// Writes `images` to the thread's `images/` folder, as files named
+    /// `<UTC time>-<n>.<extension>` made exclusively, and returns them as
+    /// a turn lists them, in order. On an error, what was written is
+    /// removed. The thread must exist.
+    pub fn add_images(
+        &self,
+        id: &AgentThreadId,
+        images: &[impl Borrow<PreparedImage>],
+        at: Timestamp,
+    ) -> Result<Vec<TurnImage>> {
+        if !self.thread_dir(id).join(THREAD_FILE).is_file() {
+            return Err(Error::NotFound(id.clone()));
+        }
+        self.write_images(id, images, at)
+    }
+
+    fn write_images(
+        &self,
+        id: &AgentThreadId,
+        images: &[impl Borrow<PreparedImage>],
+        at: Timestamp,
+    ) -> Result<Vec<TurnImage>> {
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dir = self.thread_dir(id).join(IMAGES_DIR);
+        fs::create_dir_all(&dir).map_err(Error::io(&dir))?;
+        let stem = at.strftime("%Y-%m-%dT%H-%M-%SZ").to_string();
+        let mut written: Vec<TurnImage> = Vec::with_capacity(images.len());
+        let mut number = 1_u32;
+        for image in images {
+            let image: &PreparedImage = image.borrow();
+            let result = loop {
+                let name = format!("{stem}-{number}.{}", image.media_type.extension());
+                number += 1;
+                let path = dir.join(&name);
+                match OpenOptions::new().write(true).create_new(true).open(&path) {
+                    Ok(mut file) => {
+                        break file
+                            .write_all(&image.bytes)
+                            .and_then(|()| file.sync_all())
+                            .map(|()| TurnImage {
+                                name,
+                                media_type: image.media_type,
+                                size: image.bytes.len() as u64,
+                                width: image.width,
+                                height: image.height,
+                            })
+                            .map_err(|error| {
+                                fs::remove_file(&path).ok();
+                                Error::io(path)(error)
+                            });
+                    }
+                    Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                    Err(error) => break Err(Error::io(path)(error)),
+                }
+            };
+            match result {
+                Ok(image) => written.push(image),
+                Err(error) => {
+                    self.remove_images(id, &written);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(written)
+    }
+
+    /// Removes the files of `images`, as after a turn that could not be
+    /// asked for; best effort.
+    pub fn remove_images(&self, id: &AgentThreadId, images: &[TurnImage]) {
+        for image in images {
+            if let Ok(path) = self.image_path(id, image) {
+                fs::remove_file(path).ok();
+            }
+        }
+    }
+
+    /// Where the file of `image` is: `images/<name>` in the thread's
+    /// folder. Refuses ([`Error::Refused`]) a name GitEZ would not make,
+    /// so a changed `thread.json` cannot point outside the folder.
+    pub fn image_path(&self, id: &AgentThreadId, image: &TurnImage) -> Result<PathBuf> {
+        let name = &image.name;
+        let valid = !name.is_empty()
+            && name.len() <= MAX_IMAGE_NAME
+            && !name.starts_with('.')
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'));
+        if !valid {
+            return Err(Error::refused(format!(
+                "{name} is not an image GitEZ made."
+            )));
+        }
+        Ok(self.thread_dir(id).join(IMAGES_DIR).join(name))
+    }
+
+    /// The bytes of `image`. Refuses a file that is a symbolic link, is
+    /// larger than any image GitEZ writes, or is not the size the turn
+    /// lists.
+    pub fn read_image(&self, id: &AgentThreadId, image: &TurnImage) -> Result<Vec<u8>> {
+        let path = self.image_path(id, image)?;
+        let metadata = fs::symlink_metadata(&path).map_err(Error::io(&path))?;
+        if !metadata.is_file() || metadata.len() > MAX_INPUT_BYTES || metadata.len() != image.size {
+            return Err(Error::refused(format!(
+                "The image {} is not as GitEZ saved it.",
+                image.name
+            )));
+        }
+        fs::read(&path).map_err(Error::io(path))
     }
 
     /// Starts `runs/<UTC time>.jsonl` with a header line. Returns the run;

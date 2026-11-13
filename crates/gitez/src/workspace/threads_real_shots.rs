@@ -142,6 +142,11 @@ impl Real {
     /// Starts a thread on `prompt` with the composer under "Uncommitted
     /// changes", with haiku picked, and returns it once it is created.
     fn ask(&mut self, prompt: &str) -> AgentThreadKey {
+        self.ask_with_images(prompt, Vec::new())
+    }
+
+    /// [`Real::ask`], with the PNGs `images` pasted into the prompt.
+    fn ask_with_images(&mut self, prompt: &str, images: Vec<Vec<u8>>) -> AgentThreadKey {
         let before: Vec<_> = self
             .threads()
             .iter()
@@ -149,7 +154,27 @@ impl Real {
             .collect();
         self.shots.keys(self.window, "cmd-shift-a");
         self.shots.type_text(self.window, prompt);
+        let count = images.len();
+        for image in images {
+            self.shots.paste_image(self.window, image);
+        }
+        self.shots.settle();
         let workspace = self.workspace.clone();
+        let attached = self.shots.update(|cx| {
+            workspace
+                .read(cx)
+                .history
+                .read(cx)
+                .composer()
+                .map(|composer| {
+                    let images = composer.read(cx).images().read(cx);
+                    (images.len(), images.preparing())
+                })
+        });
+        assert_eq!(attached, Some((count, false)), "the images are ready");
+        if count > 0 {
+            self.save("final-image-0-composer");
+        }
         let model = self.shots.update(|cx| {
             workspace
                 .read(cx)
@@ -710,4 +735,149 @@ fn e2e_final_agent_names_the_pull_request() {
         real.save(&format!("final-title-{}-pull-request", index + 1));
     }
     assert!(problems.is_empty(), "{problems:#?}");
+}
+
+/// Digits of a 5 × 7 bitmap font, a row of five bits a line.
+const DIGITS: [[u8; 7]; 10] = [
+    [0x0e, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0e],
+    [0x04, 0x0c, 0x04, 0x04, 0x04, 0x04, 0x0e],
+    [0x0e, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1f],
+    [0x1f, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0e],
+    [0x02, 0x06, 0x0a, 0x12, 0x1f, 0x02, 0x02],
+    [0x1f, 0x10, 0x1e, 0x01, 0x01, 0x11, 0x0e],
+    [0x06, 0x08, 0x10, 0x1e, 0x11, 0x11, 0x0e],
+    [0x1f, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08],
+    [0x0e, 0x11, 0x11, 0x0e, 0x11, 0x11, 0x0e],
+    [0x0e, 0x11, 0x11, 0x0f, 0x01, 0x02, 0x0c],
+];
+
+/// A PNG of `number` drawn large, dark on light, that only a model which
+/// sees the image can read.
+fn number_image(number: u32) -> Vec<u8> {
+    const SCALE: u32 = 24;
+    let digits: Vec<usize> = number
+        .to_string()
+        .bytes()
+        .map(|digit| usize::from(digit - b'0'))
+        .collect();
+    let margin = 2 * SCALE;
+    let width = margin * 2 + digits.len() as u32 * 6 * SCALE;
+    let height = margin * 2 + 7 * SCALE;
+    let image = image::RgbImage::from_fn(width, height, |x, y| {
+        let ink = (|| {
+            let x = x.checked_sub(margin)? / SCALE;
+            let y = y.checked_sub(margin)? / SCALE;
+            let digit = digits.get((x / 6) as usize)?;
+            let column = x % 6;
+            let row = DIGITS[*digit].get(y as usize)?;
+            Some(column < 5 && row & (0x10 >> column) != 0)
+        })()
+        .unwrap_or(false);
+        if ink {
+            image::Rgb([20, 20, 24])
+        } else {
+            image::Rgb([245, 243, 236])
+        }
+    });
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image)
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .expect("encode");
+    bytes.into_inner()
+}
+
+/// A five-digit number nobody can guess: from the clock and the process.
+fn unguessable_number(salt: u32) -> u32 {
+    use std::hash::{BuildHasher as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after 1970")
+            .as_nanos(),
+    );
+    hasher.write_u32(std::process::id());
+    hasher.write_u32(salt);
+    10_000 + (hasher.finish() % 90_000) as u32
+}
+
+/// Images: a pasted image reaches the model, on the first turn and in a
+/// reply (`--resume`). Each shows a random number only a model that sees
+/// it can read; neither the thread's transcripts nor GitEZ's data folder
+/// keep the image's data, only the thread's `images` folder.
+#[test]
+fn e2e_final_image_prompt_and_reply() {
+    if !wanted() {
+        return;
+    }
+    let mut real = real("final-image", 3, |_| Vec::new(), None);
+    let started = Instant::now();
+    let first = unguessable_number(1);
+    let second = unguessable_number(2);
+    std::fs::write(real.data_dir.join("first.png"), number_image(first)).expect("write");
+    std::fs::write(real.data_dir.join("second.png"), number_image(second)).expect("write");
+    let key = real.ask_with_images(
+        "What number is written in the attached image? Answer with its digits only. \
+         Do not change, create or commit any file.",
+        vec![number_image(first)],
+    );
+    let done = real.finished(&key, "the first answer");
+    report("image", started, &done);
+    let answer = last_message(&done);
+    eprintln!("IMAGE first number {first}, answer {answer:?}");
+    assert_eq!(done.ending, Some(Ending::Answer), "{done:#?}");
+    assert_eq!(done.turns[0].images.len(), 1, "{done:#?}");
+    real.open(&key);
+    real.save("final-image-1-answer");
+    // The reply box, at the bottom of the detail panel.
+    real.shots.click(
+        real.window,
+        gpui_kit::point(gpui_kit::px(1200.), gpui_kit::px(781.)),
+    );
+    real.shots.type_text(
+        real.window,
+        "And the number in this image? Digits only, change nothing.",
+    );
+    real.shots.paste_image(real.window, number_image(second));
+    real.save("final-image-2-reply");
+    real.shots.keys(real.window, "cmd-enter");
+    real.wait(&key, Duration::from_secs(60), "the reply", |thread| {
+        thread.turns.len() == 2
+    });
+    let replied = real.wait(
+        &key,
+        Duration::from_secs(300),
+        "the second answer",
+        |thread| {
+            thread.turns.len() == 2 && thread.turns[1].result.is_some() && !thread.state.is_active()
+        },
+    );
+    report("image reply", started, &replied);
+    let reply_answer = last_message(&replied);
+    eprintln!("IMAGE second number {second}, answer {reply_answer:?}");
+    real.save("final-image-3-replied");
+    assert_eq!(replied.turns[1].images.len(), 1, "{replied:#?}");
+    assert_eq!(replied.turns[1].kind, gitez_agent_thread::TurnKind::Reply);
+    // Every PNG's base64 starts so: none in a transcript, a log, the
+    // thread's record or GitEZ's data folder.
+    let thread_dir = Store::new(&real.common_dir).thread_dir(&key.id);
+    for dir in [thread_dir.as_path(), real.data_dir.as_path()] {
+        let found: Vec<_> = files_containing(dir, "iVBORw0KGgo");
+        assert!(found.is_empty(), "image data in {found:#?}");
+    }
+    let runs = std::fs::read_dir(thread_dir.join("runs"))
+        .expect("runs")
+        .count();
+    eprintln!(
+        "IMAGE transcripts {runs}, images kept {:?}",
+        std::fs::read_dir(thread_dir.join("images"))
+            .expect("images")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect::<Vec<_>>()
+    );
+    assert!(answer.contains(&first.to_string()), "first: {answer:?}");
+    assert!(
+        reply_answer.contains(&second.to_string()),
+        "second: {reply_answer:?}"
+    );
 }
