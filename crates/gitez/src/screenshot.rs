@@ -132,11 +132,20 @@ impl Shots {
     /// The main window at its opening size, with the repository at `path`,
     /// under the live layer as in the app.
     pub fn open_workspace(&mut self, path: &Path) -> (AnyWindowHandle, Entity<Workspace>) {
+        self.open_workspace_sized(path, window_size())
+    }
+
+    /// [`Shots::open_workspace`] in a window of `size`.
+    pub fn open_workspace_sized(
+        &mut self,
+        path: &Path,
+        size: Size<Pixels>,
+    ) -> (AnyWindowHandle, Entity<Workspace>) {
         let path = path.to_owned();
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds {
                 origin: point(px(0.), px(0.)),
-                size: window_size(),
+                size,
             })),
             focus: true,
             show: true,

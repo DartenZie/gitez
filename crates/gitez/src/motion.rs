@@ -528,6 +528,22 @@ pub fn marks(window: &Window, cx: &App) -> Vec<Mark> {
     })
 }
 
+/// The marks this window's content registered at its last paint, each
+/// with the clip it was painted in: a mark inside a scrolled area is
+/// clipped to that area.
+#[cfg(test)]
+pub fn clipped_marks(window: &Window, cx: &App) -> Vec<(Mark, Bounds<Pixels>)> {
+    layer_of(window, cx).map_or_else(Vec::new, |layer| {
+        layer
+            .registry
+            .borrow()
+            .marks
+            .iter()
+            .map(|(mark, clip, _)| (mark.clone(), *clip))
+            .collect()
+    })
+}
+
 fn init(cx: &mut App) {
     if !cx.has_global::<Motion>() {
         cx.set_global(Motion {

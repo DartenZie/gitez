@@ -34,6 +34,9 @@ bring the result back as a local pull request.
 ### Local pull requests
 
 - Open any local branch as a pull request against its base branch (`main` by default).
+  The description sits above the diff and scrolls away with it, while the
+  title and buttons stay in place. A long description shows its first six
+  lines until you select **Show more**.
 - Read the diff in unified or split view, and mark files as viewed. A viewed
   file opens again when it changes. Swipe sideways, or hold Shift and scroll,
   to read long lines.

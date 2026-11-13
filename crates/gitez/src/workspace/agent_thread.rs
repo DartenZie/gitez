@@ -2920,6 +2920,69 @@ mod tests {
         Timestamp::now() - jiff::SignedDuration::from_mins(minutes)
     }
 
+    /// A thread with a long prompt and a long answer, in the detail panel
+    /// and in Home's wide thread view, each in a 700-point-tall window:
+    /// both scroll to their end.
+    #[test]
+    fn screenshot_scroll_thread_long() {
+        if !crate::screenshot::enabled() {
+            return;
+        }
+        let prompt = [PROMPT; 6].join("\n\n");
+        let answer = [ANSWER; 8].join("\n\n");
+        let lines = transcript(STEPS);
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let (dir, common_dir, id) = repository_with(&prompt, &lines, |thread| {
+            thread.state = State::Finished;
+            thread.ending = Some(Ending::Answer);
+            thread.session_id = Some("session".into());
+            let turn = &mut thread.turns[0];
+            turn.started = Some(minutes_ago(30));
+            turn.ended = Some(minutes_ago(27));
+            turn.result = Some(result(&answer, true));
+        });
+        let work_dir = dir.path().join("repo");
+        git(&work_dir, &["config", "user.name", "Ada Lovelace"]);
+        let thread = Store::new(&common_dir)
+            .load(&id)
+            .expect("the thread is read");
+        gitez_agent_thread::create_worktree(
+            &work_dir,
+            &thread.worktree,
+            &thread.branch,
+            &thread.start.commit,
+        )
+        .expect("worktree");
+        let mut shots =
+            crate::screenshot::Shots::from_env(&dir.path().join("data")).expect("enabled");
+        let tall = size(px(1440.), px(700.));
+        let (window, _) = shots.open_workspace_sized(&work_dir, tall);
+        shots.dispatch(
+            window,
+            crate::agent_threads::OpenAgentThread {
+                common_dir: common_dir.clone(),
+                id: id.clone(),
+            },
+        );
+        shots.save(window, "scroll-thread-panel-top");
+        for _ in 0..10 {
+            shots.scroll(window, gpui_kit::point(px(1260.), px(400.)), 100.);
+        }
+        shots.save(window, "scroll-thread-panel-end");
+        let key = AgentThreadKey {
+            common_dir,
+            id: thread.id.clone(),
+        };
+        let (wide, _) = shots.open(tall, |window, cx| {
+            gpui_kit::AppContext::new(cx, |cx| ThreadView::new(key, true, window, cx))
+        });
+        shots.save(wide, "scroll-thread-wide-top");
+        for _ in 0..10 {
+            shots.scroll(wide, gpui_kit::point(px(720.), px(350.)), 100.);
+        }
+        shots.save(wide, "scroll-thread-wide-end");
+    }
+
     #[test]
     fn screenshot_thread_running() {
         shoot("running", false, |thread| {

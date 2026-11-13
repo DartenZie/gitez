@@ -20,7 +20,7 @@ use gitez_review::{FileUpdate, LineChange, PullRequest, State, Store, Timestamp}
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::*;
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::text::TextView;
+use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -31,6 +31,8 @@ mod merge;
 
 pub(crate) use merge::{MergeDialog, MergeEvent, MergedPullRequest, Merging, record_merge};
 mod prompt;
+#[cfg(all(test, target_os = "macos"))]
+mod scroll_shots;
 mod threads;
 
 use super::{code, labels};
@@ -96,10 +98,15 @@ const LINE_NUMBER_WIDTH: Pixels = px(48.);
 const LINE_SIGN_WIDTH: Pixels = px(20.);
 /// Space after the text of a line.
 const LINE_TEXT_PADDING: Pixels = px(12.);
+/// Lines of a pull request's description shown before "Show more".
+const DESCRIPTION_LINES: usize = 6;
 
 /// A row of the diff list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Row {
+    /// A local pull request's description, above the first file, so it
+    /// scrolls away with the diff.
+    Description,
     /// The header of the file at this index.
     File(usize),
     /// A hunk header: file and hunk index.
@@ -139,7 +146,7 @@ impl Row {
             | Row::Thread(file, _)
             | Row::Composer(file)
             | Row::FileEnd(file) => Some(file),
-            Row::End => None,
+            Row::Description | Row::End => None,
         }
     }
 
@@ -156,6 +163,7 @@ impl Row {
             Row::FileEnd(_) => Row::FileEnd(file),
             Row::Gap(_, at) => Row::Gap(file, at),
             Row::Context(_, at, line) => Row::Context(file, at, line),
+            Row::Description => Row::Description,
             Row::End => Row::End,
         }
     }
@@ -324,6 +332,18 @@ struct PullRequestSubject {
     edit_dialog: Option<Subscription>,
     /// Set while the dialog editing a file of the head branch is open.
     file_edit_dialog: Option<Subscription>,
+    /// The description as Markdown, parsed in the background once per
+    /// change, not on every frame.
+    description: Entity<TextViewState>,
+    /// The text `description` was given last.
+    description_text: String,
+    /// Whether the whole description shows; it starts collapsed to
+    /// [`DESCRIPTION_LINES`] lines each time the pull request is opened.
+    description_expanded: bool,
+    /// Whether the description is longer than [`DESCRIPTION_LINES`] lines
+    /// where it was last painted collapsed, so it can be expanded.
+    description_long: bool,
+    _description_clamped: Subscription,
 }
 
 pub struct Review {
@@ -468,6 +488,20 @@ impl Review {
     ) -> Self {
         let load = Self::load_pull_request(repository, &store, pull_request.number, tips, cx);
         let panel = prompt::PromptPanel::new(repository, &pull_request.prompt, window, cx);
+        let description_text = pull_request.description.clone();
+        let description = cx.new(|cx| TextViewState::markdown(&description_text, cx));
+        // The description says whether it overflows its lines only once it
+        // is painted collapsed; render again only when that changes.
+        let description_clamped = cx.observe(&description, |this: &mut Self, description, cx| {
+            let long = description.read(cx).is_clamped();
+            if let Subject::PullRequest(subject) = &mut this.subject
+                && !subject.description_expanded
+                && subject.description_long != long
+            {
+                subject.description_long = long;
+                cx.notify();
+            }
+        });
         let subject = Subject::PullRequest(Box::new(PullRequestSubject {
             store,
             pull_request,
@@ -484,6 +518,11 @@ impl Review {
             merge_dialog: None,
             edit_dialog: None,
             file_edit_dialog: None,
+            description_text,
+            description,
+            description_expanded: false,
+            description_long: false,
+            _description_clamped: description_clamped,
         }));
         let mut review = Self::with_subject(repository, subject, load, cx);
         review.find_run(cx);
@@ -536,6 +575,7 @@ impl Review {
             .collect();
         subject.pull_request = pull_request;
         subject.ahead = Some(diff.ahead);
+        self.description_changed(cx);
         self.finish(Ok(diff.files), cx);
         // The viewed files may differ while the diff does not.
         let anchor = self.scroll_anchor();
@@ -767,6 +807,12 @@ impl Review {
                 |file| self.is_viewed(&files[file]),
             );
         }
+        if self.has_description() {
+            self.rows.insert(0, Row::Description);
+            for row in &mut self.file_rows {
+                *row += 1;
+            }
+        }
         self.widest = vec![0; files.len()];
         for &row in &self.rows {
             if let Some(file) = row.file() {
@@ -776,6 +822,20 @@ impl Review {
         }
         self.list.reset(self.rows.len());
         if let Some(Anchor {
+            row: Row::Description,
+            offset_in_item,
+            ..
+        }) = anchor
+        {
+            // Within the description: where it was, if it is still there.
+            if self.rows.first() == Some(&Row::Description) {
+                self.list.scroll_to(ListOffset {
+                    item_ix: 0,
+                    offset_in_item,
+                });
+            }
+            self.current_file = 0;
+        } else if let Some(Anchor {
             path,
             row,
             index,
@@ -1291,6 +1351,14 @@ impl Review {
         };
         let top = self.list.logical_scroll_top();
         let row = *self.rows.get(top.item_ix)?;
+        if row == Row::Description {
+            return Some(Anchor {
+                path: String::new(),
+                row,
+                index: 0,
+                offset_in_item: top.offset_in_item,
+            });
+        }
         let file = row.file()?;
         Some(Anchor {
             path: files[file].path.clone(),
@@ -1301,11 +1369,12 @@ impl Review {
     }
 
     fn scrolled_to(&mut self, first_row: usize, cx: &mut Context<Self>) {
-        let file = self
-            .rows
-            .get(first_row)
-            .and_then(|row| row.file())
-            .unwrap_or(self.file_rows.len().saturating_sub(1));
+        let file = match self.rows.get(first_row) {
+            Some(Row::Description) => 0,
+            row => row
+                .and_then(|row| row.file())
+                .unwrap_or(self.file_rows.len().saturating_sub(1)),
+        };
         if file != self.current_file {
             self.set_current_file(file, cx);
         }
@@ -1704,6 +1773,7 @@ impl Review {
         };
         let mono = cx.theme().mono_font_family.clone();
         match self.rows.get(index).copied() {
+            Some(Row::Description) => self.render_description(cx).into_any_element(),
             Some(Row::File(index)) => {
                 let file = &files[index];
                 let status = self.file_status(&file.path);
@@ -1888,6 +1958,94 @@ impl Review {
         }
     }
 
+    /// Whether a local pull request with a description is reviewed.
+    fn has_description(&self) -> bool {
+        matches!(&self.subject, Subject::PullRequest(subject)
+            if !subject.pull_request.description.is_empty())
+    }
+
+    /// Shows the pull request's description as it is now, after it was
+    /// read again or edited: parsed again only if it changed, collapsed
+    /// again, and its row added or removed when it appeared or went.
+    fn description_changed(&mut self, cx: &mut Context<Self>) {
+        let Subject::PullRequest(subject) = &mut self.subject else {
+            return;
+        };
+        let text = &subject.pull_request.description;
+        if *text != subject.description_text {
+            subject.description_text = text.clone();
+            subject.description_expanded = false;
+            subject
+                .description
+                .update(cx, |description, cx| description.set_text(text, cx));
+        }
+        let had = self.rows.first() == Some(&Row::Description);
+        if had != self.has_description() && !self.rows.is_empty() {
+            let anchor = self.scroll_anchor();
+            self.rebuild_rows(anchor, cx);
+        }
+    }
+
+    /// Shows the whole description, or only its first lines again.
+    fn toggle_description(&mut self, cx: &mut Context<Self>) {
+        let Subject::PullRequest(subject) = &mut self.subject else {
+            return;
+        };
+        subject.description_expanded = !subject.description_expanded;
+        // Collapsed while scrolled into it: back to its start, where "Show
+        // more" is, rather than somewhere in the diff below.
+        if !subject.description_expanded && self.list.logical_scroll_top().item_ix == 0 {
+            self.list.scroll_to(ListOffset {
+                item_ix: 0,
+                offset_in_item: px(0.),
+            });
+        }
+        cx.notify();
+    }
+
+    /// The description of a local pull request, above its first file: the
+    /// first [`DESCRIPTION_LINES`] lines and "Show more" when it is longer,
+    /// all of it and "Show less" once expanded.
+    fn render_description(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let Subject::PullRequest(subject) = &self.subject else {
+            return div();
+        };
+        let expanded = subject.description_expanded;
+        div()
+            .v_flex()
+            .w_full()
+            .gap(px(6.))
+            .pb(CARD_GAP)
+            .text_size(px(13.))
+            .line_height(relative(1.55))
+            .text_color(rgb(color::TEXT_SECONDARY))
+            // A thread's pull request takes the agent's final message,
+            // which is Markdown.
+            .child(
+                TextView::new(&subject.description)
+                    .selectable(true)
+                    .when(!expanded, |this| this.max_lines(DESCRIPTION_LINES)),
+            )
+            .when(subject.description_long, |this| {
+                this.child(
+                    div().h_flex().child(
+                        Button::new("pull-request-description-toggle")
+                            .link()
+                            .label(if expanded { "Show less" } else { "Show more" })
+                            .child(
+                                Icon::new(if expanded {
+                                    IconName::ChevronUp
+                                } else {
+                                    IconName::ChevronDown
+                                })
+                                .size(px(14.)),
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_description(cx))),
+                    ),
+                )
+            })
+    }
+
     /// "End of commit · Next: <older commit>", or "End of changes".
     fn render_end(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (end, older) = match &self.subject {
@@ -1931,6 +2089,7 @@ impl Review {
             _ => None,
         };
         let header = div()
+            .id("review-header")
             .v_flex()
             .flex_none()
             .gap(px(14.))
@@ -2126,6 +2285,10 @@ impl Review {
                                 div()
                                     .min_w_0()
                                     .font_weight(FontWeight::SEMIBOLD)
+                                    // The header stays put above the diff:
+                                    // a long title must not crowd it out.
+                                    .line_clamp(2)
+                                    .text_ellipsis()
                                     .child(pull_request.title.clone()),
                             )
                             .child(
@@ -2158,27 +2321,6 @@ impl Review {
                                 .then(|| muted(format!("· {}", missing.join(", ")))),
                         ),
                     )
-                    .when(!pull_request.description.is_empty(), |this| {
-                        this.child(
-                            div()
-                                .pt(px(2.))
-                                .text_size(px(13.))
-                                .line_height(relative(1.55))
-                                .text_color(rgb(color::TEXT_SECONDARY))
-                                // A thread's pull request takes the agent's
-                                // final message, which is Markdown.
-                                .child(
-                                    TextView::markdown(
-                                        SharedString::from(format!(
-                                            "pull-request-description-{}",
-                                            pull_request.number
-                                        )),
-                                        pull_request.description.clone(),
-                                    )
-                                    .selectable(true),
-                                ),
-                        )
-                    }),
             )
             .child(
                 div()
@@ -2388,6 +2530,7 @@ impl Review {
                 if !dir.is_empty() {
                     items.push(
                         div()
+                            .flex_none()
                             .px(px(10.))
                             .pt(px(if index == 0 { 0. } else { 8. }))
                             .pb(px(6.))
@@ -2490,6 +2633,27 @@ impl Review {
     }
 }
 
+impl Review {
+    /// `body` below the pull request's description while there is no diff
+    /// to show it in, both scrolling; `body` alone otherwise.
+    fn with_description(&self, body: impl IntoElement, cx: &mut Context<Self>) -> AnyElement {
+        if !self.has_description() {
+            return body.into_any_element();
+        }
+        div()
+            .id("review-description")
+            .v_flex()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .pt(px(20.))
+            .px(px(24.))
+            .child(div().max_w(px(900.)).child(self.render_description(cx)))
+            .child(body)
+            .into_any_element()
+    }
+}
+
 impl Focusable for Review {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -2505,14 +2669,21 @@ impl Render for Review {
         }
         self.list_width = self.list.viewport_bounds().size.width;
         let body = match &self.files {
-            None => message("Reading changes…").into_any_element(),
-            Some(Err(error)) => message(error.clone()).into_any_element(),
+            None => self
+                .with_description(message("Reading changes…"), cx)
+                .into_any_element(),
+            Some(Err(error)) => self
+                .with_description(message(error.clone()), cx)
+                .into_any_element(),
             Some(Ok(files)) if files.is_empty() => match self.subject {
-                Subject::Commit(_) => message("This commit changes no files."),
-                Subject::WorkingTree { .. } => message("No uncommitted changes."),
-                Subject::PullRequest(_) => message("This branch changes no files."),
-            }
-            .into_any_element(),
+                Subject::Commit(_) => message("This commit changes no files.").into_any_element(),
+                Subject::WorkingTree { .. } => {
+                    message("No uncommitted changes.").into_any_element()
+                }
+                Subject::PullRequest(_) => self
+                    .with_description(message("This branch changes no files."), cx)
+                    .into_any_element(),
+            },
             Some(Ok(files)) => {
                 let files = files.clone();
                 div()

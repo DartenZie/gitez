@@ -855,3 +855,47 @@ fn screenshot_u4_real_install() {
             .is_file()
     );
 }
+
+/// The sheet in a short window (1440 × 600) with twelve secrets: it
+/// scrolls to its last section.
+#[test]
+fn screenshot_scroll_settings_sheet() {
+    if !crate::screenshot::enabled() {
+        return;
+    }
+    let dir = scratch();
+    let setup = prepare(dir.path(), |common_dir, base| {
+        let mut secrets = three_secrets(common_dir);
+        secrets.extend((0..9).map(|index| SecretEntry {
+            name: format!("EXTRA_TOKEN_{index}"),
+            scope: SecretScope::All,
+            default: index % 2 == 0,
+        }));
+        let mut settings = Settings {
+            secrets,
+            ..Settings::default()
+        };
+        settings
+            .agents
+            .insert(gitez_agent::ClaudeCode::ID.into(), fake_agent(base, true));
+        settings
+    });
+    installed_srt(&setup.data_dir);
+    let data_dir = setup.data_dir.clone();
+    let mut shots = Shots::with_options(&setup.data_dir, |options| {
+        options.sandbox = gitez_sandbox::platform(&data_dir);
+    })
+    .expect("enabled");
+    shots.update(super::init);
+    let (window, _) = shots.open_workspace_sized(&setup.work_dir, size(px(1440.), px(600.)));
+    shots.keys(window, "cmd-,");
+    assert!(
+        sheet_open(&mut shots, window),
+        "⌘, opens the settings sheet"
+    );
+    shots.save(window, "scroll-settings-top");
+    for _ in 0..10 {
+        shots.scroll(window, at(720., 300.), 100.);
+    }
+    shots.save(window, "scroll-settings-end");
+}

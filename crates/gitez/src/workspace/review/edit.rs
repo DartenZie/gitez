@@ -179,6 +179,7 @@ impl Review {
             pull_request.description = description;
             pull_request.updated = Timestamp::now();
             self.save_pull_request(cx);
+            self.description_changed(cx);
         }
         window.close_dialog(cx);
         cx.notify();

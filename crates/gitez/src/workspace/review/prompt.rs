@@ -914,7 +914,7 @@ impl Review {
     }
 
     /// Scrolls the diff to thread `id`.
-    fn scroll_to_thread(&mut self, id: u32, cx: &mut Context<Self>) {
+    pub(super) fn scroll_to_thread(&mut self, id: u32, cx: &mut Context<Self>) {
         if let Some(index) = self
             .rows
             .iter()
