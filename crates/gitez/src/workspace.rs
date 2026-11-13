@@ -1,6 +1,7 @@
 //! The main window: toolbar, repository sidebar, history, commit detail and
 //! status bar, laid out as in the `Main.dc.html` artboard.
 
+mod agent_thread;
 mod agents;
 mod branch;
 mod changes;
@@ -26,7 +27,8 @@ mod steps;
 mod tag;
 mod toolbar;
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,9 +48,13 @@ use gitez_command::{Git, RewriteOutcome};
 use gitez_git::{Affected, Head, Oid, RefKind, RefLabel, Watcher, WorkingTreeStatus};
 use gitez_review::{NewPullRequest as NewPullRequestFields, State, Timestamp, Tip};
 
+use crate::agent_threads::{
+    AgentThreadKey, AgentThreads, AgentThreadsEvent, CurrentRepository, OpenAgentThread,
+};
 use crate::repository::Snapshot;
 use crate::theme::{self, color};
 use crate::undo::{Direction, UndoLog};
+use agent_thread::{ThreadView, ThreadViewEvent};
 use branch::BranchForm;
 use changes::{ChangesEvent, ChangesPanel, LastCommit};
 use cherry_pick::{CherryPick, CherryPickEvent};
@@ -185,6 +191,14 @@ pub struct Workspace {
     palette_open: bool,
     /// The cherry-pick panel, shown in place of the commit detail.
     cherry_pick: Option<(Entity<CherryPick>, Subscription)>,
+    /// The agent thread shown in place of the commit detail, and what the
+    /// history had selected when it opened: selecting something else
+    /// closes it.
+    agent_thread: Option<(Entity<ThreadView>, Subscription, Selected)>,
+    /// The state and pull request of each agent thread of the open
+    /// repository when the refs were last read, to read them again when an
+    /// agent thread's branch or pull request may have changed.
+    agent_thread_marks: HashMap<gitez_agent_thread::AgentThreadId, ThreadMark>,
     /// The dialog offering to merge a branch dropped on another, while
     /// open.
     merge_dialog: Option<Subscription>,
@@ -328,6 +342,16 @@ impl Workspace {
             cx.on_focus_lost(window, |this, window, cx| {
                 window.focus(&this.focus_handle, cx);
             }),
+            // Agent threads add branches and local pull requests.
+            cx.subscribe_in(
+                &AgentThreads::global(cx),
+                window,
+                |this, _, event, window, cx| {
+                    if let AgentThreadsEvent::Changed { .. } = event {
+                        this.agent_threads_changed(window, cx);
+                    }
+                },
+            ),
         ];
         let mut workspace = Self {
             focus_handle,
@@ -361,6 +385,8 @@ impl Workspace {
             palette: None,
             palette_open: false,
             cherry_pick: None,
+            agent_thread: None,
+            agent_thread_marks: HashMap::new(),
             open_after_reload: None,
             sidebar,
             history,
@@ -447,6 +473,7 @@ impl Workspace {
             return;
         }
         crate::recent::closed(cx);
+        AgentThreads::global(cx).update(cx, |threads, cx| threads.set_current_repository(None, cx));
         window.set_window_title("GitEZ");
         // A fresh workspace drops every view, task and watcher of the old one.
         *self = Self::new(None, window, cx);
@@ -493,6 +520,16 @@ impl Workspace {
             window.push_notification(crate::toast::warning(error.clone()), cx);
         }
         window.focus(&self.history.focus_handle(cx), cx);
+        self.agent_thread = None;
+        self.agent_thread_marks = self.thread_marks(&snapshot, cx);
+        let current = CurrentRepository {
+            work_dir: snapshot.path.clone(),
+            common_dir: snapshot.repository.common_dir(),
+            name: snapshot.name.clone(),
+        };
+        AgentThreads::global(cx).update(cx, |threads, cx| {
+            threads.set_current_repository(Some(current), cx)
+        });
         self.snapshot = Some(snapshot);
         self.error = None;
         self.set_status(None, cx);
@@ -814,6 +851,7 @@ impl Workspace {
         }
         window.focus(&review.focus_handle(cx), cx);
         self.review = Some((review, subscription));
+        self.agent_thread = None;
         cx.notify();
     }
 
@@ -1443,6 +1481,7 @@ impl Workspace {
     fn select_commit(&mut self, id: Oid, window: &mut Window, cx: &mut Context<Self>) {
         self.close_diff(cx);
         self.rewrite = None;
+        self.agent_thread = None;
         let found = self
             .history
             .update(cx, |history, cx| history.select_commit(id, cx));
@@ -1633,6 +1672,17 @@ impl Workspace {
             self.working_tree_selected = working_tree;
             cx.notify();
         }
+        // The history reports its selection again after every reload; only
+        // a different one closes the agent thread.
+        let selected = self.selected(cx);
+        if self
+            .agent_thread
+            .as_ref()
+            .is_some_and(|(_, _, opened_on)| *opened_on != selected)
+        {
+            self.agent_thread = None;
+            cx.notify();
+        }
         let selected_commit = match self.history.read(cx).selected() {
             Some(Selection::Commit(commit, _)) => Some(commit.id),
             _ => None,
@@ -1658,6 +1708,102 @@ impl Workspace {
         self.detail.update(cx, |detail, cx| {
             detail.show(&snapshot.repository, selection, cx)
         });
+    }
+
+    /// What the history has selected.
+    fn selected(&self, cx: &App) -> Selected {
+        match self.history.read(cx).selected() {
+            Some(Selection::Commit(commit, _)) => Selected::Commit(commit.id),
+            Some(Selection::WorkingTree(_)) => Selected::WorkingTree,
+            None => Selected::Nothing,
+        }
+    }
+
+    /// Shows the agent thread of `action` in place of the commit detail.
+    fn open_agent_thread(
+        &mut self,
+        action: &OpenAgentThread,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = AgentThreadKey {
+            common_dir: action.common_dir.clone(),
+            id: action.id.clone(),
+        };
+        self.show_agent_thread(key, window, cx);
+    }
+
+    /// Shows agent thread `key` in place of the commit detail, closing a
+    /// local pull request shown in the whole window.
+    fn show_agent_thread(
+        &mut self,
+        key: AgentThreadKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .review
+            .as_ref()
+            .is_some_and(|(review, _)| review.read(cx).pull_request_number().is_some())
+        {
+            self.close_review(window, cx);
+        }
+        self.cherry_pick = None;
+        if self
+            .agent_thread
+            .as_ref()
+            .is_some_and(|(thread, _, _)| *thread.read(cx).key() == key)
+        {
+            return;
+        }
+        let thread = cx.new(|cx| ThreadView::new(key, false, window, cx));
+        let subscription = cx.subscribe_in(&thread, window, |this, _, event, window, cx| {
+            match event {
+                ThreadViewEvent::OpenPullRequest { number, .. } => {
+                    let known = this.snapshot.as_ref().is_some_and(|snapshot| {
+                        snapshot
+                            .pull_requests
+                            .iter()
+                            .any(|pull_request| pull_request.number == *number)
+                    });
+                    if known {
+                        this.open_pull_request(*number, window, cx);
+                    } else {
+                        // Created after the refs were read.
+                        this.open_after_reload = Some(*number);
+                        this.reload(window, cx);
+                    }
+                }
+                ThreadViewEvent::OpenRepository { work_dir } => {
+                    this.open(work_dir.clone(), window, cx)
+                }
+            }
+        });
+        let selected = self.selected(cx);
+        self.agent_thread = Some((thread, subscription, selected));
+        cx.notify();
+    }
+
+    /// The agent threads of the open repository changed: reads the refs
+    /// and pull requests again if a thread's state or pull request did.
+    fn agent_threads_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let marks = self.thread_marks(snapshot, cx);
+        if marks != self.agent_thread_marks {
+            self.agent_thread_marks = marks;
+            self.reload(window, cx);
+        }
+    }
+
+    fn thread_marks(
+        &self,
+        snapshot: &Snapshot,
+        cx: &App,
+    ) -> HashMap<gitez_agent_thread::AgentThreadId, ThreadMark> {
+        let common_dir = snapshot.repository.common_dir();
+        thread_marks(AgentThreads::global(cx).read(cx), &common_dir)
     }
 
     fn show_error(&mut self, error: anyhow::Error, window: &mut Window, cx: &mut Context<Self>) {
@@ -1696,6 +1842,9 @@ impl Render for Workspace {
                 this.on_action(cx.listener(Self::reveal_repository))
             })
             .on_action(cx.listener(Self::review_selected))
+            .when(snapshot.is_some(), |this| {
+                this.on_action(cx.listener(Self::open_agent_thread))
+            })
             .on_action(cx.listener(Self::new_pull_request))
             .on_action(cx.listener(Self::open_palette))
             .on_action(cx.listener(Self::fetch))
@@ -1790,6 +1939,8 @@ impl Render for Workspace {
                                 .map(|panel| {
                                     if let Some((cherry_pick, _)) = &self.cherry_pick {
                                         panel.child(cherry_pick.clone())
+                                    } else if let Some((thread, _, _)) = &self.agent_thread {
+                                        panel.child(thread.clone())
                                     } else if let Some((changes, _)) = self
                                         .changes
                                         .as_ref()
@@ -1885,6 +2036,35 @@ impl Workspace {
 }
 
 /// The start buttons, and the recent repositories below them.
+/// What the history has selected, to tell when it changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Selected {
+    Nothing,
+    WorkingTree,
+    Commit(Oid),
+}
+
+/// What of an agent thread shows in the refs and pull requests.
+type ThreadMark = (gitez_agent_thread::State, Option<u32>);
+
+/// The [`ThreadMark`] of each agent thread of the repository at
+/// `common_dir`.
+fn thread_marks(
+    threads: &AgentThreads,
+    common_dir: &Path,
+) -> HashMap<gitez_agent_thread::AgentThreadId, ThreadMark> {
+    threads
+        .repository(common_dir)
+        .map(|repository| {
+            repository
+                .threads
+                .iter()
+                .map(|thread| (thread.id.clone(), (thread.state, thread.pull_request)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn start_actions(open: &'static str, cx: &App) -> impl IntoElement {
     let recent = crate::recent::paths(cx);
     div()

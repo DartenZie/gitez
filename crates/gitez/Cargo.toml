@@ -31,6 +31,10 @@ anyhow.workspace = true
 # Claude Code session ids for review prompt runs.
 uuid.workspace = true
 futures.workspace = true
+# Watching GitEZ's data folder itself, not the thread worktrees inside it.
+notify.workspace = true
+# Times of agent threads, shown in local time.
+jiff.workspace = true
 dirs.workspace = true
 serde.workspace = true
 serde_json.workspace = true

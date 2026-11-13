@@ -197,6 +197,44 @@ pub mod color {
     pub const WORKING_TREE_TEXT: u32 = REMOTE_LABEL_TEXT;
     /// Text on the small HEAD badge, which takes the branch colour.
     pub const HEAD_BADGE_TEXT: u32 = 0x0e_1a_28;
+
+    /// Agent threads' state chips, background (with alpha where it has
+    /// eight digits) and text: Running; Preparing and Ready for review;
+    /// Queued, Waiting, No changes and Completed; Failed and Stopped, also
+    /// the text of a failed tool in a thread's activity.
+    pub const THREAD_RUNNING: u32 = 0x5f_a8_f5_29;
+    pub const THREAD_RUNNING_TEXT: u32 = 0x8f_c2_f8;
+    pub const THREAD_PREPARING: u32 = 0x4f_c6_b0_29;
+    pub const THREAD_PREPARING_TEXT: u32 = 0x7f_d8_c6;
+    pub const THREAD_QUEUED: u32 = 0x26_26_2b;
+    pub const THREAD_QUEUED_TEXT: u32 = 0xcf_cb_c0;
+    pub const THREAD_FAILED: u32 = 0xf0_8a_7e_29;
+    pub const THREAD_FAILED_TEXT: u32 = 0xf5_a8_9e;
+    /// The border of a picker or option that is on; its background is
+    /// [`SELECTED`].
+    #[allow(dead_code, reason = "for the agent thread screens still to come")]
+    pub const PICKER_ON_BORDER: u32 = 0xe8_b0_4b_99;
+    /// A selected option card, and a fresh row in Home.
+    #[allow(dead_code, reason = "for the agent thread screens still to come")]
+    pub const OPTION_ON: u32 = 0x1f_1b_14;
+    /// The dashed border of the collapsed "Ask an agent…" row.
+    #[allow(dead_code, reason = "for the agent thread screens still to come")]
+    pub const COMPOSER_BORDER: u32 = 0x3a_3a_40;
+    /// The chip naming a tool an agent uses.
+    pub const TOOL_CHIP: u32 = 0x1f_1f_23;
+    pub const TOOL_CHIP_BORDER: u32 = 0x2e_2e_34;
+    /// The square behind an agent's mark.
+    pub const AGENT_MARK_BACKGROUND: u32 = 0x2a_24_18;
+    /// Host names in Settings.
+    #[allow(dead_code, reason = "for the agent thread screens still to come")]
+    pub const HOST_CHIP: u32 = 0x23_23_27;
+    /// Text fields in Settings.
+    #[allow(dead_code, reason = "for the agent thread screens still to come")]
+    pub const FIELD: u32 = 0x141416;
+    /// The step an agent is running now, in a thread's activity.
+    pub const LIVE_ROW: u32 = 0x5f_a8_f5_12;
+    /// Between the rows of the tables in Settings.
+    pub const ROW_DIVIDER: u32 = 0x22_22_26;
 }
 
 /// Colours of the commit graph's lines, indexed by the layout's colour

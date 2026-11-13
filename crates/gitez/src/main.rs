@@ -3,7 +3,10 @@
 //!
 //! `gitez [path]` opens the repository containing `path` straight away;
 //! without one, GitEZ opens the repository that was open when it last quit.
+//! `gitez supervise …` runs the supervisor of one agent thread instead
+//! (see `gitez_supervisor::cli`); GitEZ starts it for every agent thread.
 
+mod agent_threads;
 mod assets;
 mod menus;
 mod project_icon;
@@ -17,12 +20,20 @@ mod undo;
 mod workspace;
 
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use gpui_kit::*;
 
 use workspace::Workspace;
 
-fn main() {
+fn main() -> ExitCode {
+    // A supervisor needs no window, theme or shell environment: it runs
+    // with the environment GitEZ gave it.
+    let mut args = std::env::args_os();
+    if args.nth(1).is_some_and(|arg| arg == "supervise") {
+        return gitez_supervisor::cli::main(args);
+    }
+
     // Before anything else: it changes the environment, and git needs the
     // user's PATH to find filters such as git-crypt.
     shell_path::init();
@@ -39,6 +50,7 @@ fn main() {
             theme::init(cx);
 
             recent::init(cx);
+            agent_threads::init(cx);
             menus::init(cx);
             cx.bind_keys(workspace::key_bindings());
             // One window per process for now, so closing it ends the app.
@@ -66,4 +78,5 @@ fn main() {
             .expect("failed to open the main window");
             cx.activate(true);
         });
+    ExitCode::SUCCESS
 }
