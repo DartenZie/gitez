@@ -5,12 +5,18 @@
 //! repository is `gitez-git`'s job.
 //!
 //! The methods of [`Git`] wait for `git` to finish, so call them off the UI
-//! thread.
+//! thread. A git that never finishes, because a process it started (ssh, a
+//! hook) is still there, is ended with an [`Operation`]: see
+//! [`Git::with_operation`].
 
-use std::ffi::OsStr;
-use std::io::Write as _;
+mod run;
+
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+
+pub use run::{CANCEL_GRACE, Operation, STALLED_AFTER};
+use run::{End, Stream};
 
 /// Errors from running `git`.
 #[derive(Debug, thiserror::Error)]
@@ -27,9 +33,62 @@ pub enum Error {
     /// hook that rejected the change.
     #[error("{output}")]
     Failed { command: String, output: String },
+    /// The command was ended with [`Operation::cancel`], or never started
+    /// because the operation was cancelled already. `output` is what git
+    /// had written to standard error by then; it is often why git was
+    /// still running.
+    #[error("cancelled")]
+    Cancelled { command: String, output: String },
+    /// Branch `branch` is checked out in a worktree that cannot be used, so
+    /// nothing was changed: see [`Git::pull_branch`].
+    #[error("{branch} is checked out in the worktree at {}, which {problem}", .path.display())]
+    WorktreeUnavailable {
+        branch: String,
+        path: PathBuf,
+        problem: WorktreeProblem,
+    },
+}
+
+impl Error {
+    /// Whether the command was ended with [`Operation::cancel`].
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled { .. })
+    }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Why git cannot be run in a worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeProblem {
+    /// Its folder is gone; git still holds the branch for it until
+    /// `git worktree prune`.
+    Missing,
+    /// It is locked (`git worktree lock`), with the reason given, if one
+    /// was.
+    Locked(Option<String>),
+}
+
+impl std::fmt::Display for WorktreeProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => f.write_str("no longer exists"),
+            Self::Locked(None) => f.write_str("is locked"),
+            Self::Locked(Some(reason)) => write!(f, "is locked ({reason})"),
+        }
+    }
+}
+
+/// A working tree of the repository, as `git worktree list` describes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Worktree {
+    pub path: PathBuf,
+    /// The local branch checked out in it, such as `main`; `None` when it
+    /// is on no branch or has no working tree (a bare repository).
+    pub branch: Option<String>,
+    /// Why git cannot be run in it, if it cannot.
+    pub problem: Option<WorktreeProblem>,
+}
 
 /// How [`Git::merge_branch`] ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +184,9 @@ pub enum PullMethod {
     Configured,
     /// A merge commit when the branches have diverged (`--no-rebase`).
     Merge,
+    /// Only by moving the branch forward; refused, changing nothing, when
+    /// the branch has commits its upstream lacks (`--ff-only`).
+    FastForward,
 }
 
 /// How [`Git::pull`] ended.
@@ -172,7 +234,17 @@ pub fn needs_pull_method(error: &Error) -> bool {
 /// Whether `error`, from [`Git::pull_branch`], says the branch has commits
 /// its upstream lacks, so it cannot be fast-forwarded.
 pub fn not_fast_forward(error: &Error) -> bool {
-    matches!(error, Error::Failed { output, .. } if output.contains("[rejected]"))
+    // A fetch into the branch says the first, a pull in its worktree the
+    // second.
+    matches!(error, Error::Failed { output, .. }
+        if output.contains("[rejected]") || output.contains("Not possible to fast-forward"))
+}
+
+/// Whether `error`, from [`Git::pull_branch`], says uncommitted changes in
+/// the branch's working tree are in the way of the new commits.
+pub fn blocked_by_changes(error: &Error) -> bool {
+    matches!(error, Error::Failed { output, .. }
+        if output.contains("would be overwritten by merge"))
 }
 
 /// Whether `error`, from [`Git::delete_branch`], says the branch has
@@ -231,6 +303,13 @@ pub enum RevertOutcome {
 #[derive(Debug, Clone)]
 pub struct Git {
     work_dir: PathBuf,
+    /// Set for every git it runs, after the environment of GitEZ itself.
+    env: Vec<(OsString, OsString)>,
+    /// What can cancel the git it runs.
+    operation: Option<Operation>,
+    /// Whether it undoes a half-done change, and so runs even after the
+    /// operation was cancelled.
+    undoing: bool,
 }
 
 impl Git {
@@ -238,11 +317,49 @@ impl Git {
     pub fn new(work_dir: impl Into<PathBuf>) -> Self {
         Self {
             work_dir: work_dir.into(),
+            env: Vec::new(),
+            operation: None,
+            undoing: false,
         }
     }
 
     pub fn work_dir(&self) -> &Path {
         &self.work_dir
+    }
+
+    /// Makes every git this runs part of `operation`, which can cancel it
+    /// and knows what it has written: see [`Operation`]. Every git runs in
+    /// its own process group either way.
+    #[must_use]
+    pub fn with_operation(mut self, operation: &Operation) -> Self {
+        self.operation = Some(operation.clone());
+        self
+    }
+
+    /// Sets environment variable `key` to `value` for every git this runs,
+    /// such as `GIT_SSH_COMMAND`.
+    #[must_use]
+    pub fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+        self.env.push((key.into(), value.into()));
+        self
+    }
+
+    /// The same in the working tree `work_dir` of the same repository.
+    fn in_work_dir(&self, work_dir: &Path) -> Self {
+        Self {
+            work_dir: work_dir.to_owned(),
+            ..self.clone()
+        }
+    }
+
+    /// The same for undoing a half-done change: what it runs starts even
+    /// after the operation was cancelled, so a cancelled command leaves
+    /// nothing half done. Cancelling again ends that too.
+    fn undoing(&self) -> Self {
+        Self {
+            undoing: true,
+            ..self.clone()
+        }
     }
 
     /// Clones `url` into `dest`, which must not exist yet or be empty, like
@@ -439,7 +556,7 @@ impl Git {
         {
             // Best effort: the error that stopped the merge is the one to
             // report.
-            self.switch(branch).ok();
+            self.undoing().switch(branch).ok();
         }
         merged
     }
@@ -454,7 +571,7 @@ impl Git {
         if how == MergeMethod::Rebase {
             // Checks out `head` and replays its commits on top of `base`.
             if let Err(error) = self.run(["rebase", "--quiet", base, head], None) {
-                self.run(["rebase", "--abort"], None).ok();
+                self.undoing().run(["rebase", "--abort"], None).ok();
                 return Err(error);
             }
         }
@@ -475,7 +592,10 @@ impl Git {
                     ],
                     None,
                 );
-                if merged.is_err() && !self.conflicted()?.is_empty() {
+                // A cancelled merge is undone below, not left to resolve.
+                if matches!(&merged, Err(error) if !error.is_cancelled())
+                    && !self.conflicted()?.is_empty()
+                {
                     return Ok(MergeOutcome::Conflicts);
                 }
                 merged.map(drop)
@@ -491,7 +611,9 @@ impl Git {
             // As `git merge --abort` does; a squash leaves no merge to
             // abort, so this undoes it too. Git refused to start if
             // uncommitted changes were in the way, so none are lost.
-            self.run(["reset", "--quiet", "--merge"], None).ok();
+            self.undoing()
+                .run(["reset", "--quiet", "--merge"], None)
+                .ok();
         }
         merged.map(|()| MergeOutcome::Merged)
     }
@@ -503,12 +625,12 @@ impl Git {
     pub fn rebase_branch(&self, branch: &str, onto: &str, return_to: Option<&str>) -> Result<()> {
         let rebased = self.run(["rebase", "--quiet", onto, branch], None);
         if rebased.is_err() {
-            self.run(["rebase", "--abort"], None).ok();
+            self.undoing().run(["rebase", "--abort"], None).ok();
         }
         if let Some(return_to) = return_to
             && return_to != branch
         {
-            let switched = self.switch(return_to);
+            let switched = self.undoing().switch(return_to);
             // The error that stopped the rebase is the one to report.
             if rebased.is_ok() {
                 switched?;
@@ -545,9 +667,10 @@ impl Git {
             }
             args.extend(commits.iter().map(String::as_str));
             let picked = self.run(args, None).map(drop);
-            if picked.is_err() && self.run(["cherry-pick", "--abort"], None).is_err() {
+            let undo = self.undoing();
+            if picked.is_err() && undo.run(["cherry-pick", "--abort"], None).is_err() {
                 // Nothing to abort after `--no-commit`: undo what it staged.
-                self.run(["reset", "--quiet", "--merge"], None).ok();
+                undo.run(["reset", "--quiet", "--merge"], None).ok();
             }
             picked
         });
@@ -556,9 +679,9 @@ impl Git {
         {
             // Best effort: the error that stopped the cherry-pick is the one
             // to report.
-            self.switch(branch).ok();
+            self.undoing().switch(branch).ok();
         }
-        if stashed && let Err(error) = self.run(["stash", "pop", "--quiet"], None) {
+        if stashed && let Err(error) = self.undoing().run(["stash", "pop", "--quiet"], None) {
             let Error::Failed { command, output } = error else {
                 return Err(error);
             };
@@ -627,18 +750,32 @@ impl Git {
     /// `git pull`. A merge or rebase that conflicts stops with the conflicts
     /// in the working tree, to be resolved as after any merge or rebase.
     pub fn pull(&self, method: PullMethod) -> Result<PullOutcome> {
-        let mut args = vec!["pull", "--quiet"];
-        if method == PullMethod::Merge {
-            args.push("--no-rebase");
-        }
-        // No editor can open for a merge message.
-        match self.run_with_env(args, None, &[("GIT_MERGE_AUTOEDIT", "no")]) {
-            Ok(_) => Ok(PullOutcome::Pulled),
-            Err(_) if self.conflicted().is_ok_and(|paths| !paths.is_empty()) => {
+        match self.run_pull(method) {
+            Ok(()) => Ok(PullOutcome::Pulled),
+            // Also when the pull was cancelled after it stopped.
+            Err(_)
+                if self
+                    .undoing()
+                    .conflicted()
+                    .is_ok_and(|paths| !paths.is_empty()) =>
+            {
                 Ok(PullOutcome::Conflicts)
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// `git pull` in this working tree, the way `method` says.
+    fn run_pull(&self, method: PullMethod) -> Result<()> {
+        let mut args = vec!["pull", "--quiet"];
+        match method {
+            PullMethod::Configured => {}
+            PullMethod::Merge => args.push("--no-rebase"),
+            PullMethod::FastForward => args.push("--ff-only"),
+        }
+        // No editor can open for a merge message.
+        self.run_with_env(args, None, &[("GIT_MERGE_AUTOEDIT", "no")])
+            .map(drop)
     }
 
     /// Sends branch `branch`, checked out, to its upstream, like `git push`.
@@ -657,15 +794,64 @@ impl Git {
         self.run(args, None).map(drop)
     }
 
-    /// Fast-forwards branch `branch`, not checked out, to its upstream on
-    /// the remote, like `git fetch <remote> <upstream>:<branch>`. Fails,
-    /// changing nothing, when the branch has commits its upstream lacks
-    /// (see [`not_fast_forward`]) or has no upstream.
-    pub fn pull_branch(&self, branch: &str) -> Result<()> {
+    /// Fast-forwards branch `branch` to its upstream on the remote, where
+    /// the branch is.
+    ///
+    /// Checked out nowhere, it is fetched into, like `git fetch <remote>
+    /// <upstream>:<branch>`. Checked out in a working tree, this one or
+    /// another, it is pulled there, like `git pull --ff-only` in that
+    /// folder: git refuses to fetch into a branch that is checked out, and
+    /// its files have to follow it. Returns that working tree, if there is
+    /// one.
+    ///
+    /// Fails, changing nothing, when the branch has commits its upstream
+    /// lacks (see [`not_fast_forward`]), when uncommitted changes in its
+    /// working tree are in the way (see [`blocked_by_changes`]), when that
+    /// working tree is missing or locked
+    /// ([`Error::WorktreeUnavailable`]), or when the branch has no
+    /// upstream.
+    pub fn pull_branch(&self, branch: &str) -> Result<Option<PathBuf>> {
         let (remote, merge) = self.upstream_of(branch)?;
+        if let Some(worktree) = self.worktree_of(branch)? {
+            if let Some(problem) = worktree.problem {
+                return Err(Error::WorktreeUnavailable {
+                    branch: branch.to_owned(),
+                    path: worktree.path,
+                    problem,
+                });
+            }
+            self.in_work_dir(&worktree.path)
+                .run_pull(PullMethod::FastForward)?;
+            return Ok(Some(worktree.path));
+        }
         let refspec = format!("{merge}:refs/heads/{branch}");
         // Not `--quiet`: it hides the line saying why a fetch was rejected.
-        self.run(["fetch", &remote, &refspec], None).map(drop)
+        self.run(["fetch", &remote, &refspec], None)?;
+        Ok(None)
+    }
+
+    /// The working tree local branch `branch` is checked out in, if it is
+    /// checked out: this one, the repository's main one or a linked one.
+    pub fn worktree_of(&self, branch: &str) -> Result<Option<Worktree>> {
+        Ok(self
+            .worktrees()?
+            .into_iter()
+            .find(|worktree| worktree.branch.as_deref() == Some(branch)))
+    }
+
+    /// The repository's working trees, the main one first, like `git
+    /// worktree list`.
+    pub fn worktrees(&self) -> Result<Vec<Worktree>> {
+        // `-z` keeps a path with a line break in it whole; git before 2.36
+        // does not know it.
+        let (output, end) = match self.run(["worktree", "list", "--porcelain", "-z"], None) {
+            Ok(output) => (output, b'\0'),
+            Err(Error::Failed { .. }) => {
+                (self.run(["worktree", "list", "--porcelain"], None)?, b'\n')
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(parse_worktrees(&output, end))
     }
 
     /// Sends branch `branch`, checked out or not, to its upstream, like
@@ -715,7 +901,12 @@ impl Git {
         let command = if pop { "pop" } else { "apply" };
         match self.run(["stash", command, "--quiet", &stash], None) {
             Ok(_) => Ok(UnstashOutcome::Applied),
-            Err(_) if self.conflicted().is_ok_and(|paths| !paths.is_empty()) => {
+            Err(_)
+                if self
+                    .undoing()
+                    .conflicted()
+                    .is_ok_and(|paths| !paths.is_empty()) =>
+            {
                 Ok(UnstashOutcome::Conflicts)
             }
             Err(error) => Err(error),
@@ -782,8 +973,13 @@ impl Git {
         args.push(commit);
         match self.run(args, None) {
             Ok(_) => Ok(RevertOutcome::Reverted),
-            Err(_) if self.conflicted().is_ok_and(|paths| !paths.is_empty()) => {
-                self.run(["revert", "--abort"], None)?;
+            Err(_)
+                if self
+                    .undoing()
+                    .conflicted()
+                    .is_ok_and(|paths| !paths.is_empty()) =>
+            {
+                self.undoing().run(["revert", "--abort"], None)?;
                 Ok(RevertOutcome::Conflicts)
             }
             Err(error) => Err(error),
@@ -801,56 +997,52 @@ impl Git {
     /// Nothing can ask for input: no prompt, no editor (messages stay as git
     /// proposes them) and no pager. Returns whether git succeeded.
     pub fn run_as_typed(&self, args: &[String], mut output: impl FnMut(String)) -> Result<bool> {
-        use std::io::BufRead as _;
-
-        let mut child = Command::new("git")
-            .arg("-C")
-            .arg(&self.work_dir)
+        let mut command = self.command();
+        command
             .args(args)
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_EDITOR", "true")
             .env("GIT_SEQUENCE_EDITOR", "true")
-            .env("GIT_PAGER", "cat")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(Error::Spawn)?;
-        let (sender, lines) = std::sync::mpsc::channel();
-        let readers: Vec<_> = [
-            child
-                .stdout
-                .take()
-                .map(|out| Box::new(out) as Box<dyn std::io::Read + Send>),
-            child
-                .stderr
-                .take()
-                .map(|err| Box::new(err) as Box<dyn std::io::Read + Send>),
-        ]
-        .into_iter()
-        .flatten()
-        .map(|stream| {
-            let sender = sender.clone();
-            std::thread::spawn(move || {
-                for line in std::io::BufReader::new(stream).lines() {
-                    let Ok(line) = line else { break };
-                    if sender.send(line).is_err() {
-                        break;
+            .env("GIT_PAGER", "cat");
+        // The line each stream is in the middle of.
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut said = Vec::new();
+        let end = run::run(
+            command,
+            None,
+            self.operation.as_ref(),
+            self.undoing,
+            |stream, bytes| {
+                let line = match stream {
+                    Stream::Out => &mut out,
+                    Stream::Err => {
+                        said.extend_from_slice(bytes);
+                        &mut err
+                    }
+                };
+                for byte in bytes {
+                    if *byte == b'\n' {
+                        output(line_of(line));
+                        line.clear();
+                    } else {
+                        line.push(*byte);
                     }
                 }
-            })
-        })
-        .collect();
-        // Ends once both readers are done.
-        drop(sender);
-        for line in lines {
-            output(line);
+            },
+        )
+        .map_err(Error::Spawn)?;
+        for line in [out, err] {
+            if !line.is_empty() {
+                output(line_of(&line));
+            }
         }
-        for reader in readers {
-            let _ = reader.join();
+        match end {
+            End::Exited(status) => Ok(status.success()),
+            End::Cancelled => Err(Error::Cancelled {
+                command: describe(args),
+                output: run::text(&said),
+            }),
         }
-        let status = child.wait().map_err(Error::Spawn)?;
-        Ok(status.success())
     }
 
     /// Rewrites the commits after `base` (all of them, from the root, when
@@ -985,9 +1177,10 @@ impl Git {
                 Ok(RewriteOutcome::Done)
             }
             Err(error) => {
-                if self.rebasing().unwrap_or(true) {
+                let undo = self.undoing();
+                if undo.rebasing().unwrap_or(true) {
                     // Brings back stashed changes too.
-                    self.run(["rebase", "--abort"], None).ok();
+                    undo.run(["rebase", "--abort"], None).ok();
                 }
                 self.clean_rewrite_dir();
                 Err(error)
@@ -1013,7 +1206,7 @@ impl Git {
     }
 
     fn clean_rewrite_dir(&self) {
-        if let Ok(dir) = self.rewrite_dir() {
+        if let Ok(dir) = self.undoing().rewrite_dir() {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
@@ -1042,7 +1235,9 @@ impl Git {
         // Literal pathspecs stop `git stash` from cleaning the untracked
         // files it stashed, which it does with the pathspec `:/`.
         self.run_with_env(args, None, &[("GIT_LITERAL_PATHSPECS", "0")])?;
+        // Stashed by now, so asked even after a cancel.
         let after = self
+            .undoing()
             .run(["rev-parse", "--quiet", "--verify", "refs/stash"], None)
             .ok();
         Ok(after.is_some() && after != before)
@@ -1070,6 +1265,7 @@ impl Git {
             let path = std::slice::from_ref(path);
             match self.run_with_paths(["checkout", flag], path) {
                 Ok(()) => self.stage(path)?,
+                Err(error) if error.is_cancelled() => return Err(error),
                 // That side has no version of it: it deleted the file.
                 Err(error) => self
                     .run_with_paths(["rm", "--quiet"], path)
@@ -1161,12 +1357,12 @@ impl Git {
     }
 
     fn discard_changes(&self, paths: Option<&[String]>, untracked: bool) -> Result<Option<String>> {
-        let top = || {
-            self.run(["rev-parse", "--quiet", "--verify", "refs/stash"], None)
+        let top = |git: &Self| {
+            git.run(["rev-parse", "--quiet", "--verify", "refs/stash"], None)
                 .ok()
                 .map(|id| String::from_utf8_lossy(&id).trim().to_owned())
         };
-        let before = top();
+        let before = top(self);
         let mut args = vec!["stash", "push", "--quiet"];
         if untracked {
             args.push("--include-untracked");
@@ -1193,11 +1389,14 @@ impl Git {
                 self.run_with_env(args, None, &literal)?;
             }
         }
-        let after = top();
+        // Stashed by now, so finished even after a cancel: the changes
+        // would stay on the stash list, discarded but not said to be.
+        let finish = self.undoing();
+        let after = top(&finish);
         if after.is_none() || after == before {
             return Ok(None);
         }
-        self.drop_stash(0)?;
+        finish.drop_stash(0)?;
         Ok(after)
     }
 
@@ -1248,34 +1447,38 @@ impl Git {
             .into_iter()
             .map(|arg| arg.as_ref().to_owned())
             .collect();
-        let mut child = Command::new("git")
-            .arg("-C")
-            .arg(&self.work_dir)
+        let mut command = self.command();
+        command
             .args(&args)
             // Paths are file names, never patterns.
             .env("GIT_LITERAL_PATHSPECS", "1")
             // Nothing can answer a prompt.
             .env("GIT_TERMINAL_PROMPT", "0")
-            .envs(env.iter().copied())
-            .stdin(if input.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(Error::Spawn)?;
-        if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
-            // A command that fails early stops reading; its output says why.
-            let _ = stdin.write_all(input);
-        }
-        let output = child.wait_with_output().map_err(Error::Spawn)?;
-        if output.status.success() {
-            return Ok(output.stdout);
-        }
-        let mut text = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout);
+            .envs(env.iter().copied());
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        let end = run::run(
+            command,
+            input,
+            self.operation.as_ref(),
+            self.undoing,
+            |stream, bytes| match stream {
+                Stream::Out => stdout.extend_from_slice(bytes),
+                Stream::Err => stderr.extend_from_slice(bytes),
+            },
+        )
+        .map_err(Error::Spawn)?;
+        let status = match end {
+            End::Exited(status) if status.success() => return Ok(stdout),
+            End::Exited(status) => status,
+            End::Cancelled => {
+                return Err(Error::Cancelled {
+                    command: describe(&args),
+                    output: run::text(&stderr),
+                });
+            }
+        };
+        let mut text = run::text(&stderr);
+        let stdout = String::from_utf8_lossy(&stdout);
         if !stdout.trim().is_empty() {
             // Hooks often write to standard output.
             if !text.is_empty() {
@@ -1284,19 +1487,88 @@ impl Git {
             text.push_str(stdout.trim());
         }
         if text.is_empty() {
-            text = format!("git exited with {}", output.status);
+            text = format!("git exited with {status}");
         }
         Err(Error::Failed {
-            command: format!(
-                "git {}",
-                args.iter()
-                    .map(|arg| arg.to_string_lossy())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            ),
+            command: describe(&args),
             output: text,
         })
     }
+
+    /// `git` in the working tree, with this handle's environment.
+    fn command(&self) -> Command {
+        let mut command = Command::new("git");
+        command
+            .arg("-C")
+            .arg(&self.work_dir)
+            .envs(self.env.iter().map(|(key, value)| (key, value)));
+        command
+    }
+}
+
+/// `git <args>`, to name a command in an error.
+fn describe<S: AsRef<OsStr>>(args: &[S]) -> String {
+    let mut command = String::from("git");
+    for arg in args {
+        command.push(' ');
+        command.push_str(&arg.as_ref().to_string_lossy());
+    }
+    command
+}
+
+/// The working trees in `output`, what `git worktree list --porcelain`
+/// wrote with each line ended by `end`: an empty line ends a working tree.
+fn parse_worktrees(output: &[u8], end: u8) -> Vec<Worktree> {
+    let mut worktrees: Vec<Worktree> = Vec::new();
+    let mut started = false;
+    for line in output.split(|byte| *byte == end) {
+        let line = String::from_utf8_lossy(line);
+        if line.is_empty() {
+            started = false;
+            continue;
+        }
+        let (key, value) = match line.split_once(' ') {
+            Some((key, value)) => (key, Some(value)),
+            None => (&*line, None),
+        };
+        if key == "worktree" {
+            let path = PathBuf::from(value.unwrap_or_default());
+            // Git says so itself (`prunable`) only when the folder's `.git`
+            // file is gone too.
+            let problem = (!path.exists()).then_some(WorktreeProblem::Missing);
+            worktrees.push(Worktree {
+                path,
+                branch: None,
+                problem,
+            });
+            started = true;
+            continue;
+        }
+        let Some(worktree) = worktrees.last_mut().filter(|_| started) else {
+            continue;
+        };
+        match key {
+            "branch" => {
+                worktree.branch = value
+                    .and_then(|name| name.strip_prefix("refs/heads/"))
+                    .map(str::to_owned);
+            }
+            "prunable" => worktree.problem = Some(WorktreeProblem::Missing),
+            // Missing matters more: there is nothing to unlock.
+            "locked" if worktree.problem.is_none() => {
+                let reason = value.filter(|reason| !reason.is_empty());
+                worktree.problem = Some(WorktreeProblem::Locked(reason.map(str::to_owned)));
+            }
+            _ => {}
+        }
+    }
+    worktrees
+}
+
+/// One line of git's output, without its line ending.
+fn line_of(line: &[u8]) -> String {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    String::from_utf8_lossy(line).into_owned()
 }
 
 /// The editor git runs for each commit a rewrite rewords: it puts the

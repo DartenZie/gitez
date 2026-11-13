@@ -7,6 +7,7 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::remote::{RemoteOp, RemoteTarget};
 use super::{NewTag, Workspace};
 use crate::theme::color;
 
@@ -316,7 +317,9 @@ impl Workspace {
             return;
         };
         let (to, tag) = (remote.clone(), name.clone());
-        self.run_git(
+        self.run_remote(
+            RemoteOp::Push,
+            RemoteTarget::Remote(remote.clone()),
             None,
             move |git| git.push_tag(&to, &tag),
             move |_, result, _, window, cx| {
@@ -359,7 +362,9 @@ impl Workspace {
             return;
         }
         let (on, tag) = (remote.clone(), name.clone());
-        self.run_git(
+        self.run_remote(
+            RemoteOp::Push,
+            RemoteTarget::Remote(remote.clone()),
             None,
             move |git| git.delete_remote_tag(&on, &tag),
             move |_, result, _, window, cx| {

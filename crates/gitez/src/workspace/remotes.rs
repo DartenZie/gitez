@@ -9,6 +9,7 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::remote::{RemoteOp, RemoteTarget};
 use super::{AddRemote, Workspace};
 use crate::theme::color;
 
@@ -376,25 +377,23 @@ impl Workspace {
         match request {
             RemoteRequest::Add { name, url } => {
                 let remote = name.clone();
+                // Added first, on its own: the fetch that follows reaches
+                // the network, so it runs where it can be cancelled.
                 self.run_git(
                     None,
-                    move |git| {
-                        git.add_remote(&remote, &url)?;
-                        Ok(git.fetch_remote(&remote).err())
-                    },
-                    move |_, result, _, window, cx| {
-                        let notification = match result {
-                            Ok(None) => {
-                                crate::toast::success(format!("Added {name} and fetched it"))
-                            }
-                            Ok(Some(error)) => crate::toast::warning(format!(
-                                "Added {name}, but could not fetch it: {error}"
-                            )),
-                            Err(error) => {
-                                crate::toast::error(format!("Could not add {name}: {error}"))
-                            }
-                        };
-                        window.push_notification(notification, cx);
+                    move |git| git.add_remote(&remote, &url),
+                    move |this, result, _, window, cx| match result {
+                        Ok(()) => {
+                            window.push_notification(
+                                crate::toast::success(format!("Added {name}")),
+                                cx,
+                            );
+                            this.fetch_one_remote(name, window, cx);
+                        }
+                        Err(error) => window.push_notification(
+                            crate::toast::error(format!("Could not add {name}: {error}")),
+                            cx,
+                        ),
                     },
                     window,
                     cx,
@@ -448,7 +447,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let remote = name.clone();
-        self.run_git(
+        self.run_remote(
+            RemoteOp::Fetch,
+            RemoteTarget::Remote(name.clone()),
             None,
             move |git| git.fetch_remote(&remote),
             move |_, result, _, window, cx| {

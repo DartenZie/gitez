@@ -12,6 +12,9 @@ publish = false
 [dependencies]
 thiserror.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 

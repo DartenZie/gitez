@@ -3,9 +3,10 @@
 //! any git command. A git command GitEZ has a screen for is offered there;
 //! any other runs exactly as typed, its output streaming into the palette.
 
-use gitez_command::Git;
+use gitez_command::{Git, Operation};
 use gitez_git::{Oid, RefKind, Repository};
 use gpui_kit::assets::IconName;
+use gpui_kit::component::button::*;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -332,6 +333,10 @@ struct Console {
     lines: Vec<SharedString>,
     /// `None` while it runs.
     ok: Option<bool>,
+    /// Ends the git it runs.
+    operation: Operation,
+    /// Whether it was cancelled: ending, or ended that way.
+    cancelled: bool,
     scroll: UniformListScrollHandle,
     _run: Task<()>,
 }
@@ -883,7 +888,8 @@ impl Palette {
         let Some(dir) = self.repository.work_dir() else {
             return;
         };
-        let git = Git::new(dir);
+        let operation = Operation::new();
+        let git = Git::new(dir).with_operation(&operation);
         let command = format!(
             "git {}",
             args.iter()
@@ -923,7 +929,13 @@ impl Palette {
                 Err(error) => {
                     this.update(cx, |this, _| {
                         if let Some(console) = &mut this.console {
-                            console.lines.push(error.to_string().into());
+                            // What git wrote is in the lines above.
+                            let line = if error.is_cancelled() {
+                                "Cancelled.".to_owned()
+                            } else {
+                                error.to_string()
+                            };
+                            console.lines.push(line.into());
                         }
                     })
                     .ok();
@@ -947,9 +959,26 @@ impl Palette {
             command,
             lines: Vec::new(),
             ok: None,
+            operation,
+            cancelled: false,
             scroll: UniformListScrollHandle::new(),
             _run: task,
         });
+        cx.notify();
+    }
+
+    /// Ends the git command running, with every process git started for
+    /// it. Its output shows that it ended, shortly after.
+    fn cancel_typed(&mut self, cx: &mut Context<Self>) {
+        let Some(console) = &mut self.console else {
+            return;
+        };
+        if console.ok.is_some() || console.cancelled {
+            return;
+        }
+        console.cancelled = true;
+        // Returns at once; git is ended on the thread that runs it.
+        console.operation.cancel();
         cx.notify();
     }
 
@@ -1144,11 +1173,14 @@ impl Palette {
     fn render_console(&self, console: &Console, cx: &mut Context<Self>) -> impl IntoElement {
         let mono = cx.theme().mono_font_family.clone();
         let lines = console.lines.clone();
-        let (status, status_color) = match console.ok {
-            None => ("running…", color::TEXT_MUTED),
-            Some(true) => ("done", color::DIFF_ADDED),
-            Some(false) => ("failed", color::DIFF_REMOVED),
+        let (status, status_color) = match (console.ok, console.cancelled) {
+            (None, false) => ("running…", color::TEXT_MUTED),
+            (None, true) => ("cancelling…", color::TEXT_MUTED),
+            (Some(true), _) => ("done", color::DIFF_ADDED),
+            (Some(false), true) => ("cancelled", color::TEXT_MUTED),
+            (Some(false), false) => ("failed", color::DIFF_REMOVED),
         };
+        let can_cancel = console.ok.is_none() && !console.cancelled;
         div()
             .v_flex()
             .gap(px(8.))
@@ -1175,7 +1207,16 @@ impl Palette {
                             .flex_none()
                             .text_color(rgb(status_color))
                             .child(status),
-                    ),
+                    )
+                    .when(can_cancel, |this| {
+                        this.child(
+                            Button::new("cancel-command")
+                                .xsmall()
+                                .label("Cancel")
+                                .tooltip("End the command and every process git started for it")
+                                .on_click(cx.listener(|this, _, _, cx| this.cancel_typed(cx))),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -1207,7 +1248,8 @@ impl Palette {
                     .text_size(px(12.))
                     .text_color(rgb(color::TEXT_MUTED))
                     .child(if console.ok.is_none() {
-                        "Esc hides the palette; the command keeps running."
+                        "Esc hides the palette; the command keeps running until it ends or you \
+                         cancel it."
                     } else {
                         "Type to search again, or ⌘↵ to run the command once more."
                     }),

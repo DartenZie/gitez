@@ -801,8 +801,14 @@ fn pulls_and_pushes_a_branch_not_checked_out() {
     assert!(not_fast_forward(&error), "{error}");
     assert_eq!(git(b.work_dir(), &["rev-parse", "feature"]), before);
 
-    // The branch checked out is pulled with `pull`.
-    assert!(b.pull_branch("main").is_err());
+    // The branch checked out is pulled where it is, not fetched into.
+    let main = git(a.work_dir(), &["rev-parse", "origin/main"]);
+    let pulled = b.pull_branch("main").expect("pull in the working tree");
+    assert_eq!(
+        pulled,
+        Some(b.work_dir().canonicalize().expect("canonical path"))
+    );
+    assert_eq!(git(b.work_dir(), &["rev-parse", "main"]), main);
     git(b.work_dir(), &["branch", "--quiet", "lonely"]);
     assert!(b.pull_branch("lonely").is_err());
 }
