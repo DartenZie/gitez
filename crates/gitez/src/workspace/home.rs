@@ -4,7 +4,8 @@
 //!
 //! The sidebar lists the threads that need the owner (Finished: a pull
 //! request ready, an answer, a failure or a stop), newest first, and below
-//! them one collapsed section with the active, waiting and completed ones.
+//! them the active ones, then the waiting ones. Completed threads are not
+//! listed.
 //! The main area is the launcher with the recent repositories and Open,
 //! Clone and New repository, or the thread picked in the sidebar.
 
@@ -71,19 +72,11 @@ pub(crate) struct Listed {
     pub active: Vec<Item>,
     /// Queued (in the order they start) or waiting for the usage limit.
     pub waiting: Vec<Item>,
-    /// Completed, newest first.
-    pub completed: Vec<Item>,
-}
-
-impl Listed {
-    /// How many threads "Active and completed" holds.
-    fn more(&self) -> usize {
-        self.active.len() + self.waiting.len() + self.completed.len()
-    }
 }
 
 /// The threads of every repository, or of the one whose git common dir is
-/// `filter`, sorted into the sidebar's lists.
+/// `filter`, sorted into the sidebar's lists. Completed threads are left
+/// out.
 pub(crate) fn list(threads: &AgentThreads, filter: Option<&Path>) -> Listed {
     let mut listed = Listed::default();
     for repository in threads.repositories() {
@@ -109,7 +102,7 @@ pub(crate) fn list(threads: &AgentThreads, filter: Option<&Path>) -> Listed {
                 State::Finished => listed.finished.push(item),
                 State::Preparing | State::Running => listed.active.push(item),
                 State::Queued | State::Waiting => listed.waiting.push(item),
-                State::Completed => listed.completed.push(item),
+                State::Completed => {}
             }
         }
     }
@@ -124,9 +117,6 @@ pub(crate) fn list(threads: &AgentThreads, filter: Option<&Path>) -> Listed {
     listed
         .waiting
         .sort_by_key(|item| (item.thread.state == State::Queued, item.thread.created));
-    listed.completed.sort_by_key(|item| {
-        std::cmp::Reverse(item.thread.completed.unwrap_or(item.thread.updated))
-    });
     listed
 }
 
@@ -191,7 +181,7 @@ fn started_line(thread: Option<&AgentThread>) -> &'static str {
             "Sent to the background. It runs on its own branch and is listed under Active."
         }
         Some(State::Finished) => "It has finished and is listed under Finished.",
-        Some(State::Completed) => "It is completed and listed under Completed.",
+        Some(State::Completed) => "It is completed and no longer listed.",
     }
 }
 
@@ -203,8 +193,6 @@ pub struct Home {
     /// The git common dir of the repository whose threads are listed;
     /// `None`: every repository.
     filter: Option<PathBuf>,
-    /// Whether "Active and completed" is expanded.
-    more_open: bool,
     /// The thread shown instead of the launcher.
     thread: Option<(Entity<ThreadView>, Subscription)>,
     /// The thread started last from the launcher, marked in the sidebar.
@@ -229,12 +217,12 @@ pub struct Home {
 enum SidebarEntry {
     /// What could not be read, watched or completed.
     Notices(Vec<Notice>),
-    /// "Finished" with how many.
-    Finished(usize),
+    /// A section's heading and debug selector, with how many: "Finished",
+    /// "Active".
+    Section(&'static str, &'static str, usize),
     Note(&'static str),
     Row(Box<Item>, Kind),
-    /// "Active and completed" with how many, to expand or collapse.
-    More(usize),
+    /// A group's heading inside a section: "Waiting".
     Group(&'static str, &'static str),
 }
 
@@ -272,7 +260,6 @@ impl Home {
             model,
             composer,
             filter: None,
-            more_open: false,
             thread: None,
             started: None,
             starting: false,
@@ -354,11 +341,6 @@ impl Home {
         cx.notify();
     }
 
-    fn toggle_more(&mut self, cx: &mut Context<Self>) {
-        self.more_open = !self.more_open;
-        cx.notify();
-    }
-
     /// Starts the thread the launcher asks for; control returns at once and
     /// the thread shows in the sidebar. If it cannot start, the prompt goes
     /// back into the launcher.
@@ -374,8 +356,7 @@ impl Home {
                 match started {
                     Ok(key) => {
                         this.started = Some(key);
-                        // Where it is listed: shown, and not filtered out.
-                        this.more_open = true;
+                        // Where it is listed: not filtered out.
                         if this
                             .filter
                             .as_ref()
@@ -476,12 +457,17 @@ enum Kind {
     Finished,
     Active,
     Waiting,
-    Completed,
 }
 
 /// A section's heading, with its count at the end.
-fn section_heading(title: &'static str, count: Option<usize>, cx: &App) -> Div {
+fn section_heading(
+    title: &'static str,
+    selector: &'static str,
+    count: Option<usize>,
+    cx: &App,
+) -> Div {
     div()
+        .debug_selector(move || selector.into())
         .h_flex()
         .gap(px(8.))
         .px(px(16.))
@@ -502,7 +488,7 @@ fn section_heading(title: &'static str, count: Option<usize>, cx: &App) -> Div {
         })
 }
 
-/// A group's heading inside "Active and completed".
+/// A group's heading inside a section.
 fn group_heading(title: &'static str, selector: &'static str) -> Div {
     div()
         .debug_selector(move || selector.into())
@@ -645,7 +631,11 @@ impl Home {
             .repositories()
             .iter()
             .any(|repository| !repository.threads.is_empty());
-        entries.push(SidebarEntry::Finished(listed.finished.len()));
+        entries.push(SidebarEntry::Section(
+            "Finished",
+            "home-section-finished",
+            listed.finished.len(),
+        ));
         if listed.finished.is_empty() {
             entries.push(SidebarEntry::Note(if any_thread {
                 "No finished threads"
@@ -654,45 +644,34 @@ impl Home {
                  branch in its own worktree, and shows here when it needs you."
             }));
         }
-        let more = listed.more();
         entries.extend(
             listed
                 .finished
                 .into_iter()
                 .map(|item| SidebarEntry::Row(Box::new(item), Kind::Finished)),
         );
-        entries.push(SidebarEntry::More(more));
-        if self.more_open {
-            if more == 0 {
-                entries.push(SidebarEntry::Note(
-                    "No active, waiting or completed threads",
-                ));
-            }
-            for (title, selector, items, kind) in [
-                ("Active", "home-group-active", listed.active, Kind::Active),
-                (
-                    "Waiting",
-                    "home-group-waiting",
-                    listed.waiting,
-                    Kind::Waiting,
-                ),
-                (
-                    "Completed",
-                    "home-group-completed",
-                    listed.completed,
-                    Kind::Completed,
-                ),
-            ] {
-                if items.is_empty() {
-                    continue;
-                }
-                entries.push(SidebarEntry::Group(title, selector));
-                entries.extend(
-                    items
-                        .into_iter()
-                        .map(|item| SidebarEntry::Row(Box::new(item), kind)),
-                );
-            }
+        entries.push(SidebarEntry::Section(
+            "Active",
+            "home-section-active",
+            listed.active.len() + listed.waiting.len(),
+        ));
+        if listed.active.is_empty() && listed.waiting.is_empty() {
+            entries.push(SidebarEntry::Note("No running or waiting threads"));
+        }
+        entries.extend(
+            listed
+                .active
+                .into_iter()
+                .map(|item| SidebarEntry::Row(Box::new(item), Kind::Active)),
+        );
+        if !listed.waiting.is_empty() {
+            entries.push(SidebarEntry::Group("Waiting", "home-group-waiting"));
+            entries.extend(
+                listed
+                    .waiting
+                    .into_iter()
+                    .map(|item| SidebarEntry::Row(Box::new(item), Kind::Waiting)),
+            );
         }
         entries
     }
@@ -736,52 +715,24 @@ impl Home {
                 .pb(px(4.))
                 .child(render_notices(notices.clone(), "home-notice", cx))
                 .into_any_element(),
-            SidebarEntry::Finished(count) => {
-                section_heading("Finished", Some(*count), cx).into_any_element()
+            SidebarEntry::Section(title, selector, count) => {
+                let heading = section_heading(title, selector, Some(*count), cx);
+                // A divider above every section but the first.
+                if index == 0 || matches!(self.entries[index - 1], SidebarEntry::Notices(_)) {
+                    heading.into_any_element()
+                } else {
+                    div()
+                        .mt(px(12.))
+                        .border_t_1()
+                        .border_color(rgb(color::ROW_DIVIDER))
+                        .child(heading)
+                        .into_any_element()
+                }
             }
             SidebarEntry::Note(text) => note(text).into_any_element(),
             SidebarEntry::Row(item, kind) => self
                 .render_row(item, *kind, &self.places, Timestamp::now(), cx)
                 .into_any_element(),
-            SidebarEntry::More(more) => {
-                let toggle = div()
-                    .id("home-more")
-                    .debug_selector(|| "home-more".into())
-                    .h_flex()
-                    .gap(px(8.))
-                    .h(px(34.))
-                    .px(px(16.))
-                    .text_size(px(12.))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(rgb(color::TEXT_SECONDARY))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(color::NAV_HOVER)).text_color(rgb(color::TEXT)))
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_more(cx)))
-                    .child(
-                        Icon::new(if self.more_open {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        })
-                        .size(px(12.)),
-                    )
-                    .child("Active and completed")
-                    .child(
-                        div()
-                            .ml_auto()
-                            .font_family(cx.theme().mono_font_family.clone())
-                            .text_size(px(11.))
-                            .text_color(rgb(color::TEXT_FAINT))
-                            .child(more.to_string()),
-                    );
-                div()
-                    .v_flex()
-                    .mt(px(12.))
-                    .border_t_1()
-                    .border_color(rgb(color::ROW_DIVIDER))
-                    .child(toggle)
-                    .into_any_element()
-            }
             SidebarEntry::Group(title, selector) => {
                 group_heading(title, selector).into_any_element()
             }
@@ -1004,7 +955,6 @@ impl Home {
                 .get(&key)
                 .map(|place| ordinal(*place))
                 .unwrap_or_default(),
-            Kind::Completed => ago(thread.completed.unwrap_or(thread.updated), now),
         };
         let title = div()
             .flex_1()
@@ -1013,13 +963,7 @@ impl Home {
             .whitespace_nowrap()
             .text_ellipsis()
             .text_size(px(12.5))
-            .map(|this| {
-                if kind == Kind::Completed {
-                    this.text_color(rgb(color::TEXT_MUTED))
-                } else {
-                    this.font_weight(FontWeight::MEDIUM)
-                }
-            })
+            .font_weight(FontWeight::MEDIUM)
             .child(thread.title.clone());
         let first = div().h_flex().gap(px(8.)).min_w_0().child(title).child(
             div()
@@ -1031,11 +975,7 @@ impl Home {
 
         let repository = div()
             .flex_none()
-            .text_color(rgb(if kind == Kind::Completed {
-                color::TEXT_MUTED
-            } else {
-                color::TEXT_SECONDARY
-            }))
+            .text_color(rgb(color::TEXT_SECONDARY))
             .child(item.repository.clone());
         let dot = || div().flex_none().child("·");
         let ellipsis = || {
@@ -1054,7 +994,7 @@ impl Home {
             .child(repository);
         let mut buttons = Vec::new();
         match kind {
-            Kind::Finished | Kind::Completed => {
+            Kind::Finished => {
                 let model = self.model.read(cx);
                 let limit = model.settings().threads.max_running as usize;
                 let spans = status_line(thread, model.agents(), &item.facts, None, limit, now);
@@ -1062,16 +1002,14 @@ impl Home {
                     .min_h(px(22.))
                     .child(dot())
                     .child(status_line_element(spans, cx).flex_1().min_w_0());
-                if kind == Kind::Finished {
-                    let model = self.model.read(cx);
-                    let actions = row_actions(
-                        thread,
-                        model.agents(),
-                        &model.settings().sandbox.package_hosts,
-                    );
-                    for (index, action) in actions.into_iter().enumerate() {
-                        buttons.push(self.row_button(action, index, thread, &key, busy, cx));
-                    }
+                let model = self.model.read(cx);
+                let actions = row_actions(
+                    thread,
+                    model.agents(),
+                    &model.settings().sandbox.package_hosts,
+                );
+                for (index, action) in actions.into_iter().enumerate() {
+                    buttons.push(self.row_button(action, index, thread, &key, busy, cx));
                 }
             }
             Kind::Active => {
@@ -1682,6 +1620,11 @@ mod tests {
         failed: AgentThreadId,
         /// beta's pull request, 5 minutes ago.
         pull_request: AgentThreadId,
+        /// alpha's running thread, beta's waiting one and beta's completed
+        /// one.
+        running: AgentThreadId,
+        waiting: AgentThreadId,
+        completed: AgentThreadId,
     }
 
     /// Two repositories with three finished threads, one running, one
@@ -1703,15 +1646,15 @@ mod tests {
         let answer = thread(&alpha, &data_dir, "Explain the lanes", 60, |thread| {
             finished(Ending::Answer, 30)(thread);
         });
-        thread(&alpha, &data_dir, "Migrate the build", 8, |thread| {
+        let running = thread(&alpha, &data_dir, "Migrate the build", 8, |thread| {
             thread.state = State::Running;
             thread.turns[0].started = Some(minutes_ago(8));
         });
-        thread(&beta, &data_dir, "Update the template", 20, |thread| {
+        let waiting = thread(&beta, &data_dir, "Update the template", 20, |thread| {
             thread.state = State::Waiting;
             thread.waiting_until = Some(Timestamp::now() + jiff::SignedDuration::from_hours(1));
         });
-        thread(&beta, &data_dir, "Add a toggle", 3000, |thread| {
+        let completed = thread(&beta, &data_dir, "Add a toggle", 3000, |thread| {
             finished(Ending::PullRequest, 2900)(thread);
             thread.state = State::Completed;
             thread.completed = Some(minutes_ago(2800));
@@ -1763,6 +1706,9 @@ mod tests {
             answer,
             failed,
             pull_request,
+            running,
+            waiting,
+            completed,
         };
         (fixture, home, cx)
     }
@@ -1888,7 +1834,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn home_lists_finished_threads_newest_first_and_the_rest_on_request(cx: &mut TestAppContext) {
+    fn home_lists_finished_then_active_threads_and_no_completed_ones(cx: &mut TestAppContext) {
         let (fixture, home, mut cx) = home(cx);
         let model = cx.update(|_, cx| AgentThreads::global(cx));
 
@@ -1897,7 +1843,6 @@ mod tests {
             let listed = list(model, None);
             assert_eq!(listed.active.len(), 1);
             assert_eq!(listed.waiting.len(), 1);
-            assert_eq!(listed.completed.len(), 1);
             listed
                 .finished
                 .iter()
@@ -1918,33 +1863,26 @@ mod tests {
             .collect();
         assert!(tops.is_sorted(), "drawn in that order: {tops:?}");
 
-        // "Active and completed" is collapsed, and expands into three groups.
-        for group in [
-            "home-group-active",
-            "home-group-waiting",
-            "home-group-completed",
-        ] {
-            assert!(cx.debug_bounds(group).is_none(), "{group} is collapsed");
-        }
-        let toggle = cx.debug_bounds("home-more").expect("the toggle is drawn");
-        cx.simulate_click(toggle.center(), gpui_kit::Modifiers::none());
-        redraw(&mut cx);
-        let groups: Vec<f32> = [
-            "home-group-active",
-            "home-group-waiting",
-            "home-group-completed",
-        ]
-        .iter()
-        .map(|group| {
+        // Then Active, its running thread and its waiting group, with no
+        // toggle; the completed thread is not listed at all.
+        let at = |cx: &mut VisualTestContext, selector: &'static str| {
             f32::from(
-                cx.debug_bounds(group)
-                    .unwrap_or_else(|| panic!("{group} is shown"))
+                cx.debug_bounds(selector)
+                    .unwrap_or_else(|| panic!("{selector} is shown"))
                     .origin
                     .y,
             )
-        })
-        .collect();
-        assert!(groups.is_sorted(), "Active, Waiting, Completed: {groups:?}");
+        };
+        let finished = at(&mut cx, "home-section-finished");
+        let active = at(&mut cx, "home-section-active");
+        let running = top(&mut cx, &fixture.running).expect("the running row is drawn");
+        let waiting_group = at(&mut cx, "home-group-waiting");
+        let waiting = top(&mut cx, &fixture.waiting).expect("the waiting row is drawn");
+        let order = [finished, tops[2], active, running, waiting_group, waiting];
+        assert!(order.is_sorted(), "Finished, Active, Waiting: {order:?}");
+        assert!(top(&mut cx, &fixture.completed).is_none(), "not listed");
+        assert!(cx.debug_bounds("home-more").is_none(), "no toggle");
+        assert!(cx.debug_bounds("home-group-completed").is_none());
 
         // The filter narrows the list to one repository.
         home.update(&mut cx, |home, cx| {
@@ -1962,7 +1900,7 @@ mod tests {
             cx.debug_bounds("home-group-waiting").is_none(),
             "beta's wait is hidden"
         );
-        assert!(cx.debug_bounds("home-group-active").is_some());
+        assert!(top(&mut cx, &fixture.running).is_some(), "alpha's is shown");
         model.read_with(&cx, |model, _| {
             let listed = list(model, Some(&fixture.beta));
             assert_eq!(listed.finished.len(), 1);

@@ -412,17 +412,11 @@ fn shown_pull_request(shots: &mut Shots, workspace: &Entity<Workspace>) -> Optio
     })
 }
 
-/// The ids in Home's lists: finished, active, waiting, completed.
-fn listed(shots: &mut Shots) -> [Vec<AgentThreadId>; 4] {
+/// The ids in Home's lists: finished, active, waiting.
+fn listed(shots: &mut Shots) -> [Vec<AgentThreadId>; 3] {
     shots.update(|cx| {
         let listed = super::list(AgentThreads::global(cx).read(cx), None);
-        [
-            listed.finished,
-            listed.active,
-            listed.waiting,
-            listed.completed,
-        ]
-        .map(|items| {
+        [listed.finished, listed.active, listed.waiting].map(|items| {
             items
                 .into_iter()
                 .map(|item| item.thread.id.clone())
@@ -508,11 +502,6 @@ mod at {
         point(px(700.), px(y + 55. * index as f32))
     }
 
-    /// The "Active and completed" toggle under five finished rows.
-    pub fn more() -> Point<Pixels> {
-        env("U6_MORE", 150., 613.)
-    }
-
     /// The finished row `index` (0 first): its title.
     /// In [`super::world`]'s list: rows with Retry are taller.
     pub fn finished_row(index: usize) -> Point<Pixels> {
@@ -596,15 +585,10 @@ fn screenshot_u6_home() {
         shots.save(window, &format!("u6-picker-{name}"));
         shots.keys(window, "escape");
     }
-    // "Active and completed", expanded with a click, in three groups.
-    shots.click(window, at::more());
-    let open = shots.update(|cx| home.read(cx).more_open);
-    assert!(open, "the toggle expands the section");
-    shots.save(window, "u6-expanded");
+    // Active and Waiting under the finished threads.
     shots.scroll(window, point(px(150.), px(600.)), 30.);
-    shots.save(window, "u6-expanded-scrolled");
+    shots.save(window, "u6-home-scrolled");
     shots.scroll(window, point(px(150.), px(600.)), -30.);
-    shots.update(|cx| home.update(cx, |home, cx| home.toggle_more(cx)));
 
     // The repository filter: notes-site has no finished thread.
     shots.click(window, at::filter());
@@ -616,11 +600,9 @@ fn screenshot_u6_home() {
         Some(common_dir_of(&world.notes)),
         "the filter narrows"
     );
-    shots.update(|cx| home.update(cx, |home, cx| home.toggle_more(cx)));
     shots.save(window, "u6-filtered");
     shots.click(window, at::filter());
     shots.click(window, at::filter_item(3));
-    shots.update(|cx| home.update(cx, |home, cx| home.toggle_more(cx)));
     shots.save(window, "u6-filtered-dotfiles");
     shots.click(window, at::filter());
     shots.click(window, at::filter_item(0));
@@ -888,12 +870,11 @@ fn e2e_u6_home_fake_agent() {
                 .any(|thread| thread.id == answer.id && thread.state == State::Completed)
         },
     );
-    let [finished, _, _, completed] = listed(&mut shots);
+    let [finished, active, waiting] = listed(&mut shots);
     assert_eq!(finished, std::slice::from_ref(&work), "gone from Finished");
-    assert_eq!(
-        completed,
-        std::slice::from_ref(&answer.id),
-        "listed under Completed"
+    assert!(
+        !active.contains(&answer.id) && !waiting.contains(&answer.id),
+        "a completed thread is not listed"
     );
     shots.save(window, "u6-e2e-9-completed");
 }
