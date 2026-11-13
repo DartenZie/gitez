@@ -1129,6 +1129,188 @@ fn branch_diff_shows_the_changes_since_the_branch_left_its_base() {
     assert!(diff.files.is_empty());
 }
 
+/// The paths `branch_diff` shows for `head` against `base`, each with its
+/// added and removed lines.
+fn branch_changes(repo: &Repository, base: Oid, head: Oid) -> Vec<(String, usize, usize)> {
+    repo.branch_diff(base, head, DiffOptions::default())
+        .expect("branch diff")
+        .files
+        .into_iter()
+        .map(|file| {
+            let counts = file.line_counts().expect("text");
+            (file.path, counts.added, counts.removed)
+        })
+        .collect()
+}
+
+/// A repository whose `main` has `shared.txt` and `main.txt`, ten lines
+/// each, with `feature` checked out on top of it.
+fn branch_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    let lines: String = (1..=10).map(|line| format!("line {line}\n")).collect();
+    for file in ["shared.txt", "main.txt"] {
+        std::fs::write(fixture.root.join(file), &lines).expect("write file");
+        fixture.git(&["add", file]);
+    }
+    fixture.git(&["commit", "--quiet", "-m", "start"]);
+    fixture.git(&["checkout", "--quiet", "-b", "feature"]);
+    fixture
+}
+
+impl Fixture {
+    /// Commits `file` with `line` (1-based) replaced by `text`.
+    fn change_line(&self, file: &str, line: usize, text: &str) -> Oid {
+        self.clock.set(self.clock.get() + 60);
+        let path = self.root.join(file);
+        let contents = std::fs::read_to_string(&path).expect("read file");
+        let mut lines: Vec<&str> = contents.lines().collect();
+        lines[line - 1] = text;
+        std::fs::write(&path, lines.join("\n") + "\n").expect("write file");
+        self.git(&["commit", "--quiet", "-am", text]);
+        self.rev("HEAD")
+    }
+
+    /// Brings `branch` into the branch checked out as one commit that is
+    /// not a merge.
+    fn squash(&self, branch: &str) -> Oid {
+        self.clock.set(self.clock.get() + 60);
+        self.git(&["merge", "--quiet", "--squash", branch]);
+        self.git(&["commit", "--quiet", "-m", "squash"]);
+        self.rev("HEAD")
+    }
+}
+
+#[test]
+fn branch_diff_leaves_out_the_base_merged_into_the_branch() {
+    let fixture = branch_fixture();
+    fixture.commit("feature.txt", "feature one");
+    fixture.git(&["checkout", "--quiet", "main"]);
+    fixture.change_line("main.txt", 2, "main");
+    fixture.change_line("shared.txt", 2, "main");
+    fixture.git(&["checkout", "--quiet", "feature"]);
+    fixture.merge("main", "Merge main");
+    let head = fixture.change_line("shared.txt", 9, "feature");
+    fixture.git(&["checkout", "--quiet", "main"]);
+    let base = fixture.change_line("main.txt", 9, "main again");
+    let repo = fixture.open();
+
+    assert_eq!(
+        branch_changes(&repo, base, head),
+        [("feature.txt".into(), 1, 0), ("shared.txt".into(), 1, 1)]
+    );
+}
+
+#[test]
+fn branch_diff_leaves_out_the_base_squashed_into_the_branch() {
+    let fixture = branch_fixture();
+    fixture.commit("feature.txt", "feature one");
+    fixture.change_line("shared.txt", 9, "feature");
+    fixture.git(&["checkout", "--quiet", "main"]);
+    fixture.change_line("main.txt", 2, "main");
+    let base = fixture.change_line("shared.txt", 2, "main");
+    fixture.git(&["checkout", "--quiet", "feature"]);
+    // Not a merge commit: the branches still fork where they did.
+    let head = fixture.squash("main");
+    let repo = fixture.open();
+    let objects = fixture.git(&["count-objects", "-v"]);
+
+    let diff = repo
+        .branch_diff(base, head, DiffOptions::default())
+        .expect("branch diff");
+    assert_eq!(diff.merge_base, Some(fixture.rev("main~2")));
+    assert_eq!(diff.ahead, 3);
+    let own = [("feature.txt".into(), 1, 0), ("shared.txt".into(), 1, 1)];
+    assert_eq!(branch_changes(&repo, base, head), own);
+    // The file both changed is compared with the base's own.
+    let DiffContent::Text(hunks) = &diff.files[1].content else {
+        panic!("shared.txt is text");
+    };
+    assert_eq!(
+        hunks[0].old_side,
+        Some(LineSource::Blob(fixture.rev("main:shared.txt")))
+    );
+    assert_eq!(
+        repo.merge_preview(base, head).expect("preview").files,
+        own.len()
+    );
+    // Working it out wrote nothing.
+    assert_eq!(fixture.git(&["count-objects", "-v"]), objects);
+
+    // The base moves on, in a file the branch left alone and in one it
+    // changed: its earlier changes still do not show.
+    fixture.git(&["checkout", "--quiet", "main"]);
+    fixture.change_line("main.txt", 9, "main again");
+    let base = fixture.change_line("shared.txt", 5, "main again");
+    assert_eq!(
+        branch_changes(&repo, base, head),
+        [("feature.txt".into(), 1, 0), ("shared.txt".into(), 2, 2)]
+    );
+}
+
+#[test]
+fn branch_diff_leaves_out_changes_the_base_made_too() {
+    let fixture = branch_fixture();
+    fixture.commit("feature.txt", "feature one");
+    let picked = fixture.change_line("shared.txt", 2, "both");
+    let head = fixture.change_line("shared.txt", 9, "feature");
+    fixture.git(&["checkout", "--quiet", "main"]);
+    fixture.git(&["cherry-pick", &picked.to_string()]);
+    let base = fixture.rev("HEAD");
+    let repo = fixture.open();
+
+    assert_eq!(
+        branch_changes(&repo, base, head),
+        [("feature.txt".into(), 1, 0), ("shared.txt".into(), 1, 1)]
+    );
+
+    // All of it is on the base: nothing is left to review.
+    fixture.squash("feature");
+    let base = fixture.rev("HEAD");
+    assert_eq!(branch_changes(&repo, base, head), []);
+}
+
+#[test]
+fn branch_diff_of_branches_that_merged_each_other_shows_the_branch_alone() {
+    let fixture = branch_fixture();
+    // `lower` and `upper` are stacked on `main`, and each merges it.
+    fixture.git(&["checkout", "--quiet", "-b", "lower"]);
+    fixture.commit("lower.txt", "lower");
+    fixture.git(&["checkout", "--quiet", "-b", "upper"]);
+    fixture.commit("upper.txt", "upper");
+    fixture.git(&["checkout", "--quiet", "main"]);
+    fixture.change_line("main.txt", 2, "main");
+    fixture.git(&["checkout", "--quiet", "lower"]);
+    let base = fixture.merge("main", "Merge main into lower");
+    fixture.git(&["checkout", "--quiet", "upper"]);
+    let head = fixture.merge("main", "Merge main into upper");
+    let repo = fixture.open();
+
+    // Two merge bases: neither alone gives the changes of `upper`.
+    assert_eq!(
+        branch_changes(&repo, base, head),
+        [("upper.txt".into(), 1, 0)]
+    );
+}
+
+#[test]
+fn branch_diff_shows_conflicting_changes_since_the_merge_base() {
+    let fixture = branch_fixture();
+    let head = fixture.change_line("shared.txt", 2, "feature");
+    fixture.git(&["checkout", "--quiet", "main"]);
+    fixture.change_line("main.txt", 2, "main");
+    let base = fixture.change_line("shared.txt", 2, "main");
+    let repo = fixture.open();
+
+    assert_eq!(
+        repo.merge_preview(base, head).expect("preview").conflicts,
+        ["shared.txt"]
+    );
+    assert_eq!(
+        branch_changes(&repo, base, head),
+        [("shared.txt".into(), 1, 1)]
+    );
+}
+
 #[test]
 fn user_name_is_read_from_the_repository_config() {
     let fixture = Fixture::new();
