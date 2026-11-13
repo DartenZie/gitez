@@ -14,6 +14,7 @@ mod conflicts;
 mod detail;
 mod graph;
 mod history;
+mod home;
 mod labels;
 mod lanes;
 mod new_pull_request;
@@ -70,6 +71,7 @@ use history::{
     AskAgent, BranchDropped, CherryPickRequested, History, LaneSelected, PickedChanged, Selection,
     SelectionChanged, StartRequested,
 };
+use home::{Home, HomeEvent, NewThread};
 use new_pull_request::{FormEvent, NewPullRequestForm};
 use palette::{Palette, PaletteCommand, PaletteContext, PaletteEvent};
 use remote::{RemoteActions, RemoteOp};
@@ -116,6 +118,7 @@ pub struct OpenRecent {
 pub fn key_bindings() -> Vec<KeyBinding> {
     let mut bindings = history::key_bindings();
     bindings.extend(composer::key_bindings());
+    bindings.extend(home::key_bindings());
     bindings.extend(review::key_bindings());
     bindings.extend(palette::key_bindings());
     bindings.push(KeyBinding::new("secondary-k", OpenPalette, None));
@@ -144,9 +147,9 @@ pub struct Workspace {
     cloning: Option<(PathBuf, Task<()>)>,
     /// The "Clone repository" form, while its dialog is open.
     clone_form: Option<(Entity<CloneForm>, Subscription)>,
-    /// Why the last attempt to open a repository failed, shown while no
-    /// repository is open.
-    error: Option<SharedString>,
+    /// Home, shown while no repository is open; kept while one is, so it
+    /// is as it was on coming back.
+    home: Option<(Entity<Home>, Subscription)>,
     /// Uncommitted changes of the open repository, once read.
     status: Option<Arc<WorkingTreeStatus>>,
     /// The status read in flight. Dropping it ignores its result.
@@ -224,6 +227,16 @@ pub struct Workspace {
 impl Workspace {
     /// Creates the workspace and starts opening `path`, if given.
     pub fn new(path: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::with_home(path, None, window, cx)
+    }
+
+    /// [`Workspace::new`], keeping `home` as it was if given.
+    fn with_home(
+        path: Option<PathBuf>,
+        home: Option<Entity<Home>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
         let history = cx.new(History::new);
@@ -354,7 +367,7 @@ impl Workspace {
             // Files change outside GitEZ; read the status again on return.
             // The toolbar names the next undo and redo steps.
             cx.observe_global::<UndoLog>(|_, cx| cx.notify()),
-            // The start screen lists the recent repositories.
+            // The toolbar's repository menu lists the recent repositories.
             cx.observe_global::<crate::recent::Recent>(|_, cx| cx.notify()),
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
@@ -372,7 +385,10 @@ impl Workspace {
                 &AgentThreads::global(cx),
                 window,
                 |this, _, event, window, cx| {
-                    if let AgentThreadsEvent::Changed { .. } = event {
+                    // Only the open repository's threads touch its refs.
+                    if let AgentThreadsEvent::Changed { common_dir } = event
+                        && this.is_open(common_dir, cx)
+                    {
                         this.agent_threads_changed(window, cx);
                     }
                 },
@@ -391,7 +407,7 @@ impl Workspace {
             loading: None,
             cloning: None,
             clone_form: None,
-            error: None,
+            home: None,
             status: None,
             status_load: None,
             status_error: None,
@@ -426,10 +442,55 @@ impl Workspace {
             detail,
             _subscriptions: subscriptions,
         };
-        if let Some(path) = path {
-            workspace.open(path, window, cx);
+        if let Some(home) = home {
+            workspace.attach_home(home, window, cx);
+        }
+        match path {
+            Some(path) => workspace.open(path, window, cx),
+            None => workspace.show_home_view(window, cx),
         }
         workspace
+    }
+
+    /// Home, made the first time it is needed.
+    fn home(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<Home> {
+        if let Some((home, _)) = &self.home {
+            return home.clone();
+        }
+        let home = cx.new(|cx| Home::new(window, cx));
+        self.attach_home(home.clone(), window, cx);
+        home
+    }
+
+    fn attach_home(&mut self, home: Entity<Home>, window: &mut Window, cx: &mut Context<Self>) {
+        let subscription =
+            cx.subscribe_in(&home, window, |this, _, event, window, cx| match event {
+                HomeEvent::OpenRepository(path) => this.open(path.clone(), window, cx),
+                HomeEvent::OpenPullRequest { common_dir, number } => {
+                    this.open_then(common_dir, AfterOpen::PullRequest(*number), window, cx)
+                }
+            });
+        self.home = Some((home, subscription));
+    }
+
+    /// Shows Home, as it was when last shown: its launcher checks the
+    /// agents and the sandbox again and takes the cursor.
+    fn show_home_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let home = self.home(window, cx);
+        home.update(cx, |home, cx| home.shown(window, cx));
+        cx.notify();
+    }
+
+    /// Whether Home is what the window shows: no repository is open, being
+    /// opened or cloned.
+    fn home_shown(&self) -> bool {
+        self.snapshot.is_none() && self.loading.is_none() && self.cloning.is_none()
+    }
+
+    /// `⌘N` in Home: the launcher.
+    fn new_thread(&mut self, _: &NewThread, window: &mut Window, cx: &mut Context<Self>) {
+        let home = self.home(window, cx);
+        home.update(cx, |home, cx| home.new_thread(window, cx));
     }
 
     /// Asks for a directory and opens the repository containing it.
@@ -482,8 +543,8 @@ impl Workspace {
         }
     }
 
-    /// Closes the open repository, back to the start screen, unless a git
-    /// command is still running in it.
+    /// Closes the open repository, back to Home, unless a git command is
+    /// still running in it.
     fn close_repository(
         &mut self,
         _: &CloseRepository,
@@ -508,13 +569,15 @@ impl Workspace {
         crate::recent::closed(cx);
         AgentThreads::global(cx).update(cx, |threads, cx| threads.set_current_repository(None, cx));
         window.set_window_title("GitEZ");
-        // A fresh workspace drops every view, task and watcher of the old one.
-        *self = Self::new(None, window, cx);
+        // A fresh workspace drops every view, task and watcher of the old
+        // one; Home stays as it was.
+        let home = self.home.take().map(|(home, _)| home);
+        *self = Self::with_home(None, home, window, cx);
         cx.notify();
     }
 
     /// Home (the toolbar's Home button, "All threads"): closes the open
-    /// repository, so the window shows what it shows without one.
+    /// repository, so the window shows Home.
     fn show_home(&mut self, _: &ShowHome, window: &mut Window, cx: &mut Context<Self>) {
         if self.snapshot.is_some() || self.loading.is_some() {
             self.close_repository(&CloseRepository, window, cx);
@@ -588,7 +651,9 @@ impl Workspace {
         });
         self.snapshot = Some(snapshot);
         self.update_lanes(cx);
-        self.error = None;
+        if let Some((home, _)) = &self.home {
+            home.update(cx, |home, cx| home.set_error(None, cx));
+        }
         self.set_status(None, cx);
         self.status_error = None;
         self.refresh_status(window, cx);
@@ -1796,6 +1861,12 @@ impl Workspace {
             common_dir: action.common_dir.clone(),
             id: action.id.clone(),
         };
+        // Home shows threads itself, of any repository.
+        if self.home_shown() {
+            let home = self.home(window, cx);
+            home.update(cx, |home, cx| home.show_thread(key, window, cx));
+            return;
+        }
         if !self.is_open(&action.common_dir, cx) {
             self.open_then(&action.common_dir, AfterOpen::Thread(key), window, cx);
             return;
@@ -2048,7 +2119,9 @@ impl Workspace {
         if self.snapshot.is_some() {
             window.push_notification(crate::toast::error(message), cx);
         } else {
-            self.error = Some(message);
+            let home = self.home(window, cx);
+            home.update(cx, |home, cx| home.set_error(Some(message), cx));
+            self.show_home_view(window, cx);
         }
         cx.notify();
     }
@@ -2061,8 +2134,10 @@ impl Focusable for Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let snapshot = self.snapshot.clone();
+        // Without a repository (and none on its way), the window is Home.
+        let home = self.home_shown().then(|| self.home(window, cx));
 
         div()
             .key_context("Workspace")
@@ -2102,7 +2177,11 @@ impl Render for Workspace {
             .bg(rgb(color::BACKGROUND))
             .text_color(rgb(color::TEXT))
             .text_size(theme::TEXT_SIZE)
-            .child(toolbar::Toolbar {
+            .when_some(home.clone(), |this, home| {
+                this.on_action(cx.listener(Self::new_thread)).child(home)
+            })
+            .when(home.is_none(), |this| {
+                this.child(toolbar::Toolbar {
                 repository_name: snapshot.as_ref().map(|snapshot| snapshot.name.clone()),
                 repository_icon: snapshot.as_ref().and_then(|snapshot| snapshot.icon.clone()),
                 repository_path: snapshot.as_ref().map(|snapshot| snapshot.path.clone()),
@@ -2173,7 +2252,7 @@ impl Render for Workspace {
                         )
                         .child(resizable_panel().child(match selection_review {
                             Some(review) => review.into_any_element(),
-                            None => self.render_history(cx),
+                            None => self.render_history(),
                         }))
                         .child(
                             resizable_panel()
@@ -2211,6 +2290,7 @@ impl Render for Workspace {
             .child(status_bar::StatusBar {
                 snapshot,
                 status: self.status.clone(),
+            })
             })
             .when_some(
                 self.palette
@@ -2257,45 +2337,21 @@ impl Workspace {
         ))
     }
 
-    /// The history list, or what to show while no repository is open.
-    fn render_history(&self, cx: &App) -> AnyElement {
+    /// The history list, or what to show while a repository is being
+    /// opened or cloned (Home takes the window otherwise).
+    fn render_history(&self) -> AnyElement {
         if self.snapshot.is_some() {
             return self.history.clone().into_any_element();
         }
-        if let Some((path, _)) = &self.loading {
-            return empty_state(
-                "Opening repository…",
-                path.display().to_string(),
-                None::<Button>,
-            )
-            .into_any_element();
-        }
-        if let Some((dest, _)) = &self.cloning {
-            return empty_state(
-                "Cloning repository…",
-                dest.display().to_string(),
-                None::<Button>,
-            )
-            .into_any_element();
-        }
-        if let Some(error) = &self.error {
-            return empty_state(
-                "Could not open the repository",
-                error.clone(),
-                Some(start_actions("Open another…", cx)),
-            )
-            .into_any_element();
-        }
-        empty_state(
-            "No repository open",
-            "Open a repository to see its history, clone one, or create a new one.",
-            Some(start_actions("Open repository…", cx)),
-        )
-        .into_any_element()
+        let (title, path) = match (&self.loading, &self.cloning) {
+            (Some((path, _)), _) => ("Opening repository…", path),
+            (None, Some((dest, _))) => ("Cloning repository…", dest),
+            (None, None) => return div().into_any_element(),
+        };
+        empty_state(title, path.display().to_string(), None::<Button>).into_any_element()
     }
 }
 
-/// The start buttons, and the recent repositories below them.
 /// What to show once a repository being opened has loaded: an agent
 /// thread or a local pull request of it, asked for from the Agents popover
 /// while another repository (or none) was open.
@@ -2360,84 +2416,6 @@ fn thread_marks(
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn start_actions(open: &'static str, cx: &App) -> impl IntoElement {
-    let recent = crate::recent::paths(cx);
-    div()
-        .v_flex()
-        .items_center()
-        .gap(px(24.))
-        .child(start_buttons(open))
-        .when(!recent.is_empty(), |this| this.child(recent_list(recent)))
-}
-
-/// The recent repositories, each opening on click.
-fn recent_list(paths: &[PathBuf]) -> impl IntoElement {
-    div()
-        .v_flex()
-        .w(px(420.))
-        .child(
-            div()
-                .px(px(10.))
-                .pb(px(6.))
-                .text_size(px(11.))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(color::TEXT_FAINT))
-                .child("RECENT"),
-        )
-        .children(paths.iter().enumerate().map(|(index, path)| {
-            let name = path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string());
-            let action = OpenRecent { path: path.clone() };
-            div()
-                .id(("recent-repository", index))
-                .h_flex()
-                .gap(px(10.))
-                .h(px(32.))
-                .px(px(10.))
-                .rounded(px(6.))
-                .cursor_pointer()
-                .hover(|style| style.bg(rgb(color::ROW_HOVER)))
-                .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
-                .child(
-                    Icon::new(IconName::Folder)
-                        .size(px(14.))
-                        .text_color(rgb(color::TEXT_MUTED)),
-                )
-                .child(div().flex_none().child(name))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_right()
-                        .text_color(rgb(color::TEXT_FAINT))
-                        .child(crate::recent::display(path)),
-                )
-        }))
-}
-
-/// Opening, cloning or creating a repository; `open` labels the first.
-fn start_buttons(open: &'static str) -> impl IntoElement {
-    let button = |id: &'static str, label: &'static str, action: fn() -> Box<dyn Action>| {
-        Button::new(id)
-            .h(px(30.))
-            .label(label)
-            .on_click(move |_, window, cx| window.dispatch_action(action(), cx))
-    };
-    div()
-        .h_flex()
-        .gap(px(8.))
-        .child(button("open-repository", open, || Box::new(OpenRepository)).primary())
-        .child(button("clone-repository", "Clone…", || {
-            Box::new(CloneRepository)
-        }))
-        .child(button("init-repository", "New repository…", || {
-            Box::new(InitRepository)
-        }))
 }
 
 /// A centred title, an explanation and an optional action, filling the rest

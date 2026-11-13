@@ -406,7 +406,7 @@ fn initial(name: Option<&str>) -> SharedString {
 /// The Home button at the left end: back to Home, where every
 /// repository's agent threads are; shown as the current place while no
 /// repository is open (`home`).
-fn home_button(home: bool) -> Button {
+pub(crate) fn home_button(home: bool) -> Button {
     Button::new("home")
         .debug_selector(|| "toolbar-home".into())
         .size(BUTTON_HEIGHT)

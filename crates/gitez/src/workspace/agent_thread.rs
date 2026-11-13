@@ -28,7 +28,6 @@ use crate::theme::{self, color};
 use activity::{Entry, Row, TurnEvents};
 
 /// What the thread view asks of the window it is in.
-#[allow(dead_code, reason = "for the agent thread screens still to come")]
 pub enum ThreadViewEvent {
     OpenPullRequest {
         common_dir: PathBuf,

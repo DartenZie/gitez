@@ -433,7 +433,8 @@ fn folder_row() -> Point<Pixels> {
 }
 
 /// Rows open their thread in the detail panel; Review opens the pull
-/// request; Home and All threads close the repository.
+/// request; Home and All threads close the repository, and without one a
+/// row shows its thread in Home.
 #[test]
 fn screenshot_u3_drive() {
     if !crate::screenshot::enabled() {
@@ -468,8 +469,7 @@ fn screenshot_u3_drive() {
     );
     shots.save(window, "u3-drive-3-pull-request");
 
-    // All threads closes the repository: the start screen until Home
-    // exists.
+    // All threads closes the repository: Home.
     open_popover(&mut shots, window);
     shots.save(window, "u3-drive-4-popover-over-review");
     shots.click(window, at::all_threads());
@@ -478,22 +478,34 @@ fn screenshot_u3_drive() {
     shots.save(window, "u3-drive-5-all-threads");
 
     // Without a repository the popover lists every repository's threads;
-    // a row opens the thread's repository, then the thread.
+    // a row shows the thread in Home.
     open_popover(&mut shots, window);
     shots.save(window, "u3-drive-6-popover-all");
     shots.click(window, at::second_group_row());
     let open = shots.update(|cx| workspace.read(cx).snapshot.is_some());
-    assert!(open, "the row opens the thread's repository");
+    assert!(!open, "Home shows the thread itself");
+    let in_home = shots.update(|cx| {
+        let workspace = workspace.read(cx);
+        let (home, _) = workspace.home.as_ref().expect("Home is made");
+        home.read(cx).shown_thread(cx)
+    });
     assert_eq!(
-        shown_thread(&mut shots, &workspace),
+        in_home,
         Some(AgentThreadKey {
             common_dir: mix.common_dir.clone(),
             id: mix.answer.clone(),
         }),
-        "then the thread"
+        "the row's thread"
     );
     shots.save(window, "u3-drive-7-opened");
 
+    // Open the repository again, then go Home.
+    let work_dir = mix.work_dir.clone();
+    shots.update_window(window, |window, cx| {
+        workspace.update(cx, |workspace, cx| workspace.open(work_dir, window, cx))
+    });
+    let open = shots.update(|cx| workspace.read(cx).snapshot.is_some());
+    assert!(open, "the repository opens again");
     // Home closes the repository too.
     shots.click(window, at::home());
     let open = shots.update(|cx| workspace.read(cx).snapshot.is_some());

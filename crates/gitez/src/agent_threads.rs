@@ -84,7 +84,6 @@ pub struct Counts {
 }
 
 /// What the windows should react to.
-#[allow(dead_code, reason = "for the agent thread screens still to come")]
 pub enum AgentThreadsEvent {
     /// Agent threads of this repository changed (state, pull request,
     /// activity).
@@ -108,7 +107,6 @@ pub struct StartRequest {
 }
 
 /// The repository open in the window, for Settings' "In this repository".
-#[allow(dead_code, reason = "for the agent thread screens still to come")]
 pub struct CurrentRepository {
     pub work_dir: PathBuf,
     pub common_dir: PathBuf,
@@ -132,7 +130,6 @@ const DEBUG_ENV: &str = "GITEZ_DEBUG_THREADS";
 
 /// The agent threads of all repositories GitEZ knows of, and what is
 /// needed to start more: settings, agents and the sandbox.
-#[allow(dead_code, reason = "for the agent thread screens still to come")]
 pub struct AgentThreads {
     data_dir: Option<PathBuf>,
     /// `data_dir` with symlinks resolved, once read.
@@ -291,7 +288,6 @@ impl AgentThreads {
         })
     }
 
-    #[allow(dead_code, reason = "for the agent thread screens still to come")]
     pub fn repository_by_work_dir(&self, work_dir: &Path) -> Option<&RepositoryThreads> {
         self.repositories
             .iter()

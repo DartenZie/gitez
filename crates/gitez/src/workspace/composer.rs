@@ -356,6 +356,31 @@ impl Composer {
         cx.notify();
     }
 
+    /// Home: the work dir of the repository picked, once it is read.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn picked_repository(&self) -> Option<&std::path::Path> {
+        self.target.as_ref().map(|target| target.work_dir.as_path())
+    }
+
+    /// Home: reads the picked repository again, as its branches may have
+    /// moved since; picks the first repository if none is picked yet.
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        if self.mode != ComposerMode::Home {
+            return;
+        }
+        let path = match &self.target {
+            Some(target) => Some(target.work_dir.clone()),
+            None if self.target_error.is_none() => self
+                .repository_choices(cx)
+                .first()
+                .map(|(path, _)| path.clone()),
+            None => None,
+        };
+        if let Some(path) = path {
+            self.choose_repository(path, cx);
+        }
+    }
+
     fn settings(&self, cx: &App) -> Arc<Settings> {
         self.model.read(cx).settings().clone()
     }
@@ -1126,7 +1151,14 @@ impl Composer {
                 div()
                     .h_flex()
                     .gap(px(6.))
-                    .child(initial_square(&label, px(16.)))
+                    .map(|this| match &self.target {
+                        Some(_) => this.child(initial_square(&label, px(16.))),
+                        None => this.child(
+                            Icon::new(IconName::Folder)
+                                .size(px(13.))
+                                .text_color(rgb(color::TEXT_MUTED)),
+                        ),
+                    })
                     .child(label),
             )
             .dropdown_menu(move |mut menu, _, _| {

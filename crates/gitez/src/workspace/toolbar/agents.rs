@@ -145,7 +145,7 @@ pub(crate) struct Item {
 }
 
 impl Item {
-    fn key(&self) -> AgentThreadKey {
+    pub(crate) fn key(&self) -> AgentThreadKey {
         AgentThreadKey {
             common_dir: self.common_dir.clone(),
             id: self.thread.id.clone(),
@@ -219,7 +219,7 @@ pub(crate) fn row_actions(thread: &AgentThread) -> Vec<RowAction> {
 
 impl RowAction {
     /// The button's label for a thread whose network is `network`.
-    fn label(self, network: NetworkProfile) -> String {
+    pub(crate) fn label(self, network: NetworkProfile) -> String {
         match self {
             RowAction::Stop => "Stop".to_owned(),
             RowAction::Cancel => "Cancel".to_owned(),
@@ -371,7 +371,7 @@ pub(crate) fn status_line(
 }
 
 /// How long an active thread has run: "now", "14 min".
-fn elapsed(thread: &AgentThread, now: Timestamp) -> String {
+pub(crate) fn elapsed(thread: &AgentThread, now: Timestamp) -> String {
     let seconds = thread.run_time(now).as_secs();
     if seconds < 60 {
         "now".to_owned()
