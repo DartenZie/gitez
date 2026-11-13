@@ -2371,7 +2371,6 @@ dependencies = [
  "gitez-git",
  "gitez-review",
  "gitez-sandbox",
- "gitez-secret",
  "gitez-settings",
  "jiff",
  "rustix",

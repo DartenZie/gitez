@@ -16,7 +16,6 @@ path = "src/bin/gitez-supervisor.rs"
 [dependencies]
 gitez-agent.workspace = true
 gitez-sandbox.workspace = true
-gitez-secret.workspace = true
 gitez-settings.workspace = true
 gitez-agent-thread.workspace = true
 gitez-review.workspace = true
