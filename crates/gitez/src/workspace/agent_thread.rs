@@ -545,7 +545,12 @@ fn ending_label(ending: Option<Ending>) -> &'static str {
 
 /// The chip showing [`state_label`] in the state's colours.
 pub fn state_chip(thread: &AgentThread) -> Div {
-    let (background, text) = match (thread.state, thread.ending) {
+    chip(thread.state, thread.ending, state_label(thread))
+}
+
+/// A chip saying `label` in the colours of `state` and `ending`.
+pub fn chip(state: State, ending: Option<Ending>, label: String) -> Div {
+    let (background, text) = match (state, ending) {
         (State::Running, _) => (rgba(color::THREAD_RUNNING), color::THREAD_RUNNING_TEXT),
         (State::Preparing, _) | (State::Finished, Some(Ending::PullRequest)) => {
             (rgba(color::THREAD_PREPARING), color::THREAD_PREPARING_TEXT)
@@ -555,7 +560,7 @@ pub fn state_chip(thread: &AgentThread) -> Div {
         }
         _ => (rgb(color::THREAD_QUEUED), color::THREAD_QUEUED_TEXT),
     };
-    let mark = if thread.state == State::Completed {
+    let mark = if state == State::Completed {
         Icon::new(IconName::Check).size(px(11.)).into_any_element()
     } else {
         div()
@@ -578,7 +583,7 @@ pub fn state_chip(thread: &AgentThread) -> Div {
         .font_weight(FontWeight::MEDIUM)
         .whitespace_nowrap()
         .child(mark)
-        .child(state_label(thread))
+        .child(label)
 }
 
 /// `time` as hours and minutes in the local time zone.
@@ -598,7 +603,7 @@ fn git_time(time: Timestamp) -> gitez_git::Timestamp {
 }
 
 /// "14 min", "2 h 5 min".
-fn duration(seconds: i64) -> String {
+pub fn duration(seconds: i64) -> String {
     let minutes = (seconds.max(0) + 30) / 60;
     match minutes {
         0 => "under a minute".to_owned(),
@@ -654,7 +659,7 @@ fn summary(thread: &AgentThread, now: Timestamp) -> String {
 }
 
 /// The square with an agent's mark.
-fn agent_mark(agent: &str) -> Div {
+pub fn agent_mark(agent: &str) -> Div {
     let mark = if agent == gitez_agent::ClaudeCode::ID {
         svg()
             .path("agents/claude.svg")
@@ -679,7 +684,7 @@ fn agent_mark(agent: &str) -> Div {
 }
 
 /// A branch name in its colour; cut with an ellipsis where space is short.
-fn branch_chip(name: &str, small: bool) -> Div {
+pub fn branch_chip(name: &str, small: bool) -> Div {
     let branch_color = theme::branch_color(name);
     div()
         .flex_shrink(1.)
@@ -699,7 +704,7 @@ fn branch_chip(name: &str, small: bool) -> Div {
 }
 
 /// A keycap on an amber button: dark, as the button's label.
-fn on_accent(key_cap: Div) -> Div {
+pub fn on_accent(key_cap: Div) -> Div {
     key_cap
         .border_color(theme::with_alpha(color::ON_ACCENT, 0.4))
         .text_color(rgb(color::ON_ACCENT))

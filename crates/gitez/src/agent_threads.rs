@@ -62,7 +62,6 @@ pub struct RepositoryThreads {
 
 /// How many agent threads are in each group.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[allow(dead_code, reason = "for the agent thread screens still to come")]
 pub struct Counts {
     /// Preparing or running.
     pub active: usize,
@@ -86,7 +85,7 @@ pub enum AgentThreadsEvent {
 }
 
 /// What a new agent thread starts with.
-#[allow(dead_code, reason = "for the agent thread screens still to come")]
+#[derive(Debug, Clone)]
 pub struct StartRequest {
     pub work_dir: PathBuf,
     pub common_dir: PathBuf,
@@ -257,7 +256,6 @@ impl AgentThreads {
         self.data_dir.as_deref()
     }
 
-    #[allow(dead_code, reason = "for the agent thread screens still to come")]
     pub fn repositories(&self) -> &[RepositoryThreads] {
         &self.repositories
     }
@@ -292,7 +290,6 @@ impl AgentThreads {
     }
 
     /// Of one repository, or of all with `None`.
-    #[allow(dead_code, reason = "for the agent thread screens still to come")]
     pub fn counts(&self, common_dir: Option<&Path>) -> Counts {
         match common_dir {
             Some(common_dir) => self
@@ -309,12 +306,10 @@ impl AgentThreads {
 
     /// Agent threads holding a running-agent slot now (Preparing, Running),
     /// across repositories.
-    #[allow(dead_code, reason = "for the agent thread screens still to come")]
     pub fn running(&self) -> usize {
         self.counts(None).active
     }
 
-    #[allow(dead_code, reason = "for the agent thread screens still to come")]
     pub fn settings(&self) -> &Arc<Settings> {
         &self.settings
     }
@@ -329,7 +324,6 @@ impl AgentThreads {
         &self.agents
     }
 
-    #[allow(dead_code, reason = "for the agent thread screens still to come")]
     pub fn sandbox(&self) -> &Arc<dyn gitez_sandbox::Sandbox> {
         &self.sandbox
     }
@@ -394,7 +388,6 @@ impl AgentThreads {
     /// Creates the agent thread (queued), lists its repository in the
     /// index, reads its secrets from the keychain and starts its
     /// supervisor with `gitez supervise start`. Runs in the background.
-    #[allow(dead_code, reason = "for the agent thread screens still to come")]
     pub fn start(
         &mut self,
         request: StartRequest,
@@ -799,7 +792,6 @@ impl AgentThreads {
 
 impl Counts {
     /// The counts of `threads`.
-    #[allow(dead_code, reason = "for the agent thread screens still to come")]
     pub fn of<'a>(threads: impl IntoIterator<Item = &'a AgentThread>) -> Self {
         use gitez_agent_thread::State;
         let mut counts = Counts::default();

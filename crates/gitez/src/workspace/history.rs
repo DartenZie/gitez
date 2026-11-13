@@ -1,10 +1,14 @@
 //! The commit history: every commit reachable from a ref, newest first, with
 //! its graph, labels, author and date, in a virtual list. Uncommitted changes
 //! get a row of their own at the top, joined to the commit `HEAD` points at
-//! by a dashed line. A local branch's label, here or in the sidebar, can be
-//! dragged onto another branch to merge it there, as in the `Merge.dc.html`
-//! artboard. ⌘-click and ⇧-click pick several
-//! commits, to cherry-pick them, as in the `CherryPick.dc.html` artboard.
+//! by a dashed line. Under it, the "Ask an agent…" row opens the composer
+//! that starts an agent thread, and each active agent thread has a row of
+//! its own, a live lane, with a dashed line down to the commit its branch
+//! is at, as in the `C-1-Start` and `C-2-Sessions` boards. A local branch's
+//! label, here or in the sidebar, can be dragged onto another branch to
+//! merge it there, as in the `Merge.dc.html` artboard. ⌘-click and ⇧-click
+//! pick several commits, to cherry-pick them, as in the `CherryPick.dc.html`
+//! artboard.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -20,7 +24,10 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::composer::{Composer, ComposerEvent};
+use super::lanes::Lane;
 use super::{graph, labels};
+use crate::agent_threads::{AgentThreadKey, AgentThreads};
 use crate::repository::Snapshot;
 use crate::theme::{self, color};
 use crate::time;
@@ -32,7 +39,9 @@ actions!(
         SelectNext,
         SelectFirst,
         SelectLast,
-        CancelDrag
+        CancelDrag,
+        /// Opens the composer that starts an agent thread.
+        AskAgent
     ]
 );
 
@@ -49,6 +58,8 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("end", SelectLast, CONTEXT),
         KeyBinding::new("enter", super::ReviewSelected, CONTEXT),
         KeyBinding::new("escape", CancelDrag, CONTEXT),
+        // Handled by the workspace, which may first have to show the history.
+        KeyBinding::new("secondary-shift-a", AskAgent, Some("Workspace")),
     ]
 }
 
@@ -83,6 +94,12 @@ mod columns {
 /// Emitted when the selected row changes, or the uncommitted changes while
 /// their row is selected.
 pub struct SelectionChanged;
+
+/// Emitted when an agent thread's lane is selected, to show the thread.
+pub struct LaneSelected(pub AgentThreadKey);
+
+/// Emitted when the composer asks for a thread to start; it has closed.
+pub struct StartRequested(pub crate::agent_threads::StartRequest);
 
 /// Emitted when the commits picked with ⌘-click or ⇧-click change.
 pub struct PickedChanged;
@@ -151,15 +168,64 @@ enum DragRole {
 /// What the selected row shows.
 pub enum Selection<'a> {
     WorkingTree(&'a Arc<WorkingTreeStatus>),
+    /// An active agent thread's lane.
+    Lane(&'a Lane),
     Commit(&'a Commit, &'a [RefLabel]),
 }
 
-/// A row of the list.
+/// A row of the list, from the top: the uncommitted changes, the "Ask an
+/// agent…" row, the live lanes, then the commits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Entry {
     WorkingTree,
+    /// Opens the composer; never selected.
+    Composer,
+    /// The lane at this index of `live`.
+    Lane(usize),
     /// The commit at this index of `commits`.
     Commit(usize),
+}
+
+/// An entry, by what it stands for rather than its position.
+enum EntryKey {
+    WorkingTree,
+    Lane(AgentThreadKey),
+    Commit(usize),
+}
+
+/// Where a dashed line from a row above the commits ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum End {
+    /// At the commit at this index of `commits`.
+    At(usize),
+    /// At a commit not read yet: through every row read.
+    Beyond,
+    /// Nowhere: there is no commit to join (an unborn branch).
+    Nowhere,
+}
+
+/// A dashed line from a row above the commits down to a commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DashedLine {
+    lane: usize,
+    /// `0xRRGGBB`.
+    color: u32,
+    end: End,
+}
+
+impl DashedLine {
+    fn dashed(&self) -> graph::Dashed {
+        (self.lane, self.color)
+    }
+
+    /// Whether it passes the commit at `index` on its way down.
+    fn passes(&self, index: usize) -> bool {
+        match self.end {
+            End::At(end) => index < end,
+            End::Beyond => true,
+            End::Nowhere => false,
+        }
+    }
 }
 
 pub struct History {
@@ -181,9 +247,18 @@ pub struct History {
     head: Option<Oid>,
     /// Index of the `HEAD` commit in `commits`, once read.
     head_index: Option<usize>,
-    /// The lane of the dashed line from the uncommitted-changes row down to
-    /// the `HEAD` commit: one that no row above `HEAD` uses.
-    working_tree_lane: usize,
+    /// The dashed lines from the rows above the commits: the uncommitted
+    /// changes' first while their row is shown, then one per live lane.
+    dashed: Vec<DashedLine>,
+    /// The lane of the "Ask an agent…" row's node.
+    composer_lane: usize,
+    /// The composer, while the repository can start agent threads; its row
+    /// shows while it is set.
+    composer: Option<(Entity<Composer>, Subscription)>,
+    /// Whether the composer is open under its row.
+    composer_open: bool,
+    /// The active agent threads of the repository, oldest first.
+    live: Vec<Lane>,
     /// Uncommitted changes; the list shows their row while not clean.
     working_tree: Option<Arc<WorkingTreeStatus>>,
     /// The commit summary typed in the uncommitted-changes row, shared with
@@ -206,6 +281,8 @@ pub struct History {
 }
 
 impl EventEmitter<SelectionChanged> for History {}
+impl EventEmitter<LaneSelected> for History {}
+impl EventEmitter<StartRequested> for History {}
 impl EventEmitter<BranchDropped> for History {}
 impl EventEmitter<PickedChanged> for History {}
 impl EventEmitter<CherryPickRequested> for History {}
@@ -224,7 +301,11 @@ impl History {
             groups: HashMap::new(),
             head: None,
             head_index: None,
-            working_tree_lane: 0,
+            dashed: Vec::new(),
+            composer_lane: 0,
+            composer: None,
+            composer_open: false,
+            live: Vec::new(),
             working_tree: None,
             summary: None,
             selected: None,
@@ -246,6 +327,8 @@ impl History {
             focus_handle: self.focus_handle.clone(),
             scroll: self.scroll.clone(),
             summary: self.summary.take(),
+            composer: self.composer.take(),
+            live: std::mem::take(&mut self.live),
             repository: Some(snapshot.repository.clone()),
             labels: snapshot.refs.labels_by_commit(),
             groups: snapshot.refs.groups_by_commit(),
@@ -356,9 +439,6 @@ impl History {
         self.head_index = head.and_then(|head| commits.iter().position(|commit| commit.id == head));
         self.commits = commits;
         self.rows = rows;
-        self.working_tree_lane = self
-            .head_index
-            .map_or(0, |head| working_tree_lane(&self.rows, head));
         self.labels = labels;
         self.groups = groups;
         // Its rows may have moved.
@@ -369,6 +449,7 @@ impl History {
             drag._incoming = None;
         }
         self.head = head;
+        self.update_dashed();
         self.complete = true;
         self.error = None;
         self.now = time::now();
@@ -396,7 +477,6 @@ impl History {
 
     /// Adds a batch of commits; returns whether more may follow.
     fn append(&mut self, commits: Vec<Commit>, rows: Vec<Row>, cx: &mut Context<Self>) -> bool {
-        let commits_len = commits.len();
         if commits.is_empty() {
             self.complete = true;
             self._load = None;
@@ -415,11 +495,7 @@ impl History {
         }
         self.commits.extend(commits);
         self.rows.extend(rows);
-        if let Some(head) = self.head_index
-            && head >= self.rows.len() - commits_len
-        {
-            self.working_tree_lane = working_tree_lane(&self.rows, head);
-        }
+        self.update_dashed();
         cx.notify();
         true
     }
@@ -448,6 +524,7 @@ impl History {
             return;
         }
         self.working_tree = status;
+        self.update_dashed();
         if self.selected == Some(Entry::WorkingTree) {
             if self.working_tree.is_none() {
                 self.selected = None;
@@ -474,6 +551,8 @@ impl History {
     pub fn selected(&self) -> Option<Selection<'_>> {
         match self.selected? {
             Entry::WorkingTree => self.working_tree.as_ref().map(Selection::WorkingTree),
+            Entry::Composer => None,
+            Entry::Lane(index) => self.live.get(index).map(Selection::Lane),
             Entry::Commit(index) => {
                 let commit = self.commits.get(index)?;
                 let labels = self.labels.get(&commit.id).map_or(&[][..], Vec::as_slice);
@@ -546,57 +625,146 @@ impl History {
         true
     }
 
-    /// Where the uncommitted-changes row is, if shown: always at the top.
-    fn working_tree_index(&self) -> Option<usize> {
-        self.working_tree.as_ref().map(|_| 0)
+    /// Rows above the commits.
+    fn top_rows(&self) -> usize {
+        usize::from(self.working_tree.is_some())
+            + usize::from(self.composer.is_some())
+            + self.live.len()
     }
 
     /// Number of rows in the list.
     fn len(&self) -> usize {
-        self.commits.len() + usize::from(self.working_tree_index().is_some())
+        self.top_rows() + self.commits.len()
     }
 
     fn entry(&self, index: usize) -> Entry {
-        match self.working_tree_index() {
-            Some(wip) if index == wip => Entry::WorkingTree,
-            Some(wip) if index > wip => Entry::Commit(index - 1),
-            _ => Entry::Commit(index),
+        let mut index = index;
+        if self.working_tree.is_some() {
+            if index == 0 {
+                return Entry::WorkingTree;
+            }
+            index -= 1;
         }
+        if self.composer.is_some() {
+            if index == 0 {
+                return Entry::Composer;
+            }
+            index -= 1;
+        }
+        if index < self.live.len() {
+            return Entry::Lane(index);
+        }
+        Entry::Commit(index - self.live.len())
     }
 
     fn index_of(&self, entry: Entry) -> Option<usize> {
-        match (entry, self.working_tree_index()) {
-            (Entry::WorkingTree, wip) => wip,
-            (Entry::Commit(index), Some(wip)) if index >= wip => Some(index + 1),
-            (Entry::Commit(index), _) => Some(index),
+        let working_tree = usize::from(self.working_tree.is_some());
+        let composer = usize::from(self.composer.is_some());
+        match entry {
+            Entry::WorkingTree => self.working_tree.is_some().then_some(0),
+            Entry::Composer => self.composer.is_some().then_some(working_tree),
+            Entry::Lane(index) => {
+                (index < self.live.len()).then_some(working_tree + composer + index)
+            }
+            Entry::Commit(index) => Some(working_tree + composer + self.live.len() + index),
         }
+    }
+
+    /// The dashed line from the uncommitted-changes row, while it is shown.
+    fn working_tree_line(&self) -> Option<&DashedLine> {
+        self.working_tree.as_ref()?;
+        self.dashed.first()
+    }
+
+    /// The dashed line of the live lane at `index`.
+    fn lane_line(&self, index: usize) -> Option<&DashedLine> {
+        self.dashed
+            .get(usize::from(self.working_tree.is_some()) + index)
+    }
+
+    /// Works out the dashed lines again: where each ends, and its lane.
+    fn update_dashed(&mut self) {
+        let commit_index = |id: Oid| self.commits.iter().position(|commit| commit.id == id);
+        let end_at = |tip: Option<Oid>, index: Option<usize>| match (tip, index) {
+            (None, _) => End::Nowhere,
+            (Some(_), Some(index)) => End::At(index),
+            (Some(_), None) => End::Beyond,
+        };
+        let mut lines = Vec::new();
+        if self.working_tree.is_some() {
+            let color = self
+                .head_index
+                .and_then(|index| self.rows.get(index))
+                .map_or(0, |row| row.color);
+            lines.push((
+                end_at(self.head, self.head_index),
+                theme::graph_color(color),
+            ));
+        }
+        for lane in &self.live {
+            let index = lane.tip.and_then(commit_index);
+            lines.push((end_at(lane.tip, index), theme::branch_color(&lane.branch)));
+        }
+        let ends: Vec<End> = lines.iter().map(|(end, _)| *end).collect();
+        let lanes = dashed_lanes(&self.rows, &ends);
+        self.dashed = lines
+            .into_iter()
+            .zip(lanes)
+            .map(|((end, color), lane)| DashedLine { lane, color, end })
+            .collect();
+        self.composer_lane = match self.working_tree_line() {
+            Some(line) => line.lane,
+            None => self
+                .head_index
+                .and_then(|index| self.rows.get(index))
+                .map_or(0, |row| row.lane),
+        };
     }
 
     /// The lane of an entry's node in the graph.
     fn graph_lane(&self, entry: Entry) -> Option<usize> {
         match entry {
-            Entry::WorkingTree => Some(self.working_tree_line()?.0),
+            Entry::WorkingTree => Some(self.working_tree_line()?.lane),
+            Entry::Composer => Some(self.composer_lane),
+            Entry::Lane(index) => Some(self.lane_line(index)?.lane),
             Entry::Commit(index) => self.rows.get(index).map(|row| row.lane),
         }
     }
 
-    /// The lane and colour of the uncommitted-changes row's node and its
-    /// dashed line, while that row is shown. Lane 0 until `HEAD` is read.
-    fn working_tree_line(&self) -> Option<(usize, usize)> {
-        self.working_tree.as_ref()?;
-        let color = self
-            .head_index
-            .and_then(|index| self.rows.get(index))
-            .map_or(0, |row| row.color);
-        Some((self.working_tree_lane, color))
-    }
-
     /// Lanes the graph column must show.
     fn graph_lanes(&self) -> usize {
-        match self.working_tree_line() {
-            Some((lane, _)) => self.lanes.max(lane + 1),
-            None => self.lanes,
+        let mut lanes = self.lanes;
+        if self.composer.is_some() {
+            lanes = lanes.max(self.composer_lane + 1);
         }
+        for line in &self.dashed {
+            lanes = lanes.max(line.lane + 1);
+        }
+        lanes
+    }
+
+    /// The dashed lines of the rows above the row at list position `index`,
+    /// itself above the commits, that pass it.
+    fn through_top_row(&self, index: usize) -> Vec<graph::Dashed> {
+        let mut through = Vec::new();
+        let mut row = 0;
+        if let Some(line) = self.working_tree_line() {
+            if row < index && line.end != End::Nowhere {
+                through.push(line.dashed());
+            }
+            row += 1;
+        }
+        row += usize::from(self.composer.is_some());
+        for lane in 0..self.live.len() {
+            if let Some(line) = self.lane_line(lane)
+                && row < index
+                && line.end != End::Nowhere
+            {
+                through.push(line.dashed());
+            }
+            row += 1;
+        }
+        through
     }
 
     fn select(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -604,11 +772,31 @@ impl History {
             return;
         };
         let entry = self.entry(index.min(last));
+        if entry == Entry::Composer {
+            return;
+        }
         if self.selected != Some(entry) {
             self.selected = Some(entry);
             self.scroll_to_selection();
             cx.emit(SelectionChanged);
             cx.notify();
+        }
+        if let Entry::Lane(lane) = entry
+            && let Some(lane) = self.live.get(lane)
+        {
+            cx.emit(LaneSelected(lane.key.clone()));
+        }
+    }
+
+    /// `index`, or the row next to it in the direction of `step` when it is
+    /// the "Ask an agent…" row, which is not selected with the keys.
+    fn skip_composer(&self, index: usize, step: isize) -> usize {
+        if self.entry(index) != Entry::Composer {
+            return index;
+        }
+        match index.checked_add_signed(step) {
+            Some(next) if next < self.len() => next,
+            _ => index.saturating_add_signed(-step),
         }
     }
 
@@ -634,20 +822,132 @@ impl History {
         let index = self
             .selected_index()
             .map_or(0, |index| index.saturating_sub(1));
-        self.select(index, cx);
+        self.select(self.skip_composer(index, -1), cx);
     }
 
     fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
         let index = self.selected_index().map_or(0, |index| index + 1);
-        self.select(index, cx);
+        self.select(self.skip_composer(index, 1), cx);
     }
 
     fn select_first(&mut self, _: &SelectFirst, _: &mut Window, cx: &mut Context<Self>) {
-        self.select(0, cx);
+        self.select(self.skip_composer(0, 1), cx);
     }
 
     fn select_last(&mut self, _: &SelectLast, _: &mut Window, cx: &mut Context<Self>) {
         self.select(usize::MAX, cx);
+    }
+
+    /// Shows `composer` as the "Ask an agent…" row, or removes the row
+    /// with `None`, as in a bare repository.
+    pub fn set_composer(
+        &mut self,
+        composer: Option<Entity<Composer>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.composer.as_ref().map(|(known, _)| known) == composer.as_ref() {
+            return;
+        }
+        let selected = self.selected.and_then(|entry| self.entry_key(entry));
+        self.composer = composer.map(|composer| {
+            let subscription =
+                cx.subscribe_in(
+                    &composer,
+                    window,
+                    |this, _, event, window, cx| match event {
+                        ComposerEvent::Submit(request) => {
+                            this.close_composer(window, cx);
+                            cx.emit(StartRequested((**request).clone()));
+                        }
+                        ComposerEvent::Cancel => this.close_composer(window, cx),
+                    },
+                );
+            (composer, subscription)
+        });
+        if self.composer.is_none() {
+            self.composer_open = false;
+        }
+        self.update_dashed();
+        self.restore_selection(selected);
+        cx.notify();
+    }
+
+    /// The live lanes shown.
+    #[cfg(test)]
+    pub fn lanes(&self) -> &[Lane] {
+        &self.live
+    }
+
+    /// The composer, while its row is shown.
+    pub fn composer(&self) -> Option<&Entity<Composer>> {
+        self.composer.as_ref().map(|(composer, _)| composer)
+    }
+
+    /// Opens the composer under its row, scrolled into view at the top of
+    /// the list, with the cursor in its prompt.
+    pub fn open_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((composer, _)) = &self.composer else {
+            return;
+        };
+        self.composer_open = true;
+        self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+        composer.update(cx, |composer, cx| {
+            // Agents installed or signed in since it was last open.
+            composer.check(cx);
+            composer.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Closes the composer, back to the list; what was typed stays for
+    /// next time.
+    pub fn close_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.composer_open {
+            self.composer_open = false;
+            window.focus(&self.focus_handle, cx);
+            cx.notify();
+        }
+    }
+
+    /// Shows `lanes`, the active agent threads of the repository, oldest
+    /// first. A selected lane stays selected while its thread is active.
+    pub fn set_lanes(&mut self, lanes: Vec<Lane>, cx: &mut Context<Self>) {
+        if lanes == self.live {
+            return;
+        }
+        let selected = self.selected.and_then(|entry| self.entry_key(entry));
+        self.live = lanes;
+        self.update_dashed();
+        self.restore_selection(selected);
+        cx.notify();
+    }
+
+    /// What `entry` stands for, to find it again after rows above the
+    /// commits came or went: lanes by their thread.
+    fn entry_key(&self, entry: Entry) -> Option<EntryKey> {
+        Some(match entry {
+            Entry::WorkingTree => EntryKey::WorkingTree,
+            Entry::Composer => return None,
+            Entry::Lane(index) => EntryKey::Lane(self.live.get(index)?.key.clone()),
+            Entry::Commit(index) => EntryKey::Commit(index),
+        })
+    }
+
+    /// Selects `key` again. A lane whose thread is no longer active is
+    /// unselected without telling: its thread stays on screen until
+    /// something else is selected.
+    fn restore_selection(&mut self, key: Option<EntryKey>) {
+        self.selected = match key {
+            None => None,
+            Some(EntryKey::WorkingTree) => Some(Entry::WorkingTree),
+            Some(EntryKey::Commit(index)) => Some(Entry::Commit(index)),
+            Some(EntryKey::Lane(key)) => self
+                .live
+                .iter()
+                .position(|lane| lane.key == key)
+                .map(Entry::Lane),
+        };
     }
 
     fn graph_width(&self) -> Pixels {
@@ -1084,11 +1384,16 @@ impl History {
                         .commits
                         .get(commit)
                         .is_some_and(|commit| self.picked.contains(&commit.id)),
-                    Entry::WorkingTree => false,
+                    Entry::WorkingTree | Entry::Composer | Entry::Lane(_) => false,
                 };
+                if entry == Entry::Composer {
+                    return Some(self.render_composer_row(index, cx));
+                }
                 let row = self.row_shell(index, picked || self.selected == Some(entry), cx);
                 match entry {
                     Entry::WorkingTree => self.render_working_tree(row, cx),
+                    Entry::Composer => None,
+                    Entry::Lane(lane) => self.render_lane(row, index, lane, cx),
                     Entry::Commit(commit) => self.render_commit(row, commit, cx),
                 }
             })
@@ -1135,6 +1440,7 @@ impl History {
                 if !typing {
                     window.focus(&this.focus_handle, cx);
                 }
+                this.close_composer(window, cx);
                 let modifiers = event.modifiers();
                 if modifiers.secondary() || modifiers.shift {
                     this.pick(index, modifiers.shift, cx);
@@ -1214,11 +1520,13 @@ impl History {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let status = self.working_tree.as_ref()?;
-        let (lane, color) = self.working_tree_line()?;
-        let cell = graph::working_tree_cell(
-            lane,
-            color,
-            self.head_index.is_some(),
+        let line = self.working_tree_line()?;
+        let cell = graph::node_cell(
+            graph::Node::WorkingTree,
+            line.lane,
+            line.color,
+            line.end != End::Nowhere,
+            Vec::new(),
             self.graph_width(),
             self.graph_scroll,
         );
@@ -1273,6 +1581,174 @@ impl History {
         )
     }
 
+    /// The "Ask an agent…" row: opens the composer under it.
+    fn render_composer_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let mono = cx.theme().mono_font_family.clone();
+        let branch = self
+            .composer
+            .as_ref()
+            .and_then(|(composer, _)| composer.read(cx).start_branch().map(str::to_owned));
+        let model = AgentThreads::global(cx).read(cx);
+        let running = model.running();
+        let limit = model.settings().threads.max_running as usize;
+        let slots = if running < limit {
+            format!("{running} of {limit} agents running")
+        } else {
+            format!("{running} of {limit} agents running · the next thread waits")
+        };
+        let cell = graph::node_cell(
+            graph::Node::Composer,
+            self.composer_lane,
+            color::TAG_LABEL_BORDER,
+            false,
+            self.through_top_row(index),
+            self.graph_width(),
+            self.graph_scroll,
+        );
+        let open = self.composer_open;
+        div()
+            .id(index)
+            .debug_selector(|| "ask-an-agent".into())
+            .h_flex()
+            .w_full()
+            .relative()
+            .h(ROW_HEIGHT)
+            .pr(columns::END_PADDING)
+            .gap(columns::GAP)
+            .cursor_pointer()
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .h(px(1.))
+                    .bg(rgb(color::ROW_BORDER)),
+            )
+            .child(self.graph_column(div().w(columns::REFS), cell, cx))
+            .children(self.pick_cell(None))
+            .child(
+                div()
+                    .h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h(px(26.))
+                    .px(px(10.))
+                    .gap(px(8.))
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_dashed()
+                    .map(|this| {
+                        if open {
+                            this.border_color(theme::with_alpha(color::ACCENT, 0.55))
+                                .bg(rgb(color::OPTION_ON))
+                        } else {
+                            this.border_color(rgb(color::COMPOSER_BORDER))
+                                .hover(|style| style.bg(rgb(color::ROW_HOVER)))
+                        }
+                    })
+                    .text_size(px(12.5))
+                    .text_color(rgb(color::TEXT_MUTED))
+                    .child(
+                        Icon::new(IconName::Terminal)
+                            .size(px(13.))
+                            .text_color(rgb(color::ACCENT)),
+                    )
+                    .child(
+                        div()
+                            .h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(match &branch {
+                                Some(_) => "Ask an agent to work from\u{a0}",
+                                None => "Ask an agent…",
+                            })
+                            .when_some(branch, |this, branch| {
+                                this.child(
+                                    div()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .font_family(mono)
+                                        .text_color(rgb(theme::branch_color(&branch)))
+                                        .child(branch),
+                                )
+                                .child("…")
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .text_size(px(11.5))
+                            .child(slots),
+                    )
+                    .child(
+                        div()
+                            .h_flex()
+                            .flex_none()
+                            .gap(px(2.))
+                            .child(labels::key_cap(labels::SECONDARY_KEY, cx))
+                            .child(labels::key_cap("⇧", cx))
+                            .child(labels::key_cap("A", cx)),
+                    ),
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                if this.composer_open {
+                    this.close_composer(window, cx);
+                } else {
+                    this.open_composer(window, cx);
+                }
+            }))
+            .into_any_element()
+    }
+
+    /// An active agent thread's row: its branch, a live node with a dashed
+    /// line down to the commit its branch is at, what the agent does now,
+    /// the agent, and how long it has run.
+    fn render_lane(
+        &self,
+        row: Stateful<Div>,
+        index: usize,
+        lane: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let live = self.live.get(lane)?;
+        let line = self.lane_line(lane)?;
+        let node = match live.state {
+            gitez_agent_thread::State::Preparing => graph::Node::Preparing,
+            _ => graph::Node::Running,
+        };
+        let cell = graph::node_cell(
+            node,
+            line.lane,
+            line.color,
+            line.end != End::Nowhere,
+            self.through_top_row(index),
+            self.graph_width(),
+            self.graph_scroll,
+        );
+        let refs = div()
+            .h_flex()
+            .h_full()
+            .w(columns::REFS)
+            .flex_none()
+            .pl(px(10.))
+            .pr(px(6.))
+            .child(super::agent_thread::branch_chip(&live.branch, true));
+        let mono = cx.theme().mono_font_family.clone();
+        Some(
+            row.when(self.drag_role(None).is_some(), |this| this.opacity(0.45))
+                .child(self.graph_column(refs, cell, cx))
+                .children(self.pick_cell(None))
+                .child(live.description(mono))
+                .child(live.agent_and_time(columns::AUTHOR + columns::GAP + columns::DATE))
+                .into_any_element(),
+        )
+    }
+
     fn render_commit(
         &self,
         row: Stateful<Div>,
@@ -1281,26 +1757,27 @@ impl History {
     ) -> Option<AnyElement> {
         let commit = self.commits.get(index)?;
         let graph_row = self.rows.get(index)?;
-        let working_tree = self
-            .working_tree_line()
-            .filter(|_| self.head_index.is_some_and(|head| index <= head));
-        let head = if self.head != Some(commit.id) {
-            graph::Head::No
-        } else if let Some((lane, _)) = working_tree {
-            graph::Head::BelowWorkingTree { lane }
-        } else {
-            graph::Head::Yes
-        };
-        // The dashed line passes the rows between the two.
-        let through = working_tree.filter(|_| self.head_index != Some(index));
+        let through = self
+            .dashed
+            .iter()
+            .filter(|line| line.passes(index))
+            .map(DashedLine::dashed)
+            .collect();
+        let ending = self
+            .dashed
+            .iter()
+            .filter(|line| line.end == End::At(index))
+            .map(DashedLine::dashed)
+            .collect();
         let labelled = self
             .groups
             .get(&commit.id)
             .is_some_and(|groups| !groups.is_empty());
         let cell = graph::cell(
             graph_row.clone(),
-            head,
+            self.head == Some(commit.id),
             through,
+            ending,
             labelled,
             self.graph_width(),
             self.graph_scroll,
@@ -1530,6 +2007,33 @@ impl Render for History {
             .when(!self.picked.is_empty(), |this| {
                 this.child(self.render_pick_bar(cx))
             })
+            .children(self.render_composer())
+    }
+}
+
+/// Heights of the list's title and column headings, above its rows.
+const HEADINGS: Pixels = px(46. + 28.);
+
+impl History {
+    /// The open composer, a card over the rows under its own row, which it
+    /// follows while the list scrolls.
+    fn render_composer(&self) -> Option<Div> {
+        if !self.composer_open {
+            return None;
+        }
+        let (composer, _) = self.composer.as_ref()?;
+        let row = self.index_of(Entry::Composer)?;
+        let scrolled = self.scroll.0.borrow().base_handle.offset().y;
+        let top = (HEADINGS + ROW_HEIGHT * (row + 1) as f32 + scrolled).max(HEADINGS);
+        Some(
+            div()
+                .absolute()
+                .top(top + px(2.))
+                .left(px(10.))
+                .right(columns::END_PADDING)
+                .occlude()
+                .child(composer.clone()),
+        )
     }
 }
 
@@ -1623,37 +2127,68 @@ fn format_count(count: usize) -> String {
     formatted
 }
 
-/// A lane for the dashed line from the uncommitted-changes row at the top
-/// down to the `HEAD` commit at `rows[head]`: `HEAD`'s own lane when no row
-/// above uses it, so the line drops straight onto the node, or else the
-/// leftmost lane free in every row above.
-fn working_tree_lane(rows: &[Row], head: usize) -> usize {
-    let Some(head_lane) = rows.get(head).map(|row| row.lane) else {
-        return 0;
-    };
-    let mut used = Vec::new();
-    for row in &rows[..head] {
-        let lanes = row.segments.iter().map(|segment| match *segment {
+/// The lanes a graph row uses: its node's and its lines'.
+fn row_lanes(row: &Row) -> impl Iterator<Item = usize> + '_ {
+    row.segments
+        .iter()
+        .map(|segment| match *segment {
             Segment::Through { lane, .. }
             | Segment::In { lane, .. }
             | Segment::Out { lane, .. } => lane,
-        });
-        for lane in lanes.chain([row.lane]) {
-            if lane >= used.len() {
-                used.resize(lane + 1, false);
+        })
+        .chain([row.lane])
+}
+
+/// Lanes for dashed lines that all start above the commits at `rows` and
+/// end as `ends` say, in that order. Each takes the lane of the commit it
+/// ends at when no row above that commit uses it, so it drops straight onto
+/// the node, or else the leftmost lane free in every row it passes; no two
+/// take the same lane, since all of them pass the rows above the commits.
+fn dashed_lanes(rows: &[Row], ends: &[End]) -> Vec<usize> {
+    let stop = |end: &End| match *end {
+        End::At(index) => index.min(rows.len()),
+        End::Beyond => rows.len(),
+        End::Nowhere => 0,
+    };
+    // The lanes used above each line's end, in one pass down the rows.
+    let mut order: Vec<usize> = (0..ends.len()).collect();
+    order.sort_by_key(|&line| stop(&ends[line]));
+    let mut used: Vec<bool> = Vec::new();
+    let mut used_above = vec![Vec::new(); ends.len()];
+    let mut scanned = 0;
+    for line in order {
+        let stop = stop(&ends[line]);
+        for row in &rows[scanned..stop] {
+            for lane in row_lanes(row) {
+                if lane >= used.len() {
+                    used.resize(lane + 1, false);
+                }
+                used[lane] = true;
             }
-            used[lane] = true;
         }
+        scanned = stop;
+        used_above[line] = used.clone();
     }
-    if !used.get(head_lane).copied().unwrap_or(false) {
-        return head_lane;
+    let mut taken: Vec<usize> = Vec::with_capacity(ends.len());
+    for (end, used) in ends.iter().zip(&used_above) {
+        let free =
+            |lane: usize| !used.get(lane).copied().unwrap_or(false) && !taken.contains(&lane);
+        let preferred = match *end {
+            End::At(index) => rows.get(index).map(|row| row.lane),
+            End::Beyond | End::Nowhere => None,
+        };
+        let lane = match preferred.filter(|&lane| free(lane)) {
+            Some(lane) => lane,
+            None => (0..).find(|&lane| free(lane)).unwrap_or_default(),
+        };
+        taken.push(lane);
     }
-    used.iter().position(|used| !used).unwrap_or(used.len())
+    taken
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{format_count, working_tree_lane};
+    use super::{End, dashed_lanes, format_count};
     use gitez_git::Oid;
     use gitez_git::graph::GraphLayout;
 
@@ -1672,9 +2207,9 @@ mod tests {
         ];
         // Both tips above HEAD use lanes 0 and 1; HEAD sits in lane 0.
         assert_eq!(rows[2].lane, 0);
-        assert_eq!(working_tree_lane(&rows, 2), 2);
+        assert_eq!(dashed_lanes(&rows, &[End::At(2)]), [2]);
         // HEAD at the top keeps its own lane.
-        assert_eq!(working_tree_lane(&rows, 0), rows[0].lane);
+        assert_eq!(dashed_lanes(&rows, &[End::At(0)]), [rows[0].lane]);
     }
 
     #[test]
@@ -1687,7 +2222,42 @@ mod tests {
             layout.push(oid(3), &[]),
         ];
         assert_eq!(rows[1].lane, 1);
-        assert_eq!(working_tree_lane(&rows, 1), 1);
+        assert_eq!(dashed_lanes(&rows, &[End::At(1)]), [1]);
+    }
+
+    #[test]
+    fn several_dashed_lines_take_lanes_of_their_own() {
+        // main: 1 → 2 → 3; a side branch 4 forks from 3.
+        let mut layout = GraphLayout::new();
+        let rows = vec![
+            layout.push(oid(1), &[oid(2)]),
+            layout.push(oid(4), &[oid(3)]),
+            layout.push(oid(2), &[oid(3)]),
+            layout.push(oid(3), &[]),
+        ];
+        assert_eq!((rows[0].lane, rows[1].lane), (0, 1));
+        // The uncommitted changes on 1 (HEAD, the top row) drop straight
+        // onto it; a thread whose branch is at 1 too must curve in from a
+        // free lane; a thread at 2 finds lanes 0 and 1 used above it; a
+        // thread whose tip is not read yet, and one with nothing to join,
+        // take the next free lanes.
+        let lanes = dashed_lanes(
+            &rows,
+            &[
+                End::At(0),
+                End::At(0),
+                End::At(2),
+                End::Beyond,
+                End::Nowhere,
+            ],
+        );
+        assert_eq!(lanes, [0, 1, 2, 3, 4]);
+        // A lone thread at 3, whose lane 0 is used above, takes lane 2.
+        assert_eq!(dashed_lanes(&rows, &[End::At(3)]), [2]);
+        // With nothing to join, the leftmost lane is free.
+        assert_eq!(dashed_lanes(&rows, &[End::Nowhere]), [0]);
+        // A thread at the top row, after a line that took its lane.
+        assert_eq!(dashed_lanes(&rows, &[End::Beyond, End::At(1)]), [2, 1]);
     }
 
     #[test]

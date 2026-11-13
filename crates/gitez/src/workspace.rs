@@ -7,11 +7,15 @@ mod branch;
 mod changes;
 mod cherry_pick;
 mod code;
+mod composer;
+#[cfg(all(test, target_os = "macos"))]
+mod composer_shots;
 mod conflicts;
 mod detail;
 mod graph;
 mod history;
 mod labels;
+mod lanes;
 mod new_pull_request;
 mod palette;
 mod remote;
@@ -50,6 +54,7 @@ use gitez_review::{NewPullRequest as NewPullRequestFields, State, Timestamp, Tip
 
 use crate::agent_threads::{
     AgentThreadKey, AgentThreads, AgentThreadsEvent, CurrentRepository, OpenAgentThread,
+    StartRequest,
 };
 use crate::repository::Snapshot;
 use crate::theme::{self, color};
@@ -58,10 +63,12 @@ use agent_thread::{ThreadView, ThreadViewEvent};
 use branch::BranchForm;
 use changes::{ChangesEvent, ChangesPanel, LastCommit};
 use cherry_pick::{CherryPick, CherryPickEvent};
+use composer::{Composer, ComposerMode};
 use conflicts::{Conflicts, ConflictsEvent};
 use detail::{DetailEvent, DetailPane};
 use history::{
-    BranchDropped, CherryPickRequested, History, PickedChanged, Selection, SelectionChanged,
+    AskAgent, BranchDropped, CherryPickRequested, History, LaneSelected, PickedChanged, Selection,
+    SelectionChanged, StartRequested,
 };
 use new_pull_request::{FormEvent, NewPullRequestForm};
 use palette::{Palette, PaletteCommand, PaletteContext, PaletteEvent};
@@ -107,6 +114,7 @@ pub struct OpenRecent {
 /// Key bindings of the views inside the workspace.
 pub fn key_bindings() -> Vec<KeyBinding> {
     let mut bindings = history::key_bindings();
+    bindings.extend(composer::key_bindings());
     bindings.extend(review::key_bindings());
     bindings.extend(palette::key_bindings());
     bindings.push(KeyBinding::new("secondary-k", OpenPalette, None));
@@ -283,6 +291,20 @@ impl Workspace {
                 window,
                 |this, _, _: &CherryPickRequested, window, cx| this.open_cherry_pick(window, cx),
             ),
+            cx.subscribe_in(
+                &history,
+                window,
+                |this, _, LaneSelected(key), window, cx| {
+                    this.show_agent_thread(key.clone(), window, cx)
+                },
+            ),
+            cx.subscribe_in(
+                &history,
+                window,
+                |this, _, StartRequested(request), window, cx| {
+                    this.start_agent_thread(request.clone(), window, cx)
+                },
+            ),
             cx.subscribe(&history, |this, history, _: &PickedChanged, cx| {
                 let Some((panel, _)) = &this.cherry_pick else {
                     return;
@@ -352,6 +374,11 @@ impl Workspace {
                     }
                 },
             ),
+            // The live lanes follow the threads' states and activity, and
+            // their elapsed times the model's periodic redraws.
+            cx.observe(&AgentThreads::global(cx), |this, _, cx| {
+                this.update_lanes(cx)
+            }),
         ];
         let mut workspace = Self {
             focus_handle,
@@ -516,6 +543,11 @@ impl Workspace {
             .update(cx, |sidebar, cx| sidebar.set_snapshot(snapshot.clone(), cx));
         self.history
             .update(cx, |history, cx| history.load(&snapshot, cx));
+        // A new composer: nothing typed for another repository carries over.
+        let composer =
+            composer_mode(&snapshot).map(|mode| cx.new(|cx| Composer::new(mode, window, cx)));
+        self.history
+            .update(cx, |history, cx| history.set_composer(composer, window, cx));
         if let Some(error) = &snapshot.pull_requests_error {
             window.push_notification(crate::toast::warning(error.clone()), cx);
         }
@@ -531,6 +563,7 @@ impl Workspace {
             threads.set_current_repository(Some(current), cx)
         });
         self.snapshot = Some(snapshot);
+        self.update_lanes(cx);
         self.error = None;
         self.set_status(None, cx);
         self.status_error = None;
@@ -649,7 +682,9 @@ impl Workspace {
                                 }
                             });
                         }
+                        this.update_composer(&snapshot, window, cx);
                         this.snapshot = Some(snapshot);
+                        this.update_lanes(cx);
                         this.refresh_status(window, cx);
                         if let Some(number) = this.open_after_reload.take() {
                             this.open_pull_request(number, window, cx);
@@ -756,6 +791,11 @@ impl Workspace {
                 let status = status.clone();
                 let (head, _) = head_of(snapshot);
                 cx.new(|cx| Review::working_tree(&repository, status, head, cx))
+            }
+            Some(Selection::Lane(lane)) => {
+                let key = lane.key.clone();
+                self.show_agent_thread(key, window, cx);
+                return;
             }
             None => return,
         };
@@ -1701,7 +1741,8 @@ impl Workspace {
             cx.notify();
         }
         let selection = match self.history.read(cx).selected() {
-            Some(Selection::WorkingTree(_)) => return,
+            // A lane's thread opens on `LaneSelected`, with the window.
+            Some(Selection::WorkingTree(_) | Selection::Lane(_)) => return,
             Some(Selection::Commit(commit, labels)) => Some((commit.clone(), labels.to_vec())),
             None => None,
         };
@@ -1715,6 +1756,7 @@ impl Workspace {
         match self.history.read(cx).selected() {
             Some(Selection::Commit(commit, _)) => Selected::Commit(commit.id),
             Some(Selection::WorkingTree(_)) => Selected::WorkingTree,
+            Some(Selection::Lane(lane)) => Selected::Lane(lane.key.clone()),
             None => Selected::Nothing,
         }
     }
@@ -1784,6 +1826,108 @@ impl Workspace {
         cx.notify();
     }
 
+    /// ⌘⇧A: opens the composer under the history's "Ask an agent…" row,
+    /// showing the history first if a local pull request is in its place.
+    fn ask_agent(&mut self, _: &AskAgent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.conflicts.is_some() || self.rewrite.is_some() {
+            window.push_notification(
+                crate::toast::info("Finish the merge or rewrite first, then ask an agent."),
+                cx,
+            );
+            return;
+        }
+        if self.history.read(cx).composer().is_none() {
+            let reason = match &self.snapshot {
+                Some(snapshot) if snapshot.repository.work_dir().is_none() => {
+                    "A bare repository has no working tree to start from."
+                }
+                _ => "The repository has no branch to start from yet: make a first commit.",
+            };
+            window.push_notification(crate::toast::info(reason), cx);
+            return;
+        }
+        if self.review.is_some() {
+            self.close_review(window, cx);
+        }
+        self.history
+            .update(cx, |history, cx| history.open_composer(window, cx));
+    }
+
+    /// Updates the composer after the refs were read again: its branches,
+    /// and whether it shows at all.
+    fn update_composer(
+        &mut self,
+        snapshot: &Snapshot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let existing = self.history.read(cx).composer().cloned();
+        let composer = match (composer_mode(snapshot), existing) {
+            (None, _) => None,
+            (Some(mode), Some(composer)) => {
+                composer.update(cx, |composer, cx| composer.set_mode(mode, cx));
+                Some(composer)
+            }
+            (Some(mode), None) => Some(cx.new(|cx| Composer::new(mode, window, cx))),
+        };
+        self.history
+            .update(cx, |history, cx| history.set_composer(composer, window, cx));
+    }
+
+    /// Shows the open repository's active agent threads as live lanes.
+    fn update_lanes(&mut self, cx: &mut Context<Self>) {
+        let lanes = match &self.snapshot {
+            Some(snapshot) => lanes::lanes(
+                AgentThreads::global(cx).read(cx),
+                &snapshot.repository.common_dir(),
+                &snapshot.refs.branches,
+                gitez_agent_thread::Timestamp::now(),
+            ),
+            None => Vec::new(),
+        };
+        self.history
+            .update(cx, |history, cx| history.set_lanes(lanes, cx));
+    }
+
+    /// Starts the agent thread the composer asks for, then shows it. If it
+    /// cannot start, the composer opens again with the prompt.
+    fn start_agent_thread(
+        &mut self,
+        request: StartRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let title = gitez_agent_thread::title_from_prompt(&request.prompt);
+        let prompt = request.prompt.clone();
+        let start = AgentThreads::global(cx).update(cx, |threads, cx| threads.start(request, cx));
+        cx.spawn_in(window, async move |this, cx| {
+            let started = start.await;
+            this.update_in(cx, |this, window, cx| match started {
+                Ok(key) => {
+                    window.push_notification(
+                        crate::toast::success(format!("Started \u{201c}{title}\u{201d}")),
+                        cx,
+                    );
+                    this.show_agent_thread(key, window, cx);
+                }
+                Err(error) => {
+                    window.push_notification(
+                        crate::toast::error(format!("Could not start the agent thread: {error:#}")),
+                        cx,
+                    );
+                    let composer = this.history.read(cx).composer().cloned();
+                    if let Some(composer) = composer {
+                        composer.update(cx, |composer, cx| composer.set_prompt(prompt, window, cx));
+                        this.history
+                            .update(cx, |history, cx| history.open_composer(window, cx));
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// The agent threads of the open repository changed: reads the refs
     /// and pull requests again if a thread's state or pull request did.
     fn agent_threads_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1844,6 +1988,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::review_selected))
             .when(snapshot.is_some(), |this| {
                 this.on_action(cx.listener(Self::open_agent_thread))
+                    .on_action(cx.listener(Self::ask_agent))
             })
             .on_action(cx.listener(Self::new_pull_request))
             .on_action(cx.listener(Self::open_palette))
@@ -2037,11 +2182,39 @@ impl Workspace {
 
 /// The start buttons, and the recent repositories below them.
 /// What the history has selected, to tell when it changes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Selected {
     Nothing,
     WorkingTree,
+    Lane(AgentThreadKey),
     Commit(Oid),
+}
+
+/// What the composer of the repository of `snapshot` starts threads
+/// from; `None` when it cannot start any: a bare repository, or one with no
+/// branch yet.
+fn composer_mode(snapshot: &Snapshot) -> Option<ComposerMode> {
+    let work_dir = snapshot.repository.work_dir()?.to_owned();
+    let branches: Vec<(String, Oid)> = snapshot
+        .refs
+        .branches
+        .iter()
+        .map(|branch| (branch.name.clone(), branch.target))
+        .collect();
+    if branches.is_empty() {
+        return None;
+    }
+    let current = match &snapshot.refs.head {
+        Some(Head::Branch { name, .. }) => Some(name.clone()),
+        _ => None,
+    };
+    Some(ComposerMode::Repository {
+        work_dir,
+        common_dir: snapshot.repository.common_dir(),
+        name: snapshot.name.clone(),
+        branches,
+        current,
+    })
 }
 
 /// What of an agent thread shows in the refs and pull requests.

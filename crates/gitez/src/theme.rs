@@ -215,10 +215,8 @@ pub mod color {
     #[allow(dead_code, reason = "for the agent thread screens still to come")]
     pub const PICKER_ON_BORDER: u32 = 0xe8_b0_4b_99;
     /// A selected option card, and a fresh row in Home.
-    #[allow(dead_code, reason = "for the agent thread screens still to come")]
     pub const OPTION_ON: u32 = 0x1f_1b_14;
     /// The dashed border of the collapsed "Ask an agent…" row.
-    #[allow(dead_code, reason = "for the agent thread screens still to come")]
     pub const COMPOSER_BORDER: u32 = 0x3a_3a_40;
     /// The chip naming a tool an agent uses.
     pub const TOOL_CHIP: u32 = 0x1f_1f_23;

@@ -62,6 +62,13 @@ impl Shots {
     /// The recent repositories are kept in memory: the user's own data
     /// folder is never read or written.
     pub fn from_env(data_dir: &Path) -> Option<Self> {
+        Self::with_options(data_dir, |_| {})
+    }
+
+    /// [`Shots::from_env`], with the agent threads' options changed by
+    /// `configure` first: another sandbox or agents, a supervisor to start
+    /// threads with, file watching.
+    pub fn with_options(data_dir: &Path, configure: impl FnOnce(&mut Options)) -> Option<Self> {
         let dir = PathBuf::from(std::env::var_os(DIR_ENV).filter(|dir| !dir.is_empty())?);
         std::fs::create_dir_all(&dir).expect("the screenshot folder can be created");
         let mut cx = HeadlessAppContext::with_platform(
@@ -69,23 +76,21 @@ impl Shots {
             Arc::new(crate::assets::Assets),
             gpui_kit::platform::current_headless_renderer,
         );
-        let data_dir = data_dir.to_owned();
+        let mut options = Options {
+            data_dir: Some(data_dir.to_owned()),
+            sandbox: Arc::new(gitez_sandbox::Passthrough),
+            agents: gitez_agent::Registry::builtin(),
+            secrets: Arc::new(gitez_secret::Memory::default()),
+            exe: Err("no supervisor in screenshots".into()),
+            watch: false,
+        };
+        configure(&mut options);
         cx.update(|cx| {
             gpui_kit::init(cx);
             load_fonts(cx);
             crate::theme::init(cx);
             crate::recent::init_in_memory(cx);
-            init_with(
-                Options {
-                    data_dir: Some(data_dir),
-                    sandbox: Arc::new(gitez_sandbox::Passthrough),
-                    agents: gitez_agent::Registry::builtin(),
-                    secrets: Arc::new(gitez_secret::Memory::default()),
-                    exe: Err("no supervisor in screenshots".into()),
-                    watch: false,
-                },
-                cx,
-            );
+            init_with(options, cx);
             cx.bind_keys(crate::workspace::key_bindings());
         });
         let mut shots = Self { cx, dir };
