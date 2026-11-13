@@ -1,44 +1,47 @@
-//! An agent running as a child process: its output line by line, a way to
-//! stop it, and how it ended.
+//! A child process described by a [`CommandSpec`]: its output line by line,
+//! a way to stop it, and how it ended. It knows nothing about agents; an
+//! agent only builds the command.
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use crate::{Error, Result};
+use crate::{CommandSpec, Error, Result};
 
-/// Keep this much of the end of the agent's error output, to explain a
+/// Keep this much of the end of the process's error output, to explain a
 /// failure.
 const STDERR_TAIL: usize = 8 * 1024;
-/// How often to check whether the agent has exited once its output ended.
+/// How often to check whether the process has exited once its output ended.
 const EXIT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// A running agent.
-pub struct Session {
+/// A running process, in a process group of its own.
+pub struct AgentProcess {
     child: Arc<Mutex<Child>>,
+    id: u32,
     stdout: BufReader<ChildStdout>,
-    /// Collects the end of the error output; joined in [`Session::finish`].
+    /// Collects the end of the error output; joined in [`AgentProcess::finish`].
     stderr: Option<JoinHandle<String>>,
-    /// Writes the prompt; joined in [`Session::finish`].
+    /// Writes the standard input; joined in [`AgentProcess::finish`].
     stdin: Option<JoinHandle<()>>,
     stopped: Arc<Mutex<bool>>,
 }
 
-/// Stops a [`Session`] from another thread.
+/// Stops an [`AgentProcess`] from another thread.
 #[derive(Clone)]
 pub struct Stopper {
     child: Arc<Mutex<Child>>,
     stopped: Arc<Mutex<bool>>,
 }
 
-/// How the agent's process ended.
+/// How the process ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome {
-    /// Whether it exited successfully.
+    /// Whether it exited successfully. For an agent that is not whether its
+    /// run succeeded: read that from its own output.
     pub success: bool,
-    /// Whether it was stopped with [`Stopper::stop`].
+    /// Whether [`Stopper::interrupt`] or [`Stopper::stop`] was called.
     pub stopped: bool,
     /// Its exit code, if it exited rather than being killed.
     pub code: Option<i32>,
@@ -46,41 +49,54 @@ pub struct Outcome {
     pub stderr: String,
 }
 
-impl Session {
-    /// Runs `program` with `args` in `dir`, writing `input` to its standard
-    /// input.
-    pub(crate) fn start(program: &Path, args: &[&str], dir: &Path, input: &str) -> Result<Self> {
+impl AgentProcess {
+    /// Spawns `command` in a new process group, stdout and stderr piped,
+    /// stdin as `command.stdin` says.
+    pub fn spawn(command: &CommandSpec) -> Result<Self> {
         let start_error = |source| Error::Start {
-            program: program.to_owned(),
+            program: command.program.clone(),
             source,
         };
-        let mut command = Command::new(program);
-        command
-            .args(args)
-            .current_dir(dir)
-            .stdin(Stdio::piped())
+        let mut process = Command::new(&command.program);
+        process
+            .args(&command.args)
+            .stdin(if command.stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if !command.cwd.as_os_str().is_empty() {
+            process.current_dir(&command.cwd);
+        }
+        for name in &command.env_remove {
+            process.env_remove(name);
+        }
+        for (name, value) in &command.env {
+            process.env(name, value);
+        }
         // Its own process group, so stopping it also stops the commands it
         // runs, which share its output.
         #[cfg(unix)]
-        std::os::unix::process::CommandExt::process_group(&mut command, 0);
-        let mut child = command.spawn().map_err(start_error)?;
-        let (Some(mut stdin), Some(stdout), Some(mut stderr)) =
-            (child.stdin.take(), child.stdout.take(), child.stderr.take())
-        else {
+        std::os::unix::process::CommandExt::process_group(&mut process, 0);
+        let mut child = process.spawn().map_err(start_error)?;
+        let (Some(stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take()) else {
             // Piped above, so always there; stop the process rather than
-            // leave it waiting.
+            // leave it running unread.
             child.kill().ok();
+            child.wait().ok();
             return Err(start_error(std::io::Error::other("no pipe to the process")));
         };
-        // Written from a thread, so a prompt larger than the pipe's buffer
-        // cannot block reading the output. Closing stdin ends the prompt.
-        let input = input.to_owned();
-        let stdin = std::thread::spawn(move || {
-            // The process may exit without reading it all.
-            stdin.write_all(input.as_bytes()).ok();
-        });
+        // Written from a thread, so an input larger than the pipe's buffer
+        // cannot block reading the output. Closing stdin ends the input.
+        let stdin = match (command.stdin.clone(), child.stdin.take()) {
+            (Some(input), Some(mut pipe)) => Some(std::thread::spawn(move || {
+                // The process may exit without reading it all.
+                pipe.write_all(input.as_bytes()).ok();
+            })),
+            _ => None,
+        };
         let stderr = std::thread::spawn(move || {
             let mut tail = Vec::new();
             let mut buffer = [0_u8; 4096];
@@ -96,16 +112,22 @@ impl Session {
             String::from_utf8_lossy(&tail).trim().to_owned()
         });
         Ok(Self {
+            id: child.id(),
             child: Arc::new(Mutex::new(child)),
             stdout: BufReader::new(stdout),
             stderr: Some(stderr),
-            stdin: Some(stdin),
+            stdin,
             stopped: Arc::new(Mutex::new(false)),
         })
     }
 
+    /// The process id, which is also the process group id.
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+
     /// The next line of output, without its line ending; `None` once the
-    /// agent closed its output.
+    /// process and everything it started closed their output.
     pub fn next_line(&mut self) -> Result<Option<String>> {
         let mut line = Vec::new();
         let read = self
@@ -128,13 +150,13 @@ impl Session {
         }
     }
 
-    /// Waits for the agent to exit.
+    /// Waits for the process to exit.
     pub fn finish(mut self) -> Result<Outcome> {
         if let Some(stdin) = self.stdin.take() {
             stdin.join().ok();
         }
-        // Polled rather than waited on, so the process stays free for
-        // `Stopper::stop` to kill.
+        // Polled rather than waited on, so the process stays free for the
+        // `Stopper` to signal.
         let status = loop {
             if let Some(status) = lock(&self.child).try_wait().map_err(Error::Read)? {
                 break status;
@@ -156,27 +178,49 @@ impl Session {
 }
 
 impl Stopper {
-    /// Ends the agent's process. Its output then ends too.
+    /// Sends SIGINT to the whole process group: Claude Code ends its turn
+    /// cleanly and reports a result. The process decides when it exits.
+    pub fn interrupt(&self) {
+        self.signal(Signal::Interrupt);
+    }
+
+    /// Kills the whole process group: the process and the commands it
+    /// started. Its output then ends.
     pub fn stop(&self) {
+        self.signal(Signal::Kill);
+    }
+
+    fn signal(&self, signal: Signal) {
         *lock(&self.stopped) = true;
         let mut child = lock(&self.child);
-        // Already exited: nothing to stop.
+        // Already exited and reaped: its id may belong to another process
+        // by now, so nothing is sent.
         if matches!(child.try_wait(), Ok(Some(_))) {
             return;
         }
         #[cfg(unix)]
         {
-            // The whole group: the agent and the commands it started.
-            Command::new("kill")
-                .arg("-KILL")
-                .arg(format!("-{}", child.id()))
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .ok();
+            use rustix::process::{Pid, Signal as Unix, kill_process_group};
+            let pid = i32::try_from(child.id()).ok().and_then(Pid::from_raw);
+            if let Some(pid) = pid {
+                let signal = match signal {
+                    Signal::Interrupt => Unix::INT,
+                    Signal::Kill => Unix::KILL,
+                };
+                // Fails only when the group is gone already.
+                kill_process_group(pid, signal).ok();
+            }
         }
-        child.kill().ok();
+        if signal == Signal::Kill {
+            child.kill().ok();
+        }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Signal {
+    Interrupt,
+    Kill,
 }
 
 /// `mutex` locked; a panic elsewhere while holding it does not matter for

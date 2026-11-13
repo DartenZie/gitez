@@ -2269,6 +2269,7 @@ dependencies = [
 name = "gitez-agent"
 version = "0.1.0"
 dependencies = [
+ "rustix",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
@@ -2332,6 +2333,7 @@ name = "gitez-sandbox"
 version = "0.1.0"
 dependencies = [
  "gitez-agent",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

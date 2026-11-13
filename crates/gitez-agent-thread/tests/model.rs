@@ -1,0 +1,386 @@
+//! The agent thread model: its JSON form and the changes its state allows.
+
+mod common;
+
+use common::{EXAMPLE, at};
+use gitez_agent_thread::{
+    AgentThread, AgentThreadId, CONTINUE_PROMPT, Ending, Error, RetryPlan, State, Step,
+    SupervisorInfo, TurnKind, TurnResult,
+};
+use gitez_sandbox::NetworkProfile;
+
+fn example() -> AgentThread {
+    serde_json::from_str(EXAMPLE).expect("the example parses")
+}
+
+/// The example, finished with a final message and a session.
+fn finished(ending: Ending) -> AgentThread {
+    let mut thread = example();
+    thread.state = State::Finished;
+    thread.ending = Some(ending);
+    thread.supervisor = None;
+    thread.activity = None;
+    let turn = &mut thread.turns[0];
+    turn.ended = Some(at("2026-11-13T10:01:31Z"));
+    turn.result = Some(TurnResult {
+        success: true,
+        message: "Added the blame view.".to_owned(),
+        cost_usd: Some(0.42),
+        duration_ms: Some(1_200_000),
+        steps: 40,
+        exit_code: Some(0),
+        stopped: false,
+        blocked_hosts: Vec::new(),
+    });
+    thread
+}
+
+fn refusal(result: Result<impl std::fmt::Debug, Error>) -> String {
+    match result {
+        Err(Error::Refused(message)) => message,
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_example_round_trips() {
+    let thread = example();
+    assert_eq!(thread.id.as_str(), "add-a-blame-view-to-the-commit-detail");
+    assert_eq!(thread.network, NetworkProfile::Packages);
+    assert_eq!(thread.state, State::Running);
+    assert_eq!(
+        thread.supervisor,
+        Some(SupervisorInfo {
+            pid: 48211,
+            child_group: Some(48230),
+            started: at("2026-11-13T09:41:08Z"),
+        })
+    );
+    assert!(
+        thread
+            .worktree
+            .to_str()
+            .expect("utf-8")
+            .contains("Application Support")
+    );
+
+    let mut value = serde_json::to_value(&thread).expect("serialises");
+    value
+        .as_object_mut()
+        .expect("an object")
+        .insert("version".to_owned(), 1.into());
+    let expected: serde_json::Value = serde_json::from_str(EXAMPLE).expect("parses");
+    assert_eq!(value, expected);
+}
+
+#[test]
+fn empty_options_are_left_out_or_null_as_the_format_says() {
+    let mut thread = example();
+    thread.model = None;
+    thread.session_id = None;
+    thread.activity = None;
+    thread.supervisor = None;
+    let value = serde_json::to_value(&thread).expect("serialises");
+    let object = value.as_object().expect("an object");
+    for omitted in [
+        "model",
+        "session_id",
+        "pull_request",
+        "activity",
+        "waiting_until",
+        "error",
+        "supervisor",
+        "completed",
+    ] {
+        assert!(!object.contains_key(omitted), "{omitted} is omitted");
+    }
+    assert_eq!(object["ending"], serde_json::Value::Null);
+    assert_eq!(object["turns"][0]["result"], serde_json::Value::Null);
+    assert_eq!(object["warnings"], serde_json::json!([]));
+}
+
+#[test]
+fn ids_are_slugs() {
+    for valid in ["a", "fix-2", "add-a-blame-view", &"x".repeat(48)] {
+        assert!(AgentThreadId::new(valid).is_ok(), "{valid}");
+    }
+    for invalid in [
+        "",
+        "-a",
+        "a-",
+        "a--b",
+        "A",
+        "a_b",
+        "a/b",
+        "é",
+        &"x".repeat(49),
+    ] {
+        assert!(
+            matches!(AgentThreadId::new(invalid), Err(Error::InvalidId(_))),
+            "{invalid}"
+        );
+    }
+    let id = AgentThreadId::new("fix-2").expect("valid");
+    assert_eq!(id.branch(), "agent/fix-2");
+    assert_eq!(id.to_string(), "fix-2");
+    assert!(serde_json::from_str::<AgentThreadId>(r#""Not Valid""#).is_err());
+}
+
+#[test]
+fn active_states_have_a_supervisor() {
+    let active: Vec<State> = [
+        State::Queued,
+        State::Preparing,
+        State::Running,
+        State::Waiting,
+        State::Finished,
+        State::Completed,
+    ]
+    .into_iter()
+    .filter(|state| state.is_active())
+    .collect();
+    assert_eq!(
+        active,
+        [
+            State::Queued,
+            State::Preparing,
+            State::Running,
+            State::Waiting
+        ]
+    );
+}
+
+#[test]
+fn an_active_thread_refuses_turns_retries_and_completion() {
+    let mut thread = example();
+    let still = "The agent is still working on this thread.";
+    let now = at("2026-11-13T10:00:00Z");
+    assert_eq!(
+        refusal(thread.request_turn(TurnKind::Reply, "More".to_owned(), now)),
+        still
+    );
+    assert_eq!(
+        refusal(thread.request_retry(NetworkProfile::Open, now)),
+        still
+    );
+    assert_eq!(refusal(thread.mark_completed(now)), still);
+    assert_eq!(thread, example(), "nothing changed");
+}
+
+#[test]
+fn a_reply_queues_a_finished_thread_that_has_a_conversation() {
+    let now = at("2026-11-13T10:05:00Z");
+    let mut thread = finished(Ending::Answer);
+    thread.session_id = None;
+    assert_eq!(
+        refusal(thread.request_turn(TurnKind::Reply, "More".to_owned(), now)),
+        "Retry this thread first: the agent never started."
+    );
+
+    let mut thread = finished(Ending::PullRequest);
+    thread.waiting_until = Some(now);
+    assert!(
+        thread
+            .request_turn(TurnKind::Start, "Again".to_owned(), now)
+            .is_err(),
+        "only replies and reviews"
+    );
+    assert_eq!(thread.pending_turn(), None);
+    thread
+        .request_turn(TurnKind::Review, "Fix the comments".to_owned(), now)
+        .expect("a review turn");
+    assert_eq!(thread.state, State::Queued);
+    assert_eq!(thread.ending, None);
+    assert_eq!(thread.waiting_until, None);
+    assert_eq!(thread.pending_turn(), Some(1));
+    let turn = &thread.turns[1];
+    assert_eq!(turn.kind, TurnKind::Review);
+    assert_eq!(turn.prompt, "Fix the comments");
+    assert!(turn.resume);
+    assert_eq!(turn.requested, now);
+    // The last message stays until the new turn has one.
+    assert_eq!(thread.final_message(), Some("Added the blame view."));
+}
+
+#[test]
+fn only_a_failed_or_stopped_thread_can_be_retried() {
+    let now = at("2026-11-13T10:05:00Z");
+    for ending in [Ending::Answer, Ending::PullRequest] {
+        let mut thread = finished(ending);
+        assert_eq!(
+            refusal(thread.request_retry(NetworkProfile::Open, now)),
+            "Only a thread that failed or was stopped can be retried."
+        );
+    }
+}
+
+#[test]
+fn the_retry_plan_follows_the_failed_step_and_the_conversation() {
+    let now = at("2026-11-13T10:05:00Z");
+    let cases = [
+        (Step::Queue, false, RetryPlan::RunAgain),
+        (Step::Worktree, false, RetryPlan::RunAgain),
+        (Step::Prepare, false, RetryPlan::RunAgain),
+        (Step::Sandbox, false, RetryPlan::RunAgain),
+        (Step::Supervisor, false, RetryPlan::RunAgain),
+        (Step::Agent, false, RetryPlan::RunAgain),
+        (Step::Queue, true, RetryPlan::Continue),
+        (Step::Supervisor, true, RetryPlan::Continue),
+        (Step::Agent, true, RetryPlan::Continue),
+        (Step::Commit, true, RetryPlan::Finish),
+        (Step::PullRequest, false, RetryPlan::Finish),
+    ];
+    for (step, has_session, expected) in cases {
+        let mut thread = finished(Ending::Answer);
+        if !has_session {
+            thread.session_id = None;
+        }
+        thread.fail(step, "It broke.", now);
+        let plan = thread
+            .request_retry(NetworkProfile::Open, now)
+            .expect("a failed thread can be retried");
+        assert_eq!(plan, expected, "{step:?}, session {has_session}");
+        assert_eq!(thread.state, State::Queued);
+        assert_eq!(thread.network, NetworkProfile::Open);
+        assert_eq!(thread.ending, None);
+        assert_eq!(thread.error, None);
+        match plan {
+            RetryPlan::Finish => {
+                assert_eq!(thread.turns.len(), 1);
+                assert_eq!(thread.pending_turn(), None);
+            }
+            RetryPlan::RunAgain => {
+                let turn = &thread.turns[1];
+                assert_eq!(turn.kind, TurnKind::Retry);
+                assert_eq!(turn.prompt, thread.turns[0].prompt);
+                assert!(!turn.resume);
+                assert_eq!(thread.pending_turn(), Some(1));
+            }
+            RetryPlan::Continue => {
+                let turn = &thread.turns[1];
+                assert_eq!(turn.kind, TurnKind::Retry);
+                assert_eq!(turn.prompt, CONTINUE_PROMPT);
+                assert!(turn.resume);
+            }
+        }
+    }
+
+    for (has_session, expected) in [(true, RetryPlan::Continue), (false, RetryPlan::RunAgain)] {
+        let mut thread = finished(Ending::Stopped);
+        if !has_session {
+            thread.session_id = None;
+        }
+        assert_eq!(
+            thread
+                .request_retry(NetworkProfile::AgentOnly, now)
+                .expect("a stopped thread can be retried"),
+            expected
+        );
+    }
+}
+
+#[test]
+fn a_retry_keeps_a_reply_that_never_ran() {
+    let now = at("2026-11-13T10:05:00Z");
+    let mut thread = finished(Ending::Answer);
+    thread
+        .request_turn(TurnKind::Reply, "Also add a test.".to_owned(), now)
+        .expect("reply");
+    thread.fail(Step::Sandbox, "The sandbox is not installed.", now);
+    assert_eq!(
+        thread
+            .request_retry(NetworkProfile::Packages, now)
+            .expect("retry"),
+        RetryPlan::Continue
+    );
+    let turn = thread.turns.last().expect("a turn");
+    assert_eq!(turn.kind, TurnKind::Retry);
+    assert_eq!(turn.prompt, "Also add a test.");
+    assert_eq!(thread.pending_turn(), Some(2));
+}
+
+#[test]
+fn failing_ends_the_running_turn_and_clears_the_supervisor() {
+    let mut thread = example();
+    let now = at("2026-11-13T10:00:00Z");
+    thread.fail(Step::Supervisor, "GitEZ's supervisor stopped.", now);
+    assert_eq!(thread.state, State::Finished);
+    assert_eq!(thread.ending, Some(Ending::Failed));
+    let error = thread.error.as_ref().expect("an error");
+    assert_eq!(error.step, Step::Supervisor);
+    assert_eq!(error.message, "GitEZ's supervisor stopped.");
+    assert_eq!(error.at, now);
+    assert_eq!(thread.supervisor, None);
+    assert_eq!(thread.activity, None);
+    assert_eq!(thread.turns[0].ended, Some(now));
+    // 09:41:31 to 10:00:00, and it no longer grows.
+    let later = at("2026-11-13T12:00:00Z");
+    assert_eq!(thread.run_time(later).as_secs(), 18 * 60 + 29);
+}
+
+#[test]
+fn completing_is_final() {
+    let now = at("2026-11-13T10:05:00Z");
+    let mut thread = finished(Ending::Failed);
+    thread.mark_completed(now).expect("complete");
+    assert_eq!(thread.state, State::Completed);
+    assert_eq!(thread.completed, Some(now));
+    assert_eq!(thread.ending, Some(Ending::Failed));
+    let completed = "This thread is completed.";
+    assert_eq!(refusal(thread.mark_completed(now)), completed);
+    assert_eq!(
+        refusal(thread.request_turn(TurnKind::Reply, "More".to_owned(), now)),
+        completed
+    );
+    assert_eq!(
+        refusal(thread.request_retry(NetworkProfile::Open, now)),
+        completed
+    );
+}
+
+#[test]
+fn steps_and_run_time_add_up_the_turns() {
+    let thread = example();
+    assert_eq!(thread.steps(), 31, "from the activity while it runs");
+    // Running: counts up to now.
+    assert_eq!(thread.run_time(at("2026-11-13T09:42:31Z")).as_secs(), 60);
+
+    let mut thread = finished(Ending::Answer);
+    assert_eq!(thread.steps(), 40, "from the results once finished");
+    assert_eq!(
+        thread.run_time(at("2026-11-14T00:00:00Z")).as_secs(),
+        20 * 60
+    );
+    thread
+        .request_turn(
+            TurnKind::Reply,
+            "More".to_owned(),
+            at("2026-11-13T11:00:00Z"),
+        )
+        .expect("reply");
+    let turn = &mut thread.turns[1];
+    turn.started = Some(at("2026-11-13T11:00:00Z"));
+    turn.ended = Some(at("2026-11-13T11:00:30Z"));
+    turn.result = Some(TurnResult {
+        success: true,
+        message: String::new(),
+        cost_usd: None,
+        duration_ms: None,
+        steps: 2,
+        exit_code: Some(0),
+        stopped: false,
+        blocked_hosts: Vec::new(),
+    });
+    thread.state = State::Finished;
+    assert_eq!(thread.steps(), 42);
+    assert_eq!(
+        thread.run_time(at("2026-11-14T00:00:00Z")).as_secs(),
+        20 * 60 + 30
+    );
+    assert_eq!(
+        thread.final_message(),
+        Some("Added the blame view."),
+        "an empty message does not hide the one before"
+    );
+    assert_eq!(thread.pending_turn(), None);
+}

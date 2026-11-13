@@ -1091,6 +1091,42 @@ impl Git {
         self.run(["merge", "--abort"], None).map(drop)
     }
 
+    /// Adds a linked worktree at `path` with `branch` checked out, like
+    /// `git worktree add <path> <branch>`. The branch must exist and not be
+    /// checked out in another worktree; `path` must not exist or be empty.
+    pub fn worktree_add(&self, path: &Path, branch: &str) -> Result<()> {
+        self.run(
+            [
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                OsStr::new("--quiet"),
+                OsStr::new("--"),
+                path.as_os_str(),
+                OsStr::new(branch),
+            ],
+            None,
+        )
+        .map(drop)
+    }
+
+    /// Removes the linked worktree at `path`, like `git worktree remove`.
+    /// Without `force` git refuses while the worktree has changes or
+    /// untracked files; with it they are lost.
+    pub fn worktree_remove(&self, path: &Path, force: bool) -> Result<()> {
+        let mut args = vec![OsStr::new("worktree"), OsStr::new("remove")];
+        if force {
+            args.push(OsStr::new("--force"));
+        }
+        args.extend([OsStr::new("--"), path.as_os_str()]);
+        self.run(args, None).map(drop)
+    }
+
+    /// Forgets linked worktrees whose folders are gone, like
+    /// `git worktree prune`.
+    pub fn worktree_prune(&self) -> Result<()> {
+        self.run(["worktree", "prune"], None).map(drop)
+    }
+
     /// Sets `key` in the repository's own configuration to `value`, like
     /// `git config --local`, or removes it when `value` is `None`.
     pub fn set_config(&self, key: &str, value: Option<&str>) -> Result<()> {

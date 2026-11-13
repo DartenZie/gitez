@@ -9,7 +9,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt as _;
-use gitez_agent::{Agent, AgentEvent, ClaudeCode, Outcome, Stopper};
+use gitez_agent::{
+    Agent, AgentConfig, AgentEvent, AgentProcess, ClaudeCode, Conversation, Outcome, Registry,
+    RunSpec, Stopper,
+};
 use gitez_command::Git;
 use gitez_git::Repository;
 use gitez_review::{PromptContext, RunHeader, Side, Store, Template, Timestamp};
@@ -363,13 +366,13 @@ impl Review {
         let Subject::PullRequest(subject) = &self.subject else {
             return;
         };
-        let Some(agent) = gitez_agent::agent(&subject.pull_request.prompt.agent) else {
+        let Some(agent) = Registry::builtin().get(&subject.pull_request.prompt.agent) else {
             return;
         };
         let number = subject.pull_request.number;
         let key = (self.repository.common_dir(), number);
         let (store, dir) = (subject.store.clone(), dir.to_owned());
-        let run = cx.new(|cx| AgentRun::start(agent.into(), prompt, dir, store, number, cx));
+        let run = cx.new(|cx| AgentRun::start(agent, prompt, dir, store, number, cx));
         cx.default_global::<AgentRuns>().0.insert(key, run.clone());
         self.show_run(run, cx);
     }
@@ -404,7 +407,7 @@ impl Review {
         };
         let included = open.iter().filter(|thread| thread.in_prompt).count();
         let prompt = self.prompt_text(cx);
-        let agent = gitez_agent::agent(&pull_request.prompt.agent);
+        let agent = Registry::builtin().get(&pull_request.prompt.agent);
         let cannot_send = self.cannot_send(cx);
         let options = &pull_request.prompt;
 
@@ -723,7 +726,10 @@ impl Review {
         });
         let events = run.events.iter().filter_map(|event| {
             let element = match event {
-                AgentEvent::Started { .. } | AgentEvent::Finished(_) => return None,
+                // The result says when the usage limit stopped the run.
+                AgentEvent::Started { .. }
+                | AgentEvent::UsageLimit(_)
+                | AgentEvent::Finished(_) => return None,
                 AgentEvent::Text(text) => div()
                     .text_size(px(12.5))
                     .line_height(relative(1.5))
@@ -928,7 +934,7 @@ impl AgentRun {
                     None
                 }
             };
-            let mut session = match thread_agent.start(&prompt, &dir) {
+            let mut session = match start(thread_agent.as_ref(), &prompt, &dir) {
                 Ok(session) => session,
                 Err(error) => {
                     send(Message::Ended(Err(format!(
@@ -995,7 +1001,7 @@ impl AgentRun {
 
     /// The run a transcript with `header` and output `lines` records.
     fn saved(header: RunHeader, lines: &[String]) -> Self {
-        let agent = gitez_agent::agent(&header.agent);
+        let agent = Registry::builtin().get(&header.agent);
         Self {
             agent: agent
                 .as_ref()
@@ -1081,4 +1087,32 @@ impl AgentRun {
             _ => (format!("Failed · started {ago}"), color::DIFF_REMOVED),
         }
     }
+}
+
+/// Starts `agent` on `prompt` in `dir`, the checked-out working tree, as
+/// configured by default and outside GitEZ's sandbox.
+fn start(
+    agent: &dyn Agent,
+    prompt: &str,
+    dir: &std::path::Path,
+) -> gitez_agent::Result<AgentProcess> {
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let mut command = agent.command(
+        &AgentConfig::default(),
+        &RunSpec {
+            prompt,
+            cwd: dir,
+            model: None,
+            conversation: Conversation::New {
+                session_id: &session_id,
+            },
+            system_prompt: None,
+        },
+    )?;
+    // Not inside GitEZ's sandbox: Claude Code's own sandbox, if the user
+    // turned it on, still applies, as before.
+    if agent.id() == ClaudeCode::ID {
+        ClaudeCode::keep_own_sandbox(&mut command);
+    }
+    AgentProcess::spawn(&command)
 }

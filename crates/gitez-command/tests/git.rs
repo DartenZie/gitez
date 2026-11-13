@@ -1308,3 +1308,56 @@ fn clones_a_repository_and_creates_one() {
         "no commits yet"
     );
 }
+
+#[test]
+fn adds_removes_and_prunes_linked_worktrees() {
+    let dir = repository();
+    std::fs::write(dir.path().join("a.txt"), "a\n").expect("write");
+    let git_ = Git::new(dir.path());
+    git_.stage_all().expect("stage");
+    git_.commit("First").expect("commit");
+    git_.create_branch("agent/one", "main", false)
+        .expect("branch");
+    git_.create_branch("agent/two", "main", false)
+        .expect("branch");
+
+    // A folder with a space, as GitEZ's data folder has on macOS, and a
+    // name that looks like an option.
+    let parent = tempfile::tempdir().expect("temporary directory");
+    let one = parent.path().join("Application Support").join("-one");
+    std::fs::create_dir_all(one.parent().expect("a parent")).expect("create folder");
+    git_.worktree_add(&one, "agent/one").expect("add worktree");
+    assert_eq!(git(&one, &["branch", "--show-current"]), "agent/one");
+    assert_eq!(
+        std::fs::read_to_string(one.join("a.txt")).expect("checked out"),
+        "a\n"
+    );
+    assert!(
+        git_.worktree_add(&parent.path().join("again"), "agent/one")
+            .is_err(),
+        "a branch is checked out in one worktree only"
+    );
+    assert!(
+        git_.worktree_add(&parent.path().join("none"), "agent/none")
+            .is_err(),
+        "the branch must exist"
+    );
+
+    std::fs::write(one.join("new.txt"), "new\n").expect("write");
+    assert!(
+        git_.worktree_remove(&one, false).is_err(),
+        "untracked files keep the worktree without force"
+    );
+    git_.worktree_remove(&one, true).expect("remove worktree");
+    assert!(!one.exists());
+
+    let two = parent.path().join("two");
+    git_.worktree_add(&two, "agent/two").expect("add worktree");
+    std::fs::remove_dir_all(&two).expect("remove folder");
+    assert!(git(dir.path(), &["worktree", "list"]).contains("prunable"));
+    git_.worktree_prune().expect("prune");
+    assert_eq!(git(dir.path(), &["worktree", "list"]).lines().count(), 1);
+    // The branch is free again.
+    git_.delete_branch("agent/two", true)
+        .expect("delete branch");
+}

@@ -13,10 +13,11 @@ publish = false
 gitez-agent.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
+rustix.workspace = true
 
 [lints]
 workspace = true

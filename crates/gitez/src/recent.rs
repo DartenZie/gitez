@@ -3,7 +3,8 @@
 //!
 //! Kept in `recent.json` in GitEZ's own data folder:
 //! `~/Library/Application Support/GitEZ` on macOS,
-//! `$XDG_STATE_HOME/gitez` (`~/.local/state/gitez`) on Linux.
+//! `$XDG_STATE_HOME/gitez` (`~/.local/state/gitez`) on Linux, or
+//! `$GITEZ_DATA_DIR` when set (see `gitez_settings::data_dir`).
 
 use std::path::{Path, PathBuf};
 
@@ -41,7 +42,7 @@ impl Global for Recent {}
 /// Reads the list. Called once at start, before the window opens: the file
 /// is tiny, and it decides which repository to open.
 pub fn init(cx: &mut App) {
-    let file = data_dir().map(|dir| dir.join("recent.json"));
+    let file = gitez_settings::data_dir().map(|dir| dir.join("recent.json"));
     let (file, data) = match file.as_deref().map(read) {
         Some(Ok(Some(data))) => (file, data),
         // Written by a newer GitEZ: leave it alone.
@@ -122,16 +123,6 @@ fn update(cx: &mut App, change: impl FnOnce(&mut File)) {
         cx.global_mut::<Recent>().saving = Some(save);
     }
     crate::menus::set(cx);
-}
-
-fn data_dir() -> Option<PathBuf> {
-    if cfg!(target_os = "macos") {
-        dirs::data_dir().map(|dir| dir.join("GitEZ"))
-    } else {
-        dirs::state_dir()
-            .or_else(dirs::data_dir)
-            .map(|dir| dir.join("gitez"))
-    }
 }
 
 /// Reads the list at `path`: empty if there is none, `None` if a newer

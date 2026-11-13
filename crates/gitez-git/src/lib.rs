@@ -16,6 +16,7 @@ mod diff;
 mod error;
 mod follow;
 pub mod graph;
+mod include;
 mod merge;
 mod pick;
 mod refs;

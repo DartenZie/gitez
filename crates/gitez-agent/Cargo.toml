@@ -1,6 +1,6 @@
 [package]
 name = "gitez-agent"
-description = "Coding agents GitEZ sends review prompts to, starting with Claude Code."
+description = "Coding agents GitEZ runs, starting with Claude Code: the commands they need and what their output reports."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,6 +12,9 @@ publish = false
 [dependencies]
 serde_json.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
