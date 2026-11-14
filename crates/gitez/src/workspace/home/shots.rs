@@ -14,7 +14,7 @@ use gitez_agent_thread::{
 };
 use gitez_sandbox::NetworkProfile;
 use gitez_settings::{AgentEntry, SecretEntry, SecretScope, Settings, ThreadSettings};
-use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, point, px};
+use gpui_kit::{AnyWindowHandle, AppContext as _, Entity};
 
 use super::Home;
 use crate::agent_threads::{AgentThreadKey, AgentThreads};
@@ -585,10 +585,10 @@ fn screenshot_u6_home() {
         shots.save(window, &format!("u6-picker-{name}"));
         shots.keys(window, "escape");
     }
-    // Active and Waiting under the finished threads.
-    shots.scroll(window, point(px(150.), px(600.)), 30.);
-    shots.save(window, "u6-home-scrolled");
-    shots.scroll(window, point(px(150.), px(600.)), -30.);
+    // Active and Waiting, unfolded at the bottom of the sidebar.
+    shots.click_id(window, "home-active-toggle");
+    shots.save(window, "u6-home-active");
+    shots.click_id(window, "home-active-toggle");
 
     // The repository filter: notes-site has no finished thread.
     shots.click(window, at::filter());

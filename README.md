@@ -160,9 +160,12 @@ inside your repository, and runs in a [sandbox](#the-agent-sandbox).
 - **Home** is shown when no repository is open. It has a launcher that starts
   a thread in any repository (`⌘N`), the recent repositories with Open, Clone
   and New repository, and a sidebar with the threads of every repository:
-  finished threads first, newest first, then the active ones and those
-  waiting for a slot or the usage limit. Completed threads are not listed. A finished thread with a pull request opens as a
-  thread, or opens its pull request in its repository.
+  finished threads first, newest first. The active ones and those waiting
+  for a slot or the usage limit are hidden in a collapsed **Active** section
+  at the bottom of the sidebar; click it to show them. It opens on its own
+  when you start a thread from the launcher. Completed threads are not
+  listed. A finished thread with a pull request opens as a thread, or opens
+  its pull request in its repository.
 - **Moved or deleted repositories**: if a repository's folder is gone, Home's
   recent repositories and the launcher's Repository picker show it muted, as
   "Moved or deleted", and you cannot open or pick it. **Remove from list**

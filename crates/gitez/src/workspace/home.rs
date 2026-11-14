@@ -4,8 +4,8 @@
 //!
 //! The sidebar lists the threads that need the owner (Finished: a pull
 //! request ready, an answer, a failure or a stop), newest first, and below
-//! them the active ones, then the waiting ones. Completed threads are not
-//! listed.
+//! them, folded into a toggle at the very bottom of the sidebar, the active
+//! ones, then the waiting ones. Completed threads are not listed.
 //! The main area is the launcher with the recent repositories and Open,
 //! Clone and New repository, or the thread picked in the sidebar.
 
@@ -193,6 +193,8 @@ pub struct Home {
     /// The git common dir of the repository whose threads are listed;
     /// `None`: every repository.
     filter: Option<PathBuf>,
+    /// Whether the Active section at the bottom of the sidebar is unfolded.
+    active_open: bool,
     /// The thread shown instead of the launcher.
     thread: Option<(Entity<ThreadView>, Subscription)>,
     /// The thread started last from the launcher, marked in the sidebar.
@@ -217,13 +219,10 @@ pub struct Home {
 enum SidebarEntry {
     /// What could not be read, watched or completed.
     Notices(Vec<Notice>),
-    /// A section's heading and debug selector, with how many: "Finished",
-    /// "Active".
+    /// A section's heading and debug selector, with how many: "Finished".
     Section(&'static str, &'static str, usize),
     Note(&'static str),
     Row(Box<Item>, Kind),
-    /// A group's heading inside a section: "Waiting".
-    Group(&'static str, &'static str),
 }
 
 impl EventEmitter<HomeEvent> for Home {}
@@ -260,6 +259,7 @@ impl Home {
             model,
             composer,
             filter: None,
+            active_open: false,
             thread: None,
             started: None,
             starting: false,
@@ -336,6 +336,11 @@ impl Home {
         cx.notify();
     }
 
+    fn toggle_active(&mut self, cx: &mut Context<Self>) {
+        self.active_open = !self.active_open;
+        cx.notify();
+    }
+
     fn set_filter(&mut self, filter: Option<PathBuf>, cx: &mut Context<Self>) {
         self.filter = filter;
         cx.notify();
@@ -356,7 +361,9 @@ impl Home {
                 match started {
                     Ok(key) => {
                         this.started = Some(key);
-                        // Where it is listed: not filtered out.
+                        // Where it is listed: unfolded, and not filtered
+                        // out.
+                        this.active_open = true;
                         if this
                             .filter
                             .as_ref()
@@ -619,7 +626,8 @@ impl Home {
             ))
     }
 
-    /// The sidebar's entries for `listed`.
+    /// The sidebar's entries for `listed`'s finished threads; the active
+    /// and waiting ones are drawn by `render_active`.
     fn sidebar_entries(&self, listed: Listed, cx: &App) -> Vec<SidebarEntry> {
         let model = self.model.read(cx);
         let mut entries = Vec::new();
@@ -650,29 +658,6 @@ impl Home {
                 .into_iter()
                 .map(|item| SidebarEntry::Row(Box::new(item), Kind::Finished)),
         );
-        entries.push(SidebarEntry::Section(
-            "Active",
-            "home-section-active",
-            listed.active.len() + listed.waiting.len(),
-        ));
-        if listed.active.is_empty() && listed.waiting.is_empty() {
-            entries.push(SidebarEntry::Note("No running or waiting threads"));
-        }
-        entries.extend(
-            listed
-                .active
-                .into_iter()
-                .map(|item| SidebarEntry::Row(Box::new(item), Kind::Active)),
-        );
-        if !listed.waiting.is_empty() {
-            entries.push(SidebarEntry::Group("Waiting", "home-group-waiting"));
-            entries.extend(
-                listed
-                    .waiting
-                    .into_iter()
-                    .map(|item| SidebarEntry::Row(Box::new(item), Kind::Waiting)),
-            );
-        }
         entries
     }
 
@@ -733,13 +718,86 @@ impl Home {
             SidebarEntry::Row(item, kind) => self
                 .render_row(item, *kind, &self.places, Timestamp::now(), cx)
                 .into_any_element(),
-            SidebarEntry::Group(title, selector) => {
-                group_heading(title, selector).into_any_element()
-            }
         }
     }
 
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
+    /// The Active section at the very bottom of the sidebar: a toggle with
+    /// how many threads run or wait, folded at first; unfolded, the running
+    /// threads, then the waiting ones under "Waiting", scrolled when they
+    /// are many.
+    fn render_active(&self, active: Vec<Item>, waiting: Vec<Item>, cx: &mut Context<Self>) -> Div {
+        let count = active.len() + waiting.len();
+        let toggle = div()
+            .id("home-active-toggle")
+            .debug_selector(|| "home-section-active".into())
+            .h_flex()
+            .flex_none()
+            .gap(px(8.))
+            .h(px(34.))
+            .px(px(16.))
+            .text_size(px(11.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(color::TEXT_FAINT))
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(color::NAV_HOVER)).text_color(rgb(color::TEXT)))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_active(cx)))
+            .child(
+                Icon::new(if self.active_open {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .size(px(12.)),
+            )
+            .child("ACTIVE")
+            .child(
+                div()
+                    .ml_auto()
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(count.to_string()),
+            );
+        let section = div()
+            .v_flex()
+            .flex_shrink(1.)
+            .min_h_0()
+            .max_h(relative(0.6))
+            .border_t_1()
+            .border_color(rgb(color::ROW_DIVIDER))
+            .child(toggle);
+        if !self.active_open {
+            return section;
+        }
+        let now = Timestamp::now();
+        let mut rows = div()
+            .id("home-active-rows")
+            .debug_selector(|| "home-active-rows".into())
+            .v_flex()
+            .flex_shrink(1.)
+            .min_h_0()
+            .overflow_y_scroll()
+            .pb(px(8.));
+        if count == 0 {
+            rows = rows.child(note("No running or waiting threads"));
+        }
+        for item in &active {
+            rows = rows.child(self.render_row(item, Kind::Active, &self.places, now, cx));
+        }
+        if !waiting.is_empty() {
+            rows = rows.child(group_heading("Waiting", "home-group-waiting"));
+            for item in &waiting {
+                rows = rows.child(self.render_row(item, Kind::Waiting, &self.places, now, cx));
+            }
+        }
+        section.child(rows)
+    }
+
+    fn render_sidebar(
+        &self,
+        active_items: Vec<Item>,
+        waiting_items: Vec<Item>,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let launcher = self.thread.is_none();
         let new_thread = div()
             .id("home-new-thread")
@@ -877,6 +935,7 @@ impl Home {
             slots.push_str(&format!(" · {waiting} waiting"));
         }
         let footer = div()
+            .debug_selector(|| "home-footer".into())
             .h_flex()
             .flex_none()
             .gap(px(8.))
@@ -929,6 +988,7 @@ impl Home {
             .border_color(rgb(color::BORDER))
             .child(top)
             .child(list)
+            .child(self.render_active(active_items, waiting_items, cx))
             .child(footer)
     }
 
@@ -1469,8 +1529,10 @@ fn badges(threads: &[Arc<AgentThread>]) -> Vec<(String, u32, bool)> {
 
 impl Render for Home {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let listed = list(self.model.read(cx), self.filter.as_deref());
+        let mut listed = list(self.model.read(cx), self.filter.as_deref());
         self.places = queue_places(self.model.read(cx));
+        let active = std::mem::take(&mut listed.active);
+        let waiting = std::mem::take(&mut listed.waiting);
         let entries = self.sidebar_entries(listed, cx);
         self.set_entries(entries);
         let main = match &self.thread {
@@ -1495,7 +1557,7 @@ impl Render for Home {
                     .items_start()
                     .flex_1()
                     .min_h_0()
-                    .child(self.render_sidebar(cx))
+                    .child(self.render_sidebar(active, waiting, cx))
                     .child(main),
             )
     }
@@ -1863,8 +1925,9 @@ mod tests {
             .collect();
         assert!(tops.is_sorted(), "drawn in that order: {tops:?}");
 
-        // Then Active, its running thread and its waiting group, with no
-        // toggle; the completed thread is not listed at all.
+        // Then Active, folded at the very bottom of the sidebar, above its
+        // footer: its running and waiting threads are hidden until it is
+        // unfolded. The completed thread is not listed at all.
         let at = |cx: &mut VisualTestContext, selector: &'static str| {
             f32::from(
                 cx.debug_bounds(selector)
@@ -1874,6 +1937,23 @@ mod tests {
             )
         };
         let finished = at(&mut cx, "home-section-finished");
+        let toggle = cx
+            .debug_bounds("home-section-active")
+            .expect("the Active toggle is drawn");
+        let sidebar_bottom = cx
+            .debug_bounds("home-footer")
+            .expect("the footer is drawn")
+            .origin
+            .y;
+        assert!(
+            toggle.bottom() <= sidebar_bottom && sidebar_bottom - toggle.bottom() < px(20.),
+            "at the bottom, just above the footer: {toggle:?}"
+        );
+        assert!(top(&mut cx, &fixture.running).is_none(), "folded");
+        assert!(top(&mut cx, &fixture.waiting).is_none(), "folded");
+        assert!(cx.debug_bounds("home-group-waiting").is_none(), "folded");
+        cx.simulate_click(toggle.center(), gpui_kit::Modifiers::none());
+        redraw(&mut cx);
         let active = at(&mut cx, "home-section-active");
         let running = top(&mut cx, &fixture.running).expect("the running row is drawn");
         let waiting_group = at(&mut cx, "home-group-waiting");
@@ -1881,7 +1961,6 @@ mod tests {
         let order = [finished, tops[2], active, running, waiting_group, waiting];
         assert!(order.is_sorted(), "Finished, Active, Waiting: {order:?}");
         assert!(top(&mut cx, &fixture.completed).is_none(), "not listed");
-        assert!(cx.debug_bounds("home-more").is_none(), "no toggle");
         assert!(cx.debug_bounds("home-group-completed").is_none());
 
         // The filter narrows the list to one repository.
