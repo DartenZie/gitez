@@ -1835,18 +1835,29 @@ impl ThreadView {
             // Only the rows in view are laid out: a transcript of thousands
             // of steps draws as fast as a short one.
             body.child(
-                list(
-                    self.rows.clone(),
-                    // Each row takes the list's width, as when drawn whole.
-                    cx.processor(|this, index: usize, _, cx| {
-                        div()
-                            .w_full()
-                            .child(this.render_planned(index, cx))
-                            .into_any_element()
-                    }),
-                )
-                .h(VIRTUAL_HEIGHT)
-                .w_full(),
+                // GPUI's list scrolls itself but lets the wheel event go on
+                // to the thread's own scroll, which then moves too: the
+                // list keeps the events it gets.
+                div()
+                    .id("thread-activity-list")
+                    .debug_selector(|| "thread-activity-list".into())
+                    .w_full()
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                    .child(
+                        list(
+                            self.rows.clone(),
+                            // Each row takes the list's width, as when drawn
+                            // whole.
+                            cx.processor(|this, index: usize, _, cx| {
+                                div()
+                                    .w_full()
+                                    .child(this.render_planned(index, cx))
+                                    .into_any_element()
+                            }),
+                        )
+                        .h(VIRTUAL_HEIGHT)
+                        .w_full(),
+                    ),
             )
         } else {
             body.children((0..rows).map(|index| self.render_planned(index, cx)))
@@ -3431,6 +3442,44 @@ mod tests {
         let (rows, _, following) = draw_activity(dir.path(), key, super::VIRTUAL_FROM, cx);
         assert_eq!(rows, 400);
         assert!(following, "a live list follows its newest row");
+    }
+
+    /// Scrolling over a long, virtual activity scrolls only the activity,
+    /// never the thread around it.
+    #[gpui_kit::test]
+    fn scrolling_a_long_activity_leaves_the_thread_in_place(cx: &mut TestAppContext) {
+        let (dir, key) = long_thread(400);
+        let (view, mut cx) = open(dir.path(), key, &mut *cx);
+        let bounds = cx
+            .debug_bounds("thread-activity-list")
+            .expect("the activity is a virtual list");
+        let position = bounds.origin + gpui_kit::point(px(40.), px(20.));
+        let scroll = |cx: &mut VisualTestContext, lines: f32| {
+            cx.simulate_event(gpui_kit::ScrollWheelEvent {
+                position,
+                delta: gpui_kit::ScrollDelta::Lines(gpui_kit::point(0., lines)),
+                ..Default::default()
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        };
+        let at = |cx: &VisualTestContext| {
+            let top = view.read_with(cx, |view, _| view.rows.logical_scroll_top());
+            (top.item_ix, top.offset_in_item)
+        };
+        let top = at(&cx);
+        // Up, away from the newest step: the list moves, the thread does not.
+        scroll(&mut cx, 5.);
+        assert_ne!(at(&cx), top, "the activity scrolls");
+        assert_eq!(
+            view.read_with(&cx, |view, _| view.scroll.offset().y),
+            px(0.)
+        );
+        // Down past the newest step: the list stops, and so does the thread.
+        scroll(&mut cx, -50.);
+        assert_eq!(
+            view.read_with(&cx, |view, _| view.scroll.offset().y),
+            px(0.)
+        );
     }
 
     /// Times drawing the activity of 2,000 and 20,000 steps whole and
