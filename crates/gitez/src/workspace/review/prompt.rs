@@ -1422,17 +1422,26 @@ impl Launch {
             Some(model) => {
                 let model = model.read(cx);
                 let entry = model.settings().agent(id);
+                let agent = model.agents().get(id)?;
                 Some(Self {
-                    agent: model.agents().get(id)?,
                     config: entry.config(),
-                    model: entry.model,
+                    model: Some(
+                        entry
+                            .model
+                            .unwrap_or_else(|| agent.default_model().to_owned()),
+                    )
+                    .filter(|alias| !alias.is_empty()),
+                    agent,
                 })
             }
-            None => Some(Self {
-                agent: Registry::builtin().get(id)?,
-                config: AgentConfig::default(),
-                model: None,
-            }),
+            None => {
+                let agent = Registry::builtin().get(id)?;
+                Some(Self {
+                    model: Some(agent.default_model().to_owned()).filter(|alias| !alias.is_empty()),
+                    agent,
+                    config: AgentConfig::default(),
+                })
+            }
         }
     }
 }

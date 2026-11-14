@@ -25,6 +25,8 @@ pub(super) struct AgentForm {
     id: &'static str,
     name: &'static str,
     models: &'static [ModelChoice],
+    /// The model used while Settings name none.
+    default_model: &'static str,
     program: Entity<InputState>,
     config_dir: Entity<InputState>,
     env: Entity<TextareaState>,
@@ -128,6 +130,7 @@ impl AgentForm {
                     id: agent.id(),
                     name: agent.name(),
                     models: agent.models(),
+                    default_model: agent.default_model(),
                     program,
                     config_dir,
                     env,
@@ -517,7 +520,7 @@ impl SettingsSheet {
             .settings()
             .agent(form.id)
             .model
-            .unwrap_or_default();
+            .unwrap_or_else(|| form.default_model.to_owned());
         let chosen_label = form
             .models
             .iter()

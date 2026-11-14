@@ -405,14 +405,15 @@ fn the_login_status_is_read_from_the_logged_in_field() {
 }
 
 #[test]
-fn the_first_model_is_the_agent_default() {
-    assert_eq!(ClaudeCode.models()[0], ("", "Agent default"));
-    assert!(
-        ClaudeCode
-            .models()
-            .iter()
-            .any(|(alias, _)| *alias == "haiku")
-    );
+fn every_model_is_named_and_opus_is_the_default() {
+    let aliases: Vec<&str> = ClaudeCode
+        .models()
+        .iter()
+        .map(|(alias, _)| *alias)
+        .collect();
+    assert_eq!(aliases, ["fable", "opus", "sonnet", "haiku"]);
+    assert!(aliases.contains(&ClaudeCode.default_model()));
+    assert_eq!(ClaudeCode.default_model(), "opus");
 }
 
 /// Claude Code's connectors proxy and telemetry intake, which real runs

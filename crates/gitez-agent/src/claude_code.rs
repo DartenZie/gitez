@@ -94,7 +94,7 @@ const LOGIN_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_SANITISED_LEN: usize = 200;
 
 const MODELS: [ModelChoice; 4] = [
-    ("", "Agent default"),
+    ("fable", "Fable"),
     ("opus", "Opus"),
     ("sonnet", "Sonnet"),
     ("haiku", "Haiku"),
@@ -185,6 +185,10 @@ impl Agent for ClaudeCode {
 
     fn models(&self) -> &'static [ModelChoice] {
         &MODELS
+    }
+
+    fn default_model(&self) -> &'static str {
+        "opus"
     }
 
     /// The agent entry's program; else `claude` on the `PATH` or where its

@@ -502,13 +502,21 @@ impl Composer {
         self.model.read(cx).settings().clone()
     }
 
-    /// The model alias asked for; empty for the agent's default.
+    /// The model alias asked for: the one picked, else the one Settings
+    /// name, else the agent's default.
     pub(super) fn model_alias(&self, cx: &App) -> String {
         self.model_alias.clone().unwrap_or_else(|| {
             self.settings(cx)
                 .agent(&self.agent)
                 .model
-                .unwrap_or_default()
+                .unwrap_or_else(|| {
+                    self.model
+                        .read(cx)
+                        .agents()
+                        .get(&self.agent)
+                        .map(|agent| agent.default_model().to_owned())
+                        .unwrap_or_default()
+                })
         })
     }
 
@@ -1012,7 +1020,6 @@ impl Composer {
             .iter()
             .find(|(alias, _)| *alias == chosen)
             .map_or_else(|| chosen.clone(), |(_, label)| (*label).to_owned());
-        let agent_name = self.agent_name(cx);
         let view = cx.entity().downgrade();
         picker("composer-model")
             .child(
@@ -1026,19 +1033,15 @@ impl Composer {
                 menu = menu.min_w(px(240.)).check_side(Side::Right).label("Model");
                 for &(alias, label) in &models {
                     let view = view.clone();
-                    let item = if alias.is_empty() {
-                        let subtitle = format!("As set in {agent_name}");
-                        PopupMenuItem::element(move |_, _| two_lines(label, subtitle.clone()))
-                    } else {
-                        PopupMenuItem::new(label)
-                    };
-                    menu = menu.item(item.checked(alias == chosen).on_click(move |_, _, cx| {
-                        view.update(cx, |this, cx| {
-                            this.model_alias = Some(alias.to_owned());
-                            cx.notify();
-                        })
-                        .ok();
-                    }));
+                    menu = menu.item(PopupMenuItem::new(label).checked(alias == chosen).on_click(
+                        move |_, _, cx| {
+                            view.update(cx, |this, cx| {
+                                this.model_alias = Some(alias.to_owned());
+                                cx.notify();
+                            })
+                            .ok();
+                        },
+                    ));
                 }
                 menu
             })
@@ -2229,7 +2232,7 @@ mod tests {
             "Text Only"
         }
         fn models(&self) -> &'static [gitez_agent::ModelChoice] {
-            &[("", "Agent default")]
+            &[("text", "Text")]
         }
         fn locate(&self, _: &gitez_agent::AgentConfig) -> gitez_agent::Result<std::path::PathBuf> {
             Ok("/bin/true".into())

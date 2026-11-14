@@ -288,7 +288,7 @@ impl Agent for Echo {
     }
 
     fn models(&self) -> &'static [ModelChoice] {
-        &[("", "Agent default")]
+        &[("echo", "Echo")]
     }
 
     fn locate(&self, config: &AgentConfig) -> gitez_agent::Result<PathBuf> {

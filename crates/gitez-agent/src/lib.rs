@@ -130,8 +130,7 @@ pub enum LoginStatus {
     Unknown(String),
 }
 
-/// A model the agent can be asked for: (alias, label). The empty alias is
-/// "Agent default".
+/// A model the agent can be asked for: (alias, label).
 pub type ModelChoice = (&'static str, &'static str);
 
 /// A host an agent contacts on its own that it does not need to do its
@@ -180,8 +179,13 @@ pub trait Agent: Send + Sync {
     fn id(&self) -> &'static str;
     /// Shown to the user, such as "Claude Code".
     fn name(&self) -> &'static str;
-    /// The first entry is ("", "Agent default").
+    /// The models offered, in the order shown.
     fn models(&self) -> &'static [ModelChoice];
+    /// The alias used when Settings name no model: the first of
+    /// [`Agent::models`], or empty (no model asked for) without any.
+    fn default_model(&self) -> &'static str {
+        self.models().first().map_or("", |(alias, _)| alias)
+    }
     /// The binary to run, or why there is none.
     fn locate(&self, config: &AgentConfig) -> Result<std::path::PathBuf>;
     /// The command for one run. Does not start anything.
