@@ -28,10 +28,10 @@ pub struct Lane {
     pub title: SharedString,
     /// Preparing or Running.
     pub state: State,
-    /// `agent/<id>`.
-    pub branch: String,
+    /// `agent/<id>`; `None` for a Discuss thread, which has no branch.
+    pub branch: Option<String>,
     /// The commit the branch is at: its tip once it exists, else the commit
-    /// the thread started from.
+    /// the thread started from (always, for a Discuss thread).
     pub tip: Option<Oid>,
     /// The tool the agent uses now, or "Setup" while preparing.
     pub tool: Option<SharedString>,
@@ -98,7 +98,7 @@ fn lane(
 ) -> Lane {
     let tip = branches
         .iter()
-        .find(|branch| branch.name == thread.branch)
+        .find(|branch| Some(&branch.name) == thread.branch.as_ref())
         .map(|branch| branch.target)
         .or_else(|| Oid::from_hex(thread.start.commit.as_bytes()).ok());
     let preparing = thread.state == State::Preparing;

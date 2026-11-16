@@ -281,6 +281,7 @@ impl Agent for ClaudeCode {
         AgentNeeds {
             write_dirs,
             write_files: Vec::new(),
+            create_dirs: Vec::new(),
             hosts: HOSTS.map(str::to_owned).into(),
         }
     }
@@ -292,31 +293,46 @@ impl Agent for ClaudeCode {
     /// Adds, for the run's folder: its transcripts (`projects/<folder>`,
     /// needed to resume), its temporary folder and its log folder; and for
     /// its session: `session-env/<id>` and `file-history/<id>`.
+    ///
+    /// In a folder shared with the user's own sessions
+    /// ([`RunSpec::shared_folder`]) the run gets only its own conversation
+    /// there: `projects/<folder>/<id>.jsonl` and `projects/<folder>/<id>`
+    /// (its subagents and tool results), and `<id>` in the temporary
+    /// folder. The rest of `projects/<folder>` holds the user's other
+    /// conversations and the memory their later sessions load.
     fn needs_for_run(&self, config: &AgentConfig, run: &RunSpec<'_>) -> AgentNeeds {
         let mut needs = self.needs(config);
         let config_dir = Self::config_dir(config).path;
         let tmp = temp_root(config);
         let cache = cache_dir();
+        let session_id = run.conversation.session_id();
+        // An id is a UUID; anything else could name a folder outside these.
+        let session_id = (!session_id.is_empty()
+            && session_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-'))
+        .then_some(session_id);
         for name in project_names(run.cwd) {
-            needs
-                .write_dirs
-                .push(config_dir.join("projects").join(&name));
-            if let Some(uid) = uid() {
+            let project = config_dir.join("projects").join(&name);
+            let project_tmp = uid().map(|uid| tmp.join(format!("claude-{uid}")).join(&name));
+            if !run.shared_folder {
+                needs.write_dirs.push(project);
+                needs.write_dirs.extend(project_tmp);
+            } else if let Some(session_id) = session_id {
+                needs
+                    .write_files
+                    .push(project.join(format!("{session_id}.jsonl")));
+                needs.write_dirs.push(project.join(session_id));
                 needs
                     .write_dirs
-                    .push(tmp.join(format!("claude-{uid}")).join(&name));
+                    .extend(project_tmp.map(|tmp| tmp.join(session_id)));
+                needs.create_dirs.push(project);
             }
             if let Some(cache) = &cache {
                 needs.write_dirs.push(cache.join(&name));
             }
         }
-        let session_id = run.conversation.session_id();
-        // An id is a UUID; anything else could name a folder outside these.
-        if !session_id.is_empty()
-            && session_id
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-')
-        {
+        if let Some(session_id) = session_id {
             needs
                 .write_dirs
                 .push(config_dir.join("session-env").join(session_id));

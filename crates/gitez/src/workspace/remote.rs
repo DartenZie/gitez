@@ -845,11 +845,11 @@ impl ThreadWorktrees {
             branches: threads
                 .iter()
                 .filter(|thread| thread.state != ThreadState::Completed)
-                .map(|thread| thread.branch.clone())
+                .filter_map(|thread| thread.branch.clone())
                 .collect(),
             worktrees: threads
                 .iter()
-                .map(|thread| thread.worktree.clone())
+                .filter_map(|thread| thread.worktree.clone())
                 .collect(),
         }
     }

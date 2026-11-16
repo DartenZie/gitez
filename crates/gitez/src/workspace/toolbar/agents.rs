@@ -254,7 +254,9 @@ impl RowAction {
 
 /// What Complete does to `thread`, for its tooltip.
 pub(crate) fn complete_tooltip(thread: &AgentThread) -> &'static str {
-    if thread.has_uncommitted() == Some(true) {
+    if thread.own().is_none() {
+        "Ends the discussion. The thread stays readable; nothing in your working tree changes."
+    } else if thread.has_uncommitted() == Some(true) {
         "Asks first: the worktree has uncommitted changes, which removing it discards"
     } else {
         "Removes the worktree, and the branch if it has no commits. The thread stays readable."
@@ -819,11 +821,12 @@ fn empty(scope: Option<&AgentsScope>) -> Div {
     let hint = match scope {
         Some(_) => {
             "Ask an agent from the row under the uncommitted changes in the history, \
-                    or press ⌘⇧A. Each thread works on its own branch in its own worktree."
+                    or press ⌘⇧A. Discuss with it, or let it implement on its own branch in \
+                    its own worktree."
         }
         None => {
-            "Start one from the launcher. Each thread works on its own branch in its own \
-                 worktree."
+            "Start one from the launcher. Discuss with an agent, or let it implement on its \
+                 own branch in its own worktree."
         }
     };
     div()

@@ -13,7 +13,8 @@ directly. Review data is stored under the repository's `.git` directory
 (`.git/gitez/reviews`, see "Review storage" below), never in the working
 tree. GitEZ also runs **agent threads**: a coding agent works in the
 background on its own `agent/<slug>` branch and linked worktree, inside a
-sandbox, and its result is reviewed as a local pull request (see "Agent
+sandbox, and its result is reviewed as a local pull request; or it only
+discusses, reading the working tree and changing nothing (see "Agent
 threads" below).
 
 The reference design is a Design canvas at
@@ -127,7 +128,23 @@ Decided 2026-10-23; change only with the owner's agreement.
   coding agent that works in the background, and the conversation that
   follows. Claude Code is the only agent; others come behind the `Agent`
   trait and the `Registry` of `gitez-agent`.
-  - One thread is one branch, `agent/<id>` (the id is a slug of the title
+  - Modes (decided 2026-11-16): a thread is **Implement** (the default;
+    everything below, unless it says Discuss) or **Discuss** (`mode` in
+    `thread.json`, left out for Implement). A Discuss thread runs in the
+    user's checked-out working tree (`work_dir`) and changes nothing: no
+    branch, no worktree (`branch` and `worktree` are absent), no Preparing,
+    no setup command, no commit of leftovers, no pull request; every turn
+    ends as an answer. It needs a branch checked out, and has `tmp/` and
+    `caches/` folders of its own (`scratch`). The composer remembers the
+    mode used last (`threads.last_mode` in `settings.json`). An older GitEZ
+    cannot read a Discuss record and leaves it alone; `version` stays 1.
+  - Handoff: "Implement…" in a Discuss thread asks the agent for a brief
+    (`BRIEF_PROMPT`, a turn of kind `brief`), then opens the composer with
+    it as the prompt of a new Implement thread, which starts with a fresh
+    context and names the discussion in `origin`. The brief's `# heading`
+    becomes the new thread's title.
+  - An Implement thread is one branch, `agent/<id>` (the id is a slug of
+    the title
     taken from the prompt, with `-2`, `-3`… when taken; the title, not the
     id, becomes the pull request's when the supervisor creates it), and one
     linked worktree at
@@ -189,8 +206,16 @@ Decided 2026-10-23; change only with the owner's agreement.
     lets the agent write its worktree, the object store, its own branch's
     ref, reflog and lock, `packed-refs.lock`, its own `tmp/` and `caches/`
     folders in the data folder, the per-project and per-session paths of its
-    configuration folder, and the folders the user adds in Settings. It
-    denies the common dir's `hooks`, `config` and `gitez/`, the object
+    configuration folder, and the folders the user adds in Settings. A
+    Discuss thread may write only its own `tmp/` and `caches/` and what
+    the agent needs of its configuration folder; there, because the
+    working tree's per-project folder is shared with the user's own
+    Claude Code sessions, only this conversation's files
+    (`projects/<folder>/<session id>.jsonl` and
+    `projects/<folder>/<session id>/`), never the rest of that folder (the
+    memory the user's sessions load). It runs with `GIT_OPTIONAL_LOCKS=0`.
+    Both modes are denied
+    the common dir's `hooks`, `config` and `gitez/`, the object
     store's alternates and commit graphs, the worktree's `.git` file, the
     `commondir`, `gitdir`, `config`, `config.worktree` and `locked` files of
     the worktree's git dir, and GitEZ's `settings.json` and `threads.json`;
@@ -220,7 +245,9 @@ Decided 2026-10-23; change only with the owner's agreement.
     makes the whole configuration folder writable.
   - Naming, in the UI and in code: the noun is "thread" (never "session",
     "task" or "job"); the verb is "Complete" (never "archive" or
-    "dismiss"); the states are one word each: Queued, Preparing, Running,
+    "dismiss"); the modes are "Discuss" and "Implement" (never "chat",
+    "plan" or "ask"), and what goes from one to the other is a "brief";
+    the states are one word each: Queued, Preparing, Running,
     Waiting, Finished, Completed, and a finished thread ended as a pull
     request, an answer, failed or stopped. In code an agent thread is
     always `AgentThread…` (`AgentThread`, `AgentThreadId`, `AgentThreadKey`,

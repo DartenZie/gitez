@@ -97,6 +97,7 @@ pub fn report_toast(report: &CompleteReport) -> Notification {
         Some(Kept::Untrusted(_)) => crate::toast::warning(
             "Completed; the worktree is kept because GitEZ no longer trusts it",
         ),
+        None if report.nothing_to_remove => crate::toast::success("Completed"),
         None => crate::toast::success(match (report.worktree_removed, report.branch_deleted) {
             (true, true) => "Completed; the worktree and its empty branch are removed",
             (true, false) => "Completed; the worktree is removed and the branch kept",
@@ -185,7 +186,7 @@ fn ask_uncommitted(
          lost. Keep the worktree to complete the thread and look at them later; it stays listed \
          with the thread until you remove it.",
         thread.title,
-        thread.worktree.display()
+        thread.worktree_display()
     );
     let commit_error = super::commit_error_text(thread);
     let thread = thread.clone();
@@ -297,7 +298,7 @@ pub fn untrusted_text(thread: &AgentThread, problem: &str) -> String {
         "The git files of the worktree at {} changed since GitEZ made it: {problem} GitEZ runs no \
          git there and will not delete it, as that could act on another repository. Look at the \
          folder yourself and remove it when you are sure.",
-        thread.worktree.display()
+        thread.worktree_display()
     )
 }
 
@@ -320,13 +321,13 @@ pub fn remove_worktree(key: AgentThreadKey, busy: Busy, window: &mut Window, cx:
         format!(
             "This deletes the worktree at {} and {what}, and the branch {} unless it has commits \
              that the pull request did not merge. The thread stays readable.",
-            thread.worktree.display(),
-            thread.branch
+            thread.worktree_display(),
+            thread.branch_name()
         )
     } else {
         format!(
             "This deletes the worktree at {} and {what}. The thread stays readable.",
-            thread.worktree.display()
+            thread.worktree_display()
         )
     };
     window.open_dialog(cx, move |dialog, _, cx| {

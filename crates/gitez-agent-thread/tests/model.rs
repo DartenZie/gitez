@@ -2,10 +2,10 @@
 
 mod common;
 
-use common::{EXAMPLE, at};
+use common::{EXAMPLE, at, worktree_of};
 use gitez_agent_thread::{
-    AgentThread, AgentThreadId, CONTINUE_PROMPT, Ending, Error, RetryPlan, State, Step,
-    SupervisorInfo, TurnKind, TurnResult,
+    AgentThread, AgentThreadId, BRIEF_PROMPT, CONTINUE_PROMPT, Ending, Error, Mode, RetryPlan,
+    State, Step, SupervisorInfo, TurnKind, TurnResult,
 };
 use gitez_sandbox::NetworkProfile;
 
@@ -57,8 +57,7 @@ fn the_example_round_trips() {
         })
     );
     assert!(
-        thread
-            .worktree
+        worktree_of(&thread)
             .to_str()
             .expect("utf-8")
             .contains("Application Support")
@@ -480,4 +479,80 @@ fn a_turn_without_images_has_no_images_field() {
     );
     let back: AgentThread = serde_json::from_value(value).expect("parses");
     assert_eq!(back, with);
+}
+
+/// A finished Discuss thread with a conversation.
+fn discussion() -> AgentThread {
+    let mut thread = finished(Ending::Answer);
+    thread.mode = Mode::Discuss;
+    thread.branch = None;
+    thread.worktree = None;
+    thread.work_dir = Some("/Users/me/repo".into());
+    thread
+}
+
+#[test]
+fn only_a_discuss_thread_writes_a_brief() {
+    let now = at("2026-11-13T10:05:00Z");
+    let mut implement = finished(Ending::Answer);
+    assert_eq!(
+        refusal(implement.request_turn(TurnKind::Brief, BRIEF_PROMPT.to_owned(), now)),
+        "Only a Discuss thread can write a brief."
+    );
+
+    let mut thread = discussion();
+    assert_eq!(
+        refusal(thread.request_turn(TurnKind::Review, "Fix it".to_owned(), now)),
+        "A Discuss thread has no pull request."
+    );
+    assert_eq!(thread.brief(), None, "an answer is not a brief");
+    thread
+        .request_turn(TurnKind::Brief, BRIEF_PROMPT.to_owned(), now)
+        .expect("a brief turn");
+    assert_eq!(thread.state, State::Queued);
+    assert_eq!(thread.pending_turn(), Some(1));
+    assert!(thread.turns[1].resume, "it continues the discussion");
+    assert_eq!(thread.brief(), None, "not answered yet");
+
+    thread.state = State::Finished;
+    thread.ending = Some(Ending::Answer);
+    let mut result = thread.turns[0].result.clone().expect("a result");
+    result.message = "# Cache parsed config files\n\nGoal: …".to_owned();
+    thread.turns[1].started = Some(now);
+    thread.turns[1].ended = Some(now);
+    thread.turns[1].result = Some(result.clone());
+    assert_eq!(
+        thread.brief(),
+        Some("# Cache parsed config files\n\nGoal: …")
+    );
+
+    // A brief that failed, and a brief the discussion moved on from.
+    result.success = false;
+    thread.turns[1].result = Some(result);
+    assert_eq!(thread.brief(), None);
+    thread.turns[1].result.as_mut().expect("a result").success = true;
+    thread
+        .request_turn(TurnKind::Reply, "One more thing".to_owned(), now)
+        .expect("a reply");
+    assert_eq!(thread.brief(), None);
+}
+
+#[test]
+fn the_brief_prompt_asks_for_a_title_and_a_brief_that_stands_alone() {
+    assert!(BRIEF_PROMPT.contains("\"# <title>\""));
+    assert!(BRIEF_PROMPT.contains("have not seen this conversation"));
+    assert!(
+        BRIEF_PROMPT.contains("its own.\n\nBegin with"),
+        "paragraphs are kept apart"
+    );
+}
+
+#[test]
+fn a_mode_is_written_only_when_it_is_discuss() {
+    assert_eq!(Mode::default(), Mode::Implement);
+    let text = serde_json::to_string(&discussion()).expect("json");
+    assert!(text.contains("\"mode\":\"discuss\""), "{text}");
+    let text = serde_json::to_string(&finished(Ending::Answer)).expect("json");
+    assert!(!text.contains("\"mode\""), "{text}");
+    assert_eq!(Mode::ALL.map(Mode::label), ["Discuss", "Implement"]);
 }

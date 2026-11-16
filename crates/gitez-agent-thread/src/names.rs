@@ -10,8 +10,13 @@ const MAX_SLUG: usize = 40;
 
 /// The agent thread's title: the prompt's first sentence or line, at most 72
 /// characters, cut at a word boundary with "…". A sentence ends at `.`,
-/// `!`, `?` or `:` followed by a space; the `.` and `:` are left out.
+/// `!`, `?` or `:` followed by a space; the `.` and `:` are left out. A
+/// prompt that starts with a level-1 Markdown heading (a brief does) is
+/// titled by it ([`title_from_message`]).
 pub fn title_from_prompt(prompt: &str) -> String {
+    if let Some(title) = title_from_message(prompt) {
+        return shorten(&title);
+    }
     let line = prompt
         .lines()
         .map(str::trim)
@@ -329,6 +334,19 @@ mod tests {
         );
         assert_eq!(title_from_prompt("Rename foo\nand bar"), "Rename foo");
         assert_eq!(title_from_prompt("   \n "), "Untitled thread");
+    }
+
+    #[test]
+    fn a_prompt_that_starts_with_a_heading_is_titled_by_it() {
+        let brief = "# Cache parsed config files\n\n## Goal\n\nParse each file once.";
+        assert_eq!(title_from_prompt(brief), "Cache parsed config files");
+        assert_eq!(title_from_request(brief, 0), "Cache parsed config files");
+        // Not a heading: an issue number, a tag.
+        assert_eq!(title_from_prompt("#123 fails on CI"), "#123 fails on CI");
+        assert_eq!(
+            title_from_prompt("## Goal\n\nParse each file once."),
+            "## Goal"
+        );
     }
 
     #[test]

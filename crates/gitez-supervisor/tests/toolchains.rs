@@ -25,9 +25,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command as Process;
 use std::time::{Duration, Instant};
 
-use common::{Fixture, git, is_done};
+use common::{Fixture, git, is_done, worktree_of};
 use gitez_agent::ClaudeCode;
-use gitez_agent_thread::{AgentThread, NewAgentThread, Start, Timestamp};
+use gitez_agent_thread::{AgentThread, Mode, NewAgentThread, Start, Timestamp};
 use gitez_sandbox::NetworkProfile;
 use gitez_settings::{Loaded, Settings};
 use gitez_supervisor::{Command, Launch, Secrets};
@@ -43,7 +43,7 @@ for arg in "$@"; do
 done
 cat > /dev/null
 printf '%s\n' "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$sid\",\"model\":\"fake\"}"
-/bin/bash "$GITEZ_WORKLOAD" < /dev/null 2>&1 | sed -u 's/^/OUT /'
+GITEZ_TEST_SESSION="$sid" /bin/bash "$GITEZ_WORKLOAD" < /dev/null 2>&1 | sed -u 's/^/OUT /'
 printf '%s\n' "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\",\"session_id\":\"$sid\",\"num_turns\":1}"
 "#;
 
@@ -318,6 +318,15 @@ impl Toolchains {
 
     /// [`Self::run`] for a thread whose prompt starts with `title`.
     fn run_titled(&self, network: NetworkProfile, title: &str, workload: &str) -> Output {
+        self.set_workload(workload);
+        self.start(
+            network,
+            &format!("{title} {}", Timestamp::now().as_nanosecond()),
+        )
+    }
+
+    /// Makes `workload` what the fake agent runs next.
+    fn set_workload(&self, workload: &str) {
         let script = self
             .fixture
             .base
@@ -334,15 +343,27 @@ impl Toolchains {
                     script.to_string_lossy().into_owned(),
                 );
         });
-        self.start(
-            network,
-            &format!("{title} {}", Timestamp::now().as_nanosecond()),
-        )
     }
 
     /// Starts a thread for `prompt` with `network` through the supervisor
     /// binary and waits until it is done.
     fn start(&self, network: NetworkProfile, prompt: &str) -> Output {
+        self.start_in_mode(Mode::Implement, network, prompt)
+    }
+
+    /// Runs `workload` as the agent of a new Discuss thread in the main
+    /// worktree.
+    fn discuss(&self, network: NetworkProfile, workload: &str) -> Output {
+        self.set_workload(workload);
+        self.start_in_mode(
+            Mode::Discuss,
+            network,
+            &format!("discussion {}", Timestamp::now().as_nanosecond()),
+        )
+    }
+
+    /// [`Self::start`] for a thread of `mode`.
+    fn start_in_mode(&self, mode: Mode, network: NetworkProfile, prompt: &str) -> Output {
         let thread = self
             .fixture
             .store()
@@ -351,10 +372,13 @@ impl Toolchains {
                     prompt: prompt.to_owned(),
                     agent: ClaudeCode::ID.to_owned(),
                     model: Some("haiku".to_owned()),
+                    mode,
                     start: Start {
                         branch: "main".to_owned(),
                         commit: self.fixture.head(),
                     },
+                    work_dir: (mode == Mode::Discuss).then(|| self.fixture.root.clone()),
+                    origin: None,
                     network,
                     secrets: Vec::new(),
                 },
@@ -401,8 +425,7 @@ impl Toolchains {
 
     /// The thread's temporary and caches folders.
     fn scratch(&self, thread: &AgentThread) -> gitez_agent_thread::ScratchDirs {
-        let key = thread
-            .worktree
+        let key = worktree_of(thread)
             .parent()
             .and_then(Path::file_name)
             .and_then(|name| name.to_str())
@@ -811,6 +834,107 @@ step main-worktree sh -c "echo x > '$(dirname "$common")/escape.txt'"
     assert!(!remote.join("refs/heads/pushed").exists());
 }
 
+/// A Discuss thread runs in the user's working tree and reads it, with
+/// what is uncommitted there; the sandbox refuses every write in the
+/// repository (files, the index, commits, refs, hooks, config). Its own
+/// `$TMPDIR` is writable, and in the agent's configuration folder only its
+/// own conversation, not the rest of the folder it shares with the user's
+/// sessions there.
+#[test]
+#[ignore = "runs the real sandbox"]
+fn a_discussion_reads_the_working_tree_and_writes_nothing_in_it() {
+    let toolchains = Toolchains::new();
+    let root = &toolchains.fixture.root;
+    // What the user has not committed.
+    let readme = std::fs::read_to_string(root.join("README.md")).unwrap_or_default();
+    let edited = format!("{readme}the user's uncommitted line\n");
+    std::fs::write(root.join("README.md"), &edited).expect("edit");
+    let status = git(root, &["status", "--porcelain"]);
+    let refs = git(root, &["for-each-ref"]);
+    let worktrees = git(root, &["worktree", "list", "--porcelain"]);
+    let out = toolchains.discuss(
+        NetworkProfile::AgentOnly,
+        r#"
+echo "cwd=$(pwd -P)"
+step read grep -c "uncommitted line" README.md
+step status git status --short
+step diff git diff --stat
+step log git log --oneline -3
+step grep git grep -n hello
+step new-file sh -c 'echo x > escape.txt'
+step edit sh -c 'echo x >> README.md'
+step delete rm README.md
+step add git add -A
+step commit git commit --quiet --allow-empty -m "sneaky"
+step branch git branch sneaky
+step tag git tag t1
+step checkout git checkout --quiet -b elsewhere
+step stash git stash
+common=$(git rev-parse --git-common-dir)
+step hook sh -c "echo x > '$common/hooks/pre-commit'"
+step config git config --local foo.bar 1
+step tmp sh -c 'echo note > "$TMPDIR/note.txt" && cat "$TMPDIR/note.txt"'
+step system-tmp sh -c 'echo x > /tmp/gitez-discuss-test'
+step home sh -c 'echo x > ~/gitez-discuss-test'
+project=$(ls -d "$CLAUDE_CONFIG_DIR"/projects/*/ | head -n 1)
+echo "project=$project"
+step own-conversation sh -c "echo '{}' >> '${project}${GITEZ_TEST_SESSION}.jsonl'"
+step own-folder mkdir -p "${project}${GITEZ_TEST_SESSION}/subagents"
+step memory sh -c "mkdir -p '${project}memory' && echo x > '${project}memory/MEMORY.md'"
+step other-conversation sh -c "echo '{}' > '${project}11111111-2222-3333-4444-555555555555.jsonl'"
+"#,
+    );
+    let here = root.canonicalize().expect("canonical");
+    assert_eq!(PathBuf::from(out.value("cwd")), here);
+    assert_eq!(out.ok("read").trim(), "1");
+    assert!(out.ok("status").contains("README.md"));
+    for name in [
+        "diff",
+        "log",
+        "grep",
+        "tmp",
+        "own-conversation",
+        "own-folder",
+    ] {
+        out.ok(name);
+    }
+    for name in [
+        "new-file",
+        "edit",
+        "delete",
+        "add",
+        "commit",
+        "branch",
+        "tag",
+        "checkout",
+        "stash",
+        "hook",
+        "config",
+        "system-tmp",
+        "home",
+        "memory",
+        "other-conversation",
+    ] {
+        out.failed(name);
+    }
+    assert!(
+        !out.value("project").is_empty(),
+        "the project folder is made"
+    );
+    // Nothing moved.
+    assert_eq!(
+        std::fs::read_to_string(root.join("README.md")).expect("read"),
+        edited
+    );
+    assert!(!root.join("escape.txt").exists());
+    assert_eq!(git(root, &["status", "--porcelain"]), status);
+    assert_eq!(git(root, &["for-each-ref"]), refs);
+    assert_eq!(git(root, &["worktree", "list", "--porcelain"]), worktrees);
+    assert_eq!(out.thread.own(), None);
+    assert_eq!(out.thread.ending, Some(gitez_agent_thread::Ending::Answer));
+    assert_eq!(out.thread.pull_request, None);
+}
+
 /// Everyday tools: `find`, `sed -i`, temporary files in `$TMPDIR`. macOS
 /// `mktemp` without a template uses the system temporary folder, which
 /// stays read-only (the system prompt tells the agent); so do `/tmp`, the
@@ -938,7 +1062,7 @@ fn explore() {
     if let Some(result) = thread.turns.last().and_then(|turn| turn.result.as_ref()) {
         println!("blocked hosts: {:?}", result.blocked_hosts);
     }
-    println!("worktree: {}", thread.worktree.display());
+    println!("worktree: {}", worktree_of(thread).display());
     println!(
         "thread folder: {}",
         toolchains.fixture.thread_dir(&thread.id).display()

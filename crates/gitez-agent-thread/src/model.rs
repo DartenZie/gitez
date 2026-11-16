@@ -1,13 +1,13 @@
 //! What an agent thread holds, as stored in its `thread.json`, and the
 //! changes its state allows.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gitez_sandbox::NetworkProfile;
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, Result, TurnImage};
+use crate::{Error, Result, ScratchDirs, TurnImage};
 
 /// An agent thread's id: its slug, unique in its repository. Also its
 /// folder name, its branch `agent/<id>` and its worktree folder name.
@@ -94,6 +94,36 @@ impl State {
     }
 }
 
+/// What an agent thread is for, chosen when it is started.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    /// The agent changes files on its own branch in its own worktree, and
+    /// its commits become a local pull request.
+    #[default]
+    Implement,
+    /// The agent reads the user's working tree and answers: the sandbox
+    /// lets it change nothing there. No branch, no worktree, no pull
+    /// request.
+    Discuss,
+}
+
+impl Mode {
+    pub const ALL: [Mode; 2] = [Self::Discuss, Self::Implement];
+
+    /// "Implement", "Discuss".
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Implement => "Implement",
+            Self::Discuss => "Discuss",
+        }
+    }
+
+    pub fn is_implement(&self) -> bool {
+        *self == Self::Implement
+    }
+}
+
 /// How a finished (or completed) agent thread ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -129,6 +159,9 @@ pub enum TurnKind {
     Retry,
     /// Continue after the usage limit reset (made by the supervisor).
     Resume,
+    /// GitEZ asked a Discuss thread for a brief ([`BRIEF_PROMPT`]) to start
+    /// an Implement thread with.
+    Brief,
 }
 
 /// One prompt sent to the agent, and how its run went.
@@ -258,8 +291,9 @@ pub struct DeletedBranch {
     pub at: Timestamp,
 }
 
-/// A prompt given to a coding agent working on its own branch in its own
-/// worktree, and the conversation that follows: one `thread.json`.
+/// A prompt given to a coding agent, and the conversation that follows: one
+/// `thread.json`. An Implement thread works on its own branch in its own
+/// worktree; a Discuss thread reads the user's working tree ([`Mode`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentThread {
     pub id: AgentThreadId,
@@ -269,15 +303,33 @@ pub struct AgentThread {
     pub agent: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Mode::is_implement")]
+    pub mode: Mode,
     pub state: State,
     /// Set when `state` is Finished or Completed.
     pub ending: Option<Ending>,
     pub created: Timestamp,
     pub updated: Timestamp,
+    /// For a Discuss thread: what was checked out when it started.
     pub start: Start,
-    /// `agent/<id>`.
-    pub branch: String,
-    pub worktree: PathBuf,
+    /// `agent/<id>`; `None` for a Discuss thread, which has no branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// `None` for a Discuss thread, which has no worktree of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<PathBuf>,
+    /// A Discuss thread only: the working tree the agent reads, the one
+    /// the user had open when they started it (the main one or a linked
+    /// one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_dir: Option<PathBuf>,
+    /// A Discuss thread only: its folders in GitEZ's data folder (an
+    /// Implement thread's follow from where its worktree is).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch: Option<ScratchDirs>,
+    /// The Discuss thread whose brief started this thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<AgentThreadId>,
     /// Whether the worktree was prepared (includes copied, caches cloned,
     /// setup command run).
     pub prepared: bool,
@@ -328,7 +380,13 @@ pub struct NewAgentThread {
     pub prompt: String,
     pub agent: String,
     pub model: Option<String>,
+    pub mode: Mode,
     pub start: Start,
+    /// For [`Mode::Discuss`]: the working tree the agent reads. Unused
+    /// for an Implement thread.
+    pub work_dir: Option<PathBuf>,
+    /// The Discuss thread whose brief this thread starts with.
+    pub origin: Option<AgentThreadId>,
     pub network: NetworkProfile,
     pub secrets: Vec<String>,
 }
@@ -350,11 +408,72 @@ pub enum RetryPlan {
 pub const CONTINUE_PROMPT: &str =
     "GitEZ stopped your last run before it finished. Continue the task where you left off.";
 
+/// The prompt of a [`TurnKind::Brief`] turn: what "Implement…" asks a
+/// Discuss thread for. The answer becomes the first prompt of an Implement
+/// thread, whose agent has not seen the discussion.
+pub const BRIEF_PROMPT: &str = "\
+Write a brief for an engineer who will implement what we discussed. They have not seen this \
+conversation and start with a fresh context, in a fresh checkout of the repository without \
+uncommitted changes, so the brief must stand on its own.
+
+Begin with a title for the change as a level-1 Markdown heading (\"# <title>\") in the \
+imperative mood, like a good commit subject, about 60 characters at most. Then, under short \
+headings: the goal and why; what we decided, with the reasons that matter; constraints and \
+conventions to follow; the files and code to look at, as paths; how to verify the result; and \
+what is out of scope. Leave out anything we discussed and dropped. If something needed is still \
+undecided, list it under \"Open questions\".
+
+Reply with the brief only: no preamble and no closing remarks.";
+
 const STILL_WORKING: &str = "The agent is still working on this thread.";
 const COMPLETED: &str = "This thread is completed.";
 const NEVER_STARTED: &str = "Retry this thread first: the agent never started.";
 
 impl AgentThread {
+    /// An Implement thread's branch and worktree; `None` for a Discuss
+    /// thread, which has neither.
+    pub fn own(&self) -> Option<(&str, &Path)> {
+        Some((self.branch.as_deref()?, self.worktree.as_deref()?))
+    }
+
+    /// The worktree's path as said in a message about it; empty for a
+    /// Discuss thread, which has none and gets no such message.
+    pub fn worktree_display(&self) -> std::path::Display<'_> {
+        self.worktree.as_deref().unwrap_or(Path::new("")).display()
+    }
+
+    /// The branch's name as said in a message about it; empty for a
+    /// Discuss thread.
+    pub fn branch_name(&self) -> &str {
+        self.branch.as_deref().unwrap_or_default()
+    }
+
+    /// Why this record cannot be used, if its mode and its places do not
+    /// go together.
+    pub(crate) fn inconsistency(&self) -> Option<&'static str> {
+        match self.mode {
+            Mode::Implement if self.own().is_none() => {
+                Some("an Implement thread without a branch and a worktree")
+            }
+            Mode::Discuss if self.work_dir.is_none() => {
+                Some("a Discuss thread without a working tree")
+            }
+            Mode::Discuss if self.branch.is_some() || self.worktree.is_some() => {
+                Some("a Discuss thread with a branch or a worktree")
+            }
+            _ => None,
+        }
+    }
+
+    /// The last turn's brief, if that turn is a [`TurnKind::Brief`] the
+    /// agent answered: what an Implement thread can start with.
+    pub fn brief(&self) -> Option<&str> {
+        let turn = self.turns.last()?;
+        let result = turn.result.as_ref()?;
+        (turn.kind == TurnKind::Brief && result.success && !result.message.trim().is_empty())
+            .then_some(result.message.as_str())
+    }
+
     /// The newest turn's final message that is not empty.
     pub fn final_message(&self) -> Option<&str> {
         self.turns
@@ -405,9 +524,10 @@ impl AgentThread {
         }
     }
 
-    /// Adds a Reply or Review turn: allowed only when Finished and
-    /// `session_id` is set; sets state Queued, clears `ending`, `error`,
-    /// `waiting_until`. Err(Refused) otherwise.
+    /// Adds a Reply or Review turn, or a Discuss thread's Brief turn:
+    /// allowed only when Finished and `session_id` is set; sets state
+    /// Queued, clears `ending`, `error`, `waiting_until`. Err(Refused)
+    /// otherwise.
     pub fn request_turn(&mut self, kind: TurnKind, prompt: String, at: Timestamp) -> Result<()> {
         self.request_turn_with_images(kind, prompt, Vec::new(), at)
     }
@@ -421,10 +541,20 @@ impl AgentThread {
         images: Vec<TurnImage>,
         at: Timestamp,
     ) -> Result<()> {
-        if !matches!(kind, TurnKind::Reply | TurnKind::Review) {
-            return Err(Error::refused(
-                "Only a reply or review comments can continue a thread.",
-            ));
+        match (kind, self.mode) {
+            (TurnKind::Reply, _) | (TurnKind::Review, Mode::Implement) => {}
+            (TurnKind::Brief, Mode::Discuss) => {}
+            (TurnKind::Brief, Mode::Implement) => {
+                return Err(Error::refused("Only a Discuss thread can write a brief."));
+            }
+            (TurnKind::Review, Mode::Discuss) => {
+                return Err(Error::refused("A Discuss thread has no pull request."));
+            }
+            _ => {
+                return Err(Error::refused(
+                    "Only a reply or review comments can continue a thread.",
+                ));
+            }
         }
         self.check_finished()?;
         if self.session_id.is_none() {
@@ -479,7 +609,10 @@ impl AgentThread {
                 let (prompt, images) = match self.turns.last() {
                     Some(turn)
                         if turn.started.is_none()
-                            && matches!(turn.kind, TurnKind::Reply | TurnKind::Review) =>
+                            && matches!(
+                                turn.kind,
+                                TurnKind::Reply | TurnKind::Review | TurnKind::Brief
+                            ) =>
                     {
                         (turn.prompt.clone(), turn.images.clone())
                     }

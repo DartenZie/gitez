@@ -190,10 +190,12 @@ fn start(
         prompt: prompt.into(),
         agent: gitez_agent::ClaudeCode::ID.into(),
         model: model.map(str::to_owned),
+        mode: gitez_agent_thread::Mode::Implement,
         start: gitez_agent_thread::Start {
             branch: "main".into(),
             commit: head,
         },
+        origin: None,
         network: NetworkProfile::AgentOnly,
         secrets: Vec::new(),
         images: Vec::new(),
@@ -283,7 +285,10 @@ fn gitez_command_output(dir: &Path, args: &[&str]) -> String {
 fn assert_completed(work_dir: &Path, thread: &AgentThread, merged: bool) {
     assert_eq!(thread.state, State::Completed, "{thread:#?}");
     assert!(thread.completed.is_some());
-    assert!(!thread.worktree.exists(), "the worktree folder is gone");
+    assert!(
+        !crate::agent_threads::thread_worktree(thread).exists(),
+        "the worktree folder is gone"
+    );
     let worktrees = gitez_command_output(work_dir, &["worktree", "list", "--porcelain"]);
     assert_eq!(
         worktrees
@@ -293,7 +298,14 @@ fn assert_completed(work_dir: &Path, thread: &AgentThread, merged: bool) {
         1,
         "{worktrees}"
     );
-    let branches = gitez_command_output(work_dir, &["branch", "--list", &thread.branch]);
+    let branches = gitez_command_output(
+        work_dir,
+        &[
+            "branch",
+            "--list",
+            crate::agent_threads::thread_branch(thread),
+        ],
+    );
     if merged {
         assert_eq!(branches, "", "the merged branch is deleted");
         let deleted = thread.deleted_branch.as_ref().expect("recorded");
@@ -561,15 +573,25 @@ fn e2e_u5_merged_while_closed() {
     });
     gitez_agent_thread::create_worktree(
         &work_dir,
-        &made.worktree,
-        &made.branch,
+        crate::agent_threads::thread_worktree(&made),
+        crate::agent_threads::thread_branch(&made),
         &made.start.commit,
     )
     .expect("worktree");
-    std::fs::write(made.worktree.join("agent.txt"), "one\n").expect("write");
-    git(&made.worktree, &["add", "."]);
-    git(&made.worktree, &["commit", "-qm", "Agent: add agent.txt"]);
-    let head = gitez_command_output(&made.worktree, &["rev-parse", "HEAD"]);
+    std::fs::write(
+        crate::agent_threads::thread_worktree(&made).join("agent.txt"),
+        "one\n",
+    )
+    .expect("write");
+    git(crate::agent_threads::thread_worktree(&made), &["add", "."]);
+    git(
+        crate::agent_threads::thread_worktree(&made),
+        &["commit", "-qm", "Agent: add agent.txt"],
+    );
+    let head = gitez_command_output(
+        crate::agent_threads::thread_worktree(&made),
+        &["rev-parse", "HEAD"],
+    );
     let store = gitez_review::Store::new(&common_dir);
     let mut pull_request = store
         .create(
@@ -581,7 +603,7 @@ fn e2e_u5_merged_while_closed() {
                     commit: made.start.commit.clone(),
                 },
                 head: gitez_review::Tip {
-                    branch: made.branch.clone(),
+                    branch: crate::agent_threads::thread_branch(&made).to_owned(),
                     commit: head,
                 },
             },
@@ -605,7 +627,14 @@ fn e2e_u5_merged_while_closed() {
     // GitEZ running.
     git(
         &work_dir,
-        &["merge", "-q", "--no-ff", "-m", "Merge", &made.branch],
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "Merge",
+            crate::agent_threads::thread_branch(&made),
+        ],
     );
     pull_request.state = gitez_review::State::Merged;
     store.save(&pull_request).expect("saved");
@@ -670,19 +699,27 @@ fn thread_with_pull_request(
             thread.turns[0].result = Some(result("Added the blame view.", true));
         },
     );
-    gitez_agent_thread::create_worktree(work_dir, &made.worktree, &made.branch, &made.start.commit)
-        .expect("worktree");
+    gitez_agent_thread::create_worktree(
+        work_dir,
+        crate::agent_threads::thread_worktree(&made),
+        crate::agent_threads::thread_branch(&made),
+        &made.start.commit,
+    )
+    .expect("worktree");
     std::fs::write(
-        made.worktree.join("blame.rs"),
+        crate::agent_threads::thread_worktree(&made).join("blame.rs"),
         "fn blame() {}\nfn lines() {}\n",
     )
     .expect("write");
-    git(&made.worktree, &["add", "."]);
+    git(crate::agent_threads::thread_worktree(&made), &["add", "."]);
     git(
-        &made.worktree,
+        crate::agent_threads::thread_worktree(&made),
         &["commit", "-qm", "Read who last changed each line"],
     );
-    let head = gitez_command_output(&made.worktree, &["rev-parse", "HEAD"]);
+    let head = gitez_command_output(
+        crate::agent_threads::thread_worktree(&made),
+        &["rev-parse", "HEAD"],
+    );
     let pull_request = gitez_review::Store::new(&common_dir)
         .create(
             gitez_review::NewPullRequest {
@@ -693,7 +730,7 @@ fn thread_with_pull_request(
                     commit: made.start.commit.clone(),
                 },
                 head: gitez_review::Tip {
-                    branch: made.branch.clone(),
+                    branch: crate::agent_threads::thread_branch(&made).to_owned(),
                     commit: head,
                 },
             },
@@ -800,11 +837,11 @@ fn screenshot_u5_thread_states() {
         let work_dir = repository(&base);
         let (key, number) = thread_with_pull_request(&base, &work_dir, change);
         if name == "u5-worktree-gone" {
-            let worktree = gitez_agent_thread::Store::new(&key.common_dir)
+            let thread = gitez_agent_thread::Store::new(&key.common_dir)
                 .load(&key.id)
-                .expect("load")
-                .worktree;
-            std::fs::remove_dir_all(worktree).expect("deleted by hand");
+                .expect("load");
+            std::fs::remove_dir_all(crate::agent_threads::thread_worktree(&thread))
+                .expect("deleted by hand");
         }
         shoot_panel(&base, &work_dir, number, name);
     }
@@ -928,7 +965,9 @@ fn e2e_u5_real_haiku() {
         first.pull_request
     );
     let number = first.pull_request.expect("a pull request");
-    let excerpt = std::fs::read_to_string(first.worktree.join("hello.txt")).expect("hello.txt");
+    let excerpt =
+        std::fs::read_to_string(crate::agent_threads::thread_worktree(&first).join("hello.txt"))
+            .expect("hello.txt");
     comment(
         &common_dir,
         number,
@@ -984,11 +1023,17 @@ fn e2e_u5_real_haiku() {
         second.ending,
         second.turns.last().and_then(|turn| turn.result.clone())
     );
-    let text = std::fs::read_to_string(second.worktree.join("hello.txt")).expect("hello.txt");
+    let text =
+        std::fs::read_to_string(crate::agent_threads::thread_worktree(&second).join("hello.txt"))
+            .expect("hello.txt");
     eprintln!("hello.txt now: {text:?}");
     let commits = gitez_command_output(
         &work_dir,
-        &["log", "--format=%s", &format!("main..{}", second.branch)],
+        &[
+            "log",
+            "--format=%s",
+            &format!("main..{}", crate::agent_threads::thread_branch(&second)),
+        ],
     );
     eprintln!("commits of the branch:\n{commits}");
     shots.settle();
@@ -1147,7 +1192,12 @@ fn e2e_c1_uncommitted_keep_then_remove() {
         "the thread to complete",
         |thread| thread.state == State::Completed,
     );
-    assert!(completed.worktree.join("draft.md").exists(), "kept");
+    assert!(
+        crate::agent_threads::thread_worktree(&completed)
+            .join("draft.md")
+            .exists(),
+        "kept"
+    );
     shots.save(window, "fix-c1-3-completed-kept");
     shots.save_region(window, detail_region(), "fix-c1-3-completed-kept-panel");
 
@@ -1155,7 +1205,7 @@ fn e2e_c1_uncommitted_keep_then_remove() {
     assert!(shots.has_id(window, "remove-worktree-confirm"), "it asks");
     shots.save(window, "fix-c1-4-remove-asks");
     shots.click_id(window, "remove-worktree-confirm");
-    let worktree = completed.worktree.clone();
+    let worktree = crate::agent_threads::thread_worktree(&completed).to_owned();
     settle_until(
         &mut shots,
         Duration::from_secs(30),
@@ -1199,10 +1249,17 @@ fn e2e_c1_uncommitted_discard() {
         "the thread to complete",
         |thread| thread.state == State::Completed,
     );
-    assert!(!thread.worktree.exists(), "discarded with the worktree");
+    assert!(
+        !crate::agent_threads::thread_worktree(&thread).exists(),
+        "discarded with the worktree"
+    );
     let worktrees = gitez_command_output(&work_dir, &["worktree", "list", "--porcelain"]);
     assert!(
-        !worktrees.contains(&completed.worktree.display().to_string()),
+        !worktrees.contains(
+            &crate::agent_threads::thread_worktree(&completed)
+                .display()
+                .to_string()
+        ),
         "{worktrees}"
     );
     shots.save_region(window, detail_region(), "fix-c1-6-discarded-panel");
@@ -1253,7 +1310,9 @@ fn e2e_c1_merge_keeps_leftovers() {
         |thread| thread.state == State::Completed,
     );
     assert!(
-        completed.worktree.join("draft.md").exists(),
+        crate::agent_threads::thread_worktree(&completed)
+            .join("draft.md")
+            .exists(),
         "the merge keeps the worktree with its uncommitted change"
     );
     assert!(
@@ -1267,7 +1326,14 @@ fn e2e_c1_merge_keeps_leftovers() {
         completed.warnings
     );
     // The kept worktree sits on the branch: it stays with it.
-    gitez_command_output(&work_dir, &["rev-parse", "--verify", &completed.branch]);
+    gitez_command_output(
+        &work_dir,
+        &[
+            "rev-parse",
+            "--verify",
+            crate::agent_threads::thread_branch(&completed),
+        ],
+    );
     assert_eq!(completed.deleted_branch, None);
     let merged = gitez_review::Store::new(&common_dir)
         .load(number)
@@ -1326,7 +1392,10 @@ fn merge_deletes_the_branch(option: &'static str, name: &str) {
         |thread| thread.state == State::Finished && thread.pull_request.is_some(),
     );
     let number = finished.pull_request.expect("a pull request");
-    let agent_commit = gitez_command_output(&work_dir, &["rev-parse", &finished.branch]);
+    let agent_commit = gitez_command_output(
+        &work_dir,
+        &["rev-parse", crate::agent_threads::thread_branch(&finished)],
+    );
     // main moves on, so the merge is a real merge, squash or rebase.
     std::fs::write(work_dir.join("main.txt"), "main\n").expect("write");
     git(&work_dir, &["add", "main.txt"]);

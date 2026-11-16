@@ -1,6 +1,10 @@
 //! The supervisor's work for one agent thread (DESIGN D.5): check, queue,
 //! worktree, prepare, run the agent, check refs, commit leftovers, pull
 //! request, final state.
+//!
+//! A Discuss thread has no worktree of its own: the agent runs in the
+//! user's working tree, which the sandbox lets it only read. Nothing is
+//! prepared, committed or turned into a pull request for it.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::File;
@@ -16,9 +20,9 @@ use gitez_agent::{
     ImageInput, RunSpec, Stopper,
 };
 use gitez_agent_thread::{
-    Activity, AgentThread, AgentThreadId, CONTINUE_PROMPT, Ending, PrepareStep, RunHeader, State,
-    Step, Store, SupervisorInfo, Timestamp, Turn, TurnKind, TurnResult, Uncommitted,
-    title_from_message,
+    Activity, AgentThread, AgentThreadId, CONTINUE_PROMPT, Ending, Mode, PrepareStep, RunHeader,
+    ScratchDirs, State, Step, Store, SupervisorInfo, Timestamp, Turn, TurnKind, TurnResult,
+    Uncommitted, title_from_message,
 };
 use gitez_git::{RefState, Repository};
 use gitez_sandbox::{Network, NetworkProfile, Sandbox as _, Status};
@@ -26,7 +30,7 @@ use gitez_settings::{Loaded, Settings};
 use jiff::SignedDuration;
 
 use crate::liveness::SupervisorLock;
-use crate::policy::{self, Place};
+use crate::policy::{self, Place, Work};
 use crate::queue::{Queue, Slot, Waited};
 use crate::toolchains;
 use crate::{Command, Error, Result, Secrets};
@@ -304,10 +308,24 @@ impl Pipeline<'_> {
     /// [`gitez_agent_thread::check_worktree`]) before anything runs there.
     /// A branch with commits beyond the start is checked out inside the
     /// sandbox, never here.
+    ///
+    /// For a Discuss thread: check the working tree it reads
+    /// ([`Self::working_tree`]).
     fn worktree(&mut self) -> Result<(), End> {
         let failed = |message: String| End::Failed(Step::Worktree, message);
+        if self.thread.mode == Mode::Discuss {
+            return self.working_tree();
+        }
+        let Some((branch, worktree)) = self
+            .thread
+            .own()
+            .map(|(branch, worktree)| (branch.to_owned(), worktree.to_owned()))
+        else {
+            return Err(failed(
+                "The thread has no branch and no worktree.".to_owned(),
+            ));
+        };
         let main_dir = self.main_dir().map_err(failed)?;
-        let worktree = self.thread.worktree.clone();
         let exists = std::fs::symlink_metadata(&worktree).is_ok();
         if !exists || !self.thread.prepared {
             self.set_preparing("creating worktree");
@@ -331,7 +349,7 @@ impl Pipeline<'_> {
         let created = gitez_agent_thread::create_worktree_with(
             &git,
             &worktree,
-            &self.thread.branch,
+            &branch,
             &self.thread.start.commit,
         );
         cancel.finish();
@@ -351,6 +369,68 @@ impl Pipeline<'_> {
         }
         let scratch =
             gitez_agent_thread::scratch_dirs(&self.env.data_dir, &self.repository_key(), &self.id);
+        self.own_scratch(&scratch)?;
+        self.place = Some(Place {
+            common_dir: self.common_dir.clone(),
+            work: Work::Own {
+                worktree,
+                worktree_git_dir: created.git_dir,
+                branch,
+            },
+            tmp_dir: scratch.tmp,
+            caches_dir: scratch.caches,
+            data_dir: self.env.data_dir.clone(),
+        });
+        self.worktree_ready = true;
+        if created.needs_checkout {
+            self.checkout()?;
+        }
+        Ok(())
+    }
+
+    /// Step 3 for a Discuss thread: nothing is made. The working tree the
+    /// thread reads must still be one of this repository; the thread's
+    /// scratch folders are created. No git runs here.
+    fn working_tree(&mut self) -> Result<(), End> {
+        let failed = |message: String| End::Failed(Step::Worktree, message);
+        let Some(work_dir) = self.thread.work_dir.clone() else {
+            return Err(failed(
+                "The thread does not say which working tree to read.".to_owned(),
+            ));
+        };
+        let gone = || {
+            failed(format!(
+                "The working tree {} is gone, or is no longer one of this repository.",
+                work_dir.display()
+            ))
+        };
+        let repository = Repository::open(&work_dir).map_err(|_| gone())?;
+        let same = |a: &Path, b: &Path| policy::real(a) == policy::real(b);
+        if !same(&repository.common_dir(), &self.common_dir)
+            || !repository
+                .work_dir()
+                .is_some_and(|found| same(found, &work_dir))
+        {
+            return Err(gone());
+        }
+        let Some(scratch) = self.thread.scratch_dirs() else {
+            return Err(failed(
+                "The thread does not say where its temporary folder is.".to_owned(),
+            ));
+        };
+        self.own_scratch(&scratch)?;
+        self.place = Some(Place {
+            common_dir: self.common_dir.clone(),
+            work: Work::ReadOnly { work_dir },
+            tmp_dir: scratch.tmp,
+            caches_dir: scratch.caches,
+            data_dir: self.env.data_dir.clone(),
+        });
+        Ok(())
+    }
+
+    /// Makes the thread's scratch folders, real folders of its own.
+    fn own_scratch(&mut self, scratch: &ScratchDirs) -> Result<(), End> {
         for dir in [&scratch.tmp, &scratch.caches] {
             match own_dir(dir) {
                 Ok(false) => {}
@@ -360,25 +440,12 @@ impl Pipeline<'_> {
                     dir.display()
                 )),
                 Err(error) => {
-                    return Err(failed(format!(
-                        "GitEZ could not create {}: {error}",
-                        dir.display()
-                    )));
+                    return Err(End::Failed(
+                        Step::Worktree,
+                        format!("GitEZ could not create {}: {error}", dir.display()),
+                    ));
                 }
             }
-        }
-        self.place = Some(Place {
-            common_dir: self.common_dir.clone(),
-            worktree,
-            worktree_git_dir: created.git_dir,
-            branch: self.thread.branch.clone(),
-            tmp_dir: scratch.tmp,
-            caches_dir: scratch.caches,
-            data_dir: self.env.data_dir.clone(),
-        });
-        self.worktree_ready = true;
-        if created.needs_checkout {
-            self.checkout()?;
         }
         Ok(())
     }
@@ -415,7 +482,7 @@ impl Pipeline<'_> {
                 Step::Worktree,
                 format!(
                     "GitEZ could not check out {} in the worktree:\n{}",
-                    self.thread.branch,
+                    self.thread.branch.as_deref().unwrap_or_default(),
                     lines.join("\n")
                 ),
             ));
@@ -431,17 +498,20 @@ impl Pipeline<'_> {
         }
     }
 
-    /// Step 4: copy includes, clone caches, run the setup command.
+    /// Step 4: copy includes, clone caches, run the setup command. Not
+    /// for a Discuss thread, whose working tree is the user's as it is.
     fn prepare(&mut self, context: &Context) -> Result<(), End> {
         if self.thread.prepared {
             return Ok(());
         }
+        let Some(worktree) = self.thread.worktree.clone() else {
+            return Ok(());
+        };
         let failed = |message: String| End::Failed(Step::Prepare, message);
         let started = Instant::now();
         self.set_preparing("copying files");
         let main_dir = self.main_dir().map_err(failed)?;
         let main = Repository::open(&main_dir).map_err(|error| failed(error.to_string()))?;
-        let worktree = self.thread.worktree.clone();
         let report = gitez_agent_thread::prepare(&main, &worktree, |step| match step {
             PrepareStep::CopyingIncludes { .. } => self.set_preparing("copying files"),
             PrepareStep::Cloning { dir } => self.set_preparing(&format!("cloning {dir}/")),
@@ -559,18 +629,24 @@ impl Pipeline<'_> {
                 session_id: &session_id,
             }
         };
-        let system_prompt = system_prompt(
-            &self.thread.branch,
-            &self.thread.start.branch,
-            self.thread.network,
-        );
+        let Some(place) = self.place.clone() else {
+            return Err(End::Failed(
+                Step::Worktree,
+                "The worktree is not ready.".to_owned(),
+            ));
+        };
+        let system_prompt = match &place.work {
+            Work::Own { branch, .. } => {
+                system_prompt(branch, &self.thread.start.branch, self.thread.network)
+            }
+            Work::ReadOnly { .. } => discuss_system_prompt(self.thread.network),
+        };
         let model = self
             .thread
             .model
             .clone()
             .filter(|model| !model.is_empty())
             .or_else(|| context.model.clone());
-        let worktree = self.thread.worktree.clone();
         // The images go with the prompt, read from the thread's folder.
         if !turn.images.is_empty() && !agent.accepts_images(model.as_deref()) {
             return Err(failed(format!(
@@ -603,7 +679,10 @@ impl Pipeline<'_> {
         let spec = RunSpec {
             prompt: &turn.prompt,
             images: &images,
-            cwd: &worktree,
+            cwd: place.dir(),
+            // The user's own sessions of the agent run in their working
+            // tree too.
+            shared_folder: place.read_only(),
             model: model.as_deref(),
             conversation,
             system_prompt: Some(&system_prompt),
@@ -612,7 +691,22 @@ impl Pipeline<'_> {
             .command(&context.config, &spec)
             .map_err(|error| failed(error.to_string()))?;
         let needs = agent.needs_for_run(&context.config, &spec);
+        for dir in &needs.create_dirs {
+            if let Err(error) = std::fs::create_dir_all(dir) {
+                log(
+                    &self.id,
+                    &format!("could not create {}: {error}", dir.display()),
+                );
+            }
+        }
         self.add_env(&mut command);
+        if place.read_only() {
+            // git would refresh the index of the tree it only reads, and
+            // report that it cannot.
+            command
+                .env
+                .push(("GIT_OPTIONAL_LOCKS".to_owned(), "0".to_owned()));
+        }
 
         let started = Timestamp::now();
         let mut transcript = self
@@ -875,9 +969,9 @@ impl Pipeline<'_> {
         let mut exempt: BTreeSet<String> = others
             .into_iter()
             .filter(|thread| thread.id != self.id && thread.state.is_active())
-            .map(|thread| thread.branch)
+            .filter_map(|thread| thread.branch)
             .collect();
-        exempt.insert(self.thread.branch.clone());
+        exempt.extend(self.thread.branch.clone());
         let mut moved: Vec<String> = changed(&before.branches, &after.branches)
             .into_iter()
             .filter(|branch| !exempt.contains(branch))
@@ -908,7 +1002,9 @@ impl Pipeline<'_> {
         if self.place.is_none() {
             return;
         }
-        let branch = self.thread.branch.clone();
+        let Some(branch) = self.thread.branch.clone() else {
+            return;
+        };
         let checked = Timestamp::now();
         self.set_activity_detail("committing leftovers");
         // Before the pull request exists, the title the agent gave its
@@ -1048,16 +1144,20 @@ status\n";
     }
 
     /// Step 8: a local pull request once the branch has commits of its own.
+    /// Never for a Discuss thread, which has no branch.
     fn pull_request(&mut self) -> Result<(), End> {
         if self.thread.pull_request.is_some() {
             return Ok(());
         }
+        let Some(branch) = self.thread.branch.clone() else {
+            return Ok(());
+        };
         let failed = |message: String| End::Failed(Step::PullRequest, message);
         let main_dir = self.main_dir().map_err(failed)?;
         let main = Repository::open(&main_dir).map_err(|error| failed(error.to_string()))?;
         let read = |error: gitez_git::Error| failed(error.to_string());
         let Some(head) = main
-            .resolve_commit(&format!("refs/heads/{}", self.thread.branch))
+            .resolve_commit(&format!("refs/heads/{branch}"))
             .map_err(read)?
         else {
             return Ok(());
@@ -1089,7 +1189,7 @@ status\n";
                         commit: base,
                     },
                     head: gitez_review::Tip {
-                        branch: self.thread.branch.clone(),
+                        branch,
                         commit: head.to_string(),
                     },
                 },
@@ -1140,11 +1240,16 @@ status\n";
         // folders must still be what they were, never links, before GitEZ
         // writes caches in them and the sandbox makes them writable.
         self.check_place(&place)?;
-        let writable: Vec<PathBuf> = settings
-            .writable_paths()
-            .iter()
-            .map(|path| policy::real(path))
-            .collect();
+        // A Discuss thread is not given the folders of Settings.
+        let writable: Vec<PathBuf> = if place.read_only() {
+            Vec::new()
+        } else {
+            settings
+                .writable_paths()
+                .iter()
+                .map(|path| policy::real(path))
+                .collect()
+        };
         let caches = toolchains::prepare(
             &place.caches_dir,
             policy::downloads(profile),
@@ -1223,14 +1328,18 @@ status\n";
     }
 
     /// Fails unless the worktree's git files are as recorded and the
-    /// thread's own folders are real folders.
+    /// thread's own folders are real folders. A Discuss thread's working
+    /// tree is the user's, which no agent could write: only the folders
+    /// are checked.
     fn check_place(&mut self, place: &Place) -> Result<(), End> {
-        gitez_agent_thread::check_worktree(
-            &place.common_dir,
-            &place.worktree,
-            self.thread.worktree_record.as_ref(),
-        )
-        .map_err(|error| End::Failed(Step::Worktree, error.to_string()))?;
+        if let Work::Own { worktree, .. } = &place.work {
+            gitez_agent_thread::check_worktree(
+                &place.common_dir,
+                worktree,
+                self.thread.worktree_record.as_ref(),
+            )
+            .map_err(|error| End::Failed(Step::Worktree, error.to_string()))?;
+        }
         for dir in [&place.tmp_dir, &place.caches_dir] {
             if own_dir(dir).map_err(|error| {
                 End::Failed(
@@ -1250,12 +1359,16 @@ status\n";
 
     /// A command run in the worktree, with GitEZ's environment.
     fn command(&self, program: &str, args: Vec<String>, stdin: Option<String>) -> CommandSpec {
+        let cwd = match &self.place {
+            Some(place) => place.dir().to_owned(),
+            None => self.thread.worktree.clone().unwrap_or_default(),
+        };
         let mut command = CommandSpec {
             program: program.into(),
             args,
             env: Vec::new(),
             env_remove: Vec::new(),
-            cwd: self.thread.worktree.clone(),
+            cwd,
             stdin,
         };
         self.add_env(&mut command);
@@ -1304,11 +1417,13 @@ status\n";
         Ok(dir)
     }
 
-    /// `<repo key>`: the worktree's parent folder, as the GUI named it.
+    /// `<repo key>`: the worktree's parent folder, as the GUI named it; for
+    /// a thread without a worktree, from the repository's folder name.
     fn repository_key(&self) -> String {
         self.thread
             .worktree
-            .parent()
+            .as_deref()
+            .and_then(Path::parent)
             .and_then(Path::file_name)
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| {
@@ -1591,7 +1706,10 @@ fn check_command(thread: &AgentThread, command: Command) -> Result<(), String> {
     let matches = thread.state == State::Queued
         && match command {
             Command::Start => pending == Some(TurnKind::Start),
-            Command::Reply => matches!(pending, Some(TurnKind::Reply | TurnKind::Review)),
+            Command::Reply => matches!(
+                pending,
+                Some(TurnKind::Reply | TurnKind::Review | TurnKind::Brief)
+            ),
             Command::Retry => matches!(pending, Some(TurnKind::Retry) | None),
         };
     if matches {
@@ -1661,20 +1779,46 @@ fn system_prompt(branch: &str, start_branch: &str, network: NetworkProfile) -> S
          (mktemp \"$TMPDIR/name.XXXXXX\"). git stash does not work here; commit work in \
          progress on your branch instead."
     );
+    prompt.push_str(network_note(network));
+    prompt
+}
+
+/// What a network profile keeps the agent from, and what the user can do
+/// about it ("" for Open).
+fn network_note(network: NetworkProfile) -> &'static str {
     match network {
-        NetworkProfile::AgentOnly => prompt.push_str(
+        NetworkProfile::AgentOnly => {
             " The network reaches only your own API: package registries cannot be reached, and \
              Cargo and Go run offline from the packages already on this computer. If the task \
              needs a download, say so in your summary: the user can retry the thread with the \
-             Packages network profile.",
-        ),
-        NetworkProfile::Packages => prompt.push_str(
+             Packages network profile."
+        }
+        NetworkProfile::Packages => {
             " The network reaches only package registries, GitHub and the repository's \
              remotes. If the task needs another host, name it in your summary: the user can \
-             retry the thread with the Open network profile.",
-        ),
-        NetworkProfile::Open => {}
+             retry the thread with the Open network profile."
+        }
+        NetworkProfile::Open => "",
     }
+}
+
+/// What a Discuss thread's agent is told: where it is, that it changes
+/// nothing, and what the sandbox does about it.
+fn discuss_system_prompt(network: NetworkProfile) -> String {
+    let mut prompt = "You are in a discussion that GitEZ started in the user's own working tree, \
+         with their uncommitted changes as they are. The user wants to ask, explore or plan, not \
+         to have anything changed yet. Read the code, run commands that only read, and answer: \
+         explain, compare options, recommend, or write a plan. Do not change, create or delete \
+         files in the repository, and do not commit, stash, check out or otherwise change its \
+         git state. You run in a sandbox that refuses every write outside $TMPDIR, so an attempt \
+         fails anyway. $TMPDIR is yours for notes and scratch files: use it, not /tmp, and give \
+         mktemp a template in it (mktemp \"$TMPDIR/name.XXXXXX\"). A build or test that writes \
+         into the working tree fails here; if you need one, send its output to $TMPDIR (for \
+         example CARGO_TARGET_DIR=\"$TMPDIR/target\") or say what you could not run. If the user \
+         asks you to make the change, say what you would do and that \"Implement…\" in GitEZ \
+         starts an agent that does it on a branch of its own, from a brief you write then."
+        .to_owned();
+    prompt.push_str(network_note(network));
     prompt
 }
 
@@ -1844,6 +1988,27 @@ mod tests {
         )));
         assert!(!is_leftovers_commit(LEFTOVERS_NOTE));
         assert!(!is_leftovers_commit("Make the greeting friendlier"));
+    }
+
+    #[test]
+    fn a_discussion_is_told_it_changes_nothing_and_how_to_hand_over() {
+        let prompt = discuss_system_prompt(NetworkProfile::Open);
+        assert!(prompt.starts_with("You are in a discussion"));
+        assert!(prompt.contains("Do not change, create or delete files"));
+        assert!(prompt.contains("refuses every write outside $TMPDIR"));
+        assert!(prompt.contains("CARGO_TARGET_DIR=\"$TMPDIR/target\""));
+        assert!(prompt.contains("\"Implement…\""));
+        // Nothing of an Implement thread's instructions.
+        assert!(!prompt.contains("Commit your work"));
+        assert!(!prompt.contains("level-1 Markdown heading"));
+        // The same words about the network as any thread.
+        assert!(!prompt.contains("network"));
+        let offline = discuss_system_prompt(NetworkProfile::AgentOnly);
+        assert!(offline.contains("retry the thread with the Packages network profile"));
+        assert!(
+            system_prompt("agent/x", "main", NetworkProfile::AgentOnly)
+                .ends_with(network_note(NetworkProfile::AgentOnly))
+        );
     }
 
     #[test]

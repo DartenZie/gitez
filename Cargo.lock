@@ -2361,6 +2361,7 @@ version = "0.1.0"
 dependencies = [
  "dirs 6.0.0",
  "gitez-agent",
+ "gitez-agent-thread",
  "gitez-sandbox",
  "serde",
  "serde_json",

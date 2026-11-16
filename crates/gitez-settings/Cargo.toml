@@ -11,6 +11,7 @@ publish = false
 
 [dependencies]
 gitez-agent.workspace = true
+gitez-agent-thread.workspace = true
 gitez-sandbox.workspace = true
 dirs.workspace = true
 serde.workspace = true

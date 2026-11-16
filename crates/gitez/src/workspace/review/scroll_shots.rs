@@ -156,21 +156,21 @@ pub(super) fn pull_request(
     );
     gitez_agent_thread::create_worktree(
         &work_dir,
-        &made.worktree,
-        &made.branch,
+        crate::agent_threads::thread_worktree(&made),
+        crate::agent_threads::thread_branch(&made),
         &made.start.commit,
     )
     .expect("worktree");
     let thirds = [0..files / 3, files / 3..files * 2 / 3, files * 2 / 3..files];
     for (number, range) in thirds.into_iter().enumerate() {
         for index in range {
-            let path = made.worktree.join(path_of(index));
+            let path = crate::agent_threads::thread_worktree(&made).join(path_of(index));
             std::fs::create_dir_all(path.parent().expect("a folder")).expect("folders");
             std::fs::write(path, source(index, lines, true)).expect("write");
         }
-        git(&made.worktree, &["add", "."]);
+        git(crate::agent_threads::thread_worktree(&made), &["add", "."]);
         git(
-            &made.worktree,
+            crate::agent_threads::thread_worktree(&made),
             &[
                 "commit",
                 "-qm",
@@ -189,8 +189,11 @@ pub(super) fn pull_request(
                     commit: made.start.commit.clone(),
                 },
                 head: gitez_review::Tip {
-                    branch: made.branch.clone(),
-                    commit: output(&made.worktree, &["rev-parse", "HEAD"]),
+                    branch: crate::agent_threads::thread_branch(&made).to_owned(),
+                    commit: output(
+                        crate::agent_threads::thread_worktree(&made),
+                        &["rev-parse", "HEAD"],
+                    ),
                 },
             },
             Timestamp::now(),

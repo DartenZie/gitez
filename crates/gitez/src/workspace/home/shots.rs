@@ -21,7 +21,7 @@ use crate::agent_threads::{AgentThreadKey, AgentThreads};
 use crate::screenshot::{Shots, git, window_size};
 use crate::workspace::Workspace;
 use crate::workspace::composer_shots::{
-    fake_agent, gitez_binary, minutes_ago, supervisor_script, thread, wait_until,
+    fake_agent, gitez_binary, minutes_ago, picker, supervisor_script, thread, wait_until,
 };
 
 /// A repository called `name` in `base`: a few commits on `main`, two
@@ -72,7 +72,10 @@ fn save_settings(data_dir: &Path, common_dir: &Path, agent: AgentEntry, limit: u
                 default: false,
             },
         ],
-        threads: ThreadSettings { max_running: limit },
+        threads: ThreadSettings {
+            max_running: limit,
+            ..ThreadSettings::default()
+        },
         ..Settings::default()
     };
     settings
@@ -167,7 +170,7 @@ fn with_pull_request(work_dir: &Path, thread: &AgentThread) -> u32 {
     let common_dir = common_dir_of(work_dir);
     let head = commit_on(
         work_dir,
-        &thread.branch,
+        crate::agent_threads::thread_branch(thread),
         &format!("{}.rs", thread.id.as_str()),
         &thread.title,
     );
@@ -181,7 +184,7 @@ fn with_pull_request(work_dir: &Path, thread: &AgentThread) -> u32 {
                     commit: thread.start.commit.clone(),
                 },
                 head: gitez_review::Tip {
-                    branch: thread.branch.clone(),
+                    branch: crate::agent_threads::thread_branch(thread).to_owned(),
                     commit: head,
                 },
             },
@@ -454,14 +457,15 @@ mod at {
         point(px(240.), title.y + px(24.))
     }
 
-    /// Entry `index` of the launcher's repository picker.
-    pub fn repository_item(index: usize) -> Point<Pixels> {
-        point(px(600.), px(359. + 41.5 * index as f32))
+    /// Entry `index` of the launcher's repository picker, which is at
+    /// `picker`.
+    pub fn repository_item(picker: Point<Pixels>, index: usize) -> Point<Pixels> {
+        point(picker.x + px(79.), picker.y + px(60. + 41.5 * index as f32))
     }
 
-    /// Haiku in the launcher's model picker.
-    pub fn haiku() -> Point<Pixels> {
-        env("U6_HAIKU", 733., 453.)
+    /// Haiku in the launcher's model picker, which is at `picker`.
+    pub fn haiku(picker: Point<Pixels>) -> Point<Pixels> {
+        point(picker.x - px(48.), picker.y + px(154.))
     }
 
     /// The reply box of a finished thread shown in Home.
@@ -508,18 +512,6 @@ mod at {
         let y = [181., 270., 331., 418., 480., 540.][index];
         point(px(120.), px(y))
     }
-
-    /// Pickers of the launcher, by name.
-    pub fn picker(name: &str) -> Point<Pixels> {
-        match name {
-            "repository" => env("U6_PICK_REPOSITORY", 521., 299.),
-            "agent" => env("U6_PICK_AGENT", 636., 299.),
-            "model" => env("U6_PICK_MODEL", 781., 299.),
-            "from" => env("U6_PICK_FROM", 943., 299.),
-            "sandbox" => env("U6_PICK_SANDBOX", 1125., 299.),
-            _ => env("U6_PICK_SECRETS", 546., 333.),
-        }
-    }
 }
 
 /// Recent repositories with a favicon show it on Home and in the launcher's
@@ -549,7 +541,8 @@ fn screenshot_u6_repository_icons() {
     let found = shots.update(|cx| crate::project_icon::of(&site, cx).is_some());
     assert!(found, "the favicon is found");
     shots.save(window, "u6-icons-home");
-    shots.click(window, at::picker("repository"));
+    let repository = picker(&mut shots, window, "repository");
+    shots.click(window, repository);
     shots.save(window, "u6-icons-picker");
 }
 
@@ -579,7 +572,8 @@ fn screenshot_u6_moved_repository() {
     let mut shots = Shots::from_env(&data_dir).expect("enabled");
     let (window, _) = open_home(&mut shots, &[&gone, &here]);
     shots.save(window, "u6-moved-home");
-    shots.click(window, at::picker("repository"));
+    let repository = picker(&mut shots, window, "repository");
+    shots.click(window, repository);
     shots.save(window, "u6-moved-picker");
 }
 
@@ -612,7 +606,8 @@ fn screenshot_u6_home() {
     let home = home_of(&mut shots, &workspace);
     // The pickers of the launcher, each opened once.
     for name in ["repository", "agent", "model", "from", "sandbox", "secrets"] {
-        shots.click(window, at::picker(name));
+        let place = picker(&mut shots, window, name);
+        shots.click(window, place);
         shots.save(window, &format!("u6-picker-{name}"));
         shots.keys(window, "escape");
     }
@@ -768,8 +763,9 @@ fn e2e_u6_home_fake_agent() {
     let home = home_of(&mut shots, &workspace);
 
     // notes-site, picked in the launcher; the prompt; ⌘↵.
-    shots.click(window, at::picker("repository"));
-    shots.click(window, at::repository_item(1));
+    let repository = picker(&mut shots, window, "repository");
+    shots.click(window, repository);
+    shots.click(window, at::repository_item(repository, 1));
     let picked = shots.update(|cx| {
         home.read(cx)
             .composer
@@ -1027,8 +1023,9 @@ fn e2e_u6_home_real_haiku() {
         "Add a file hello.txt containing hi and commit it. Do nothing else.",
     );
     // haiku, as the owner allows, picked with the model picker.
-    shots.click(window, at::picker("model"));
-    shots.click(window, at::haiku());
+    let model = picker(&mut shots, window, "model");
+    shots.click(window, model);
+    shots.click(window, at::haiku(model));
     let model = shots.update(|cx| home.read(cx).composer.read(cx).model_alias(cx));
     assert_eq!(model, "haiku", "haiku is picked");
     shots.save(window, "u6-real-1-ready");
@@ -1120,5 +1117,10 @@ fn e2e_u6_home_real_haiku() {
     shots.save(window, "u6-real-6-replied");
     assert!(after.turns[1].resume, "the reply resumes the conversation");
     assert_eq!(after.session_id, done.session_id);
-    assert!(after.worktree.join("bye.txt").is_file(), "{after:#?}");
+    assert!(
+        crate::agent_threads::thread_worktree(after)
+            .join("bye.txt")
+            .is_file(),
+        "{after:#?}"
+    );
 }

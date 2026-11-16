@@ -226,7 +226,7 @@ fn mix(base: &Path) -> Mix {
     );
     let head = commit_on(
         &work_dir,
-        &windows.branch,
+        crate::agent_threads::thread_branch(&windows),
         "paths.rs",
         "Accept verbatim and UNC paths",
     );
@@ -241,7 +241,7 @@ fn mix(base: &Path) -> Mix {
                     commit: base_commit,
                 },
                 head: gitez_review::Tip {
-                    branch: windows.branch.clone(),
+                    branch: crate::agent_threads::thread_branch(&windows).to_owned(),
                     commit: head,
                 },
             },
@@ -618,7 +618,7 @@ fn e2e_u3_popover_actions() {
         .expect("it");
     assert_eq!(retried.turns.len(), 2, "Retry added a turn");
     assert!(
-        retried.worktree.is_dir(),
+        crate::agent_threads::thread_worktree(retried).is_dir(),
         "a finished thread keeps its worktree"
     );
     shots.save(window, "u3-e2e-4-retried");
@@ -646,9 +646,9 @@ fn e2e_u3_popover_actions() {
         .expect("it")
         .clone();
     assert!(
-        !completed.worktree.exists(),
+        !crate::agent_threads::thread_worktree(&completed).exists(),
         "Complete removes the worktree: {}",
-        completed.worktree.display()
+        crate::agent_threads::thread_worktree(&completed).display()
     );
     assert!(completed.completed.is_some());
     // Readable, read-only: it loads, and a reply is refused.

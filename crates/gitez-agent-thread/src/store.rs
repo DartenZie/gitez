@@ -19,10 +19,10 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::lock::Lock;
-use crate::model::{AgentThread, AgentThreadId, NewAgentThread, State, Turn, TurnKind};
+use crate::model::{AgentThread, AgentThreadId, Mode, NewAgentThread, State, Turn, TurnKind};
 use crate::{
-    Error, MAX_INPUT_BYTES, PreparedImage, Result, TurnImage, VERSION, slug, title_from_request,
-    worktree_path,
+    Error, MAX_INPUT_BYTES, PreparedImage, Result, TurnImage, VERSION, repository_key,
+    scratch_dirs, slug, title_from_request, worktree_path,
 };
 
 const THREAD_FILE: &str = "thread.json";
@@ -172,6 +172,10 @@ impl Store {
     /// exists (`-2`, `-3`, …); worktree at
     /// `worktree_path(data_dir, repository_name, common_dir, id)`; state
     /// Queued; one Start turn with the prompt, resume false. Saves it.
+    ///
+    /// A Discuss thread ([`Mode::Discuss`]) gets no branch and no worktree:
+    /// its record holds `new.work_dir`, the working tree it reads, and its
+    /// scratch folders.
     pub fn create(
         &self,
         new: NewAgentThread,
@@ -202,6 +206,13 @@ impl Store {
         let title = title_from_request(&new.prompt, images.len());
         let base = slug(&title);
         let mut attempt = 1u32;
+        let discuss = new.mode == Mode::Discuss;
+        if discuss && new.work_dir.is_none() {
+            return Err(Error::refused(
+                "A Discuss thread needs a working tree to read.",
+            ));
+        }
+        let key = repository_key(repository_name, &common_dir);
         let (id, worktree) = loop {
             if attempt > MAX_ID_ATTEMPTS {
                 return Err(Error::refused(format!(
@@ -216,7 +227,8 @@ impl Store {
             attempt += 1;
             let id = AgentThreadId::new(candidate)?;
             let worktree = worktree_path(data_dir, repository_name, &common_dir, &id);
-            if taken(&id.branch()) || worktree.exists() {
+            // A Discuss thread makes neither, so neither can be in its way.
+            if !discuss && (taken(&id.branch()) || worktree.exists()) {
                 continue;
             }
             // Creating the folder claims the id, even against another GitEZ
@@ -240,17 +252,21 @@ impl Store {
         let mut first = Turn::first(new.prompt, at);
         first.images = turn_images;
         let thread = AgentThread {
-            branch: id.branch(),
+            branch: (!discuss).then(|| id.branch()),
+            worktree: (!discuss).then_some(worktree),
+            work_dir: new.work_dir.filter(|_| discuss),
+            scratch: discuss.then(|| scratch_dirs(data_dir, &key, &id)),
+            origin: new.origin,
             id,
             title,
             agent: new.agent,
             model: new.model,
+            mode: new.mode,
             state: State::Queued,
             ending: None,
             created: at,
             updated: at,
             start: new.start,
-            worktree,
             prepared: false,
             network: new.network,
             secrets: new.secrets,
@@ -623,5 +639,12 @@ fn parse(path: &Path, text: &str) -> Result<AgentThread> {
             version,
         });
     }
-    serde_json::from_str(text).map_err(invalid)
+    let thread: AgentThread = serde_json::from_str(text).map_err(invalid)?;
+    if let Some(problem) = thread.inconsistency() {
+        return Err(Error::Invalid {
+            path: path.to_owned(),
+            source: serde::de::Error::custom(problem),
+        });
+    }
+    Ok(thread)
 }

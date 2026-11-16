@@ -326,9 +326,17 @@ fn e2e_final_answer_then_complete() {
         thread.state == State::Completed
     });
     report("completed", started, &completed);
-    assert!(!completed.worktree.exists(), "the worktree is gone");
+    assert!(
+        !crate::agent_threads::thread_worktree(&completed).exists(),
+        "the worktree is gone"
+    );
     let branch = std::process::Command::new("git")
-        .args(["rev-parse", "--verify", "--quiet", &completed.branch])
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            crate::agent_threads::thread_branch(&completed),
+        ])
         .current_dir(&real.work_dir)
         .status()
         .expect("git runs");
@@ -377,7 +385,10 @@ fn e2e_final_stop_then_retry() {
     report("stopped", started, &stopped);
     eprintln!("stopped {:.1?} after Stop", stopping.elapsed());
     assert_eq!(stopped.ending, Some(Ending::Stopped), "{stopped:#?}");
-    assert!(stopped.worktree.exists(), "kept for a retry");
+    assert!(
+        crate::agent_threads::thread_worktree(&stopped).exists(),
+        "kept for a retry"
+    );
     real.save("final-4-2-stopped");
     let retrying = Instant::now();
     real.shots.click_id(real.window, "thread-retry");

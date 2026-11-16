@@ -7,6 +7,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
 
+use gitez_agent_thread::Mode;
 use gitez_sandbox::NetworkProfile;
 use serde::{Deserialize, Serialize};
 
@@ -84,6 +85,9 @@ pub struct ThreadSettings {
     /// At most this many agents run at once, across all repositories.
     /// Default [`DEFAULT_MAX_RUNNING`].
     pub max_running: u32,
+    /// The mode of the thread started last, which the composer starts
+    /// with. Default: Implement.
+    pub last_mode: Mode,
 }
 
 /// What the sandbox of an agent thread allows.
@@ -169,6 +173,7 @@ impl Default for ThreadSettings {
     fn default() -> Self {
         Self {
             max_running: DEFAULT_MAX_RUNNING,
+            last_mode: Mode::default(),
         }
     }
 }
@@ -436,6 +441,7 @@ mod tests {
     fn customised() -> Settings {
         let mut settings = Settings::default();
         settings.threads.max_running = 5;
+        settings.threads.last_mode = Mode::Discuss;
         settings.sandbox.default_network = NetworkProfile::Packages;
         settings.sandbox.package_hosts = vec!["crates.io".to_owned()];
         settings.sandbox.hidden_paths = vec!["~/.ssh".to_owned()];
@@ -465,6 +471,7 @@ mod tests {
     fn defaults() {
         let settings = Settings::default();
         assert_eq!(settings.threads.max_running, 3);
+        assert_eq!(settings.threads.last_mode, Mode::Implement);
         assert_eq!(settings.sandbox.default_network, NetworkProfile::AgentOnly);
         assert_eq!(
             settings.sandbox.package_hosts,
@@ -556,6 +563,7 @@ mod tests {
         assert!(text.starts_with("{\n  \"version\": 1,"), "{text}");
         let json: serde_json::Value = serde_json::from_str(&text).expect("json");
         assert_eq!(json["threads"]["max_running"], 5);
+        assert_eq!(json["threads"]["last_mode"], "discuss");
         assert_eq!(json["sandbox"]["default_network"], "packages");
         assert_eq!(json["sandbox"]["writable_paths"][0], "~/.gradle/caches");
         assert_eq!(json["secrets"][0]["scope"], "all");

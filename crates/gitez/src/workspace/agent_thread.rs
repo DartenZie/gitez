@@ -11,7 +11,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gitez_agent::{AgentEvent, BlockedHosts, Registry};
-use gitez_agent_thread::{AgentThread, Ending, State, Store, Timestamp, TurnImage, TurnKind};
+use gitez_agent_thread::{
+    AgentThread, BRIEF_PROMPT, Ending, Mode, State, Store, Timestamp, TurnImage, TurnKind,
+};
 use gitez_git::{DiffOptions, Oid};
 use gitez_sandbox::NetworkProfile;
 use gpui_kit::assets::IconName;
@@ -25,7 +27,7 @@ use gpui_kit::*;
 
 use super::labels;
 use super::prompt_images::{self, Accepts, PromptImages};
-use crate::agent_threads::{AgentThreadKey, AgentThreads, AgentThreadsEvent};
+use crate::agent_threads::{AgentThreadKey, AgentThreads, AgentThreadsEvent, OpenAgentThread};
 use crate::motion;
 use crate::theme::{self, color};
 use activity::{Entry, Planned, Row, TurnEvents};
@@ -51,6 +53,21 @@ pub enum ThreadViewEvent {
     OpenRepository {
         work_dir: PathBuf,
     },
+    /// "Implement…": open the composer with the brief a Discuss thread
+    /// wrote, to start an Implement thread from it.
+    Implement(Handoff),
+}
+
+/// What a Discuss thread hands to the composer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Handoff {
+    /// The Discuss thread.
+    pub origin: AgentThreadKey,
+    pub title: SharedString,
+    /// The first prompt of the Implement thread, for the user to edit.
+    pub brief: String,
+    /// The working tree the discussion read.
+    pub work_dir: Option<PathBuf>,
 }
 
 /// What the view is waiting for.
@@ -60,6 +77,17 @@ enum Busy {
     Completing,
     Replying,
     Retrying,
+    /// Asking a Discuss thread for its brief.
+    Briefing,
+}
+
+/// A brief "Implement…" asked for, awaited to open the composer with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AwaitedBrief {
+    /// The index its turn has in the thread.
+    turn: usize,
+    /// Whether the turn was added (the request did not fail).
+    asked: bool,
 }
 
 /// The thumbnail of an image a turn sent, by its file name.
@@ -141,6 +169,8 @@ pub struct ThreadView {
     /// The `updated` time of the thread last seen.
     seen: Option<Timestamp>,
     busy: Option<(Busy, Task<()>)>,
+    /// Set from "Implement…" until the brief arrives or fails.
+    awaited_brief: Option<AwaitedBrief>,
     scroll: ScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -205,6 +235,7 @@ impl ThreadView {
             _details_task: None,
             seen: None,
             busy: None,
+            awaited_brief: None,
             scroll: ScrollHandle::new(),
             _subscriptions: subscriptions,
         };
@@ -241,7 +272,83 @@ impl ThreadView {
                 self.read_details(&thread, cx);
             }
         }
+        self.brief_arrived(&thread, cx);
         cx.notify();
+    }
+
+    /// Hands the brief "Implement…" asked for to the composer, once its
+    /// turn has ended; forgets it when the turn failed or never started.
+    fn brief_arrived(&mut self, thread: &AgentThread, cx: &mut Context<Self>) {
+        let Some(awaited) = self.awaited_brief else {
+            return;
+        };
+        if thread.state.is_active() {
+            return;
+        }
+        match thread.turns.get(awaited.turn) {
+            Some(turn) if turn.kind == TurnKind::Brief => {
+                self.awaited_brief = None;
+                if let Some(handoff) = self.handoff(thread, cx) {
+                    cx.emit(ThreadViewEvent::Implement(handoff));
+                }
+            }
+            Some(_) => self.awaited_brief = None,
+            // The model has not read the new turn yet, unless it was
+            // never added.
+            None if !awaited.asked && self.busy.is_none() => self.awaited_brief = None,
+            None => {}
+        }
+    }
+
+    /// What the composer gets from `thread`, a Discuss thread whose last
+    /// turn is a brief.
+    fn handoff(&self, thread: &AgentThread, _cx: &App) -> Option<Handoff> {
+        let brief = thread.brief()?.trim().to_owned();
+        Some(Handoff {
+            origin: self.key.clone(),
+            title: thread.title.clone().into(),
+            brief,
+            work_dir: thread.work_dir.clone(),
+        })
+    }
+
+    /// "Implement…": opens the composer with the thread's brief; asks the
+    /// agent for one first unless its last answer is one.
+    fn implement(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread) = self.thread(cx) else {
+            return;
+        };
+        if !can_implement(&thread) || self.busy.is_some() {
+            return;
+        }
+        if let Some(handoff) = self.handoff(&thread, cx) {
+            cx.emit(ThreadViewEvent::Implement(handoff));
+            return;
+        }
+        self.activity_open = None;
+        self.awaited_brief = Some(AwaitedBrief {
+            turn: thread.turns.len(),
+            asked: false,
+        });
+        self.run(
+            Busy::Briefing,
+            window,
+            cx,
+            |model, key, cx| {
+                model.reply(
+                    key,
+                    TurnKind::Brief,
+                    BRIEF_PROMPT.to_owned(),
+                    Vec::new(),
+                    cx,
+                )
+            },
+            |this, _, _| {
+                if let Some(awaited) = &mut this.awaited_brief {
+                    awaited.asked = true;
+                }
+            },
+        );
     }
 
     /// Makes thumbnails of the turns' images not read yet, in the
@@ -518,7 +625,7 @@ impl ThreadView {
         // A deleted branch is read where it was deleted.
         let branch = match &thread.deleted_branch {
             Some(deleted) => deleted.commit.clone(),
-            None => format!("refs/heads/{}", thread.branch),
+            None => format!("refs/heads/{}", thread.branch_name()),
         };
         let number = thread.pull_request;
         let common_dir = self.key.common_dir.clone();
@@ -762,6 +869,12 @@ fn completion_note(thread: &AgentThread, worktree_present: bool) -> String {
 /// Whether a reply can continue `thread`'s conversation now.
 fn can_reply(thread: &AgentThread) -> bool {
     thread.state == State::Finished && thread.session_id.is_some()
+}
+
+/// Whether "Implement…" is offered: a Discuss thread whose conversation
+/// can go on, so the agent can write the brief.
+fn can_implement(thread: &AgentThread) -> bool {
+    thread.mode == Mode::Discuss && can_reply(thread)
 }
 
 /// Whether `thread` is finished without a pull request, so Complete is
@@ -1387,54 +1500,65 @@ impl ThreadView {
                     .into_any_element(),
             ));
         }
-        // A thread without a branch now (an answer, or a branch deleted
-        // when it was completed) shows where it started.
-        if thread.ending == Some(Ending::Answer) || thread.deleted_branch.is_some() {
-            rows = rows.child(row(
-                "Started from",
-                from(div().h_flex().gap(px(6.)).min_w_0()).into_any_element(),
-            ));
-        } else {
-            rows = rows.child(row(
-                "Branch",
-                from(
-                    div()
-                        .h_flex()
-                        .gap(px(6.))
-                        .min_w_0()
-                        .child(branch_chip(&thread.branch, false))
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_color(rgb(color::TEXT_MUTED))
-                                .child("from"),
-                        ),
-                )
-                .into_any_element(),
-            ));
+        // A thread without a branch now (a discussion, an answer, or a
+        // branch deleted when it was completed) shows where it started.
+        let branch = thread
+            .branch
+            .as_deref()
+            .filter(|_| thread.ending != Some(Ending::Answer) && thread.deleted_branch.is_none());
+        match branch {
+            None => {
+                rows = rows.child(row(
+                    "Started from",
+                    from(div().h_flex().gap(px(6.)).min_w_0()).into_any_element(),
+                ));
+            }
+            Some(branch) => {
+                rows = rows.child(row(
+                    "Branch",
+                    from(
+                        div()
+                            .h_flex()
+                            .gap(px(6.))
+                            .min_w_0()
+                            .child(branch_chip(branch, false))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_color(rgb(color::TEXT_MUTED))
+                                    .child("from"),
+                            ),
+                    )
+                    .into_any_element(),
+                ));
+            }
         }
+        let path = |dir: &std::path::Path| {
+            div()
+                .min_w_0()
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .font_family(mono.clone())
+                .text_size(px(11.5))
+                .text_color(rgb(color::TEXT_SECONDARY))
+                .child(crate::recent::display(dir))
+        };
         // Looked up with the thread in the background: never a disk read
         // while drawing.
         let present = self.model.read(cx).facts(&self.key).worktree_present;
-        if thread.state != State::Completed || present {
-            let worktree = thread.worktree.clone();
+        if let Some(worktree) = thread
+            .worktree
+            .clone()
+            .filter(|_| thread.state != State::Completed || present)
+        {
             rows = rows.child(row(
                 "Worktree",
                 div()
                     .h_flex()
                     .gap(px(4.))
                     .min_w_0()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .font_family(mono.clone())
-                            .text_size(px(11.5))
-                            .text_color(rgb(color::TEXT_SECONDARY))
-                            .child(crate::recent::display(&worktree)),
-                    )
+                    .child(path(&worktree))
                     .when(present, |this| {
                         this.child(
                             Button::new("thread-reveal-worktree")
@@ -1446,6 +1570,75 @@ impl ThreadView {
                         )
                     })
                     .into_any_element(),
+            ));
+        }
+        // A discussion reads the user's own working tree, and changes
+        // nothing in it.
+        if let Some(work_dir) = thread.work_dir.as_deref().filter(|_| !self.wide) {
+            rows = rows.child(row(
+                "Reads",
+                div()
+                    .debug_selector(|| "thread-working-tree".into())
+                    .h_flex()
+                    .gap(px(6.))
+                    .min_w_0()
+                    .child(path(work_dir))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(rgb(color::TEXT_MUTED))
+                            .child("read-only"),
+                    )
+                    .into_any_element(),
+            ));
+        }
+        let link = |id: &'static str, index: usize, thread: &AgentThread| {
+            let action = OpenAgentThread {
+                common_dir: self.key.common_dir.clone(),
+                id: thread.id.clone(),
+            };
+            div()
+                .h_flex()
+                .gap(px(8.))
+                .min_w_0()
+                .child(
+                    Button::new((id, index))
+                        .link()
+                        .label(thread.title.clone())
+                        .on_click(move |_, window, cx| {
+                            window.dispatch_action(Box::new(action.clone()), cx)
+                        }),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(rgb(color::TEXT_MUTED))
+                        .child(Look::of(thread).word()),
+                )
+        };
+        if let Some(origin) = &thread.origin {
+            let key = AgentThreadKey {
+                common_dir: self.key.common_dir.clone(),
+                id: origin.clone(),
+            };
+            let value = match self.model.read(cx).thread(&key) {
+                Some(discussion) => link("thread-origin", 0, discussion).into_any_element(),
+                // Its files are gone; its name is what is left.
+                None => div()
+                    .text_color(rgb(color::TEXT_MUTED))
+                    .child(origin.to_string())
+                    .into_any_element(),
+            };
+            rows = rows.child(row("Implements", value));
+        }
+        let implementations = self
+            .model
+            .read(cx)
+            .implementations(&self.key.common_dir, &thread.id);
+        for (index, implementation) in implementations.iter().enumerate() {
+            rows = rows.child(row(
+                if index == 0 { "Handed to" } else { "" },
+                link("thread-implementation", index, implementation).into_any_element(),
             ));
         }
         rows
@@ -1708,7 +1901,7 @@ impl ThreadView {
                             .flex_wrap()
                             .gap(px(6.))
                             .text_size(px(12.))
-                            .child(branch_chip(&thread.branch, true))
+                            .child(branch_chip(thread.branch_name(), true))
                             .child(
                                 Icon::new(IconName::ArrowRight)
                                     .size(px(12.))
@@ -2055,9 +2248,16 @@ impl ThreadView {
                 .py(px(6.))
                 .text_size(px(12.))
                 .text_color(rgb(color::TEXT_MUTED))
-                .child(Icon::new(IconName::RotateCcw).size(px(12.)))
+                .child(
+                    Icon::new(match kind {
+                        TurnKind::Brief => IconName::ArrowRight,
+                        _ => IconName::RotateCcw,
+                    })
+                    .size(px(12.)),
+                )
                 .child(match kind {
                     TurnKind::Resume => "Continued after the usage limit reset",
+                    TurnKind::Brief => "Asked for a brief to implement from",
                     _ => "Retried",
                 })
                 .into_any_element(),
@@ -2070,7 +2270,9 @@ impl ThreadView {
         }
         // The `# Title` line that named the thread is its title above.
         let message = thread.final_message_body()?.to_owned();
-        let what = if thread.ending == Some(Ending::Answer) {
+        let what = if thread.brief().is_some() {
+            "Brief"
+        } else if thread.ending == Some(Ending::Answer) {
             "Answer"
         } else {
             "Final message"
@@ -2260,7 +2462,7 @@ impl ThreadView {
                     .font_family(mono.clone())
                     .text_size(px(11.5))
                     .text_color(rgb(color::TEXT_SECONDARY))
-                    .child(crate::recent::display(&thread.worktree)),
+                    .child(thread.worktree_display().to_string()),
             );
         if let Some(uncommitted) = uncommitted {
             if !uncommitted.paths.is_empty() {
@@ -2353,16 +2555,17 @@ impl ThreadView {
                     .on_click(cx.listener(|this, _, window, cx| this.remove_worktree(window, cx))),
             );
         }
-        let worktree = thread.worktree.clone();
-        buttons = buttons.child(
-            Button::new("thread-uncommitted-reveal")
-                .ghost()
-                .h(px(28.))
-                .compact()
-                .icon(Icon::new(IconName::FolderOpen).size(px(13.)))
-                .label("Show in Finder")
-                .on_click(move |_, _, cx| cx.reveal_path(&worktree)),
-        );
+        if let Some(worktree) = thread.worktree.clone() {
+            buttons = buttons.child(
+                Button::new("thread-uncommitted-reveal")
+                    .ghost()
+                    .h(px(28.))
+                    .compact()
+                    .icon(Icon::new(IconName::FolderOpen).size(px(13.)))
+                    .label("Show in Finder")
+                    .on_click(move |_, _, cx| cx.reveal_path(&worktree)),
+            );
+        }
         Some(card.child(buttons))
     }
 
@@ -2423,23 +2626,37 @@ impl ThreadView {
         let accepts = self.accepts_images(thread, cx);
         let dropped = self.reply_images.downgrade();
         let accepts_drop = accepts.clone();
-        let (continues, highlight) = match thread.pull_request {
-            Some(number) => {
+        let implement = can_implement(thread);
+        let (continues, highlight) = match (thread.pull_request, thread.branch.as_deref()) {
+            (Some(number), Some(name)) => {
                 let prefix = "Continues on ";
-                let branch = prefix.len()..prefix.len() + thread.branch.len();
+                let branch = prefix.len()..prefix.len() + name.len();
                 let style = HighlightStyle {
-                    color: Some(rgb(theme::branch_color(&thread.branch)).into()),
+                    color: Some(rgb(theme::branch_color(name)).into()),
                     ..HighlightStyle::default()
                 };
                 (
-                    format!(
-                        "{prefix}{} · new commits update PR #{number}",
-                        thread.branch
-                    ),
+                    format!("{prefix}{name} · new commits update PR #{number}"),
                     Some((branch, style)),
                 )
             }
-            None => ("Continues in this thread’s worktree".to_owned(), None),
+            // The detail panel has room for a word or two beside the
+            // buttons.
+            _ if thread.mode == Mode::Discuss => (
+                if self.wide {
+                    "Continues the discussion · the agent changes nothing"
+                } else {
+                    "Changes nothing"
+                }
+                .to_owned(),
+                None,
+            ),
+            _ => ("Continues in this thread’s worktree".to_owned(), None),
+        };
+        let implement_tooltip = if thread.brief().is_some() {
+            "Opens the brief in the composer, to start an agent that implements it"
+        } else {
+            "Asks the agent for a brief of what you discussed, then opens it in the composer"
         };
         let continues = div()
             .flex_1()
@@ -2491,28 +2708,46 @@ impl ThreadView {
                                 .child(why)
                         }))
                         .child(
-                            div().h_flex().gap(px(10.)).child(continues).child(
-                                Button::new("thread-send")
-                                    .debug_selector(|| "thread-send".into())
-                                    .primary()
-                                    .h(px(28.))
-                                    .label("Send")
-                                    .child(
-                                        div()
-                                            .h_flex()
-                                            .gap(px(2.))
-                                            .child(on_accent(labels::key_cap(
-                                                labels::SECONDARY_KEY,
-                                                cx,
-                                            )))
-                                            .child(on_accent(labels::key_cap("↵", cx))),
+                            div()
+                                .h_flex()
+                                .gap(px(10.))
+                                .child(continues)
+                                .when(implement, |this| {
+                                    this.child(
+                                        Button::new("thread-implement")
+                                            .debug_selector(|| "thread-implement".into())
+                                            .h(px(28.))
+                                            .label("Implement…")
+                                            .tooltip(implement_tooltip)
+                                            .loading(busy == Some(Busy::Briefing))
+                                            .disabled(busy.is_some())
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.implement(window, cx)
+                                            })),
                                     )
-                                    .loading(busy == Some(Busy::Replying))
-                                    .disabled(empty || blocked.is_some() || busy.is_some())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.send_reply(window, cx)
-                                    })),
-                            ),
+                                })
+                                .child(
+                                    Button::new("thread-send")
+                                        .debug_selector(|| "thread-send".into())
+                                        .primary()
+                                        .h(px(28.))
+                                        .label("Send")
+                                        .child(
+                                            div()
+                                                .h_flex()
+                                                .gap(px(2.))
+                                                .child(on_accent(labels::key_cap(
+                                                    labels::SECONDARY_KEY,
+                                                    cx,
+                                                )))
+                                                .child(on_accent(labels::key_cap("↵", cx))),
+                                        )
+                                        .loading(busy == Some(Busy::Replying))
+                                        .disabled(empty || blocked.is_some() || busy.is_some())
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.send_reply(window, cx)
+                                        })),
+                                ),
                         ),
                 ),
             ),
@@ -2646,13 +2881,13 @@ mod tests {
     use std::sync::Arc;
 
     use gitez_agent_thread::{
-        AgentThread, AgentThreadId, Ending, Failure, NewAgentThread, RunHeader, Start, State, Step,
-        Store, Timestamp, TurnKind, TurnResult,
+        AgentThread, AgentThreadId, BRIEF_PROMPT, Ending, Failure, Mode, NewAgentThread, RunHeader,
+        Start, State, Step, Store, Timestamp, TurnKind, TurnResult,
     };
     use gitez_sandbox::NetworkProfile;
     use gpui_kit::{Entity, TestAppContext, VisualTestContext, px, size};
 
-    use super::{Entry, ThreadView, duration};
+    use super::{AwaitedBrief, Entry, Handoff, ThreadView, ThreadViewEvent, duration};
     use crate::agent_threads::{AgentThreadKey, Options, init_with};
 
     fn git(dir: &Path, args: &[&str]) {
@@ -2691,6 +2926,30 @@ mod tests {
         transcript: &[&str],
         finish: impl FnOnce(&mut AgentThread),
     ) -> (tempfile::TempDir, PathBuf, AgentThreadId) {
+        repository_in_mode(Mode::Implement, prompt, transcript, finish)
+    }
+
+    /// A repository with one Discuss thread, finished by `finish`.
+    fn repository_with_discussion(
+        finish: impl FnOnce(&mut AgentThread),
+    ) -> (tempfile::TempDir, PathBuf, AgentThreadId) {
+        repository_in_mode(
+            Mode::Discuss,
+            "How should blame read renames?",
+            &[
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"a.txt"}}]}}"#,
+            ],
+            finish,
+        )
+    }
+
+    /// [`repository_with`] with a thread of `mode`.
+    fn repository_in_mode(
+        mode: Mode,
+        prompt: &str,
+        transcript: &[&str],
+        finish: impl FnOnce(&mut AgentThread),
+    ) -> (tempfile::TempDir, PathBuf, AgentThreadId) {
         let dir = tempfile::tempdir().expect("temp dir");
         let work_dir = dir.path().join("repo");
         std::fs::create_dir(&work_dir).expect("mkdir");
@@ -2720,6 +2979,9 @@ mod tests {
                     },
                     network: NetworkProfile::AgentOnly,
                     secrets: Vec::new(),
+                    mode,
+                    work_dir: (mode == Mode::Discuss).then(|| work_dir.clone()),
+                    origin: None,
                 },
                 &data_dir,
                 "repo",
@@ -2827,6 +3089,9 @@ mod tests {
         assert!(cx.debug_bounds("thread-final-message").is_some());
         assert!(cx.debug_bounds("thread-reply").is_some());
         assert!(cx.debug_bounds("thread-retry").is_none());
+        // Only a discussion is handed over to an Implement thread.
+        assert!(cx.debug_bounds("thread-implement").is_none());
+        assert!(cx.debug_bounds("thread-working-tree").is_none());
         // The activity opens on a click and reads the transcript.
         view.update(&mut cx, |view, cx| view.toggle_activity(cx));
         cx.run_until_parked();
@@ -2840,6 +3105,151 @@ mod tests {
                 }]
             );
         });
+    }
+
+    /// A finished Discuss thread: the working tree it reads instead of a
+    /// branch and a worktree, a reply box, and "Implement…".
+    #[gpui_kit::test]
+    fn a_discussion_shows_what_it_reads_and_offers_implement(cx: &mut TestAppContext) {
+        let (dir, common_dir, id) = repository_with_discussion(|thread| {
+            thread.state = State::Finished;
+            thread.ending = Some(Ending::Answer);
+            thread.session_id = Some("session".into());
+            thread.turns[0].result = Some(result("Follow the rename in the diff.", true));
+        });
+        let thread = Store::new(&common_dir).load(&id).expect("load");
+        assert_eq!(
+            (thread.branch.as_deref(), thread.worktree.as_deref()),
+            (None, None)
+        );
+        let key = AgentThreadKey { common_dir, id };
+        let (view, mut cx) = open(dir.path(), key, cx);
+        assert!(cx.debug_bounds("thread-working-tree").is_some());
+        assert!(cx.debug_bounds("thread-implement").is_some());
+        assert!(cx.debug_bounds("thread-reply").is_some());
+        assert!(cx.debug_bounds("thread-final-message").is_some());
+        // Nothing of a worktree: none was made.
+        assert!(cx.debug_bounds("thread-uncommitted").is_none());
+        view.read_with(&cx, |view, cx| {
+            let thread = view.thread(cx).expect("the thread is read");
+            assert!(super::can_implement(&thread));
+            assert_eq!(
+                crate::workspace::toolbar::agents::complete_tooltip(&thread),
+                "Ends the discussion. The thread stays readable; nothing in your working tree \
+                 changes."
+            );
+        });
+    }
+
+    /// A discussion the agent cannot continue (it never answered) is not
+    /// handed over: there is no one to write the brief.
+    #[gpui_kit::test]
+    fn a_failed_discussion_does_not_offer_implement(cx: &mut TestAppContext) {
+        let (dir, common_dir, id) = repository_with_discussion(|thread| {
+            thread.state = State::Finished;
+            thread.ending = Some(Ending::Failed);
+        });
+        let key = AgentThreadKey { common_dir, id };
+        let (_view, mut cx) = open(dir.path(), key, cx);
+        assert!(cx.debug_bounds("thread-implement").is_none());
+        assert!(cx.debug_bounds("thread-working-tree").is_some());
+    }
+
+    /// The events `view` emits from now on.
+    fn handoffs(
+        view: &Entity<ThreadView>,
+        cx: &mut VisualTestContext,
+    ) -> Arc<std::sync::Mutex<Vec<Handoff>>> {
+        let seen: Arc<std::sync::Mutex<Vec<Handoff>>> = Arc::default();
+        cx.update(|_, cx| {
+            let seen = seen.clone();
+            cx.subscribe(view, move |_, event: &ThreadViewEvent, _| {
+                if let ThreadViewEvent::Implement(handoff) = event {
+                    seen.lock().expect("lock").push(handoff.clone());
+                }
+            })
+            .detach();
+        });
+        seen
+    }
+
+    /// "Implement…" asks the agent for a brief in a turn of its own; when
+    /// the turn ends, the brief goes to the composer with the discussion
+    /// it came from.
+    #[gpui_kit::test]
+    fn implement_asks_for_a_brief_and_hands_it_over(cx: &mut TestAppContext) {
+        let (dir, common_dir, id) = repository_with_discussion(|thread| {
+            thread.state = State::Finished;
+            thread.ending = Some(Ending::Answer);
+            thread.session_id = Some("session".into());
+            thread.turns[0].result = Some(result("Follow the rename in the diff.", true));
+        });
+        let key = AgentThreadKey {
+            common_dir: common_dir.clone(),
+            id: id.clone(),
+        };
+        let (view, mut cx) = open_in_root(dir.path(), key.clone(), cx);
+        let seen = handoffs(&view, &mut cx);
+        view.update_in(&mut cx, |view, window, cx| view.implement(window, cx));
+        view.read_with(&cx, |view, _| {
+            assert_eq!(
+                view.awaited_brief,
+                Some(AwaitedBrief {
+                    turn: 1,
+                    asked: false
+                })
+            );
+        });
+        cx.run_until_parked();
+        // The turn is recorded. Tests have no supervisor to launch, so it
+        // fails at that step, and nothing is handed over.
+        let store = Store::new(&common_dir);
+        let thread = store.load(&id).expect("load");
+        let [_, brief] = &thread.turns[..] else {
+            panic!("two turns, got {}", thread.turns.len());
+        };
+        assert_eq!(brief.kind, TurnKind::Brief);
+        assert_eq!(brief.prompt, BRIEF_PROMPT);
+        assert_eq!(thread.ending, Some(Ending::Failed));
+        assert!(seen.lock().expect("lock").is_empty());
+
+        // As the supervisor leaves it when the agent has answered.
+        let answered = store
+            .update(&id, |thread| {
+                thread.state = State::Finished;
+                thread.ending = Some(Ending::Answer);
+                thread.turns[1].result = Some(result(
+                    "# Follow renames in blame\n\nRead the rename from the diff of each commit.\n",
+                    true,
+                ));
+                Ok(thread.clone())
+            })
+            .expect("update");
+        view.update(&mut cx, |view, cx| {
+            view.model.update(cx, |model, _| {
+                model.replace_threads(&common_dir, vec![Arc::new(answered)])
+            });
+            view.awaited_brief = Some(AwaitedBrief {
+                turn: 1,
+                asked: true,
+            });
+            view.thread_changed(cx);
+            assert_eq!(view.awaited_brief, None);
+        });
+        let expected = Handoff {
+            origin: key,
+            title: "How should blame read renames?".into(),
+            brief: "# Follow renames in blame\n\nRead the rename from the diff of each commit."
+                .into(),
+            work_dir: Some(dir.path().join("repo")),
+        };
+        assert_eq!(*seen.lock().expect("lock"), std::slice::from_ref(&expected));
+        // With the brief as the last answer, "Implement…" opens it again
+        // without asking the agent.
+        view.update_in(&mut cx, |view, window, cx| view.implement(window, cx));
+        cx.run_until_parked();
+        assert_eq!(*seen.lock().expect("lock"), [expected.clone(), expected]);
+        assert_eq!(store.load(&id).expect("load").turns.len(), 2);
     }
 
     #[gpui_kit::test]
@@ -2893,12 +3303,16 @@ mod tests {
         let made = Store::new(&common_dir).load(&id).expect("load");
         gitez_agent_thread::create_worktree(
             &dir.path().join("repo"),
-            &made.worktree,
-            &made.branch,
+            crate::agent_threads::thread_worktree(&made),
+            crate::agent_threads::thread_branch(&made),
             &made.start.commit,
         )
         .expect("worktree");
-        std::fs::write(made.worktree.join("draft.md"), "a draft\n").expect("write");
+        std::fs::write(
+            crate::agent_threads::thread_worktree(&made).join("draft.md"),
+            "a draft\n",
+        )
+        .expect("write");
         let key = AgentThreadKey { common_dir, id };
         let (view, mut cx) = open(dir.path(), key, cx);
         assert!(cx.debug_bounds("thread-uncommitted").is_some());
@@ -2915,7 +3329,11 @@ mod tests {
         assert!(cx.debug_bounds("thread-complete").is_some());
         // Clicking Complete asks first: `e2e_c1_uncommitted_keep_then_remove`
         // (it needs gpui-kit's Root for the dialog).
-        assert!(made.worktree.join("draft.md").exists());
+        assert!(
+            crate::agent_threads::thread_worktree(&made)
+                .join("draft.md")
+                .exists()
+        );
     }
 
     /// Stream-JSON lines of a transcript: `("text", words)` for what the
@@ -2988,12 +3406,24 @@ mod tests {
         finish: impl FnOnce(&mut AgentThread),
         then: impl FnOnce(&mut crate::screenshot::Shots, gpui_kit::AnyWindowHandle),
     ) {
+        shoot_in_mode(Mode::Implement, PROMPT, name, pull_request, finish, then);
+    }
+
+    /// [`shoot_then`] with a thread of `mode` started with `prompt`.
+    fn shoot_in_mode(
+        mode: Mode,
+        prompt: &str,
+        name: &str,
+        pull_request: bool,
+        finish: impl FnOnce(&mut AgentThread),
+        then: impl FnOnce(&mut crate::screenshot::Shots, gpui_kit::AnyWindowHandle),
+    ) {
         if !crate::screenshot::enabled() {
             return;
         }
         let lines = transcript(STEPS);
         let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
-        let (dir, common_dir, id) = repository_with(PROMPT, &lines, finish);
+        let (dir, common_dir, id) = repository_in_mode(mode, prompt, &lines, finish);
         let work_dir = dir.path().join("repo");
         git(&work_dir, &["config", "user.name", "Ada Lovelace"]);
         if pull_request {
@@ -3011,16 +3441,28 @@ mod tests {
         let store = Store::new(&common_dir);
         let thread = store.load(&id).expect("the thread is read");
         // A real worktree, as the supervisor makes it: a bare folder would
-        // rightly be shown as one GitEZ no longer trusts.
-        if thread.state != State::Completed {
+        // rightly be shown as one GitEZ no longer trusts. A discussion has
+        // none.
+        if thread.state != State::Completed && thread.own().is_some() {
             if pull_request {
-                let path = thread.worktree.to_str().expect("a UTF-8 path");
-                git(&work_dir, &["worktree", "add", "-q", path, &thread.branch]);
+                let path = crate::agent_threads::thread_worktree(&thread)
+                    .to_str()
+                    .expect("a UTF-8 path");
+                git(
+                    &work_dir,
+                    &[
+                        "worktree",
+                        "add",
+                        "-q",
+                        path,
+                        crate::agent_threads::thread_branch(&thread),
+                    ],
+                );
             } else {
                 gitez_agent_thread::create_worktree(
                     &work_dir,
-                    &thread.worktree,
-                    &thread.branch,
+                    crate::agent_threads::thread_worktree(&thread),
+                    crate::agent_threads::thread_branch(&thread),
                     &thread.start.commit,
                 )
                 .expect("worktree");
@@ -3163,8 +3605,8 @@ mod tests {
             .expect("the thread is read");
         gitez_agent_thread::create_worktree(
             &work_dir,
-            &thread.worktree,
-            &thread.branch,
+            crate::agent_threads::thread_worktree(&thread),
+            crate::agent_threads::thread_branch(&thread),
             &thread.start.commit,
         )
         .expect("worktree");
@@ -3291,8 +3733,8 @@ mod tests {
         let thread = store.load(&id).expect("the thread is read");
         gitez_agent_thread::create_worktree(
             &work_dir,
-            &thread.worktree,
-            &thread.branch,
+            crate::agent_threads::thread_worktree(&thread),
+            crate::agent_threads::thread_branch(&thread),
             &thread.start.commit,
         )
         .expect("worktree");
@@ -3340,6 +3782,87 @@ mod tests {
             done.steps = 9;
             turn.result = Some(done);
         });
+    }
+
+    const DISCUSSION: &str = "How should blame follow a file that was renamed? I want to \
+        keep it fast on big files.";
+
+    const DISCUSSED: &str = "Blame can follow a rename without a second pass.\n\n\
+        - gix reports renames in each commit’s diff; `blame.rs` would carry the old path \
+        back with the lines it is still looking for.\n\
+        - The cost is one diff per commit that touches the file, which the view already \
+        pays.\n\n\
+        I changed nothing. Use **Implement…** when you want this built.";
+
+    const BRIEF: &str = "# Follow renames in blame\n\n\
+        **Goal.** `blame` in gitez-git follows a file across renames.\n\n\
+        **Agreed.** Take the rename from each commit’s diff; no second pass over the \
+        history.\n\n\
+        **Look at.** `crates/gitez-git/src/blame.rs`, `tests/blame.rs`.\n\n\
+        **Verify.** A test with a file renamed twice.\n\n\
+        **Out of scope.** Copies, and the view.";
+
+    /// A Discuss thread that answered: what it reads instead of a branch
+    /// and a worktree, and "Implement…" beside Send.
+    #[test]
+    fn screenshot_thread_discussion() {
+        shoot_in_mode(
+            Mode::Discuss,
+            DISCUSSION,
+            "discussion",
+            false,
+            |thread| {
+                thread.state = State::Finished;
+                thread.ending = Some(Ending::Answer);
+                thread.session_id = Some("session".into());
+                let turn = &mut thread.turns[0];
+                turn.started = Some(minutes_ago(12));
+                turn.ended = Some(minutes_ago(10));
+                let mut done = result(DISCUSSED, true);
+                done.steps = 9;
+                turn.result = Some(done);
+            },
+            |_, _| {},
+        );
+    }
+
+    /// A Discuss thread whose last answer is its brief, and the composer
+    /// "Implement…" opens with it.
+    #[test]
+    fn screenshot_thread_discussion_brief() {
+        shoot_in_mode(
+            Mode::Discuss,
+            DISCUSSION,
+            "discussion-brief",
+            false,
+            |thread| {
+                thread.state = State::Finished;
+                thread.ending = Some(Ending::Answer);
+                thread.session_id = Some("session".into());
+                let turn = &mut thread.turns[0];
+                turn.started = Some(minutes_ago(12));
+                turn.ended = Some(minutes_ago(10));
+                turn.result = Some(result(DISCUSSED, true));
+                thread
+                    .request_turn(TurnKind::Brief, BRIEF_PROMPT.into(), minutes_ago(3))
+                    .expect("a brief can be asked for");
+                thread.state = State::Finished;
+                thread.ending = Some(Ending::Answer);
+                let turn = &mut thread.turns[1];
+                turn.started = Some(minutes_ago(3));
+                turn.ended = Some(minutes_ago(2));
+                turn.result = Some(result(BRIEF, true));
+            },
+            |shots, window| {
+                shots.click_id(window, "thread-implement");
+                assert!(shots.has_id(window, "composer-send"), "the composer opens");
+                assert!(
+                    shots.has_id(window, "composer-origin-remove"),
+                    "the brief names its discussion"
+                );
+                shots.save(window, "thread-discussion-handoff");
+            },
+        );
     }
 
     #[test]

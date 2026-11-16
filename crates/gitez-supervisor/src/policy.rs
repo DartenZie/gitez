@@ -19,20 +19,47 @@ pub(crate) const ENV_REMOVE: [&str; 5] = [
     "GIT_OBJECT_DIRECTORY",
 ];
 
+/// The working tree a thread's commands run in.
+#[derive(Debug, Clone)]
+pub(crate) enum Work {
+    /// An Implement thread's own linked worktree and branch, which it
+    /// writes.
+    Own {
+        worktree: PathBuf,
+        /// The linked worktree's own git dir, `<common>/worktrees/<name>`.
+        worktree_git_dir: PathBuf,
+        branch: String,
+    },
+    /// A Discuss thread: the user's working tree, which it only reads.
+    ReadOnly { work_dir: PathBuf },
+}
+
 /// Where a thread works.
 #[derive(Debug, Clone)]
 pub(crate) struct Place {
     pub(crate) common_dir: PathBuf,
-    pub(crate) worktree: PathBuf,
-    /// The linked worktree's own git dir, `<common>/worktrees/<name>`.
-    pub(crate) worktree_git_dir: PathBuf,
-    pub(crate) branch: String,
+    pub(crate) work: Work,
     /// `<data>/tmp/<repo key>-<id>`, the commands' `TMPDIR`.
     pub(crate) tmp_dir: PathBuf,
     /// `<data>/caches/<repo key>-<id>`, the thread's own toolchain caches
     /// (see `toolchains`).
     pub(crate) caches_dir: PathBuf,
     pub(crate) data_dir: PathBuf,
+}
+
+impl Place {
+    /// The folder its commands run in.
+    pub(crate) fn dir(&self) -> &Path {
+        match &self.work {
+            Work::Own { worktree, .. } => worktree,
+            Work::ReadOnly { work_dir } => work_dir,
+        }
+    }
+
+    /// Whether the thread only reads its working tree (a Discuss thread).
+    pub(crate) fn read_only(&self) -> bool {
+        matches!(self.work, Work::ReadOnly { .. })
+    }
 }
 
 /// The policy for a command of the thread at `place`: it may write its
@@ -54,6 +81,11 @@ pub(crate) struct Place {
 /// moved, replaced or hard linked, and blocks moving the folders above
 /// them, the worktree folder included.
 ///
+/// A Discuss thread ([`Work::ReadOnly`]) may write only its temporary
+/// folder, its caches and what the agent needs: nothing in the working
+/// tree it reads, nothing in the repository's git dir, and not the folders
+/// made writable in Settings.
+///
 /// A writable path whose own name is a symbolic link is left out and
 /// returned: the sandbox would follow it, and whoever could write the
 /// folder it is in (an earlier run of the agent, for a folder such as its
@@ -66,23 +98,40 @@ pub(crate) fn policy(
     profile: Option<NetworkProfile>,
 ) -> (Policy, Vec<PathBuf>) {
     let common = real(&place.common_dir);
-    let worktree = real(&place.worktree);
-    let git_dir = real(&place.worktree_git_dir);
-    let branch_ref = Path::new("refs/heads").join(&place.branch);
-    let mut write = vec![
-        WritePath::Tree(worktree.clone()),
-        WritePath::Tree(common.join("objects")),
-        WritePath::Tree(git_dir.clone()),
-        WritePath::File(real(&common.join(&branch_ref))),
-        WritePath::File(real(&common.join(format!("{}.lock", branch_ref.display())))),
-        WritePath::File(real(&common.join("logs").join(&branch_ref))),
-        // git locks packed-refs during a commit and reports an error the
-        // agent could take for a failure when it cannot; packed-refs itself
-        // stays read-only.
-        WritePath::File(common.join("packed-refs.lock")),
+    let data = real(&place.data_dir);
+    let mut write = Vec::new();
+    let mut deny_write = Vec::new();
+    match &place.work {
+        Work::Own {
+            worktree,
+            worktree_git_dir,
+            branch,
+        } => {
+            let worktree = real(worktree);
+            let git_dir = real(worktree_git_dir);
+            let branch_ref = Path::new("refs/heads").join(branch);
+            write.extend([
+                WritePath::Tree(worktree.clone()),
+                WritePath::Tree(common.join("objects")),
+                WritePath::Tree(git_dir.clone()),
+                WritePath::File(real(&common.join(&branch_ref))),
+                WritePath::File(real(&common.join(format!("{}.lock", branch_ref.display())))),
+                WritePath::File(real(&common.join("logs").join(&branch_ref))),
+                // git locks packed-refs during a commit and reports an error
+                // the agent could take for a failure when it cannot;
+                // packed-refs itself stays read-only.
+                WritePath::File(common.join("packed-refs.lock")),
+            ]);
+            deny_write.push(worktree.join(".git"));
+            deny_write.extend(GIT_DIR_POINTERS.iter().map(|name| git_dir.join(name)));
+        }
+        // Nothing of the working tree or of the git dir is on the list.
+        Work::ReadOnly { .. } => {}
+    }
+    write.extend([
         WritePath::Tree(real(&place.tmp_dir)),
         WritePath::Tree(real(&place.caches_dir)),
-    ];
+    ]);
     write.extend(
         needs
             .write_dirs
@@ -95,16 +144,17 @@ pub(crate) fn policy(
             .iter()
             .map(|file| WritePath::File(real(file))),
     );
-    write.extend(
-        settings
-            .writable_paths()
-            .iter()
-            .map(|path| WritePath::Tree(real(path))),
-    );
+    if !place.read_only() {
+        write.extend(
+            settings
+                .writable_paths()
+                .iter()
+                .map(|path| WritePath::Tree(real(path))),
+        );
+    }
     let (write, refused): (Vec<WritePath>, Vec<WritePath>) =
         write.into_iter().partition(|write| !is_link(write.path()));
-    let data = real(&place.data_dir);
-    let mut deny_write = vec![
+    deny_write.extend([
         common.join("hooks"),
         common.join("config"),
         common.join("gitez"),
@@ -112,11 +162,9 @@ pub(crate) fn policy(
         common.join("objects/info/http-alternates"),
         common.join("objects/info/commit-graph"),
         common.join("objects/info/commit-graphs"),
-        worktree.join(".git"),
         data.join("settings.json"),
         data.join("threads.json"),
-    ];
-    deny_write.extend(GIT_DIR_POINTERS.iter().map(|name| git_dir.join(name)));
+    ]);
     let policy = Policy {
         write,
         deny_write,
@@ -332,9 +380,11 @@ mod tests {
         std::fs::create_dir_all(common.join("refs/heads/agent")).expect("dirs");
         let place = Place {
             common_dir: common.clone(),
-            worktree: base.join("wt"),
-            worktree_git_dir: common.join("worktrees/wt"),
-            branch: "agent/x".to_owned(),
+            work: Work::Own {
+                worktree: base.join("wt"),
+                worktree_git_dir: common.join("worktrees/wt"),
+                branch: "agent/x".to_owned(),
+            },
             tmp_dir: base.join("data/tmp/repo-x"),
             caches_dir: base.join("data/caches/repo-x"),
             data_dir: base.join("data"),
@@ -342,7 +392,7 @@ mod tests {
         let needs = AgentNeeds {
             write_dirs: vec![base.join("config/projects/p")],
             write_files: vec![base.join("lock")],
-            hosts: Vec::new(),
+            ..AgentNeeds::default()
         };
         let mut settings = Settings::default();
         settings.sandbox.writable_paths = vec![base.join("gradle").to_string_lossy().into_owned()];
@@ -396,14 +446,84 @@ mod tests {
     }
 
     #[test]
+    fn a_discuss_thread_may_write_nothing_in_the_repository() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let base = dir.path().canonicalize().expect("canonical");
+        let work_dir = base.join("repo");
+        let common = work_dir.join(".git");
+        std::fs::create_dir_all(common.join("refs/heads")).expect("dirs");
+        let place = Place {
+            common_dir: common.clone(),
+            work: Work::ReadOnly {
+                work_dir: work_dir.clone(),
+            },
+            tmp_dir: base.join("data/tmp/repo-x"),
+            caches_dir: base.join("data/caches/repo-x"),
+            data_dir: base.join("data"),
+        };
+        assert!(place.read_only());
+        assert_eq!(place.dir(), work_dir);
+        let session = base.join("config/projects/p/6f1c.jsonl");
+        let needs = AgentNeeds {
+            write_dirs: vec![base.join("config/projects/p/6f1c")],
+            write_files: vec![session.clone()],
+            ..AgentNeeds::default()
+        };
+        let mut settings = Settings::default();
+        settings.sandbox.writable_paths = vec![base.join("extra").display().to_string()];
+        let (policy, refused) = policy(
+            &place,
+            &needs,
+            &settings,
+            Network::Hosts(Vec::new()),
+            Some(NetworkProfile::AgentOnly),
+        );
+        assert!(refused.is_empty());
+        // Its own scratch folders and the agent's conversation: all of it.
+        assert_eq!(
+            policy.write,
+            [
+                WritePath::Tree(base.join("data/tmp/repo-x")),
+                WritePath::Tree(base.join("data/caches/repo-x")),
+                WritePath::Tree(base.join("config/projects/p/6f1c")),
+                WritePath::File(session),
+            ]
+        );
+        for write in &policy.write {
+            assert!(
+                !write.path().starts_with(&work_dir) && !work_dir.starts_with(write.path()),
+                "{write:?} reaches the working tree"
+            );
+        }
+        // The folders of Settings are for threads that build in their own
+        // worktree.
+        assert!(
+            !policy
+                .write
+                .iter()
+                .any(|write| write.path() == base.join("extra"))
+        );
+        // GitEZ's own files stay denied, should a needed path ever hold
+        // them.
+        for denied in ["hooks", "config", "gitez"] {
+            assert!(policy.deny_write.contains(&common.join(denied)), "{denied}");
+        }
+        assert!(policy.deny_write.contains(&base.join("data/settings.json")));
+        assert!(policy.deny_write.contains(&base.join("data/threads.json")));
+        assert!(!policy.deny_read.is_empty(), "hidden paths stay hidden");
+    }
+
+    #[test]
     fn the_certificate_service_opens_with_the_package_hosts() {
         let dir = tempfile::tempdir().expect("temp dir");
         let base = dir.path().canonicalize().expect("canonical");
         let place = Place {
             common_dir: base.join("repo/.git"),
-            worktree: base.join("wt"),
-            worktree_git_dir: base.join("repo/.git/worktrees/wt"),
-            branch: "agent/x".to_owned(),
+            work: Work::Own {
+                worktree: base.join("wt"),
+                worktree_git_dir: base.join("repo/.git/worktrees/wt"),
+                branch: "agent/x".to_owned(),
+            },
             tmp_dir: base.join("data/tmp/repo-x"),
             caches_dir: base.join("data/caches/repo-x"),
             data_dir: base.join("data"),
@@ -440,9 +560,11 @@ mod tests {
         std::os::unix::fs::symlink(&home, &lock).expect("link");
         let place = Place {
             common_dir: base.join("repo/.git"),
-            worktree: base.join("wt"),
-            worktree_git_dir: base.join("repo/.git/worktrees/wt"),
-            branch: "agent/x".to_owned(),
+            work: Work::Own {
+                worktree: base.join("wt"),
+                worktree_git_dir: base.join("repo/.git/worktrees/wt"),
+                branch: "agent/x".to_owned(),
+            },
             tmp_dir: tmp.clone(),
             caches_dir: base.join("data/caches/repo-x"),
             data_dir: base.join("data"),

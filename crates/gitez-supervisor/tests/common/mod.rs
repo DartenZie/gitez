@@ -14,7 +14,9 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use gitez_agent::{ClaudeCode, Registry};
-use gitez_agent_thread::{AgentThread, AgentThreadId, NewAgentThread, Start, Store, Timestamp};
+use gitez_agent_thread::{
+    AgentThread, AgentThreadId, Mode, NewAgentThread, Start, Store, Timestamp,
+};
 use gitez_sandbox::Passthrough;
 use gitez_settings::{AgentEntry, Settings};
 use gitez_supervisor::{Command, Environment, Launch, Secrets};
@@ -98,6 +100,8 @@ case "$prompt" in
   *MOVE*)
     init; tool "git update-ref"; git update-ref refs/heads/other HEAD
     result "Moved another branch." ;;
+  *WHERE*)
+    init; result "cwd=$(pwd -P) locks=$GIT_OPTIONAL_LOCKS tmp=$TMPDIR" ;;
   *)
     init; result "The answer is 42." ;;
 esac
@@ -245,16 +249,35 @@ impl Fixture {
         secrets: &[&str],
         images: &[gitez_agent_thread::PreparedImage],
     ) -> AgentThread {
+        self.create_in(Mode::Implement, prompt, secrets, images)
+    }
+
+    /// A queued Discuss thread for `prompt`, which reads the repository's
+    /// own working tree.
+    pub fn discuss(&self, prompt: &str) -> AgentThread {
+        self.create_in(Mode::Discuss, prompt, &[], &[])
+    }
+
+    fn create_in(
+        &self,
+        mode: Mode,
+        prompt: &str,
+        secrets: &[&str],
+        images: &[gitez_agent_thread::PreparedImage],
+    ) -> AgentThread {
         self.store()
             .create_with_images(
                 NewAgentThread {
                     prompt: prompt.to_owned(),
                     agent: ClaudeCode::ID.to_owned(),
                     model: Some("haiku".to_owned()),
+                    mode,
                     start: Start {
                         branch: "main".to_owned(),
                         commit: self.head(),
                     },
+                    work_dir: (mode == Mode::Discuss).then(|| self.root.clone()),
+                    origin: None,
                     network: Default::default(),
                     secrets: secrets.iter().map(|name| (*name).to_owned()).collect(),
                 },
@@ -416,4 +439,20 @@ pub fn write_script(path: &Path, body: &str) {
 /// Whether a thread is no longer active.
 pub fn is_done(thread: &AgentThread) -> bool {
     !thread.state.is_active()
+}
+
+/// An Implement thread's worktree.
+pub fn worktree_of(thread: &AgentThread) -> &Path {
+    thread
+        .worktree
+        .as_deref()
+        .expect("an Implement thread has a worktree")
+}
+
+/// An Implement thread's branch.
+pub fn branch_of(thread: &AgentThread) -> &str {
+    thread
+        .branch
+        .as_deref()
+        .expect("an Implement thread has a branch")
 }

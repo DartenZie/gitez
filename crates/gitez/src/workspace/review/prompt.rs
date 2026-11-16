@@ -494,7 +494,9 @@ impl Review {
             panel._check_worktree = cx.spawn(async move |this, cx| {
                 let gone = cx
                     .background_executor()
-                    .spawn(async move { std::fs::symlink_metadata(&worktree).is_err() })
+                    .spawn(async move {
+                        worktree.is_some_and(|dir| std::fs::symlink_metadata(dir).is_err())
+                    })
                     .await;
                 this.update(cx, |this, cx| {
                     if let Subject::PullRequest(subject) = &mut this.subject {
@@ -1103,7 +1105,7 @@ impl Review {
                         note(format!(
                             "The thread’s worktree folder is gone. Sending creates it again \
                              from {}.",
-                            thread.branch
+                            thread.branch_name()
                         ))
                         .text_color(rgb(color::ACCENT))
                         .into_any_element(),
@@ -1657,6 +1659,7 @@ fn start(
             prompt,
             images: &[],
             cwd: dir,
+            shared_folder: false,
             model,
             conversation: Conversation::New {
                 session_id: &session_id,

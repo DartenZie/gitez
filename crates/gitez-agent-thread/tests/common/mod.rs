@@ -7,7 +7,23 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use gitez_agent_thread::{NewAgentThread, Start, Store, Timestamp};
+use gitez_agent_thread::{AgentThread, Mode, NewAgentThread, Start, Store, Timestamp};
+
+/// An Implement thread's worktree.
+pub fn worktree_of(thread: &AgentThread) -> &Path {
+    thread
+        .worktree
+        .as_deref()
+        .expect("an Implement thread has a worktree")
+}
+
+/// An Implement thread's branch.
+pub fn branch_of(thread: &AgentThread) -> &str {
+    thread
+        .branch
+        .as_deref()
+        .expect("an Implement thread has a branch")
+}
 
 /// `git <args>` in `dir` with a fixed identity and no user or system
 /// config; returns its trimmed output.
@@ -98,13 +114,34 @@ impl Fixture {
             prompt: prompt.to_owned(),
             agent: "claude-code".to_owned(),
             model: Some("haiku".to_owned()),
+            mode: Mode::Implement,
             start: Start {
                 branch: "main".to_owned(),
                 commit: self.head(),
             },
+            work_dir: None,
+            origin: None,
             network: Default::default(),
             secrets: vec!["GITHUB_TOKEN".to_owned()],
         }
+    }
+
+    /// Creates a Discuss thread for `prompt`, which reads the repository's
+    /// own working tree. Every branch name counts as taken: a Discuss
+    /// thread needs none.
+    pub fn discuss(&self, prompt: &str) -> AgentThread {
+        let mut new = self.new_thread(prompt);
+        new.mode = Mode::Discuss;
+        new.work_dir = Some(self.root.clone());
+        self.store()
+            .create(
+                new,
+                &self.data_dir,
+                "my repo",
+                |_| true,
+                at("2026-11-13T09:41:07Z"),
+            )
+            .expect("create a Discuss thread")
     }
 
     /// Creates an agent thread for `prompt` in the store.

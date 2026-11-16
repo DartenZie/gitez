@@ -74,7 +74,14 @@ fn setup(base: &Path) -> (PathBuf, PathBuf, String) {
             });
         },
     );
-    git(&work_dir, &["branch", &running.branch, "main"]);
+    git(
+        &work_dir,
+        &[
+            "branch",
+            crate::agent_threads::thread_branch(&running),
+            "main",
+        ],
+    );
     let finished = thread(
         &work_dir,
         &data_dir,
@@ -87,7 +94,15 @@ fn setup(base: &Path) -> (PathBuf, PathBuf, String) {
             thread.ending = Some(Ending::Answer);
         },
     );
-    git(&work_dir, &["checkout", "-qb", &finished.branch, "main"]);
+    git(
+        &work_dir,
+        &[
+            "checkout",
+            "-qb",
+            crate::agent_threads::thread_branch(&finished),
+            "main",
+        ],
+    );
     std::fs::write(work_dir.join("paths.rs"), "fn windows_paths() {}\n").expect("write");
     git(&work_dir, &["add", "."]);
     git(
@@ -95,7 +110,16 @@ fn setup(base: &Path) -> (PathBuf, PathBuf, String) {
         &["commit", "-qm", "Accept verbatim and UNC paths"],
     );
     git(&work_dir, &["checkout", "-q", "main"]);
-    git(&work_dir, &["push", "-q", "-u", "origin", &finished.branch]);
+    git(
+        &work_dir,
+        &[
+            "push",
+            "-q",
+            "-u",
+            "origin",
+            crate::agent_threads::thread_branch(&finished),
+        ],
+    );
     gitez_agent_thread::Index::new(&data_dir)
         .add(IndexedRepository {
             common_dir,
@@ -103,7 +127,8 @@ fn setup(base: &Path) -> (PathBuf, PathBuf, String) {
             name: "repo".into(),
         })
         .expect("index");
-    (work_dir, data_dir, finished.branch)
+    let branch = crate::agent_threads::thread_branch(&finished).to_owned();
+    (work_dir, data_dir, branch)
 }
 
 fn show_running(

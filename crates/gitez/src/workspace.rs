@@ -72,7 +72,7 @@ use crate::motion;
 use crate::repository::Snapshot;
 use crate::theme::{self, color};
 use crate::undo::{Direction, UndoLog};
-use agent_thread::{ThreadView, ThreadViewEvent};
+use agent_thread::{Handoff, ThreadView, ThreadViewEvent};
 use branch::BranchForm;
 use changes::{ChangesEvent, ChangesPanel, LastCommit};
 use cherry_pick::{CherryPick, CherryPickEvent};
@@ -1976,6 +1976,9 @@ impl Workspace {
                 ThreadViewEvent::OpenRepository { work_dir } => {
                     this.open(work_dir.clone(), window, cx)
                 }
+                ThreadViewEvent::Implement(handoff) => {
+                    this.implement_from(handoff.clone(), window, cx)
+                }
             });
         let selected = self.selected(cx);
         self.agent_thread = Some((thread, subscription, selected));
@@ -2101,6 +2104,27 @@ impl Workspace {
 
     /// Starts the agent thread the composer asks for, then shows it. If it
     /// cannot start, the composer opens again with the prompt.
+    /// "Implement…" in a Discuss thread: opens the composer with the
+    /// thread's brief, to start an Implement thread from it.
+    fn implement_from(&mut self, handoff: Handoff, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(composer) = self.history.read(cx).composer().cloned() else {
+            return;
+        };
+        if self.conflicts.is_some() || self.rewrite.is_some() {
+            window.push_notification(
+                crate::toast::info("Finish the merge or rewrite first, then implement the brief."),
+                cx,
+            );
+            return;
+        }
+        if self.review.is_some() {
+            self.close_review(window, cx);
+        }
+        composer.update(cx, |composer, cx| composer.hand_over(&handoff, window, cx));
+        self.history
+            .update(cx, |history, cx| history.open_composer(window, cx));
+    }
+
     fn start_agent_thread(
         &mut self,
         request: StartRequest,

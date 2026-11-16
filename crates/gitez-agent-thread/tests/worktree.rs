@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use common::{Fixture, git};
+use common::{Fixture, branch_of, git, worktree_of};
 use gitez_agent_thread::{
     AgentThread, CACHE_DIRS, CompleteReport, Error, IfUncommitted, Kept, PrepareStep, Timestamp,
     Uncommitted, check_worktree, complete, create_worktree, prepare, scratch_dirs, watch,
@@ -30,17 +30,20 @@ fn creates_the_branch_and_its_worktree() {
     git(&fixture.root, &["add", "-A"]);
     git(&fixture.root, &["commit", "--quiet", "-m", "Later"]);
 
-    let created =
-        create_worktree(&fixture.root, &thread.worktree, &thread.branch, &start).expect("create");
+    let created = create_worktree(
+        &fixture.root,
+        worktree_of(&thread),
+        branch_of(&thread),
+        &start,
+    )
+    .expect("create");
     assert!(
         !created.needs_checkout,
         "the start commit is checked out at once"
     );
     let git_dir = created.git_dir.clone();
     assert!(
-        thread
-            .worktree
-            .starts_with(fixture.data_dir.join("worktrees")),
+        worktree_of(&thread).starts_with(fixture.data_dir.join("worktrees")),
         "in the data folder"
     );
     assert_eq!(
@@ -48,11 +51,11 @@ fn creates_the_branch_and_its_worktree() {
         start
     );
     assert_eq!(
-        git(&thread.worktree, &["branch", "--show-current"]),
+        git(worktree_of(&thread), &["branch", "--show-current"]),
         "agent/add-a-blame-view"
     );
-    assert!(thread.worktree.join("README.md").is_file());
-    assert!(!thread.worktree.join("later.txt").exists());
+    assert!(worktree_of(&thread).join("README.md").is_file());
+    assert!(!worktree_of(&thread).join("later.txt").exists());
     assert_eq!(
         canonical(&git_dir),
         canonical(
@@ -63,12 +66,12 @@ fn creates_the_branch_and_its_worktree() {
         )
     );
     assert_eq!(
-        worktree_git_dir(&thread.worktree).expect("git dir"),
+        worktree_git_dir(worktree_of(&thread)).expect("git dir"),
         git_dir
     );
     assert_eq!(
         canonical(Path::new(&git(
-            &thread.worktree,
+            worktree_of(&thread),
             &["rev-parse", "--absolute-git-dir"]
         ))),
         canonical(&git_dir)
@@ -77,7 +80,7 @@ fn creates_the_branch_and_its_worktree() {
     assert_eq!(
         check_worktree(
             &fixture.common_dir(),
-            &thread.worktree,
+            worktree_of(&thread),
             Some(&created.record)
         )
         .expect("as made"),
@@ -85,12 +88,18 @@ fn creates_the_branch_and_its_worktree() {
     );
     // Again: it is already there.
     assert_eq!(
-        create_worktree(&fixture.root, &thread.worktree, &thread.branch, &start).expect("again"),
+        create_worktree(
+            &fixture.root,
+            worktree_of(&thread),
+            branch_of(&thread),
+            &start
+        )
+        .expect("again"),
         created
     );
     // Not for another branch.
     assert!(matches!(
-        create_worktree(&fixture.root, &thread.worktree, "agent/other", &start),
+        create_worktree(&fixture.root, worktree_of(&thread), "agent/other", &start),
         Err(Error::Refused(_))
     ));
 }
@@ -100,36 +109,42 @@ fn an_existing_branch_is_checked_out_as_it_is() {
     let fixture = Fixture::new();
     let first = fixture.head();
     let thread = fixture.create("Keep going");
-    git(&fixture.root, &["branch", &thread.branch]);
+    git(&fixture.root, &["branch", branch_of(&thread)]);
     fs::write(fixture.root.join("b.txt"), "b\n").expect("write");
     git(&fixture.root, &["add", "-A"]);
     git(&fixture.root, &["commit", "--quiet", "-m", "Second"]);
     let second = fixture.head();
 
-    create_worktree(&fixture.root, &thread.worktree, &thread.branch, &second).expect("create");
-    assert_eq!(git(&thread.worktree, &["rev-parse", "HEAD"]), first);
+    create_worktree(
+        &fixture.root,
+        worktree_of(&thread),
+        branch_of(&thread),
+        &second,
+    )
+    .expect("create");
+    assert_eq!(git(worktree_of(&thread), &["rev-parse", "HEAD"]), first);
 }
 
 #[test]
 fn a_folder_in_the_way_is_refused() {
     let fixture = Fixture::new();
     let thread = fixture.create("Something");
-    fs::create_dir_all(&thread.worktree).expect("create folder");
-    fs::write(thread.worktree.join("stray.txt"), "stray\n").expect("write");
+    fs::create_dir_all(worktree_of(&thread)).expect("create folder");
+    fs::write(worktree_of(&thread).join("stray.txt"), "stray\n").expect("write");
     let result = create_worktree(
         &fixture.root,
-        &thread.worktree,
-        &thread.branch,
+        worktree_of(&thread),
+        branch_of(&thread),
         &fixture.head(),
     );
     assert!(matches!(result, Err(Error::Refused(_))), "{result:?}");
 
     // An empty folder is used.
-    fs::remove_file(thread.worktree.join("stray.txt")).expect("remove");
+    fs::remove_file(worktree_of(&thread).join("stray.txt")).expect("remove");
     create_worktree(
         &fixture.root,
-        &thread.worktree,
-        &thread.branch,
+        worktree_of(&thread),
+        branch_of(&thread),
         &fixture.head(),
     )
     .expect("create in an empty folder");
@@ -141,27 +156,25 @@ fn completing_removes_the_worktree_and_a_branch_without_commits() {
 
     let idle = made(&fixture, "Nothing to do", Some(0));
     // Leftovers the supervisor did not see do not stop the removal.
-    fs::write(idle.worktree.join("scratch.txt"), "scratch\n").expect("write");
+    fs::write(worktree_of(&idle).join("scratch.txt"), "scratch\n").expect("write");
 
     let busy = made(&fixture, "Do something", Some(0));
-    fs::write(busy.worktree.join("work.txt"), "work\n").expect("write");
-    git(&busy.worktree, &["add", "-A"]);
-    git(&busy.worktree, &["commit", "--quiet", "-m", "Work"]);
+    fs::write(worktree_of(&busy).join("work.txt"), "work\n").expect("write");
+    git(worktree_of(&busy), &["add", "-A"]);
+    git(worktree_of(&busy), &["commit", "--quiet", "-m", "Work"]);
 
     let gone = made(&fixture, "Folder gone", None);
-    fs::remove_dir_all(&gone.worktree).expect("remove folder");
+    fs::remove_dir_all(worktree_of(&gone)).expect("remove folder");
 
     // The thread's temporary folder and caches go too, read-only cached
     // sources included; another thread's stay.
-    let key = idle
-        .worktree
+    let key = worktree_of(&idle)
         .parent()
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
         .expect("the repository key folder")
         .to_owned();
-    let data_dir = idle
-        .worktree
+    let data_dir = worktree_of(&idle)
         .parent()
         .and_then(Path::parent)
         .and_then(Path::parent)
@@ -188,6 +201,7 @@ fn completing_removes_the_worktree_and_a_branch_without_commits() {
     assert_eq!(
         complete(&fixture.root, &idle, IfUncommitted::Refuse, None).expect("complete"),
         CompleteReport {
+            nothing_to_remove: false,
             worktree_removed: true,
             kept: None,
             branch_deleted: true,
@@ -195,13 +209,14 @@ fn completing_removes_the_worktree_and_a_branch_without_commits() {
             branch_kept: None,
         }
     );
-    assert!(!idle.worktree.exists());
+    assert!(!worktree_of(&idle).exists());
     assert!(!scratch.tmp.exists(), "the temporary folder is removed");
     assert!(!scratch.caches.exists(), "the caches are removed");
     assert!(other.caches.exists(), "another thread's caches stay");
     assert_eq!(
         complete(&fixture.root, &busy, IfUncommitted::Refuse, None).expect("complete"),
         CompleteReport {
+            nothing_to_remove: false,
             worktree_removed: true,
             kept: None,
             branch_deleted: false,
@@ -209,11 +224,12 @@ fn completing_removes_the_worktree_and_a_branch_without_commits() {
             branch_kept: None,
         }
     );
-    assert!(!busy.worktree.exists());
+    assert!(!worktree_of(&busy).exists());
     // A folder that is gone has nothing to lose, whatever is recorded.
     assert_eq!(
         complete(&fixture.root, &gone, IfUncommitted::Refuse, None).expect("complete"),
         CompleteReport {
+            nothing_to_remove: false,
             worktree_removed: false,
             kept: None,
             branch_deleted: true,
@@ -239,6 +255,7 @@ fn completing_removes_the_worktree_and_a_branch_without_commits() {
     assert_eq!(
         complete(&fixture.root, &idle, IfUncommitted::Refuse, None).expect("complete again"),
         CompleteReport {
+            nothing_to_remove: false,
             worktree_removed: false,
             kept: None,
             branch_deleted: false,
@@ -255,8 +272,8 @@ fn made(fixture: &Fixture, prompt: &str, count: Option<u32>) -> AgentThread {
     let mut thread = fixture.create(prompt);
     let created = create_worktree(
         &fixture.root,
-        &thread.worktree,
-        &thread.branch,
+        worktree_of(&thread),
+        branch_of(&thread),
         &thread.start.commit,
     )
     .expect("create");
@@ -275,20 +292,24 @@ fn uncommitted_changes_are_never_removed_silently() {
     let fixture = Fixture::new();
     // The supervisor recorded uncommitted changes (a failed leftover commit).
     let thread = made(&fixture, "Left work", Some(2));
-    fs::write(thread.worktree.join("work.txt"), "unsaved\n").expect("write");
+    fs::write(worktree_of(&thread).join("work.txt"), "unsaved\n").expect("write");
     let error = complete(&fixture.root, &thread, IfUncommitted::Refuse, None)
         .expect_err("refused by default");
     assert!(
         matches!(&error, Error::Uncommitted { count: Some(2), .. }),
         "{error}"
     );
-    assert!(thread.worktree.join("work.txt").exists(), "nothing removed");
+    assert!(
+        worktree_of(&thread).join("work.txt").exists(),
+        "nothing removed"
+    );
 
     // Completing it after a merge keeps the folder and its branch.
     let report = complete(&fixture.root, &thread, IfUncommitted::Keep, None).expect("kept");
     assert_eq!(
         report,
         CompleteReport {
+            nothing_to_remove: false,
             worktree_removed: false,
             kept: Some(Kept::Uncommitted { count: Some(2) }),
             branch_deleted: false,
@@ -296,8 +317,8 @@ fn uncommitted_changes_are_never_removed_silently() {
             branch_kept: None,
         }
     );
-    assert!(thread.worktree.join("work.txt").exists());
-    assert_eq!(fixture.tip(&thread.branch), thread.start.commit);
+    assert!(worktree_of(&thread).join("work.txt").exists());
+    assert_eq!(fixture.tip(branch_of(&thread)), thread.start.commit);
 
     // Removed later when the user says so.
     let report = complete(&fixture.root, &thread, IfUncommitted::Discard, None).expect("discarded");
@@ -305,7 +326,7 @@ fn uncommitted_changes_are_never_removed_silently() {
         report.worktree_removed && report.branch_deleted,
         "{report:?}"
     );
-    assert!(!thread.worktree.exists());
+    assert!(!worktree_of(&thread).exists());
 
     // With nothing recorded (count None), there is no evidence of changes,
     // so the worktree is removed as before.
@@ -318,7 +339,7 @@ fn uncommitted_changes_are_never_removed_silently() {
 /// A git dir the agent wrote, whose configuration runs a command (it writes
 /// `<marks>/pwned`) as soon as git reads a modified file's status.
 fn plant_fake_git_dir(fixture: &Fixture, thread: &AgentThread, marks: &Path) {
-    let fake = thread.worktree.join("fake.git");
+    let fake = worktree_of(thread).join("fake.git");
     let fake_text = fake.to_str().expect("utf-8");
     git(
         &fixture.root,
@@ -347,8 +368,12 @@ fn plant_fake_git_dir(fixture: &Fixture, thread: &AgentThread, marks: &Path) {
             ],
         );
     }
-    fs::write(thread.worktree.join(".gitattributes"), "* filter=evil\n").expect("write");
-    fs::write(thread.worktree.join("README.md"), "changed\n").expect("write");
+    fs::write(
+        worktree_of(thread).join(".gitattributes"),
+        "* filter=evil\n",
+    )
+    .expect("write");
+    fs::write(worktree_of(thread).join("README.md"), "changed\n").expect("write");
 }
 
 #[test]
@@ -358,15 +383,18 @@ fn a_redirected_git_file_is_never_followed() {
     fs::create_dir_all(&marks).expect("marks");
     let thread = made(&fixture, "Redirect", Some(0));
     plant_fake_git_dir(&fixture, &thread, &marks);
-    let original = fs::read_to_string(thread.worktree.join(".git")).expect("read");
+    let original = fs::read_to_string(worktree_of(&thread).join(".git")).expect("read");
     fs::write(
-        thread.worktree.join(".git"),
-        format!("gitdir: {}\n", thread.worktree.join("fake.git").display()),
+        worktree_of(&thread).join(".git"),
+        format!(
+            "gitdir: {}\n",
+            worktree_of(&thread).join("fake.git").display()
+        ),
     )
     .expect("redirect");
 
     for record in [thread.worktree_record.as_ref(), None] {
-        let error = check_worktree(&fixture.common_dir(), &thread.worktree, record)
+        let error = check_worktree(&fixture.common_dir(), worktree_of(&thread), record)
             .expect_err("redirected");
         assert!(matches!(error, Error::Tampered { .. }), "{error}");
     }
@@ -376,8 +404,8 @@ fn a_redirected_git_file_is_never_followed() {
     assert!(matches!(error, Error::Tampered { .. }), "{error}");
     let error = create_worktree(
         &fixture.root,
-        &thread.worktree,
-        &thread.branch,
+        worktree_of(&thread),
+        branch_of(&thread),
         &thread.start.commit,
     )
     .expect_err("untrusted");
@@ -387,22 +415,26 @@ fn a_redirected_git_file_is_never_followed() {
         matches!(report.kept, Some(Kept::Untrusted(_))),
         "{report:?}"
     );
-    assert!(thread.worktree.exists());
+    assert!(worktree_of(&thread).exists());
     assert!(!marks.join("pwned").exists(), "no command of the agent ran");
 
     // The same file, rewritten to say what it said, is trusted again; a
     // copy under another name (a hard link) is not.
-    fs::write(thread.worktree.join(".git"), &original).expect("restore");
+    fs::write(worktree_of(&thread).join(".git"), &original).expect("restore");
     check_worktree(
         &fixture.common_dir(),
-        &thread.worktree,
+        worktree_of(&thread),
         thread.worktree_record.as_ref(),
     )
     .expect("as made");
-    fs::hard_link(thread.worktree.join(".git"), thread.worktree.join("other")).expect("link");
+    fs::hard_link(
+        worktree_of(&thread).join(".git"),
+        worktree_of(&thread).join("other"),
+    )
+    .expect("link");
     let error = check_worktree(
         &fixture.common_dir(),
-        &thread.worktree,
+        worktree_of(&thread),
         thread.worktree_record.as_ref(),
     )
     .expect_err("linked");
@@ -411,15 +443,18 @@ fn a_redirected_git_file_is_never_followed() {
 
     // The trap was armed: git run there, as GitEZ ran it before, follows
     // the planted pointer and runs the agent's command.
-    fs::remove_file(thread.worktree.join("other")).expect("unlink");
+    fs::remove_file(worktree_of(&thread).join("other")).expect("unlink");
     fs::write(
-        thread.worktree.join(".git"),
-        format!("gitdir: {}\n", thread.worktree.join("fake.git").display()),
+        worktree_of(&thread).join(".git"),
+        format!(
+            "gitdir: {}\n",
+            worktree_of(&thread).join("fake.git").display()
+        ),
     )
     .expect("redirect");
     let _ = std::process::Command::new("git")
         .args(["status", "--porcelain"])
-        .current_dir(&thread.worktree)
+        .current_dir(worktree_of(&thread))
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .output();
@@ -435,7 +470,7 @@ fn changed_files_in_the_worktrees_git_dir_are_refused() {
     let thread = made(&fixture, "Admin files", Some(0));
     let record = thread.worktree_record.clone().expect("recorded");
     let git_dir = record.git_dir.clone();
-    let check = || check_worktree(&fixture.common_dir(), &thread.worktree, Some(&record));
+    let check = || check_worktree(&fixture.common_dir(), worktree_of(&thread), Some(&record));
     let refused = |what: &str| {
         let error = check().expect_err(what);
         assert!(matches!(error, Error::Tampered { .. }), "{what}: {error}");
@@ -460,12 +495,12 @@ fn changed_files_in_the_worktrees_git_dir_are_refused() {
         fs::remove_file(&path).expect("remove");
     }
     // The worktree folder replaced by a link to another worktree of it.
-    let moved = thread.worktree.with_file_name("moved away");
-    fs::rename(&thread.worktree, &moved).expect("move");
-    std::os::unix::fs::symlink(&moved, &thread.worktree).expect("link");
+    let moved = worktree_of(&thread).with_file_name("moved away");
+    fs::rename(worktree_of(&thread), &moved).expect("move");
+    std::os::unix::fs::symlink(&moved, worktree_of(&thread)).expect("link");
     refused("a linked worktree folder");
-    fs::remove_file(&thread.worktree).expect("unlink");
-    fs::rename(&moved, &thread.worktree).expect("move back");
+    fs::remove_file(worktree_of(&thread)).expect("unlink");
+    fs::rename(&moved, worktree_of(&thread)).expect("move back");
     check().expect("back");
 }
 
@@ -486,30 +521,34 @@ fn a_branch_with_commits_of_its_own_is_not_checked_out_outside_the_sandbox() {
     );
     let thread = made(&fixture, "Agent work", Some(0));
     // The agent's commit selects it for every file.
-    fs::write(thread.worktree.join(".gitattributes"), "* filter=user\n").expect("write");
-    fs::write(thread.worktree.join("agent.txt"), "agent\n").expect("write");
-    git(&thread.worktree, &["add", "-A"]);
-    git(&thread.worktree, &["commit", "--quiet", "-m", "Agent"]);
+    fs::write(
+        worktree_of(&thread).join(".gitattributes"),
+        "* filter=user\n",
+    )
+    .expect("write");
+    fs::write(worktree_of(&thread).join("agent.txt"), "agent\n").expect("write");
+    git(worktree_of(&thread), &["add", "-A"]);
+    git(worktree_of(&thread), &["commit", "--quiet", "-m", "Agent"]);
     let _ = fs::remove_file(marks.join("ran"));
     // The folder is deleted by hand; a reply makes it again.
-    fs::remove_dir_all(&thread.worktree).expect("remove");
+    fs::remove_dir_all(worktree_of(&thread)).expect("remove");
     git(&fixture.root, &["worktree", "prune"]);
     let created = create_worktree(
         &fixture.root,
-        &thread.worktree,
-        &thread.branch,
+        worktree_of(&thread),
+        branch_of(&thread),
         &thread.start.commit,
     )
     .expect("create");
     assert!(created.needs_checkout);
     assert!(
-        !thread.worktree.join("agent.txt").exists(),
+        !worktree_of(&thread).join("agent.txt").exists(),
         "nothing checked out"
     );
     assert!(!marks.join("ran").exists(), "no filter ran");
     // The supervisor's checkout, in the sandbox, is a reset.
-    git(&thread.worktree, &["reset", "--hard", "--quiet"]);
-    assert!(thread.worktree.join("agent.txt").exists());
+    git(worktree_of(&thread), &["reset", "--hard", "--quiet"]);
+    assert!(worktree_of(&thread).join("agent.txt").exists());
 }
 
 #[test]
@@ -529,10 +568,11 @@ fn prepare_never_writes_through_a_link_in_the_worktree() {
     let thread = made(&fixture, "Links", Some(0));
     // What a failed setup command left for the retry: links out of the
     // worktree where included files go.
-    std::os::unix::fs::symlink(&victim, thread.worktree.join("config")).expect("link");
-    std::os::unix::fs::symlink(victim.join("dot-env"), thread.worktree.join(".env")).expect("link");
+    std::os::unix::fs::symlink(&victim, worktree_of(&thread).join("config")).expect("link");
+    std::os::unix::fs::symlink(victim.join("dot-env"), worktree_of(&thread).join(".env"))
+        .expect("link");
     let main = gitez_git::Repository::open(root).expect("open");
-    let report = prepare(&main, &thread.worktree, |_| {}).expect("prepare");
+    let report = prepare(&main, worktree_of(&thread), |_| {}).expect("prepare");
     assert_eq!(report.skipped, [PathBuf::from("config/local.env")]);
     assert!(report.copied.is_empty(), "{report:?}");
     assert_eq!(
@@ -563,7 +603,7 @@ fn completing_follows_no_link_and_runs_nothing_in_the_worktree() {
     );
     git(&fixture.root, &["config", "core.hooksPath", ".husky"]);
     let thread = made(&fixture, "Traps", Some(0));
-    let worktree = &thread.worktree;
+    let worktree = worktree_of(&thread);
     fs::write(worktree.join(".gitattributes"), "* filter=user\n").expect("write");
     fs::create_dir_all(worktree.join(".husky")).expect("hooks");
     for hook in [
@@ -661,20 +701,20 @@ fn prepare_copies_included_files_and_clones_caches() {
     let thread = fixture.create("Prepare me");
     let _ = create_worktree(
         &fixture.root,
-        &thread.worktree,
-        &thread.branch,
+        worktree_of(&thread),
+        branch_of(&thread),
         &fixture.head(),
     )
     .expect("create");
     let main = gitez_git::Repository::open(root).expect("open");
     let mut steps = Vec::new();
-    let report = prepare(&main, &thread.worktree, |step| steps.push(step)).expect("prepare");
+    let report = prepare(&main, worktree_of(&thread), |step| steps.push(step)).expect("prepare");
 
     assert_eq!(
         report.copied,
         [PathBuf::from(".env"), PathBuf::from("secrets")]
     );
-    let worktree = &thread.worktree;
+    let worktree = worktree_of(&thread);
     assert_eq!(
         fs::read_to_string(worktree.join(".env")).expect("copied"),
         "TOKEN=1\n"
@@ -771,4 +811,34 @@ fn watch_reports_a_write() {
         }
     }
     assert!(seen, "the write was reported");
+}
+
+#[test]
+fn completing_a_discuss_thread_removes_only_its_scratch_folders() {
+    let fixture = Fixture::new();
+    let thread = fixture.discuss("How does the cache work?");
+    let scratch = thread.scratch_dirs().expect("its scratch folders");
+    for dir in [&scratch.tmp, &scratch.caches] {
+        fs::create_dir_all(dir).expect("create");
+        fs::write(dir.join("left.txt"), "left\n").expect("write");
+    }
+    fs::write(fixture.root.join("mine.txt"), "uncommitted\n").expect("write");
+    let refs = git(&fixture.root, &["for-each-ref"]);
+
+    let report = complete(&fixture.root, &thread, IfUncommitted::Refuse, None).expect("complete");
+    assert!(report.nothing_to_remove);
+    assert!(!report.worktree_removed);
+    assert!(!report.branch_deleted);
+    assert_eq!(report.kept, None);
+    assert!(!scratch.tmp.exists());
+    assert!(!scratch.caches.exists());
+    assert!(
+        fixture.root.join("mine.txt").exists(),
+        "the user's tree is left alone"
+    );
+    assert_eq!(git(&fixture.root, &["for-each-ref"]), refs);
+
+    let mut completed = thread.clone();
+    completed.record_completion(&report, gitez_agent_thread::Timestamp::now());
+    assert_eq!(completed, thread, "nothing to record");
 }

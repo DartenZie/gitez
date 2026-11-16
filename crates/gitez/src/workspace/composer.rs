@@ -1,6 +1,6 @@
-//! The "Ask an agent" composer: a prompt and the pickers that start an
-//! agent thread (agent, model, starting branch, sandbox network, secrets),
-//! as in the `C-1-Start` board. In a repository window it opens as a card
+//! The "Ask an agent" composer: a prompt, the mode of the thread it starts
+//! (Discuss or Implement) and the pickers (agent, model, starting branch,
+//! sandbox network, secrets), as in the `C-1-Start` board. In a repository window it opens as a card
 //! under the "Ask an agent…" row of the history; Home shows it as its
 //! launcher (`C-5-Home`), with a Repository picker in front.
 //!
@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gitez_agent::{AgentStatus, Availability, LoginStatus};
-use gitez_agent_thread::{PreparedImage, Start, slug, title_from_request};
+use gitez_agent_thread::{Mode, PreparedImage, Start, slug, title_from_request};
 use gitez_git::Oid;
 use gitez_sandbox::NetworkProfile;
 use gitez_settings::{SecretScope, Settings};
@@ -27,10 +27,10 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::agent_thread::{agent_mark, branch_chip, on_accent};
+use super::agent_thread::{Handoff, agent_mark, branch_chip, on_accent};
 use super::labels;
 use super::prompt_images::{self, Accepts, PromptImages};
-use crate::agent_threads::{AgentThreads, OpenSettings, StartRequest};
+use crate::agent_threads::{AgentThreadKey, AgentThreads, OpenSettings, StartRequest};
 use crate::theme::{self, color};
 
 actions!(composer, [Cancel]);
@@ -173,6 +173,11 @@ pub struct Composer {
     agent: String,
     /// `None`: the agent entry's default.
     model_alias: Option<String>,
+    /// What the thread is for; `None`: the mode of the thread started
+    /// last.
+    thread_mode: Option<Mode>,
+    /// The Discuss thread whose brief the prompt is, and its title.
+    origin: Option<(AgentThreadKey, SharedString)>,
     /// `None`: the branch checked out.
     from: Option<String>,
     /// `None`: the default of the settings.
@@ -241,6 +246,8 @@ impl Composer {
             focus_handle: cx.focus_handle(),
             agent,
             model_alias: None,
+            thread_mode: None,
+            origin: None,
             from: None,
             network: None,
             secrets: None,
@@ -299,6 +306,11 @@ impl Composer {
             self.from = None;
             self.secrets = None;
         }
+        // A brief is for the repository it was discussed in.
+        self.origin = self
+            .origin
+            .take()
+            .filter(|(origin, _)| origin.common_dir == target.common_dir);
         self.from = self
             .from
             .take()
@@ -329,6 +341,61 @@ impl Composer {
         self.prompt
             .update(cx, |prompt, cx| prompt.set_value(text, window, cx));
         cx.notify();
+    }
+
+    /// What the thread started is for: the mode picked, else the mode of
+    /// the thread started last.
+    pub(crate) fn thread_mode(&self, cx: &App) -> Mode {
+        self.thread_mode
+            .unwrap_or_else(|| self.settings(cx).threads.last_mode)
+    }
+
+    pub fn set_thread_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
+        self.thread_mode = Some(mode);
+        cx.notify();
+    }
+
+    /// Names the Discuss thread whose brief the prompt is (with its
+    /// title), or none: the thread started says which it implements.
+    pub fn set_origin(
+        &mut self,
+        origin: Option<(AgentThreadKey, SharedString)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.origin = origin;
+        cx.notify();
+    }
+
+    /// What is written in the prompt.
+    #[cfg(test)]
+    pub(crate) fn prompt_text(&self, cx: &App) -> String {
+        self.prompt.read(cx).value().to_string()
+    }
+
+    /// The Discuss thread whose brief the prompt is.
+    #[cfg(test)]
+    pub(crate) fn origin(&self) -> Option<&AgentThreadKey> {
+        self.origin.as_ref().map(|(origin, _)| origin)
+    }
+
+    /// Takes what a Discuss thread hands over: its brief as the prompt of
+    /// an Implement thread that names it, for the user to read, change and
+    /// send. Home picks the discussion's repository.
+    pub fn hand_over(&mut self, handoff: &Handoff, window: &mut Window, cx: &mut Context<Self>) {
+        self.thread_mode = Some(Mode::Implement);
+        self.origin = Some((handoff.origin.clone(), handoff.title.clone()));
+        let picked = self
+            .target
+            .as_ref()
+            .is_some_and(|target| target.common_dir == handoff.origin.common_dir);
+        if self.mode == ComposerMode::Home
+            && !picked
+            && let Some(work_dir) = &handoff.work_dir
+        {
+            self.choose_repository(work_dir.clone(), cx);
+        }
+        self.set_prompt(handoff.brief.clone(), window, cx);
+        self.focus(window, cx);
     }
 
     /// Puts back the images of a thread that could not start.
@@ -568,11 +635,16 @@ impl Composer {
         cx.notify();
     }
 
-    /// The branch and tip new threads start from.
-    fn start(&self) -> Option<(String, Oid)> {
-        let from = self.start_branch()?;
-        self.target
-            .as_ref()?
+    /// The branch and tip a new thread of `mode` starts from: the branch
+    /// picked, or for a discussion always the one checked out, whose
+    /// working tree it reads.
+    fn start(&self, mode: Mode) -> Option<(String, Oid)> {
+        let target = self.target.as_ref()?;
+        let from = match mode {
+            Mode::Implement => self.start_branch()?,
+            Mode::Discuss => target.current.as_deref()?,
+        };
+        target
             .branches
             .iter()
             .find(|(name, _)| name == from)
@@ -590,6 +662,8 @@ impl Composer {
     /// What keeps Send disabled, and what the user should know; in the
     /// order to show them.
     fn problems(&self, cx: &App) -> Vec<Problem> {
+        let mode = self.thread_mode(cx);
+        let discuss = mode == Mode::Discuss;
         let mut problems = Vec::new();
         let mut add = |severity, text: Sentence, settings| {
             problems.push(Problem {
@@ -615,9 +689,13 @@ impl Composer {
             ),
             (Some(target), None) if target.bare => add(
                 Severity::Blocking,
-                "A bare repository has no working tree to start from."
-                    .to_owned()
-                    .into(),
+                if discuss {
+                    "A bare repository has no working tree to discuss."
+                } else {
+                    "A bare repository has no working tree to start from."
+                }
+                .to_owned()
+                .into(),
                 false,
             ),
             (Some(target), None) if target.branches.is_empty() => add(
@@ -627,18 +705,24 @@ impl Composer {
                     .into(),
                 false,
             ),
-            (Some(_), None) if self.start_branch().is_none() => add(
+            (Some(_), None) if self.start(mode).is_none() => add(
                 Severity::Blocking,
-                "HEAD is detached: pick a branch to start from."
-                    .to_owned()
-                    .into(),
+                if discuss {
+                    "HEAD is detached: check out a branch to discuss it."
+                } else {
+                    "HEAD is detached: pick a branch to start from."
+                }
+                .to_owned()
+                .into(),
                 false,
             ),
             (Some(target), None) => {
                 // The thread's worktree is made from the branch's last
-                // commit; what the user has not committed stays behind.
+                // commit; what the user has not committed stays behind. A
+                // discussion reads the working tree as it is.
                 if let (Some(count), Some(branch)) = (target.uncommitted, self.start_branch())
                     && count > 0
+                    && !discuss
                 {
                     add(Severity::Warning, uncommitted_warning(branch), false);
                 }
@@ -742,7 +826,8 @@ impl Composer {
         if !self.can_send(cx) {
             return;
         }
-        let (Some(target), Some((branch, tip))) = (self.target.clone(), self.start()) else {
+        let mode = self.thread_mode(cx);
+        let (Some(target), Some((branch, tip))) = (self.target.clone(), self.start(mode)) else {
             return;
         };
         let prompt = self.prompt.read(cx).value().trim().to_owned();
@@ -755,10 +840,17 @@ impl Composer {
             prompt,
             agent: self.agent.clone(),
             model: (!model.is_empty()).then_some(model),
+            mode,
             start: Start {
                 branch,
                 commit: tip.to_string(),
             },
+            // A discussion implements nothing.
+            origin: self
+                .origin
+                .take()
+                .map(|(origin, _)| origin.id)
+                .filter(|_| mode == Mode::Implement),
             network: self.network(cx),
             secrets: self.secrets(cx),
             images,
@@ -1059,7 +1151,7 @@ impl Composer {
             .target
             .as_ref()
             .and_then(|target| target.current.clone());
-        let chosen = self.start();
+        let chosen = self.start(Mode::Implement);
         let view = cx.entity().downgrade();
         let short = |tip: &Oid| tip.to_string().chars().take(7).collect::<String>();
         let value = match &chosen {
@@ -1148,7 +1240,7 @@ impl Composer {
                             .size(px(13.))
                             .text_color(rgb(color::TEXT_MUTED)),
                     )
-                    .child(picker_label("Sandbox"))
+                    .child(picker_label("Network"))
                     .child(chosen.label()),
             )
             .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
@@ -1464,6 +1556,13 @@ impl Composer {
             .whitespace_nowrap()
             .text_size(px(11.5))
             .text_color(rgb(color::TEXT_MUTED));
+        if self.thread_mode(cx) == Mode::Discuss {
+            return line.child(if home {
+                "Reads the repository’s working tree and changes nothing".to_owned()
+            } else {
+                format!("Reads your working tree, changes nothing · {when}")
+            });
+        }
         match self.branch_preview(cx) {
             Some(branch) => line
                 .child(if home {
@@ -1487,6 +1586,82 @@ impl Composer {
                 format!("New worktree on its own branch · {when}")
             }),
         }
+    }
+
+    /// Discuss | Implement: what the thread is for. Two joined buttons
+    /// the height of the pickers, the mode chosen marked as on.
+    fn render_mode_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let chosen = self.thread_mode(cx);
+        let segment = |id: &'static str, mode: Mode, tooltip: &'static str| {
+            let on = mode == chosen;
+            Button::new(id)
+                .debug_selector(move || id.into())
+                .compact()
+                .h(px(28.))
+                .px(px(10.))
+                .text_size(px(12.))
+                .label(mode.label())
+                .tooltip(tooltip)
+                .selected(on)
+                .when(on, |this| {
+                    this.bg(rgb(color::SELECTED))
+                        .border_color(rgba(color::PICKER_ON_BORDER))
+                        .text_color(rgb(color::ACCENT))
+                })
+        };
+        ButtonGroup::new("composer-mode")
+            .child(segment(
+                "composer-mode-discuss",
+                Mode::Discuss,
+                "The agent reads your working tree and answers. It changes nothing.",
+            ))
+            .child(segment(
+                "composer-mode-implement",
+                Mode::Implement,
+                "The agent works on its own branch and worktree. Its commits become a local pull \
+                 request.",
+            ))
+            .on_click(cx.listener(|this, clicked: &Vec<usize>, _, cx| {
+                let mode = if clicked.contains(&1) {
+                    Mode::Implement
+                } else {
+                    Mode::Discuss
+                };
+                this.set_thread_mode(mode, cx)
+            }))
+    }
+
+    /// "From the discussion <title>", with a button to let go of it.
+    fn render_origin(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let (_, title) = self.origin.as_ref()?;
+        Some(
+            div()
+                .debug_selector(|| "composer-origin".into())
+                .h_flex()
+                .gap(px(6.))
+                .min_w_0()
+                .text_size(px(12.))
+                .text_color(rgb(color::TEXT_MUTED))
+                .child(Icon::new(IconName::MessageSquare).size(px(12.)))
+                .child(div().flex_none().child("Brief from the discussion"))
+                .child(
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_color(rgb(color::TEXT_SECONDARY))
+                        .child(title.clone()),
+                )
+                .child(
+                    Button::new("composer-origin-remove")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Close)
+                        .tooltip("Start the thread without a link to the discussion")
+                        .on_click(cx.listener(|this, _, _, cx| this.set_origin(None, cx))),
+                ),
+        )
     }
 
     fn render_problems(&self, cx: &mut Context<Self>) -> Option<Div> {
@@ -1614,6 +1789,8 @@ impl Render for Composer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let home = self.mode == ComposerMode::Home;
         let can_send = self.can_send(cx);
+        let mode = self.thread_mode(cx);
+        let discuss = mode == Mode::Discuss;
         let header = (!home).then(|| {
             div()
                 .h_flex()
@@ -1647,7 +1824,11 @@ impl Render for Composer {
                         .text_ellipsis()
                         .text_size(px(12.))
                         .text_color(rgb(color::TEXT_MUTED))
-                        .child("It works in the background on its own branch and worktree"),
+                        .child(if discuss {
+                            "It reads your working tree and answers; it changes nothing"
+                        } else {
+                            "It works in the background on its own branch and worktree"
+                        }),
                 )
                 .child(
                     div()
@@ -1665,10 +1846,12 @@ impl Render for Composer {
             .h_flex()
             .flex_wrap()
             .gap(px(6.))
+            .child(self.render_mode_toggle(cx))
             .when(home, |this| this.child(self.render_repository_picker(cx)))
             .child(self.render_agent_picker(cx))
             .child(self.render_model_picker(cx))
-            .child(self.render_from_picker(cx))
+            // A discussion reads what is checked out.
+            .when(!discuss, |this| this.child(self.render_from_picker(cx)))
             .child(self.render_sandbox_picker(cx))
             .child(self.render_secrets_picker(cx));
         let footer = div()
@@ -1683,7 +1866,7 @@ impl Render for Composer {
                     .debug_selector(|| "composer-send".into())
                     .primary()
                     .h(px(30.))
-                    .label("Send")
+                    .label(mode.label())
                     .child(
                         div()
                             .h_flex()
@@ -1733,6 +1916,7 @@ impl Render for Composer {
                 },
             ])
             .children(header)
+            .children(self.render_origin(cx))
             .child(
                 div().text_size(px(if home { 14. } else { 13. })).child(
                     Textarea::new(&self.prompt)
@@ -1772,8 +1956,10 @@ mod tests {
     use gitez_settings::{AgentEntry, SecretEntry, SecretScope, Settings};
     use gpui_kit::{AppContext as _, Entity, TestAppContext, VisualTestContext, px, size};
 
-    use super::{Composer, ComposerEvent, ComposerMode, preview_branch};
-    use crate::agent_threads::{Options, StartRequest, init_with};
+    use gitez_agent_thread::Mode;
+
+    use super::{Composer, ComposerEvent, ComposerMode, Handoff, preview_branch};
+    use crate::agent_threads::{AgentThreadKey, Options, StartRequest, init_with};
 
     fn oid(n: u8) -> Oid {
         Oid::from_bytes_or_panic(&[n; 20])
@@ -2030,6 +2216,175 @@ mod tests {
         // The prompt is emptied for the next thread.
         composer.read_with(&cx, |composer, cx| {
             assert!(composer.prompt.read(cx).value().is_empty());
+        });
+    }
+
+    /// What `composer` emits from now on.
+    fn requests(
+        composer: &Entity<Composer>,
+        cx: &mut VisualTestContext,
+    ) -> Arc<std::sync::Mutex<Vec<StartRequest>>> {
+        let sent: Arc<std::sync::Mutex<Vec<StartRequest>>> = Arc::default();
+        cx.update(|_, cx| {
+            let sent = sent.clone();
+            cx.subscribe(composer, move |_, event: &ComposerEvent, _| {
+                if let ComposerEvent::Submit(request) = event {
+                    sent.lock().expect("lock").push((**request).clone());
+                }
+            })
+            .detach();
+        });
+        sent
+    }
+
+    /// Discuss starts a thread that reads what is checked out: no From
+    /// picker, no warning about uncommitted changes, and the branch picked
+    /// for Implement is not used. Implement is the mode until one is
+    /// picked.
+    #[gpui_kit::test]
+    fn discuss_reads_what_is_checked_out(cx: &mut TestAppContext) {
+        let (composer, mut cx) = composer(cx);
+        let sent = requests(&composer, &mut cx);
+        composer.update_in(&mut cx, |composer, window, cx| {
+            ready(composer, gitez_agent::ClaudeCode::ID);
+            composer.from = Some("main".into());
+            composer.set_uncommitted(Some(2), cx);
+            composer.set_prompt("How does the parser read a rename?".into(), window, cx);
+            assert_eq!(composer.thread_mode(cx), Mode::Implement);
+            assert!(
+                composer
+                    .problems(cx)
+                    .iter()
+                    .any(|problem| problem.severity == super::Severity::Warning)
+            );
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("composer-from").is_some());
+        // The toggle's first button.
+        let discuss = cx
+            .debug_bounds("composer-mode-discuss")
+            .expect("the mode toggle is shown");
+        cx.simulate_click(discuss.center(), gpui_kit::Modifiers::none());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("composer-from").is_none());
+        assert!(cx.debug_bounds("composer-sandbox").is_some());
+        composer.update_in(&mut cx, |composer, window, cx| {
+            assert_eq!(composer.thread_mode(cx), Mode::Discuss);
+            assert_eq!(composer.problems(cx), []);
+            composer.send(window, cx);
+        });
+        let sent = sent.lock().expect("lock");
+        let [request] = &sent[..] else {
+            panic!("one request, got {}", sent.len());
+        };
+        assert_eq!(request.mode, Mode::Discuss);
+        assert_eq!(request.start.branch, "feature");
+        assert_eq!(request.start.commit, oid(2).to_string());
+        assert_eq!(request.origin, None);
+    }
+
+    /// A discussion needs a branch checked out, even when Implement could
+    /// start from a picked one.
+    #[gpui_kit::test]
+    fn discuss_needs_a_branch_checked_out(cx: &mut TestAppContext) {
+        let (composer, mut cx) = composer(cx);
+        composer.update_in(&mut cx, |composer, window, cx| {
+            ready(composer, gitez_agent::ClaudeCode::ID);
+            composer.set_mode(
+                ComposerMode::Repository {
+                    work_dir: "/repo".into(),
+                    common_dir: "/repo/.git".into(),
+                    name: "repo".into(),
+                    branches: vec![("main".into(), oid(1))],
+                    current: None,
+                    bare: false,
+                },
+                cx,
+            );
+            composer.from = Some("main".into());
+            composer.set_prompt("Where is blame read?".into(), window, cx);
+            assert!(composer.can_send(cx), "{:?}", composer.problems(cx));
+            composer.set_thread_mode(Mode::Discuss, cx);
+            assert!(!composer.can_send(cx));
+            assert!(composer.problems(cx).iter().any(|problem| {
+                problem.severity == super::Severity::Blocking
+                    && problem.text == "HEAD is detached: check out a branch to discuss it."
+            }));
+        });
+    }
+
+    /// The brief a Discuss thread hands over becomes the prompt of an
+    /// Implement thread that names the discussion; without the link, or as
+    /// a discussion, the thread started names none.
+    #[gpui_kit::test]
+    fn a_brief_handed_over_starts_an_implement_thread(cx: &mut TestAppContext) {
+        let (composer, mut cx) = composer(cx);
+        let sent = requests(&composer, &mut cx);
+        let origin = AgentThreadKey {
+            common_dir: "/repo/.git".into(),
+            id: gitez_agent_thread::AgentThreadId::new("how-should-blame-read-renames")
+                .expect("an id"),
+        };
+        let handoff = Handoff {
+            origin: origin.clone(),
+            title: "How should blame read renames?".into(),
+            brief: "# Follow renames in blame\n\nRead the rename from each commit’s diff.".into(),
+            work_dir: Some("/repo".into()),
+        };
+        composer.update_in(&mut cx, |composer, window, cx| {
+            ready(composer, gitez_agent::ClaudeCode::ID);
+            composer.set_thread_mode(Mode::Discuss, cx);
+            composer.hand_over(&handoff, window, cx);
+            assert_eq!(composer.thread_mode(cx), Mode::Implement);
+            assert_eq!(composer.origin(), Some(&origin));
+            assert_eq!(composer.prompt.read(cx).value(), handoff.brief);
+            // The thread is named by the brief's heading.
+            assert_eq!(
+                composer.branch_preview(cx).as_deref(),
+                Some("agent/follow-renames-in-blame")
+            );
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("composer-origin").is_some());
+        composer.update_in(&mut cx, |composer, window, cx| composer.send(window, cx));
+        {
+            let sent = sent.lock().expect("lock");
+            let [request] = &sent[..] else {
+                panic!("one request, got {}", sent.len());
+            };
+            assert_eq!(request.mode, Mode::Implement);
+            assert_eq!(request.origin.as_ref(), Some(&origin.id));
+            assert_eq!(request.prompt, handoff.brief);
+        }
+        // Sent: the next thread is not linked.
+        composer.read_with(&cx, |composer, _| assert_eq!(composer.origin(), None));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("composer-origin").is_none());
+
+        // A brief sent as a discussion implements nothing.
+        composer.update_in(&mut cx, |composer, window, cx| {
+            composer.hand_over(&handoff, window, cx);
+            composer.set_thread_mode(Mode::Discuss, cx);
+            composer.send(window, cx);
+        });
+        assert_eq!(sent.lock().expect("lock")[1].origin, None);
+
+        // Another repository's branches: the brief was not written for it.
+        composer.update_in(&mut cx, |composer, window, cx| {
+            composer.hand_over(&handoff, window, cx);
+            composer.set_mode(
+                ComposerMode::Repository {
+                    work_dir: "/other".into(),
+                    common_dir: "/other/.git".into(),
+                    name: "other".into(),
+                    branches: vec![("main".into(), oid(1))],
+                    current: Some("main".into()),
+                    bare: false,
+                },
+                cx,
+            );
+            assert_eq!(composer.origin(), None);
         });
     }
 

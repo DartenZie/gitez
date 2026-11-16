@@ -8,10 +8,10 @@ use std::io::Write as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use common::{EXAMPLE, Fixture, at};
+use common::{EXAMPLE, Fixture, at, branch_of, worktree_of};
 use gitez_agent_thread::{
-    AgentThreadId, Error, Index, IndexedRepository, RunHeader, State, Store, Timestamp, TurnKind,
-    repository_key,
+    AgentThreadId, Error, Index, IndexedRepository, Mode, RunHeader, State, Store, Timestamp,
+    TurnKind, repository_key,
 };
 use gitez_sandbox::NetworkProfile;
 
@@ -225,7 +225,7 @@ fn create_names_the_thread_after_the_prompt() {
     let thread = fixture.create("Fix the flaky tests. They fail on CI.");
     assert_eq!(thread.title, "Fix the flaky tests");
     assert_eq!(thread.id.as_str(), "fix-the-flaky-tests");
-    assert_eq!(thread.branch, "agent/fix-the-flaky-tests");
+    assert_eq!(branch_of(&thread), "agent/fix-the-flaky-tests");
     assert_eq!(thread.state, State::Queued);
     assert_eq!(thread.created, created);
     assert_eq!(thread.updated, created);
@@ -241,7 +241,7 @@ fn create_names_the_thread_after_the_prompt() {
     assert!(!thread.turns[0].resume);
     assert_eq!(thread.pending_turn(), Some(0));
     assert_eq!(
-        thread.worktree,
+        worktree_of(&thread),
         fixture
             .data_dir
             .join("worktrees")
@@ -249,20 +249,19 @@ fn create_names_the_thread_after_the_prompt() {
             .join("fix-the-flaky-tests")
     );
     assert!(
-        thread
-            .worktree
+        worktree_of(&thread)
             .to_str()
             .expect("utf-8")
             .contains("Application Support/GitEZ/worktrees/my-repo-"),
         "{}",
-        thread.worktree.display()
+        worktree_of(&thread).display()
     );
     assert_eq!(store.load(&thread.id).expect("load"), thread);
 
     // The same prompt again: the folder is taken.
     let second = fixture.create("Fix the flaky tests");
     assert_eq!(second.id.as_str(), "fix-the-flaky-tests-2");
-    assert_eq!(second.branch, "agent/fix-the-flaky-tests-2");
+    assert_eq!(branch_of(&second), "agent/fix-the-flaky-tests-2");
 }
 
 #[test]
@@ -281,7 +280,7 @@ fn create_skips_ids_whose_branch_or_worktree_exists() {
     assert_eq!(thread.id.as_str(), "update-the-readme-2");
 
     // A worktree folder left behind by a thread that is gone.
-    let stale = thread.worktree.with_file_name("update-the-readme-3");
+    let stale = worktree_of(&thread).with_file_name("update-the-readme-3");
     fs::create_dir_all(&stale).expect("create folder");
     let next = store
         .create(
@@ -643,4 +642,126 @@ fn a_header_lists_the_images_by_name_only() {
     );
     let (read, _) = store.read_run(run.path()).expect("read run");
     assert_eq!(read, with_images);
+}
+
+#[test]
+fn a_discuss_thread_has_no_branch_and_no_worktree() {
+    let fixture = Fixture::new();
+    let thread = fixture.discuss("How does the cache work? I want to change it.");
+    assert_eq!(thread.mode, Mode::Discuss);
+    assert_eq!(thread.id.as_str(), "how-does-the-cache-work");
+    assert_eq!(thread.branch, None);
+    assert_eq!(thread.worktree, None);
+    assert_eq!(thread.own(), None);
+    assert_eq!(thread.work_dir.as_deref(), Some(fixture.root.as_path()));
+    let name = format!(
+        "{}-how-does-the-cache-work",
+        repository_key("my repo", &fixture.common_dir())
+    );
+    let scratch = thread.scratch_dirs().expect("its scratch folders");
+    assert_eq!(scratch.tmp, fixture.data_dir.join("tmp").join(&name));
+    assert_eq!(scratch.caches, fixture.data_dir.join("caches").join(&name));
+    assert!(
+        !fixture.data_dir.join("worktrees").exists(),
+        "nothing is made for it"
+    );
+
+    let store = fixture.store();
+    let text = fs::read_to_string(store.thread_dir(&thread.id).join("thread.json")).expect("read");
+    let keys = top_level_keys(&text);
+    assert!(text.contains("\"mode\": \"discuss\""), "{text}");
+    for absent in ["branch", "worktree", "origin"] {
+        assert!(
+            !keys.iter().any(|key| key == absent),
+            "{absent} in {keys:?}"
+        );
+    }
+    for present in ["mode", "work_dir", "scratch"] {
+        assert!(
+            keys.iter().any(|key| key == present),
+            "{present} in {keys:?}"
+        );
+    }
+    assert_eq!(store.load(&thread.id).expect("load"), thread);
+
+    // An Implement thread says nothing about its mode: the format of
+    // before.
+    let implement = fixture.create("Fix the flaky tests.");
+    let text =
+        fs::read_to_string(store.thread_dir(&implement.id).join("thread.json")).expect("read");
+    assert!(!top_level_keys(&text).iter().any(|key| key == "mode"));
+    assert_eq!(implement.scratch, None);
+}
+
+#[test]
+fn a_discuss_thread_needs_a_working_tree() {
+    let fixture = Fixture::new();
+    let mut new = fixture.new_thread("Explain the build");
+    new.mode = Mode::Discuss;
+    let result = fixture.store().create(
+        new,
+        &fixture.data_dir,
+        "my repo",
+        |_| false,
+        at("2026-11-13T09:41:07Z"),
+    );
+    assert!(matches!(result, Err(Error::Refused(_))), "{result:?}");
+    assert!(fixture.store().ids().expect("ids").is_empty());
+}
+
+#[test]
+fn a_thread_can_name_the_discussion_it_implements() {
+    let fixture = Fixture::new();
+    let discussion = fixture.discuss("How should the cache be keyed?");
+    let mut new = fixture.new_thread("# Key the cache by content hash\n\nGoal: …");
+    new.origin = Some(discussion.id.clone());
+    let thread = fixture
+        .store()
+        .create(
+            new,
+            &fixture.data_dir,
+            "my repo",
+            |_| false,
+            at("2026-11-13T10:00:00Z"),
+        )
+        .expect("create");
+    assert_eq!(thread.title, "Key the cache by content hash");
+    assert_eq!(branch_of(&thread), "agent/key-the-cache-by-content-hash");
+    assert_eq!(thread.origin.as_ref(), Some(&discussion.id));
+    assert_eq!(
+        fixture.store().load(&thread.id).expect("load").origin,
+        Some(discussion.id)
+    );
+}
+
+#[test]
+fn a_record_whose_mode_and_places_disagree_is_refused() {
+    let (_dir, store, id) = example_store();
+    let path = store.thread_dir(&id).join("thread.json");
+    let branch = "  \"branch\": \"agent/add-a-blame-view-to-the-commit-detail\",\n";
+    assert!(EXAMPLE.contains(branch));
+
+    // What an older GitEZ makes of a Discuss thread, the other way round.
+    let without_branch = EXAMPLE.replace(branch, "");
+    fs::write(&path, &without_branch).expect("write");
+    assert!(matches!(store.load(&id), Err(Error::Invalid { .. })));
+
+    let discuss_with_branch = EXAMPLE.replace(
+        "  \"state\": \"running\",\n",
+        "  \"mode\": \"discuss\",\n  \"state\": \"running\",\n  \"work_dir\": \"/repo\",\n",
+    );
+    fs::write(&path, &discuss_with_branch).expect("write");
+    assert!(matches!(store.load(&id), Err(Error::Invalid { .. })));
+    assert!(matches!(
+        store.update(&id, |thread| {
+            thread.title = "Changed".to_owned();
+            Ok(())
+        }),
+        Err(Error::Invalid { .. })
+    ));
+    assert_eq!(
+        fs::read_to_string(&path).expect("read"),
+        discuss_with_branch,
+        "left as it was"
+    );
 }

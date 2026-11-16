@@ -141,6 +141,7 @@ fn run<'a>(conversation: Conversation<'a>, cwd: &'a Path) -> RunSpec<'a> {
         prompt: "Fix the bug",
         images: &[],
         cwd,
+        shared_folder: false,
         model: Some("haiku"),
         conversation,
         system_prompt: Some("Commit as you go."),
@@ -374,6 +375,79 @@ fn a_run_may_write_only_its_own_folders() {
             .iter()
             .any(|dir| dir.starts_with(config_dir.join("session-env")))
     );
+}
+
+#[test]
+fn a_run_in_a_shared_folder_may_write_only_its_own_conversation() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let config = config(&dir);
+    let config_dir = dir.path().join("config");
+    let cwd = dir.path().join("checkout");
+    std::fs::create_dir(&cwd).expect("checkout");
+    let session = "6f1c2b8e-3a1d-4c55-9b0e-2d7f1e4a9c10";
+    let run = RunSpec {
+        shared_folder: true,
+        ..run(
+            Conversation::Resume {
+                session_id: session,
+            },
+            &cwd,
+        )
+    };
+    let needs = ClaudeCode.needs_for_run(&config, &run);
+    let name = sanitise(&std::fs::canonicalize(&cwd).expect("real").to_string_lossy());
+    let project = config_dir.join("projects").join(&name);
+    // Its own transcript, subagents and tool results; never the folder,
+    // where the user's own conversations and their memory are.
+    assert!(
+        needs
+            .write_files
+            .contains(&project.join(format!("{session}.jsonl")))
+    );
+    assert!(needs.write_dirs.contains(&project.join(session)));
+    for path in needs.write_dirs.iter().chain(&needs.write_files) {
+        assert!(
+            !project.starts_with(path),
+            "{path:?} holds the whole folder"
+        );
+        assert!(!path.starts_with(project.join("memory")), "{path:?}");
+    }
+    assert!(needs.create_dirs.contains(&project));
+    assert!(
+        needs
+            .write_dirs
+            .contains(&config_dir.join("session-env").join(session))
+    );
+    #[cfg(unix)]
+    {
+        let uid = rustix::process::getuid().as_raw();
+        let tmp = std::fs::canonicalize("/tmp")
+            .expect("tmp")
+            .join(format!("claude-{uid}"))
+            .join(&name);
+        assert!(needs.write_dirs.contains(&tmp.join(session)));
+        assert!(!needs.write_dirs.contains(&tmp));
+    }
+
+    // Without an id that names a folder safely, nothing of the folder.
+    let odd = RunSpec {
+        conversation: Conversation::New {
+            session_id: "../..",
+        },
+        ..run
+    };
+    let needs = ClaudeCode.needs_for_run(&config, &odd);
+    assert!(needs.write_files.is_empty());
+    assert!(!needs.write_dirs.iter().any(|dir| dir.starts_with(&project)));
+
+    // A thread's own worktree is its own: nothing to make beforehand.
+    let own = RunSpec {
+        shared_folder: false,
+        ..run
+    };
+    let needs = ClaudeCode.needs_for_run(&config, &own);
+    assert!(needs.write_dirs.contains(&project));
+    assert!(needs.create_dirs.is_empty());
 }
 
 #[test]

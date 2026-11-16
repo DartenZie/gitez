@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gitez_agent_thread::{
-    Activity, AgentThread, Ending, IndexedRepository, NewAgentThread, Start, State, Store,
+    Activity, AgentThread, Ending, IndexedRepository, Mode, NewAgentThread, Start, State, Store,
     Timestamp,
 };
 use gitez_sandbox::NetworkProfile;
@@ -37,7 +37,8 @@ fn row(index: usize) -> gpui_kit::Point<gpui_kit::Pixels> {
 /// The fake `claude`: answers `auth status` as signed in unless
 /// `FAKE_SIGNED_IN=false`, and acts on a keyword in the prompt: WORK
 /// commits and waits for `release`, FAIL exits without a result, SLEEP
-/// waits until interrupted; anything else is answered.
+/// waits until interrupted; GitEZ's request for a brief gets one; anything
+/// else is answered.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 if [ "$1" = auth ]; then printf '{"loggedIn": %s}\n' "${FAKE_SIGNED_IN:-true}"; exit 0; fi
 log="$FAKE_LOG"
@@ -48,6 +49,7 @@ for arg in "$@"; do
   prev="$arg"
 done
 printf '%s\n' "$*" >> "$log/calls"
+pwd -P > "$log/cwd"
 prompt=$(cat)
 say() { printf '%s\n' "$1"; }
 init() { say '{"type":"system","subtype":"init","session_id":"'"$sid"'","model":"fake-model"}'; }
@@ -66,6 +68,8 @@ case "$prompt" in
     init; tool "sleep"
     trap 'say "{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"result\":\"\",\"session_id\":\"$sid\"}"; exit 0' INT
     while [ ! -e "$log/stop-never" ]; do sleep 0.1; done ;;
+  *"Write a brief for an engineer"*)
+    init; result '# Cover renames in the parser\n\nAdd a test with a file renamed twice.' ;;
   *)
     init; result "The answer is 42." ;;
 esac
@@ -140,6 +144,18 @@ pub(crate) fn repository(dir: &Path) -> PathBuf {
     work_dir
 }
 
+/// What `git <args>` prints in `dir`.
+fn git_output(dir: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .expect("git runs");
+    assert!(output.status.success(), "git {args:?}: {output:?}");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
 pub(crate) fn common_dir_of(work_dir: &Path) -> PathBuf {
     gitez_git::Repository::open(work_dir)
         .expect("open")
@@ -172,11 +188,16 @@ fn screenshot_u2_composer() {
         "Add a blame view to the commit detail. Reuse the diff list and keep it fast on big files.",
     );
     shots.save(window, "u2-composer-filled");
-    for (name, x, y) in pickers() {
-        shots.click(window, point(px(x), px(y)));
+    for name in PICKERS {
+        let place = picker(&mut shots, window, name);
+        shots.click(window, place);
         shots.save(window, &format!("u2-picker-{name}"));
         shots.keys(window, "escape");
     }
+    // A discussion: no From picker, and what the agent may do.
+    shots.click_id(window, "composer-mode-discuss");
+    shots.save(window, "u2-composer-discuss");
+    shots.click_id(window, "composer-mode-implement");
 }
 
 /// The composer with two pasted screenshots, at the window's opening size
@@ -222,29 +243,28 @@ fn screenshot_composer_images() {
     }
 }
 
-/// Where each picker of the open composer is, in window coordinates,
-/// from `U2_PICKERS` ("agent=327:325,…") or the places found on
-/// `u2-composer-filled`, where the secrets picker wraps to a second row.
-fn pickers() -> Vec<(String, f32, f32)> {
-    let spec = std::env::var("U2_PICKERS").unwrap_or_else(|_| {
-        "agent=327:325,model=476:325,from=637:325,sandbox=818:325,secrets=331:359".into()
-    });
-    spec.split(',')
-        .filter_map(|pair| {
-            let (name, place) = pair.split_once('=')?;
-            let (x, y) = place.split_once(':')?;
-            Some((name.to_owned(), x.parse().ok()?, y.parse().ok()?))
-        })
-        .collect()
-}
+/// The pickers of the open composer, by the name their screenshots have.
+const PICKERS: [&str; 5] = ["agent", "model", "from", "sandbox", "secrets"];
 
-/// Where picker `name` is, as [`pickers`] has it.
-fn picker(name: &str) -> gpui_kit::Point<gpui_kit::Pixels> {
-    let (_, x, y) = pickers()
-        .into_iter()
-        .find(|(known, _, _)| known == name)
-        .expect("a known picker");
-    point(px(x), px(y))
+/// Where picker `name` of the open composer is drawn.
+pub(crate) fn picker(
+    shots: &mut Shots,
+    window: gpui_kit::AnyWindowHandle,
+    name: &str,
+) -> gpui_kit::Point<gpui_kit::Pixels> {
+    let id = match name {
+        "repository" => "composer-repository",
+        "agent" => "composer-agent",
+        "model" => "composer-model",
+        "from" => "composer-from",
+        "sandbox" => "composer-sandbox",
+        "secrets" => "composer-secrets",
+        _ => panic!("no picker {name}"),
+    };
+    shots
+        .bounds_of(window, id)
+        .unwrap_or_else(|| panic!("the {name} picker is shown"))
+        .center()
 }
 
 /// Why Send is disabled: no sandbox, the agent missing, or signed out.
@@ -288,6 +308,17 @@ pub(crate) fn thread(
     prompt: &str,
     change: impl FnOnce(&mut AgentThread),
 ) -> AgentThread {
+    thread_in_mode(Mode::Implement, work_dir, data_dir, prompt, change)
+}
+
+/// [`thread`] with a thread of `mode`.
+pub(crate) fn thread_in_mode(
+    mode: Mode,
+    work_dir: &Path,
+    data_dir: &Path,
+    prompt: &str,
+    change: impl FnOnce(&mut AgentThread),
+) -> AgentThread {
     let common_dir = common_dir_of(work_dir);
     let store = Store::new(&common_dir);
     let head = gitez_git::Repository::open(work_dir)
@@ -308,6 +339,9 @@ pub(crate) fn thread(
                 },
                 network: NetworkProfile::AgentOnly,
                 secrets: Vec::new(),
+                mode,
+                work_dir: (mode == Mode::Discuss).then(|| work_dir.to_owned()),
+                origin: None,
             },
             data_dir,
             "repo",
@@ -325,6 +359,65 @@ pub(crate) fn thread(
 
 pub(crate) fn minutes_ago(minutes: i64) -> Timestamp {
     Timestamp::now() - jiff::SignedDuration::from_mins(minutes)
+}
+
+/// A running discussion's live lane beside an Implement thread's: at the
+/// commit it started from, in a neutral colour, named "Discussion" where
+/// the other has its branch.
+#[test]
+fn screenshot_lane_discussion() {
+    if !crate::screenshot::enabled() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let work_dir = repository(dir.path());
+    let data_dir = dir.path().join("data");
+    save_settings(
+        &data_dir,
+        &common_dir_of(&work_dir),
+        fake_agent(dir.path(), true),
+    );
+    thread(&work_dir, &data_dir, "Speed up the status read", |thread| {
+        thread.state = State::Running;
+        thread.created = minutes_ago(6);
+        thread.turns[0].started = Some(minutes_ago(6));
+    });
+    let discussion = thread_in_mode(
+        Mode::Discuss,
+        &work_dir,
+        &data_dir,
+        "How should blame follow a renamed file?",
+        |thread| {
+            thread.state = State::Running;
+            thread.created = minutes_ago(2);
+            thread.turns[0].started = Some(minutes_ago(2));
+            thread.activity = Some(Activity {
+                tool: Some("Read".into()),
+                detail: "crates/gitez-git/src/blame.rs".into(),
+                steps: 7,
+                updated: Timestamp::now(),
+            });
+        },
+    );
+    assert_eq!(discussion.own(), None);
+    gitez_agent_thread::Index::new(&data_dir)
+        .add(IndexedRepository {
+            common_dir: common_dir_of(&work_dir),
+            work_dir: work_dir.clone(),
+            name: "repo".into(),
+        })
+        .expect("index");
+    let mut shots = Shots::from_env(&data_dir).expect("enabled");
+    let (window, _) = shots.open_workspace(&work_dir);
+    shots.save(window, "lane-discussion");
+    shots.dispatch(
+        window,
+        crate::agent_threads::OpenAgentThread {
+            common_dir: common_dir_of(&work_dir),
+            id: discussion.id.clone(),
+        },
+    );
+    shots.save(window, "lane-discussion-open");
 }
 
 /// Two live lanes, Preparing and Running, with a queued and a finished
@@ -360,7 +453,14 @@ fn screenshot_u2_lanes() {
         },
     );
     // The running thread's branch has two commits of its own.
-    git(&work_dir, &["checkout", "-qb", &running.branch]);
+    git(
+        &work_dir,
+        &[
+            "checkout",
+            "-qb",
+            crate::agent_threads::thread_branch(&running),
+        ],
+    );
     for (file, message) in [
         ("blame.rs", "Read who last changed each line"),
         ("detail.rs", "Show blame in the commit detail"),
@@ -610,6 +710,158 @@ fn e2e_u2_composer_fake_agent() {
     shots.save(window, "u2-e2e-6-stopped");
 }
 
+/// A discussion from the composer to its handoff, with a fake agent and
+/// the real supervisor: the thread runs in the working tree and makes no
+/// branch, worktree or pull request; "Implement…" asks for a brief, and
+/// when it arrives the composer opens with it; sent, it starts an
+/// Implement thread that names the discussion.
+#[test]
+fn e2e_discuss_fake_agent() {
+    if !crate::screenshot::enabled() || std::env::var_os("GITEZ_E2E").is_none() {
+        return;
+    }
+    let binary = gitez_binary().expect("build target/debug/gitez first: cargo build -p gitez");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let base = dir.path().canonicalize().expect("canonical");
+    let work_dir = repository(&base);
+    // What the user has not committed: a discussion reads it as it is.
+    std::fs::write(work_dir.join("notes.txt"), "draft\n").expect("write");
+    let common_dir = common_dir_of(&work_dir);
+    let data_dir = base.join("data");
+    let log = base.join("fake log");
+    save_settings(&data_dir, &common_dir, fake_agent(&base, true));
+    let script = supervisor_script(&base, &binary, &data_dir, true);
+    let mut shots = Shots::with_options(&data_dir, |options| {
+        options.exe = Ok(script);
+        options.watch = true;
+    })
+    .expect("enabled");
+    let (window, workspace) = shots.open_workspace(&work_dir);
+    let branches = git_output(&work_dir, &["branch", "--list"]);
+
+    shots.keys(window, "cmd-shift-a");
+    shots.click_id(window, "composer-mode-discuss");
+    shots.type_text(window, "How does the parser read a rename?");
+    shots.save(window, "discuss-e2e-1-typed");
+    shots.keys(window, "cmd-enter");
+    let threads = wait_until(
+        &mut shots,
+        &common_dir,
+        Duration::from_secs(30),
+        "the discussion to answer",
+        |threads| threads.iter().any(|thread| thread.state == State::Finished),
+    );
+    let discussion = threads[0].clone();
+    assert_eq!(discussion.mode, Mode::Discuss);
+    assert_eq!(discussion.ending, Some(Ending::Answer));
+    assert_eq!(discussion.own(), None);
+    assert_eq!(discussion.pull_request, None);
+    assert_eq!(discussion.work_dir.as_deref(), Some(work_dir.as_path()));
+    // The agent ran in the working tree itself.
+    let calls = std::fs::read_to_string(log.join("cwd")).expect("the fake agent logs its folder");
+    assert_eq!(Path::new(calls.trim()), work_dir);
+    // No branch, no worktree, and the user's file is as it was.
+    assert_eq!(git_output(&work_dir, &["branch", "--list"]), branches);
+    let worktrees = git_output(&work_dir, &["worktree", "list", "--porcelain"]);
+    assert_eq!(worktrees.matches("worktree ").count(), 1, "{worktrees}");
+    assert_eq!(
+        std::fs::read_to_string(work_dir.join("notes.txt")).expect("read"),
+        "draft\n"
+    );
+    // The mode is remembered for the next thread.
+    let last = shots.update(|cx| {
+        AgentThreads::global(cx)
+            .read(cx)
+            .settings()
+            .threads
+            .last_mode
+    });
+    assert_eq!(last, Mode::Discuss);
+    shots.save(window, "discuss-e2e-2-answered");
+
+    // Implement…: a brief is asked for, and opens in the composer.
+    shots.click_id(window, "thread-implement");
+    wait_until(
+        &mut shots,
+        &common_dir,
+        Duration::from_secs(30),
+        "the brief",
+        |threads| threads.iter().any(|thread| thread.brief().is_some()),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !shots.has_id(window, "composer-origin-remove") {
+        assert!(
+            Instant::now() < deadline,
+            "the composer opens with the brief"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        shots.settle();
+    }
+    let composer = shots
+        .update(|cx| workspace.read(cx).history.read(cx).composer().cloned())
+        .expect("the composer");
+    let (prompt, mode, origin) = shots.update(|cx| {
+        let composer = composer.read(cx);
+        (
+            composer.prompt_text(cx),
+            composer.thread_mode(cx),
+            composer.origin().cloned(),
+        )
+    });
+    assert_eq!(
+        prompt,
+        "# Cover renames in the parser\n\nAdd a test with a file renamed twice."
+    );
+    assert_eq!(mode, Mode::Implement);
+    assert_eq!(origin.map(|origin| origin.id), Some(discussion.id.clone()));
+    shots.save(window, "discuss-e2e-3-brief");
+
+    // Sent: an Implement thread of its own, named by the brief's heading.
+    shots.keys(window, "cmd-enter");
+    let threads = wait_until(
+        &mut shots,
+        &common_dir,
+        Duration::from_secs(30),
+        "the Implement thread to finish",
+        |threads| {
+            threads
+                .iter()
+                .any(|thread| thread.id != discussion.id && thread.state == State::Finished)
+        },
+    );
+    let implement = threads
+        .iter()
+        .find(|thread| thread.id != discussion.id)
+        .expect("the Implement thread");
+    assert_eq!(implement.mode, Mode::Implement);
+    assert_eq!(implement.origin.as_ref(), Some(&discussion.id));
+    assert_eq!(implement.title, "Cover renames in the parser");
+    assert_eq!(
+        implement.branch.as_deref(),
+        Some("agent/cover-renames-in-the-parser")
+    );
+    // A conversation of its own, not the discussion's.
+    assert_ne!(implement.session_id, discussion.session_id);
+    assert!(!implement.turns[0].resume);
+    shots.save(window, "discuss-e2e-4-implementing");
+    // The discussion lists it.
+    shots.dispatch(
+        window,
+        crate::agent_threads::OpenAgentThread {
+            common_dir: common_dir.clone(),
+            id: discussion.id.clone(),
+        },
+    );
+    let implementations = shots.update(|cx| {
+        AgentThreads::global(cx)
+            .read(cx)
+            .implementations(&common_dir, &discussion.id)
+            .len()
+    });
+    assert_eq!(implementations, 1);
+    shots.save(window, "discuss-e2e-5-discussion");
+}
+
 /// One real run: Claude Code with haiku, picked in the composer's model
 /// picker, in the real sandbox, in a throwaway repository under
 /// `GITEZ_E2E_SCRATCH`; srt is copied from `GITEZ_E2E_SANDBOX`.
@@ -661,13 +913,14 @@ fn e2e_u2_composer_real_haiku() {
         "Add a file hello.txt containing hi and commit it. Do nothing else.",
     );
     // haiku, as the owner allows, picked with the model picker.
-    shots.click(window, picker("model"));
+    let model_picker = picker(&mut shots, window, "model");
+    shots.click(window, model_picker);
     shots.save(window, "u2-real-1-model-picker");
     let haiku = std::env::var("U2_HAIKU_Y")
         .ok()
         .and_then(|y| y.parse().ok())
         .unwrap_or(478.);
-    shots.click(window, point(picker("model").x + px(20.), px(haiku)));
+    shots.click(window, point(model_picker.x + px(20.), px(haiku)));
     let model = shots.update(|cx| {
         workspace
             .read(cx)

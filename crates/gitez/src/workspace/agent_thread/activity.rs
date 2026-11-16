@@ -83,7 +83,8 @@ pub fn entries(turns: &[TurnEvents<'_>]) -> Vec<Entry> {
                     text: turn.prompt.to_owned(),
                     turn: index,
                 },
-                TurnKind::Retry | TurnKind::Resume => Entry::Continued(turn.kind),
+                // GitEZ's own words, not the user's: named, not shown.
+                TurnKind::Retry | TurnKind::Resume | TurnKind::Brief => Entry::Continued(turn.kind),
             });
         }
         let first = entries.len();

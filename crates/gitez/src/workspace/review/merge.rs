@@ -693,7 +693,7 @@ fn carry_out(
             .load_all()
             .0
             .into_iter()
-            .find(|thread| thread.branch == head)
+            .find(|thread| thread.branch.as_deref() == Some(head.as_str()))
             .and_then(|thread| thread.worktree_record)
     });
     let rebase_head = |onto: &str| -> anyhow::Result<()> {

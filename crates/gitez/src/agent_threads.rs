@@ -20,7 +20,7 @@ use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gitez_agent_thread::{
     AgentThread, AgentThreadId, CompleteReport, Ending, IfUncommitted, Index, IndexReport,
-    IndexedRepository, Kept, Merged, NewAgentThread, State, Step, Store, Timestamp, TurnKind,
+    IndexedRepository, Kept, Merged, Mode, NewAgentThread, State, Step, Store, Timestamp, TurnKind,
 };
 use gitez_sandbox::NetworkProfile;
 use gitez_secret::SecretStore;
@@ -53,6 +53,24 @@ pub struct OpenAgentPullRequest {
 pub struct AgentThreadKey {
     pub common_dir: PathBuf,
     pub id: AgentThreadId,
+}
+
+/// Tests: the worktree of an Implement thread.
+#[cfg(test)]
+pub(crate) fn thread_worktree(thread: &AgentThread) -> &Path {
+    thread
+        .worktree
+        .as_deref()
+        .expect("an Implement thread has a worktree")
+}
+
+/// Tests: the branch of an Implement thread.
+#[cfg(test)]
+pub(crate) fn thread_branch(thread: &AgentThread) -> &str {
+    thread
+        .branch
+        .as_deref()
+        .expect("an Implement thread has a branch")
 }
 
 /// The agent threads of one repository.
@@ -89,19 +107,23 @@ pub struct ThreadFacts {
 impl ThreadFacts {
     /// Reads them for `thread` of the repository at `common_dir`. Blocks.
     fn read(common_dir: &Path, thread: &AgentThread) -> Self {
-        let worktree_present = std::fs::symlink_metadata(&thread.worktree).is_ok();
-        let untrusted = (worktree_present && !thread.state.is_active())
-            .then(|| {
+        // A Discuss thread has no worktree: nothing is present, and nothing
+        // of the user's working tree is checked.
+        let worktree = thread.worktree.as_deref();
+        let worktree_present =
+            worktree.is_some_and(|worktree| std::fs::symlink_metadata(worktree).is_ok());
+        let untrusted = worktree
+            .filter(|_| worktree_present && !thread.state.is_active())
+            .and_then(|worktree| {
                 match gitez_agent_thread::check_worktree(
                     common_dir,
-                    &thread.worktree,
+                    worktree,
                     thread.worktree_record.as_ref(),
                 ) {
                     Err(gitez_agent_thread::Error::Tampered { problem, .. }) => Some(problem),
                     _ => None,
                 }
-            })
-            .flatten();
+            });
         Self {
             worktree_present,
             untrusted,
@@ -162,13 +184,18 @@ pub enum AgentThreadsEvent {
 /// What a new agent thread starts with.
 #[derive(Debug, Clone)]
 pub struct StartRequest {
+    /// The working tree open in GitEZ: where an Implement thread starts
+    /// from, and what a Discuss thread reads.
     pub work_dir: PathBuf,
     pub common_dir: PathBuf,
     pub repository_name: String,
     pub prompt: String,
     pub agent: String,
     pub model: Option<String>,
+    pub mode: Mode,
     pub start: gitez_agent_thread::Start,
+    /// The Discuss thread whose brief the prompt is.
+    pub origin: Option<AgentThreadId>,
     pub network: NetworkProfile,
     pub secrets: Vec<String>,
     /// Sent with the prompt, made fit to send.
@@ -524,6 +551,20 @@ impl AgentThreads {
             .find(|thread| thread.pull_request == Some(number))
     }
 
+    /// The threads started from a brief of the Discuss thread `id`, oldest
+    /// first.
+    pub fn implementations(&self, common_dir: &Path, id: &AgentThreadId) -> Vec<Arc<AgentThread>> {
+        let mut threads: Vec<Arc<AgentThread>> = self
+            .repository(common_dir)
+            .into_iter()
+            .flat_map(|repository| &repository.threads)
+            .filter(|thread| thread.origin.as_ref() == Some(id))
+            .cloned()
+            .collect();
+        threads.sort_by(|a, b| a.created.cmp(&b.created).then_with(|| a.id.cmp(&b.id)));
+        threads
+    }
+
     /// Of one repository, or of all with `None`.
     pub fn counts(&self, common_dir: Option<&Path>) -> Counts {
         match common_dir {
@@ -639,17 +680,20 @@ impl AgentThreads {
     /// Creates the agent thread (queued), lists its repository in the
     /// index, reads its secrets from the keychain and starts its
     /// supervisor with `gitez supervise start`. Runs in the background.
+    /// The request's mode is the one the next composer starts with.
     pub fn start(
         &mut self,
         request: StartRequest,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<AgentThreadKey>> {
+        let mode = request.mode;
+        self.update_settings(|settings| settings.threads.last_mode = mode, cx);
         let launcher = self.launcher();
         let data_dir = self.data_dir.clone();
         let changes = self.changes.clone();
         cx.background_executor().spawn(async move {
             let data_dir =
-                data_dir.context("GitEZ has no data folder to keep the thread's worktree in")?;
+                data_dir.context("GitEZ has no data folder to keep the thread's files in")?;
             let repository = gitez_git::Repository::open(&request.work_dir)?;
             let store = Store::new(&request.common_dir);
             let thread = store.create_with_images(
@@ -657,7 +701,10 @@ impl AgentThreads {
                     prompt: request.prompt,
                     agent: request.agent,
                     model: request.model,
+                    mode: request.mode,
                     start: request.start,
+                    work_dir: (request.mode == Mode::Discuss).then(|| request.work_dir.clone()),
+                    origin: request.origin,
                     network: request.network,
                     secrets: request.secrets,
                 },
@@ -862,10 +909,12 @@ impl AgentThreads {
                     merged.as_ref(),
                 )?;
                 // What was said about the kept worktree is no longer true.
-                let worktree = thread.worktree.display().to_string();
-                thread
-                    .warnings
-                    .retain(|warning| !warning.contains(&worktree));
+                if let Some(worktree) = &thread.worktree {
+                    let worktree = worktree.display().to_string();
+                    thread
+                        .warnings
+                        .retain(|warning| !warning.contains(&worktree));
+                }
                 thread.record_completion(&report, Timestamp::now());
                 Ok(report)
             });
@@ -1934,12 +1983,12 @@ fn completion_warning(
                 "Pull request #{number} was {how}; GitEZ completed the thread but kept its \
                  worktree at {} and its branch because the worktree has uncommitted changes. \
                  Remove the worktree when you have saved what you need.",
-                thread.worktree.display()
+                thread.worktree_display()
             )),
             Some(Kept::Untrusted(problem)) => Some(format!(
                 "Pull request #{number} was {how}; GitEZ completed the thread but kept its \
                  worktree at {} and its branch: {problem} Remove the worktree yourself.",
-                thread.worktree.display()
+                thread.worktree_display()
             )),
             None if !report.worktree_removed => Some(format!(
                 "The thread’s worktree folder was already gone when pull request #{number} was \
@@ -1950,7 +1999,7 @@ fn completion_warning(
         Err(error) => Some(format!(
             "Pull request #{number} was {how}, but GitEZ could not remove the thread’s worktree \
              at {}: {}. Remove the folder yourself.",
-            thread.worktree.display(),
+            thread.worktree_display(),
             anyhow::Error::from_ref(error)
         )),
     }
@@ -1962,7 +2011,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use gitez_agent_thread::{
-        AgentThread, AgentThreadId, Ending, Failure, Start, State, Timestamp, Turn, TurnKind,
+        AgentThread, AgentThreadId, Ending, Failure, Mode, Start, State, Timestamp, Turn, TurnKind,
         TurnResult,
     };
     use gitez_sandbox::NetworkProfile;
@@ -1971,6 +2020,7 @@ mod tests {
 
     use super::{
         AgentThreadKey, Counts, Plan, complete_for_pull_request, completes_with, resolve_secrets,
+        thread_branch, thread_worktree,
     };
 
     /// An agent thread in `state` that ended with `ending`.
@@ -1989,8 +2039,12 @@ mod tests {
                 branch: "main".to_owned(),
                 commit: "0".repeat(40),
             },
-            branch: format!("agent/{id}"),
-            worktree: PathBuf::from("/nowhere").join(id),
+            mode: Mode::Implement,
+            branch: Some(format!("agent/{id}")),
+            worktree: Some(PathBuf::from("/nowhere").join(id)),
+            work_dir: None,
+            scratch: None,
+            origin: None,
             prepared: true,
             network: NetworkProfile::AgentOnly,
             secrets: Vec::new(),
@@ -2206,6 +2260,9 @@ mod tests {
                     },
                     network: NetworkProfile::AgentOnly,
                     secrets: Vec::new(),
+                    mode: gitez_agent_thread::Mode::Implement,
+                    work_dir: None,
+                    origin: None,
                 },
                 &dir.join("data"),
                 "repo",
@@ -2213,12 +2270,17 @@ mod tests {
                 Timestamp::now(),
             )
             .expect("thread");
-        gitez_agent_thread::create_worktree(&main, &created.worktree, &created.branch, &start)
-            .expect("worktree");
-        std::fs::write(created.worktree.join("b.txt"), "b\n").expect("write");
-        git(&created.worktree, &["add", "."]);
-        git(&created.worktree, &["commit", "-qm", "Add b.txt"]);
-        let head = git(&created.worktree, &["rev-parse", "HEAD"]);
+        gitez_agent_thread::create_worktree(
+            &main,
+            thread_worktree(&created),
+            thread_branch(&created),
+            &start,
+        )
+        .expect("worktree");
+        std::fs::write(thread_worktree(&created).join("b.txt"), "b\n").expect("write");
+        git(thread_worktree(&created), &["add", "."]);
+        git(thread_worktree(&created), &["commit", "-qm", "Add b.txt"]);
+        let head = git(thread_worktree(&created), &["rev-parse", "HEAD"]);
         let pull_request = gitez_review::Store::new(&common_dir)
             .create(
                 gitez_review::NewPullRequest {
@@ -2229,7 +2291,7 @@ mod tests {
                         commit: start,
                     },
                     head: gitez_review::Tip {
-                        branch: created.branch.clone(),
+                        branch: thread_branch(&created).to_owned(),
                         commit: head,
                     },
                 },
@@ -2264,7 +2326,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let (main, key, number) = finished_thread(dir.path());
         let store = gitez_agent_thread::Store::new(&key.common_dir);
-        let worktree = store.load(&key.id).expect("load").worktree;
+        let worktree = thread_worktree(&store.load(&key.id).expect("load")).to_owned();
         let now = Timestamp::now();
         // Open: nothing happens.
         assert!(!complete_for_pull_request(&main, &key, number, now).expect("checked"));
@@ -2291,7 +2353,10 @@ mod tests {
                 .map(|deleted| &deleted.commit),
             Some(&head)
         );
-        assert_eq!(git(&main, &["branch", "--list", &thread.branch]), "");
+        assert_eq!(
+            git(&main, &["branch", "--list", thread_branch(&thread)]),
+            ""
+        );
         assert_eq!(git(&main, &["worktree", "list"]).lines().count(), 1);
 
         // Reopened: the completed thread stays as it is.
@@ -2316,7 +2381,7 @@ mod tests {
         assert_eq!(thread.state, State::Completed);
         assert_eq!(thread.deleted_branch, None);
         assert!(thread.warnings.is_empty(), "{:?}", thread.warnings);
-        git(&main, &["rev-parse", "--verify", &thread.branch]);
+        git(&main, &["rev-parse", "--verify", thread_branch(&thread)]);
     }
 
     #[test]
@@ -2324,7 +2389,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let (main, key, number) = finished_thread(dir.path());
         let store = gitez_agent_thread::Store::new(&key.common_dir);
-        std::fs::remove_dir_all(store.load(&key.id).expect("load").worktree)
+        std::fs::remove_dir_all(thread_worktree(&store.load(&key.id).expect("load")))
             .expect("deleted by hand");
         set_state(&key, number, gitez_review::State::Closed);
         assert!(complete_for_pull_request(&main, &key, number, Timestamp::now()).expect("done"));

@@ -30,7 +30,7 @@ pub fn worktree_path(
 }
 
 /// A thread's own folders in GitEZ's data folder, beside its worktree.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ScratchDirs {
     /// `<data_dir>/tmp/<repository key>-<id>`: the `TMPDIR` of its commands.
     pub tmp: PathBuf,
@@ -50,11 +50,21 @@ pub fn scratch_dirs(data_dir: &Path, repository_key: &str, id: &AgentThreadId) -
     }
 }
 
-/// The scratch folders of `thread`, from where GitEZ put its worktree
-/// (`<data_dir>/worktrees/<repository key>/<id>`); `None` for a worktree
-/// elsewhere.
+impl AgentThread {
+    /// The thread's scratch folders: a Discuss thread's as recorded when
+    /// it was created; an Implement thread's from where GitEZ put its
+    /// worktree (`<data_dir>/worktrees/<repository key>/<id>`), `None` for
+    /// a worktree elsewhere.
+    pub fn scratch_dirs(&self) -> Option<ScratchDirs> {
+        scratch_dirs_of(self)
+    }
+}
+
 fn scratch_dirs_of(thread: &AgentThread) -> Option<ScratchDirs> {
-    let key_dir = thread.worktree.parent()?;
+    let Some(worktree) = &thread.worktree else {
+        return thread.scratch.clone();
+    };
+    let key_dir = worktree.parent()?;
     let worktrees = key_dir.parent()?;
     if worktrees.file_name()? != "worktrees" {
         return None;
@@ -501,6 +511,9 @@ pub enum BranchKept {
 /// What [`complete`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompleteReport {
+    /// The thread had no worktree and no branch to remove (a Discuss
+    /// thread).
+    pub nothing_to_remove: bool,
     pub worktree_removed: bool,
     /// Set when the worktree was left in place ([`IfUncommitted::Keep`]).
     pub kept: Option<Kept>,
@@ -522,16 +535,17 @@ impl AgentThread {
                 at,
             });
         }
+        let Some(branch) = &self.branch else {
+            return;
+        };
         let warning = match &report.branch_kept {
             None => return,
             Some(BranchKept::Unmerged) => format!(
-                "GitEZ kept the branch {} because it has commits that its pull request did not \
-                 merge.",
-                self.branch
+                "GitEZ kept the branch {branch} because it has commits that its pull request \
+                 did not merge."
             ),
             Some(BranchKept::CheckedOut(path)) => format!(
-                "GitEZ kept the branch {} because it is checked out in {}.",
-                self.branch,
+                "GitEZ kept the branch {branch} because it is checked out in {}.",
                 path.display()
             ),
         };
@@ -543,7 +557,7 @@ impl AgentThread {
     /// The warning [`AgentThread::record_completion`] wrote about a kept
     /// branch, if any.
     pub fn branch_kept_warning(&self) -> Option<&str> {
-        let prefix = format!("GitEZ kept the branch {} because", self.branch);
+        let prefix = format!("GitEZ kept the branch {} because", self.branch.as_ref()?);
         self.warnings
             .iter()
             .map(String::as_str)
@@ -579,17 +593,34 @@ impl AgentThread {
 /// Called again for a completed thread whose worktree was kept, with
 /// [`IfUncommitted::Discard`], it removes the worktree then, and the branch
 /// by the same rule.
+///
+/// A Discuss thread has no worktree and no branch: only its scratch
+/// folders are removed, and git is not run.
 pub fn complete(
     main_work_dir: &Path,
     thread: &AgentThread,
     uncommitted: IfUncommitted,
     merged: Option<&Merged>,
 ) -> Result<CompleteReport> {
+    let Some((branch, worktree)) = thread.own() else {
+        if let Some(dirs) = scratch_dirs_of(thread) {
+            remove_scratch(&dirs.tmp);
+            remove_scratch(&dirs.caches);
+        }
+        return Ok(CompleteReport {
+            nothing_to_remove: true,
+            worktree_removed: false,
+            kept: None,
+            branch_deleted: false,
+            deleted_at: None,
+            branch_kept: None,
+        });
+    };
     let git = Git::new(main_work_dir);
-    let exists = match fs::symlink_metadata(&thread.worktree) {
+    let exists = match fs::symlink_metadata(worktree) {
         Ok(_) => true,
         Err(error) if error.kind() == ErrorKind::NotFound => false,
-        Err(error) => return Err(Error::io(&thread.worktree)(error)),
+        Err(error) => return Err(Error::io(worktree)(error)),
     };
     let mut kept = None;
     if exists {
@@ -607,7 +638,7 @@ pub fn complete(
             match uncommitted {
                 IfUncommitted::Refuse => {
                     return Err(Error::Uncommitted {
-                        worktree: thread.worktree.clone(),
+                        worktree: worktree.to_owned(),
                         count: Some(count),
                     });
                 }
@@ -617,11 +648,7 @@ pub fn complete(
         }
         if kept.is_none() {
             let common_dir = Repository::open(main_work_dir)?.common_dir();
-            match check_worktree(
-                &common_dir,
-                &thread.worktree,
-                thread.worktree_record.as_ref(),
-            ) {
+            match check_worktree(&common_dir, worktree, thread.worktree_record.as_ref()) {
                 Ok(_) => {}
                 Err(Error::Tampered { problem, .. }) if uncommitted == IfUncommitted::Keep => {
                     kept = Some(Kept::Untrusted(problem));
@@ -630,7 +657,7 @@ pub fn complete(
             }
         }
         if kept.is_none() {
-            git.worktree_remove(&thread.worktree, true)?;
+            git.worktree_remove(worktree, true)?;
         }
     }
     if let Some(kept) = kept {
@@ -639,6 +666,7 @@ pub fn complete(
             remove_scratch(&dirs.caches);
         }
         return Ok(CompleteReport {
+            nothing_to_remove: false,
             worktree_removed: false,
             kept: Some(kept),
             branch_deleted: false,
@@ -648,12 +676,14 @@ pub fn complete(
     }
     git.worktree_prune()?;
 
-    let (deleted_at, branch_kept) = delete_branch_if_safe(main_work_dir, &git, thread, merged)?;
+    let (deleted_at, branch_kept) =
+        delete_branch_if_safe(main_work_dir, &git, thread, branch, merged)?;
     if let Some(dirs) = scratch_dirs_of(thread) {
         remove_scratch(&dirs.tmp);
         remove_scratch(&dirs.caches);
     }
     Ok(CompleteReport {
+        nothing_to_remove: false,
         worktree_removed: exists,
         kept: None,
         branch_deleted: deleted_at.is_some(),
@@ -669,10 +699,11 @@ fn delete_branch_if_safe(
     main_work_dir: &Path,
     git: &Git,
     thread: &AgentThread,
+    branch: &str,
     merged: Option<&Merged>,
 ) -> Result<(Option<String>, Option<BranchKept>)> {
     let main = Repository::open(main_work_dir)?;
-    let Some(tip) = main.resolve_commit(&format!("refs/heads/{}", thread.branch))? else {
+    let Some(tip) = main.resolve_commit(&format!("refs/heads/{branch}"))? else {
         // Already gone.
         return Ok((None, None));
     };
@@ -695,12 +726,12 @@ fn delete_branch_if_safe(
     }
     // Any working tree: the main one (also when GitEZ has a linked one
     // open), a linked one, a locked one, or one whose folder is gone.
-    if let Some(place) = git.worktree_of(&thread.branch)? {
+    if let Some(place) = git.worktree_of(branch)? {
         return Ok((None, say(BranchKept::CheckedOut(place.path))));
     }
     let tip = tip.to_string();
     git.update_refs(&[gitez_command::RefUpdate {
-        name: format!("refs/heads/{}", thread.branch),
+        name: format!("refs/heads/{branch}"),
         old: Some(tip.clone()),
         new: None,
     }])?;

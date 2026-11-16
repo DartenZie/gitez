@@ -6,7 +6,7 @@ mod common;
 
 use std::fs;
 
-use common::{Fixture, at, git};
+use common::{Fixture, at, branch_of, git, worktree_of};
 use gitez_agent_thread::{
     AgentThread, BranchKept, DeletedBranch, IfUncommitted, Kept, Merged, Timestamp, Uncommitted,
     complete, create_worktree,
@@ -19,8 +19,8 @@ fn worked(fixture: &Fixture, prompt: &str, uncommitted: u32) -> (AgentThread, St
     let mut thread = fixture.create(prompt);
     let created = create_worktree(
         &fixture.root,
-        &thread.worktree,
-        &thread.branch,
+        worktree_of(&thread),
+        branch_of(&thread),
         &thread.start.commit,
     )
     .expect("create");
@@ -33,14 +33,14 @@ fn worked(fixture: &Fixture, prompt: &str, uncommitted: u32) -> (AgentThread, St
     });
     for n in 1..=2 {
         let name = format!("{}-{n}.txt", thread.id);
-        fs::write(thread.worktree.join(&name), format!("{n}\n")).expect("write");
-        git(&thread.worktree, &["add", "-A"]);
+        fs::write(worktree_of(&thread).join(&name), format!("{n}\n")).expect("write");
+        git(worktree_of(&thread), &["add", "-A"]);
         git(
-            &thread.worktree,
+            worktree_of(&thread),
             &["commit", "--quiet", "-m", &format!("Add {name}")],
         );
     }
-    let head = fixture.tip(&thread.branch);
+    let head = fixture.tip(branch_of(&thread));
     (thread, head)
 }
 
@@ -87,7 +87,14 @@ fn a_merge_commit_deletes_the_branch_and_records_where_it_was() {
     main_moves_on(&fixture, "main.txt");
     git(
         &fixture.root,
-        &["merge", "--quiet", "--no-ff", "-m", "Merge", &thread.branch],
+        &[
+            "merge",
+            "--quiet",
+            "--no-ff",
+            "-m",
+            "Merge",
+            branch_of(&thread),
+        ],
     );
     let report = complete(
         &fixture.root,
@@ -102,8 +109,8 @@ fn a_merge_commit_deletes_the_branch_and_records_where_it_was() {
     );
     assert_eq!(report.deleted_at.as_deref(), Some(head.as_str()));
     assert_eq!(report.branch_kept, None);
-    assert!(!thread.worktree.exists());
-    assert!(!exists(&fixture, &thread.branch));
+    assert!(!worktree_of(&thread).exists());
+    assert!(!exists(&fixture, branch_of(&thread)));
 
     thread.record_completion(&report, at("2026-11-13T12:00:00Z"));
     assert_eq!(
@@ -115,7 +122,7 @@ fn a_merge_commit_deletes_the_branch_and_records_where_it_was() {
     );
     assert!(thread.warnings.is_empty(), "{:?}", thread.warnings);
     // It can be made again where it was.
-    git(&fixture.root, &["branch", &thread.branch, &head]);
+    git(&fixture.root, &["branch", branch_of(&thread), &head]);
 }
 
 #[test]
@@ -125,19 +132,19 @@ fn a_squash_deletes_the_branch_git_does_not_see_merged() {
     main_moves_on(&fixture, "main.txt");
     git(
         &fixture.root,
-        &["merge", "--quiet", "--squash", &thread.branch],
+        &["merge", "--quiet", "--squash", branch_of(&thread)],
     );
     git(&fixture.root, &["commit", "--quiet", "-m", "Squash (#1)"]);
     // git itself would refuse: the branch's commits are not in main.
     assert_ne!(
         git(
             &fixture.root,
-            &["branch", "--merged", "main", "--list", &thread.branch]
+            &["branch", "--merged", "main", "--list", branch_of(&thread)]
         ),
-        thread.branch
+        branch_of(&thread)
     );
     complete_merged(&fixture, &mut thread, &merged(&head));
-    assert!(!exists(&fixture, &thread.branch));
+    assert!(!exists(&fixture, branch_of(&thread)));
     assert_eq!(
         thread
             .deleted_branch
@@ -154,15 +161,15 @@ fn a_rebase_and_merge_deletes_the_rewritten_branch() {
     main_moves_on(&fixture, "main.txt");
     // As "Rebase and merge" does: rebased in the thread's worktree, then
     // main fast-forwarded; the pull request follows the rewritten head.
-    git(&thread.worktree, &["rebase", "--quiet", "main"]);
-    let rebased = fixture.tip(&thread.branch);
+    git(worktree_of(&thread), &["rebase", "--quiet", "main"]);
+    let rebased = fixture.tip(branch_of(&thread));
     assert_ne!(rebased, before);
     git(
         &fixture.root,
-        &["merge", "--quiet", "--ff-only", &thread.branch],
+        &["merge", "--quiet", "--ff-only", branch_of(&thread)],
     );
     complete_merged(&fixture, &mut thread, &merged(&rebased));
-    assert!(!exists(&fixture, &thread.branch));
+    assert!(!exists(&fixture, branch_of(&thread)));
     assert_eq!(
         thread
             .deleted_branch
@@ -175,14 +182,14 @@ fn a_rebase_and_merge_deletes_the_rewritten_branch() {
     // main.
     let (mut other, stale) = worked(&fixture, "Rebase again", 0);
     main_moves_on(&fixture, "again.txt");
-    git(&other.worktree, &["rebase", "--quiet", "main"]);
+    git(worktree_of(&other), &["rebase", "--quiet", "main"]);
     git(
         &fixture.root,
-        &["merge", "--quiet", "--ff-only", &other.branch],
+        &["merge", "--quiet", "--ff-only", branch_of(&other)],
     );
-    assert_ne!(fixture.tip(&other.branch), stale);
+    assert_ne!(fixture.tip(branch_of(&other)), stale);
     complete_merged(&fixture, &mut other, &merged(&stale));
-    assert!(!exists(&fixture, &other.branch));
+    assert!(!exists(&fixture, branch_of(&other)));
 }
 
 #[test]
@@ -191,16 +198,16 @@ fn commits_after_the_merge_keep_the_branch_and_say_why() {
     let (mut thread, head) = worked(&fixture, "Moved on", 0);
     git(
         &fixture.root,
-        &["merge", "--quiet", "--squash", &thread.branch],
+        &["merge", "--quiet", "--squash", branch_of(&thread)],
     );
     git(&fixture.root, &["commit", "--quiet", "-m", "Squash (#1)"]);
-    fs::write(thread.worktree.join("later.txt"), "later\n").expect("write");
-    git(&thread.worktree, &["add", "-A"]);
+    fs::write(worktree_of(&thread).join("later.txt"), "later\n").expect("write");
+    git(worktree_of(&thread), &["add", "-A"]);
     git(
-        &thread.worktree,
+        worktree_of(&thread),
         &["commit", "--quiet", "-m", "After the merge"],
     );
-    let tip = fixture.tip(&thread.branch);
+    let tip = fixture.tip(branch_of(&thread));
 
     let report = complete(
         &fixture.root,
@@ -212,13 +219,17 @@ fn commits_after_the_merge_keep_the_branch_and_say_why() {
     assert!(report.worktree_removed, "{report:?}");
     assert!(!report.branch_deleted);
     assert_eq!(report.branch_kept, Some(BranchKept::Unmerged));
-    assert_eq!(fixture.tip(&thread.branch), tip, "the branch is untouched");
+    assert_eq!(
+        fixture.tip(branch_of(&thread)),
+        tip,
+        "the branch is untouched"
+    );
 
     thread.record_completion(&report, Timestamp::now());
     assert_eq!(thread.deleted_branch, None);
     let warning = format!(
         "GitEZ kept the branch {} because it has commits that its pull request did not merge.",
-        thread.branch
+        branch_of(&thread)
     );
     assert_eq!(thread.warnings, std::slice::from_ref(&warning));
     assert_eq!(thread.branch_kept_warning(), Some(warning.as_str()));
@@ -233,7 +244,14 @@ fn a_branch_checked_out_elsewhere_is_kept() {
     let (mut thread, head) = worked(&fixture, "Elsewhere", 0);
     git(
         &fixture.root,
-        &["merge", "--quiet", "--no-ff", "-m", "Merge", &thread.branch],
+        &[
+            "merge",
+            "--quiet",
+            "--no-ff",
+            "-m",
+            "Merge",
+            branch_of(&thread),
+        ],
     );
     let other = fixture.root.parent().expect("base").join("other tree");
     git(
@@ -244,7 +262,7 @@ fn a_branch_checked_out_elsewhere_is_kept() {
             "--quiet",
             "--force",
             other.to_str().expect("utf-8"),
-            &thread.branch,
+            branch_of(&thread),
         ],
     );
     let report = complete(
@@ -265,7 +283,7 @@ fn a_branch_checked_out_elsewhere_is_kept() {
         ),
         kept => panic!("expected checked out elsewhere, got {kept:?}"),
     }
-    assert!(exists(&fixture, &thread.branch));
+    assert!(exists(&fixture, branch_of(&thread)));
     thread.record_completion(&report, Timestamp::now());
     assert!(
         thread.warnings[0].contains("because it is checked out in"),
@@ -283,7 +301,7 @@ fn a_branch_checked_out_elsewhere_is_kept() {
             "--no-ff",
             "-m",
             "Merge",
-            &main_thread.branch,
+            branch_of(&main_thread),
         ],
     );
     git(
@@ -295,9 +313,12 @@ fn a_branch_checked_out_elsewhere_is_kept() {
             other.to_str().expect("utf-8"),
         ],
     );
-    fs::remove_dir_all(&main_thread.worktree).expect("deleted by hand");
+    fs::remove_dir_all(worktree_of(&main_thread)).expect("deleted by hand");
     git(&fixture.root, &["worktree", "prune"]);
-    git(&fixture.root, &["switch", "--quiet", &main_thread.branch]);
+    git(
+        &fixture.root,
+        &["switch", "--quiet", branch_of(&main_thread)],
+    );
     let report = complete(
         &fixture.root,
         &main_thread,
@@ -309,7 +330,7 @@ fn a_branch_checked_out_elsewhere_is_kept() {
         report.branch_kept,
         Some(BranchKept::CheckedOut(fixture.root.clone()))
     );
-    assert!(exists(&fixture, &main_thread.branch));
+    assert!(exists(&fixture, branch_of(&main_thread)));
 }
 
 /// Git's list of working trees is asked, so a branch checked out in the
@@ -333,11 +354,18 @@ fn a_branch_checked_out_in_any_worktree_is_kept_wherever_gitez_runs() {
     let (thread, head) = worked(&fixture, "Main from linked", 0);
     git(
         &fixture.root,
-        &["merge", "--quiet", "--no-ff", "-m", "Merge", &thread.branch],
+        &[
+            "merge",
+            "--quiet",
+            "--no-ff",
+            "-m",
+            "Merge",
+            branch_of(&thread),
+        ],
     );
-    fs::remove_dir_all(&thread.worktree).expect("deleted by hand");
+    fs::remove_dir_all(worktree_of(&thread)).expect("deleted by hand");
     git(&fixture.root, &["worktree", "prune"]);
-    git(&fixture.root, &["switch", "--quiet", &thread.branch]);
+    git(&fixture.root, &["switch", "--quiet", branch_of(&thread)]);
     let report =
         complete(&linked, &thread, IfUncommitted::Keep, Some(&merged(&head))).expect("complete");
     match &report.branch_kept {
@@ -347,7 +375,7 @@ fn a_branch_checked_out_in_any_worktree_is_kept_wherever_gitez_runs() {
         ),
         kept => panic!("expected checked out in the main worktree, got {kept:?}"),
     }
-    assert!(exists(&fixture, &thread.branch));
+    assert!(exists(&fixture, branch_of(&thread)));
 
     // In a locked worktree.
     git(&fixture.root, &["switch", "--quiet", "main"]);
@@ -360,10 +388,10 @@ fn a_branch_checked_out_in_any_worktree_is_kept_wherever_gitez_runs() {
             "--no-ff",
             "-m",
             "Merge",
-            &locked_thread.branch,
+            branch_of(&locked_thread),
         ],
     );
-    fs::remove_dir_all(&locked_thread.worktree).expect("deleted by hand");
+    fs::remove_dir_all(worktree_of(&locked_thread)).expect("deleted by hand");
     git(&fixture.root, &["worktree", "prune"]);
     let stick = fixture.root.parent().expect("base").join("on a stick");
     git(
@@ -374,7 +402,7 @@ fn a_branch_checked_out_in_any_worktree_is_kept_wherever_gitez_runs() {
             "--quiet",
             "--lock",
             stick.to_str().expect("utf-8"),
-            &locked_thread.branch,
+            branch_of(&locked_thread),
         ],
     );
     let report = complete(
@@ -388,17 +416,24 @@ fn a_branch_checked_out_in_any_worktree_is_kept_wherever_gitez_runs() {
         matches!(&report.branch_kept, Some(BranchKept::CheckedOut(_))),
         "{report:?}"
     );
-    assert!(exists(&fixture, &locked_thread.branch));
+    assert!(exists(&fixture, branch_of(&locked_thread)));
 }
 
 #[test]
 fn a_kept_worktree_keeps_the_branch_until_it_is_removed() {
     let fixture = Fixture::new();
     let (mut thread, head) = worked(&fixture, "Left work", 2);
-    fs::write(thread.worktree.join("draft.md"), "draft\n").expect("write");
+    fs::write(worktree_of(&thread).join("draft.md"), "draft\n").expect("write");
     git(
         &fixture.root,
-        &["merge", "--quiet", "--no-ff", "-m", "Merge", &thread.branch],
+        &[
+            "merge",
+            "--quiet",
+            "--no-ff",
+            "-m",
+            "Merge",
+            branch_of(&thread),
+        ],
     );
     let merge = merged(&head);
     let report =
@@ -407,8 +442,8 @@ fn a_kept_worktree_keeps_the_branch_until_it_is_removed() {
     assert!(!report.branch_deleted);
     assert_eq!(report.branch_kept, None, "the kept worktree says it all");
     thread.record_completion(&report, Timestamp::now());
-    assert!(thread.worktree.join("draft.md").exists());
-    assert!(exists(&fixture, &thread.branch));
+    assert!(worktree_of(&thread).join("draft.md").exists());
+    assert!(exists(&fixture, branch_of(&thread)));
     assert_eq!(thread.deleted_branch, None);
 
     // "Remove worktree" later: the same rule deletes the branch then.
@@ -419,8 +454,8 @@ fn a_kept_worktree_keeps_the_branch_until_it_is_removed() {
         "{report:?}"
     );
     thread.record_completion(&report, Timestamp::now());
-    assert!(!thread.worktree.exists());
-    assert!(!exists(&fixture, &thread.branch));
+    assert!(!worktree_of(&thread).exists());
+    assert!(!exists(&fixture, branch_of(&thread)));
     assert_eq!(
         thread
             .deleted_branch
@@ -443,7 +478,7 @@ fn closing_without_a_merge_keeps_the_branch_silently() {
     thread.record_completion(&report, Timestamp::now());
     assert!(thread.warnings.is_empty());
     assert_eq!(thread.deleted_branch, None);
-    assert_eq!(fixture.tip(&thread.branch), head);
+    assert_eq!(fixture.tip(branch_of(&thread)), head);
 }
 
 #[test]
@@ -465,10 +500,17 @@ fn a_branch_no_thread_made_is_never_touched() {
     let (mut thread, head) = worked(&fixture, "Next to it", 0);
     git(
         &fixture.root,
-        &["merge", "--quiet", "--no-ff", "-m", "Merge", &thread.branch],
+        &[
+            "merge",
+            "--quiet",
+            "--no-ff",
+            "-m",
+            "Merge",
+            branch_of(&thread),
+        ],
     );
     complete_merged(&fixture, &mut thread, &merged(&head));
-    assert!(!exists(&fixture, &thread.branch));
+    assert!(!exists(&fixture, branch_of(&thread)));
     assert_eq!(
         fixture.tip("feature"),
         feature,

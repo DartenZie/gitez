@@ -6,8 +6,10 @@ mod common;
 
 use std::time::Duration;
 
-use common::{Fixture, git};
-use gitez_agent_thread::{CONTINUE_PROMPT, Ending, RetryPlan, State, Step, Timestamp, TurnKind};
+use common::{Fixture, branch_of, git, worktree_of};
+use gitez_agent_thread::{
+    BRIEF_PROMPT, CONTINUE_PROMPT, Ending, Mode, RetryPlan, State, Step, Timestamp, TurnKind,
+};
 use gitez_supervisor::{Command, Error};
 
 const PASSTHROUGH_WARNING: &str = "Ran without a sandbox (GITEZ_TEST_SANDBOX)";
@@ -40,16 +42,19 @@ fn start_creates_the_worktree_runs_setup_and_the_agent_and_opens_a_pull_request(
     assert!(thread.prepared);
     assert!(thread.warnings.iter().any(|w| w == PASSTHROUGH_WARNING));
     // The worktree, on the thread's branch, prepared by the setup command.
-    assert!(thread.worktree.join(".git").is_file());
-    assert!(thread.worktree.join("setup-ran").is_file());
+    assert!(worktree_of(&thread).join(".git").is_file());
+    assert!(worktree_of(&thread).join("setup-ran").is_file());
     assert_eq!(
-        git(&thread.worktree, &["branch", "--show-current"]),
-        thread.branch
+        git(worktree_of(&thread), &["branch", "--show-current"]),
+        branch_of(&thread)
     );
-    assert_eq!(thread.branch, format!("agent/{id}"));
+    assert_eq!(branch_of(&thread), format!("agent/{id}"));
     // The agent's commit is on its branch; main did not move.
     assert_eq!(
-        git(&fixture.root, &["log", "-1", "--format=%s", &thread.branch]),
+        git(
+            &fixture.root,
+            &["log", "-1", "--format=%s", branch_of(&thread)]
+        ),
         "Agent: first line"
     );
     assert_eq!(fixture.tip("main"), start);
@@ -97,8 +102,8 @@ fn start_creates_the_worktree_runs_setup_and_the_agent_and_opens_a_pull_request(
     );
     assert_eq!(pull_request.base.branch, "main");
     assert_eq!(pull_request.base.commit, start);
-    assert_eq!(pull_request.head.branch, thread.branch);
-    assert_eq!(pull_request.head.commit, fixture.tip(&thread.branch));
+    assert_eq!(pull_request.head.branch, branch_of(&thread));
+    assert_eq!(pull_request.head.commit, fixture.tip(branch_of(&thread)));
 }
 
 #[test]
@@ -117,8 +122,8 @@ fn the_heading_of_the_final_message_names_the_pull_request_and_the_thread() {
     // The thread takes the same name; its id, branch and worktree stay.
     assert_eq!(thread.title, "Make the greeting friendlier");
     assert_eq!(thread.id, id);
-    assert_eq!(thread.branch, created.branch);
-    assert_eq!(thread.worktree, created.worktree);
+    assert_eq!(branch_of(&thread), branch_of(&created));
+    assert_eq!(worktree_of(&thread), worktree_of(&created));
     assert_eq!(fixture.load(&id).title, "Make the greeting friendlier");
     // The final message keeps its heading; it is shown apart.
     assert_eq!(
@@ -131,7 +136,10 @@ fn the_heading_of_the_final_message_names_the_pull_request_and_the_thread() {
     );
     // GitEZ's commit of the leftovers already uses the agent's title.
     assert_eq!(
-        git(&fixture.root, &["log", "-1", "--format=%B", &thread.branch]),
+        git(
+            &fixture.root,
+            &["log", "-1", "--format=%B", branch_of(&thread)]
+        ),
         "Make the greeting friendlier\n\nChanges the agent left uncommitted, committed by GitEZ."
     );
 }
@@ -194,7 +202,7 @@ fn an_answer_without_changes_opens_no_pull_request() {
     assert_eq!(thread.ending, Some(Ending::Answer), "{thread:#?}");
     assert_eq!(thread.pull_request, None);
     assert_eq!(thread.final_message(), Some("The answer is 42."));
-    assert_eq!(fixture.tip(&thread.branch), thread.start.commit);
+    assert_eq!(fixture.tip(branch_of(&thread)), thread.start.commit);
     let reviews = gitez_review::Store::new(&fixture.common_dir());
     assert!(reviews.numbers().expect("numbers").is_empty());
 }
@@ -206,7 +214,10 @@ fn changes_the_agent_left_are_committed_by_gitez() {
     let thread = fixture.run(&id, Command::Start);
     assert_eq!(thread.ending, Some(Ending::PullRequest), "{thread:#?}");
     assert_eq!(
-        git(&fixture.root, &["log", "-1", "--format=%B", &thread.branch]),
+        git(
+            &fixture.root,
+            &["log", "-1", "--format=%B", branch_of(&thread)]
+        ),
         format!(
             "{}\n\nChanges the agent left uncommitted, committed by GitEZ.",
             thread.title
@@ -215,11 +226,11 @@ fn changes_the_agent_left_are_committed_by_gitez() {
     assert_eq!(
         git(
             &fixture.root,
-            &["show", &format!("{}:left.txt", thread.branch)]
+            &["show", &format!("{}:left.txt", branch_of(&thread))]
         ),
         "left"
     );
-    assert_eq!(git(&thread.worktree, &["status", "--porcelain"]), "");
+    assert_eq!(git(worktree_of(&thread), &["status", "--porcelain"]), "");
     assert_eq!(thread.pull_request, Some(1));
     // GitEZ's own commit does not name the pull request: the prompt does.
     assert_eq!(thread.title, "LEAVE a file uncommitted");
@@ -282,7 +293,7 @@ fn a_failed_leftover_commit_is_recorded_not_hidden() {
     assert!(thread.has_uncommitted() == Some(true));
     assert!(thread.leftover_commit_failed());
     // The change really is still in the worktree.
-    assert!(!git(&thread.worktree, &["status", "--porcelain"]).is_empty());
+    assert!(!git(worktree_of(&thread), &["status", "--porcelain"]).is_empty());
     assert!(
         thread
             .warnings
@@ -423,7 +434,11 @@ fn a_reply_resumes_the_conversation_and_updates_the_same_pull_request() {
     assert_eq!(
         git(
             &fixture.root,
-            &["rev-list", "--count", &format!("main..{}", thread.branch)]
+            &[
+                "rev-list",
+                "--count",
+                &format!("main..{}", branch_of(&thread))
+            ]
         ),
         "2"
     );
@@ -477,4 +492,203 @@ fn a_missing_thread_is_an_error() {
     )
     .expect_err("no such thread");
     assert!(matches!(error, Error::Thread(_)), "{error:?}");
+}
+
+/// The branches and worktrees of the fixture's repository, as git lists
+/// them.
+fn branches_and_worktrees(fixture: &Fixture) -> (String, String) {
+    (
+        git(
+            &fixture.root,
+            &["branch", "--list", "--format=%(refname:short)"],
+        ),
+        git(&fixture.root, &["worktree", "list", "--porcelain"]),
+    )
+}
+
+#[test]
+fn a_discuss_thread_runs_in_the_working_tree_and_makes_nothing() {
+    let fixture = Fixture::new();
+    // Not run: the working tree is the user's, as it is.
+    fixture.set_setup_command("touch setup-ran");
+    std::fs::write(fixture.root.join("mine.txt"), "uncommitted\n").expect("write");
+    let before = branches_and_worktrees(&fixture);
+    let created = fixture.discuss("WHERE are you? I want to talk about the cache.");
+    assert_eq!(created.mode, Mode::Discuss);
+
+    let thread = fixture.run(&created.id, Command::Start);
+    assert_eq!(thread.state, State::Finished, "{thread:#?}");
+    assert_eq!(thread.ending, Some(Ending::Answer));
+    assert_eq!(thread.pull_request, None);
+    assert_eq!(
+        (thread.branch.as_ref(), thread.worktree.as_ref()),
+        (None, None)
+    );
+    assert!(!thread.prepared);
+    assert_eq!(thread.worktree_record, None);
+    assert_eq!(thread.uncommitted, None, "GitEZ did not look for leftovers");
+
+    // The agent ran in the working tree itself, with a temporary folder of
+    // its own, and git told not to touch the index.
+    let scratch = thread.scratch_dirs().expect("scratch folders");
+    assert_eq!(
+        thread.final_message(),
+        Some(
+            format!(
+                "cwd={} locks=0 tmp={}",
+                fixture.root.display(),
+                scratch.tmp.display()
+            )
+            .as_str()
+        )
+    );
+    assert!(scratch.tmp.starts_with(fixture.data_dir.join("tmp")));
+    assert!(scratch.tmp.is_dir());
+    let calls = fixture.calls();
+    assert_eq!(calls.len(), 1);
+    assert!(
+        calls[0].contains("--append-system-prompt You are in a discussion"),
+        "{}",
+        calls[0]
+    );
+    assert!(!calls[0].contains("git worktree that GitEZ created"));
+
+    // Nothing was made: no branch, no worktree, no pull request, no setup.
+    assert_eq!(branches_and_worktrees(&fixture), before);
+    assert!(!fixture.data_dir.join("worktrees").exists());
+    assert!(!fixture.root.join("setup-ran").exists());
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("mine.txt")).expect("read"),
+        "uncommitted\n"
+    );
+    let reviews = gitez_review::Store::new(&fixture.common_dir());
+    assert!(reviews.numbers().expect("numbers").is_empty());
+}
+
+#[test]
+fn gitez_commits_nothing_in_the_working_tree_of_a_discuss_thread() {
+    // Without a sandbox the fake agent can write where the real one cannot;
+    // GitEZ still commits nothing there and opens no pull request.
+    let fixture = Fixture::new();
+    let head = fixture.head();
+    let id = fixture.discuss("LEAVE a file uncommitted").id;
+    let thread = fixture.run(&id, Command::Start);
+    assert_eq!(thread.ending, Some(Ending::Answer), "{thread:#?}");
+    assert_eq!(thread.pull_request, None);
+    assert_eq!(thread.uncommitted, None);
+    assert_eq!(fixture.head(), head);
+    assert_eq!(
+        git(&fixture.root, &["status", "--porcelain"]),
+        "?? left.txt"
+    );
+
+    // A commit the agent made itself is the user's branch moving: said,
+    // and still no pull request.
+    let id = fixture.discuss("COMMIT a file for me").id;
+    let thread = fixture.run(&id, Command::Start);
+    assert_eq!(thread.ending, Some(Ending::Answer), "{thread:#?}");
+    assert_eq!(thread.pull_request, None);
+    assert!(
+        thread
+            .warnings
+            .iter()
+            .any(|warning| warning.starts_with("Moved while the agent ran: main")),
+        "{:#?}",
+        thread.warnings
+    );
+    let reviews = gitez_review::Store::new(&fixture.common_dir());
+    assert!(reviews.numbers().expect("numbers").is_empty());
+}
+
+#[test]
+fn a_reply_and_a_brief_continue_a_discussion_in_the_same_folder() {
+    let fixture = Fixture::new();
+    let id = fixture.discuss("What is the answer?").id;
+    let first = fixture.run(&id, Command::Start);
+    let session = first.session_id.clone().expect("session");
+    assert_eq!(first.brief(), None);
+
+    fixture
+        .store()
+        .update(&id, |thread| {
+            thread.request_turn(
+                TurnKind::Reply,
+                "WHERE are you now?".to_owned(),
+                Timestamp::now(),
+            )
+        })
+        .expect("reply");
+    let replied = fixture.run(&id, Command::Reply);
+    assert_eq!(replied.ending, Some(Ending::Answer), "{replied:#?}");
+    assert!(
+        replied.final_message().is_some_and(
+            |message| message.starts_with(&format!("cwd={} locks=0", fixture.root.display()))
+        ),
+        "{:?}",
+        replied.final_message()
+    );
+
+    fixture
+        .store()
+        .update(&id, |thread| {
+            thread.request_turn(TurnKind::Brief, BRIEF_PROMPT.to_owned(), Timestamp::now())
+        })
+        .expect("brief");
+    let briefed = fixture.run(&id, Command::Reply);
+    assert_eq!(briefed.ending, Some(Ending::Answer), "{briefed:#?}");
+    assert_eq!(briefed.brief(), Some("The answer is 42."));
+    assert_eq!(briefed.turns.len(), 3);
+    assert_eq!(briefed.turns[2].kind, TurnKind::Brief);
+
+    let calls = fixture.calls();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(session_of(&calls[0]), (session.clone(), false));
+    assert_eq!(session_of(&calls[1]), (session.clone(), true));
+    assert_eq!(session_of(&calls[2]), (session, true));
+    assert_eq!(fixture.transcripts(&id).len(), 3);
+    assert_eq!(fixture.stdin(3), BRIEF_PROMPT);
+    assert!(!fixture.data_dir.join("worktrees").exists());
+}
+
+#[test]
+fn a_discuss_thread_whose_working_tree_is_gone_fails_before_the_agent() {
+    let fixture = Fixture::new();
+    let id = fixture.discuss("What is the answer?").id;
+    let elsewhere = fixture.base.join("gone");
+    fixture
+        .store()
+        .update(&id, |thread| {
+            thread.work_dir = Some(elsewhere.clone());
+            Ok(())
+        })
+        .expect("update");
+    let thread = fixture.run(&id, Command::Start);
+    assert_eq!(thread.ending, Some(Ending::Failed), "{thread:#?}");
+    let error = thread.error.expect("an error");
+    assert_eq!(error.step, Step::Worktree);
+    assert_eq!(
+        error.message,
+        format!(
+            "The working tree {} is gone, or is no longer one of this repository.",
+            elsewhere.display()
+        )
+    );
+    assert!(fixture.calls().is_empty(), "the agent did not run");
+
+    // Another repository's working tree is not this thread's either.
+    let other = fixture.base.join("other repo");
+    std::fs::create_dir_all(&other).expect("create");
+    git(&other, &["init", "--quiet", "--initial-branch=main"]);
+    let id = fixture.discuss("What is the answer, again?").id;
+    fixture
+        .store()
+        .update(&id, |thread| {
+            thread.work_dir = Some(other.clone());
+            Ok(())
+        })
+        .expect("update");
+    let thread = fixture.run(&id, Command::Start);
+    assert_eq!(thread.ending, Some(Ending::Failed), "{thread:#?}");
+    assert_eq!(thread.error.expect("an error").step, Step::Worktree);
+    assert!(fixture.calls().is_empty());
 }

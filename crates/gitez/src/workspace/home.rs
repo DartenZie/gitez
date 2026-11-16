@@ -177,6 +177,12 @@ fn started_line(thread: Option<&AgentThread>) -> &'static str {
             "Sent to the background. It waits for the agent’s usage limit and is listed under \
              Waiting."
         }
+        Some(State::Preparing | State::Running)
+            if thread.is_some_and(|thread| thread.own().is_none()) =>
+        {
+            "Sent to the background. It reads the working tree, changes nothing, and is listed \
+             under Active."
+        }
         Some(State::Preparing | State::Running) => {
             "Sent to the background. It runs on its own branch and is listed under Active."
         }
@@ -322,7 +328,7 @@ impl Home {
             return;
         }
         let view = cx.new(|cx| ThreadView::new(key, true, window, cx));
-        let subscription = cx.subscribe_in(&view, window, |_, _, event, _, cx| match event {
+        let subscription = cx.subscribe_in(&view, window, |_, _, event, window, cx| match event {
             ThreadViewEvent::OpenPullRequest { common_dir, number } => {
                 cx.emit(HomeEvent::OpenPullRequest {
                     common_dir: common_dir.clone(),
@@ -331,6 +337,17 @@ impl Home {
             }
             ThreadViewEvent::OpenRepository { work_dir } => {
                 cx.emit(HomeEvent::OpenRepository(work_dir.clone()))
+            }
+            // The launcher takes the thread's place, its composer holding
+            // the brief. Later: the thread's view is what is speaking.
+            ThreadViewEvent::Implement(handoff) => {
+                let handoff = handoff.clone();
+                cx.defer_in(window, move |this, window, cx| {
+                    this.thread = None;
+                    this.composer
+                        .update(cx, |composer, cx| composer.hand_over(&handoff, window, cx));
+                    cx.notify();
+                });
             }
         });
         self.thread = Some((view, subscription));
@@ -1656,6 +1673,9 @@ mod tests {
                     },
                     network: NetworkProfile::AgentOnly,
                     secrets: Vec::new(),
+                    mode: gitez_agent_thread::Mode::Implement,
+                    work_dir: None,
+                    origin: None,
                 },
                 data_dir,
                 "repo",
@@ -1803,6 +1823,52 @@ mod tests {
     /// Home's recent repositories show one that was moved or deleted
     /// muted with "Moved or deleted", as the launcher's picker does (the
     /// same check): it does not open, and "Remove from list" takes it off.
+    /// "Implement…" in a discussion shown on Home: the launcher takes the
+    /// thread's place, its composer holding the brief for the discussion's
+    /// repository, to start an Implement thread that names it.
+    #[gpui_kit::test]
+    fn a_brief_handed_over_opens_the_launcher_with_it(cx: &mut TestAppContext) {
+        use crate::workspace::agent_thread::{Handoff, ThreadViewEvent};
+        use gitez_agent_thread::Mode;
+
+        let (fixture, home, mut cx) = home(cx);
+        // beta's thread: not the repository the launcher picked first.
+        let key = crate::agent_threads::AgentThreadKey {
+            common_dir: fixture.beta.clone(),
+            id: fixture.pull_request.clone(),
+        };
+        let work_dir = fixture.beta.parent().expect("a work dir").to_owned();
+        home.update_in(&mut cx, |home, window, cx| {
+            home.show_thread(key.clone(), window, cx)
+        });
+        cx.run_until_parked();
+        let view = home.read_with(&cx, |home, cx| {
+            assert_eq!(home.shown_thread(cx), Some(key.clone()));
+            home.thread.as_ref().expect("a thread is shown").0.clone()
+        });
+        let handoff = Handoff {
+            origin: key.clone(),
+            title: "Add a feed".into(),
+            brief: "# Add an Atom feed\n\nOne entry per post.".into(),
+            work_dir: Some(work_dir.clone()),
+        };
+        view.update(&mut cx, |_, cx| {
+            cx.emit(ThreadViewEvent::Implement(handoff.clone()))
+        });
+        cx.run_until_parked();
+        home.read_with(&cx, |home, cx| {
+            assert_eq!(home.shown_thread(cx), None, "the launcher is shown");
+            let composer = home.composer.read(cx);
+            assert_eq!(composer.thread_mode(cx), Mode::Implement);
+            assert_eq!(composer.prompt_text(cx), handoff.brief);
+            // Kept when the repository's branches were read.
+            assert_eq!(composer.origin(), Some(&key));
+            assert_eq!(composer.start_branch(), Some("main"));
+            #[cfg(target_os = "macos")]
+            assert_eq!(composer.picked_repository(), Some(work_dir.as_path()));
+        });
+    }
+
     #[gpui_kit::test]
     fn a_moved_recent_repository_is_marked_and_cannot_be_opened(cx: &mut TestAppContext) {
         let (fixture, home, mut cx) = home(cx);

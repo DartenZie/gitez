@@ -96,8 +96,14 @@ pub struct RunSpec<'a> {
     /// Sent with the prompt, in order. Empty for most runs, which are then
     /// exactly as they were before agents took images.
     pub images: &'a [ImageInput<'a>],
-    /// Where the agent works: the thread's worktree.
+    /// Where the agent works: the thread's worktree, or for a Discuss
+    /// thread the user's working tree.
     pub cwd: &'a std::path::Path,
+    /// Whether `cwd` is the user's own folder, where their own sessions of
+    /// the agent run too. [`Agent::needs_for_run`] then lets the run write
+    /// only this conversation's files among what the agent keeps per
+    /// folder, never what those other sessions wrote or will read.
+    pub shared_folder: bool,
     /// A model alias such as `haiku`; `None`: the agent's default.
     pub model: Option<&'a str>,
     pub conversation: Conversation<'a>,
@@ -117,6 +123,10 @@ pub struct AgentNeeds {
     pub write_dirs: Vec<std::path::PathBuf>,
     /// Single files the agent writes.
     pub write_files: Vec<std::path::PathBuf>,
+    /// Folders that must exist before the run and that the agent cannot
+    /// make itself, their parent not being writable. Whoever starts the
+    /// run makes them.
+    pub create_dirs: Vec<std::path::PathBuf>,
     /// Hosts it talks to (its API, login refresh, telemetry it cannot run
     /// without).
     pub hosts: Vec<String>,

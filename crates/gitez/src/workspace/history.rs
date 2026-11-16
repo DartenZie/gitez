@@ -704,7 +704,12 @@ impl History {
         }
         for lane in &self.live {
             let index = lane.tip.and_then(commit_index);
-            lines.push((end_at(lane.tip, index), theme::branch_color(&lane.branch)));
+            // A discussion is on no branch: a neutral line.
+            let color = lane
+                .branch
+                .as_deref()
+                .map_or(color::TEXT_MUTED, theme::branch_color);
+            lines.push((end_at(lane.tip, index), color));
         }
         let ends: Vec<End> = lines.iter().map(|(end, _)| *end).collect();
         let lanes = dashed_lanes(&self.rows, &ends);
@@ -1740,7 +1745,15 @@ impl History {
             .flex_none()
             .pl(px(10.))
             .pr(px(6.))
-            .child(super::agent_thread::branch_chip(&live.branch, true));
+            .map(|this| match &live.branch {
+                Some(branch) => this.child(super::agent_thread::branch_chip(branch, true)),
+                None => this.child(
+                    div()
+                        .text_size(px(11.5))
+                        .text_color(rgb(color::TEXT_MUTED))
+                        .child("Discussion"),
+                ),
+            });
         let mono = cx.theme().mono_font_family.clone();
         Some(
             row.when(self.drag_role(None).is_some(), |this| this.opacity(0.45))

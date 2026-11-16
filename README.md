@@ -24,7 +24,9 @@ prompt, or send it straight to [Claude Code](https://docs.claude.com/en/docs/cla
 
 GitEZ can also start that work: **agent threads** run Claude Code in the
 background, each on its own branch and worktree and inside a sandbox, and
-bring the result back as a local pull request.
+bring the result back as a local pull request. A thread can also only
+**discuss**: the agent reads your working tree, answers and plans, and
+changes nothing until you tell it to implement.
 
 > [!WARNING]
 > GitEZ is in early development. Expect missing features and breaking changes.
@@ -68,16 +70,35 @@ tree, so it cannot be committed or pushed by accident. Linked worktrees share it
 ### Agent threads
 
 A thread is a prompt you give a coding agent (Claude Code, for now) and the
-conversation that follows. Each thread works on its own branch,
-`agent/<name>`, in its own linked worktree in GitEZ's data folder, never
-inside your repository, and runs in a [sandbox](#the-agent-sandbox).
+conversation that follows. Every thread runs in a
+[sandbox](#the-agent-sandbox), in one of two modes:
+
+- **Implement**: the agent works on its own branch, `agent/<name>`, in its
+  own linked worktree in GitEZ's data folder, never inside your repository.
+  What it commits becomes a local pull request.
+- **Discuss**: the agent reads your checked-out working tree, with your
+  uncommitted changes, and answers. It cannot change anything: the sandbox
+  refuses every write in the repository. There is no branch, no worktree
+  and no pull request. Use it to ask a question, explore the code or agree
+  on a plan.
+
+What follows describes an Implement thread, unless it says otherwise.
 
 - **Start a thread** from the "Ask an agent…" row under the uncommitted
   changes in the history (`⌘⇧A`, or File > Ask an Agent…), or from Home.
-  Write the prompt, and pick the agent, the model, the branch to start from,
-  the sandbox's network profile and the secrets the thread gets. The thread
-  starts from the branch's last commit; your uncommitted changes are not
-  included. GitEZ returns at once and the agent works in the background.
+  Write the prompt, choose **Discuss** or **Implement**, and pick the agent,
+  the model, the branch to start from, the network profile (**Network**) and
+  the secrets the thread gets. An Implement thread starts from the branch's
+  last commit; your uncommitted changes are not included. A Discuss thread
+  reads the branch you have checked out, so it has no branch to pick and
+  needs one checked out. GitEZ remembers the mode you used last. GitEZ
+  returns at once and the agent works in the background.
+- **From a discussion to an implementation**: **Implement…** in a Discuss
+  thread asks the agent to write a brief of what you agreed, and opens the
+  composer with it. Read it, change it if you want, and send it: a new
+  Implement thread starts from the brief alone, without the discussion's
+  context, and each thread links to the other. The discussion stays open
+  for more questions.
 - **Images**: paste images (`⌘V`) or drop image files into the prompt or a
   reply to show them to the agent, for example a screenshot of a bug. A
   prompt takes up to five images, as PNG, JPEG, GIF or WebP; GitEZ converts
@@ -95,8 +116,9 @@ inside your repository, and runs in a [sandbox](#the-agent-sandbox).
   if you set one in Settings.
 - **Live lanes**: a thread that is preparing or running is a dashed lane at
   the top of the history, with what its agent does now, joined to the commit
-  its branch is at. In the sidebar, the `agent/` branches are one folder
-  under Branches.
+  its branch is at. A running discussion has a grey lane, joined to the
+  commit it started from. In the sidebar, the `agent/` branches are one
+  folder under Branches.
 - **Thread view**: click a thread to open it in the detail panel: the
   prompt, the agent's steps (collapsed to one row), its final message, and
   its branch and pull request. **Reply** continues the same conversation in
@@ -145,7 +167,8 @@ inside your repository, and runs in a [sandbox](#the-agent-sandbox).
   back), and the merged pull request still shows its changes. **Closing** a
   pull request keeps the branch: its commits are nowhere else.
 - **Complete** removes the thread's worktree, and its branch if the branch
-  has no commits of its own. The thread stays readable. If the worktree has
+  has no commits of its own. The thread stays readable. Completing a Discuss
+  thread only ends it: there is nothing to remove. If the worktree has
   uncommitted changes, GitEZ asks first: discard them, or complete and keep
   the worktree to remove later. A merge or close that completes a thread
   always keeps a worktree with uncommitted changes, and its branch with it;
@@ -211,6 +234,12 @@ run in the same sandbox.
   `.vscode/`, `.idea/`, `.mcp.json`, `.claude/commands`, `.claude/agents` and
   shell startup files) are read-only too. `git stash` does not work in a
   thread.
+- **Writes in a Discuss thread**: only its own temporary folder and caches
+  in GitEZ's data folder, and the files of its own conversation in Claude
+  Code's configuration folder. Not your working tree, not the repository's
+  objects or branches, and not the folders you add in Settings. A build that
+  writes into the working tree fails; the agent is told to send build output
+  to its temporary folder. The setup command does not run.
 - **Hidden paths**: by default the agent cannot read `~/.ssh`, `~/.aws`,
   `~/.gnupg`, `~/.config/gh`, `~/.netrc`, `~/.kube`, `~/.docker/config.json`,
   `~/.git-credentials`, `~/.config/git/credentials`, `~/.npmrc`, `~/.pypirc`,
@@ -243,6 +272,10 @@ run in the same sandbox.
 > - The agent writes the thread's worktree. Treat it as an untrusted checkout
 >   when you open it in an editor, a terminal or another tool. GitEZ checks
 >   the worktree's git files before it runs git there.
+> - A Discuss thread runs in your working tree, so Claude Code keeps its
+>   conversation with your own Claude Code conversations for that folder:
+>   `claude --resume` there lists it. The agent cannot write the rest of
+>   that folder, such as the memory your own sessions load.
 
 ### Everything else you expect from a git client
 
