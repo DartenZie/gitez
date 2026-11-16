@@ -59,8 +59,7 @@ bring the result back as a local pull request.
 - Merge into the base with a merge commit, a squash, a rebase or a
   fast-forward. GitEZ warns you about conflicting files before the merge starts.
 - The sidebar lists and counts only the pull requests in review. Merged and
-  closed ones wait behind one muted row at the end of the section, such as
-  "2 merged, 1 closed"; click it to list them. A closed pull request that you
+  closed ones are finished and are not shown. A closed pull request that you
   reopen, or a merge that you undo, puts it back in the list.
 
 Review data is stored in `.git/gitez/reviews`. It is never in the working
