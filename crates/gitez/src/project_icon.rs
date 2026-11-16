@@ -1,9 +1,12 @@
-//! Finding the icon of an open repository: its favicon, app icon or logo.
+//! Finding the icon of a repository: its favicon, app icon or logo.
 
-use std::path::Path;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use gitez_git::Repository;
-use gpui_kit::{Image, ImageFormat};
+use gpui_kit::{App, Global, Image, ImageFormat};
 
 /// Deepest a tracked file can be and still be taken for the project's icon.
 const MAX_DEPTH: usize = 5;
@@ -37,6 +40,57 @@ const OTHER_PROJECTS: [&str; 14] = [
 const EXTENSIONS: [&str; 7] = ["svg", "png", "webp", "icns", "ico", "jpg", "jpeg"];
 
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+/// The icons of repositories that need not be open, by working folder, for
+/// the lists of repositories on Home and in the composer.
+#[derive(Default)]
+pub struct Icons {
+    /// Found or looked for: `None` while looking or if there is none.
+    /// Behind a `RefCell` so that a view can ask while it renders without
+    /// telling the global's observers; they are told once an icon is found.
+    known: RefCell<HashMap<PathBuf, Option<Arc<Image>>>>,
+}
+
+impl Global for Icons {}
+
+/// Starts the cache. Without it, [`of`] finds nothing.
+pub fn init(cx: &mut App) {
+    cx.set_global(Icons::default());
+}
+
+/// The icon of the repository at `work_dir`, if one was found. The first
+/// time it is asked for, it is looked for in the background, and the
+/// observers of [`Icons`] are told if one is found.
+pub fn of(work_dir: &Path, cx: &App) -> Option<Arc<Image>> {
+    let icons = cx.try_global::<Icons>()?;
+    if let Some(known) = icons.known.borrow().get(work_dir) {
+        return known.clone();
+    }
+    icons.known.borrow_mut().insert(work_dir.to_owned(), None);
+    let path = work_dir.to_owned();
+    let found = cx.background_executor().spawn({
+        let path = path.clone();
+        async move {
+            let repository = Repository::open(&path).ok()?;
+            let name = repository.name();
+            find(&repository, &name).map(Arc::new)
+        }
+    });
+    cx.spawn(async move |cx| {
+        let Some(icon) = found.await else {
+            return;
+        };
+        cx.update(|cx| {
+            if let Some(icons) = cx.try_global::<Icons>() {
+                icons.known.borrow_mut().insert(path, Some(icon));
+                // Borrowing it mutably tells its observers.
+                cx.global_mut::<Icons>();
+            }
+        });
+    })
+    .detach();
+    None
+}
 
 /// The best icon among the files tracked in `repository`, which is called
 /// `name`, if one can be read. Blocks; run it on a background thread.

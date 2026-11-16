@@ -253,6 +253,7 @@ impl Home {
                 cx.notify();
             }),
             cx.observe_global::<crate::recent::Recent>(|_, cx| cx.notify()),
+            cx.observe_global::<crate::project_icon::Icons>(|_, cx| cx.notify()),
         ];
         Self {
             focus_handle: cx.focus_handle(),
@@ -1424,7 +1425,16 @@ impl Home {
                         div()
                             .flex_none()
                             .when(unavailable.is_some(), |this| this.opacity(0.55))
-                            .child(initial_square(&name, px(28.), index == 0)),
+                            .child({
+                                let amber = index == 0;
+                                let name = name.clone();
+                                labels::repository_icon(
+                                    path,
+                                    px(28.),
+                                    move || initial_square(&name, px(28.), amber),
+                                    cx,
+                                )
+                            }),
                     )
                     .child(
                         div()

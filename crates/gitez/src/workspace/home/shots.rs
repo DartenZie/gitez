@@ -522,6 +522,37 @@ mod at {
     }
 }
 
+/// Recent repositories with a favicon show it on Home and in the launcher's
+/// Repository picker; the others keep the square with their initial.
+#[test]
+fn screenshot_u6_repository_icons() {
+    if !crate::screenshot::enabled() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let base = dir.path().canonicalize().expect("canonical");
+    let site = named_repository(&base, "notes-site");
+    std::fs::create_dir_all(site.join("public")).expect("public folder");
+    std::fs::write(
+        site.join("public/favicon.svg"),
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#4fc6b0"/><circle cx="16" cy="16" r="8" fill="#121214"/></svg>"##,
+    )
+    .expect("favicon");
+    git(&site, &["add", "public/favicon.svg"]);
+    git(&site, &["commit", "-qm", "Add a favicon"]);
+    let plain = named_repository(&base, "dotfiles");
+    let data_dir = base.join("data");
+    std::fs::create_dir_all(&data_dir).expect("data folder");
+    save_settings(&data_dir, &common_dir_of(&site), fake_agent(&base, true), 3);
+    let mut shots = Shots::from_env(&data_dir).expect("enabled");
+    let (window, _) = open_home(&mut shots, &[&site, &plain]);
+    let found = shots.update(|cx| crate::project_icon::of(&site, cx).is_some());
+    assert!(found, "the favicon is found");
+    shots.save(window, "u6-icons-home");
+    shots.click(window, at::picker("repository"));
+    shots.save(window, "u6-icons-picker");
+}
+
 /// Finding 9: a repository listed with threads that was moved or deleted
 /// shows in the launcher's Repository picker as unavailable, and Home
 /// says so with "Remove from list".

@@ -300,7 +300,7 @@ run in the same sandbox.
 - **Command palette** (`⌘K`): find actions, commits, branches and files, or
   run any `git` command and see its output stream in.
 - **Clone or create** a repository from Home, the File menu or the palette.
-- **Project icon**: the top left of the window shows the open repository's favicon, app icon (`.icns` included) or logo if a tracked file looks like one, and otherwise a badge with the first letter of its name.
+- **Project icon**: the top left of the window shows the open repository's favicon, app icon (`.icns` included) or logo if a tracked file looks like one, and otherwise a badge with the first letter of its name. Home's recent repositories and the launcher's Repository picker show the same icon for each repository.
 - **Reopen where you left off**: GitEZ opens the repository that was open when it last quit, and Home, File > Open Recent and the repository name at the top left list the last ten; click the name to switch repository or open another, and hover a repository in that list to remove it with its × button. File also has Reveal in Finder, Close Repository and Close Window.
 
 > [!NOTE]

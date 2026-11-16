@@ -188,6 +188,27 @@ pub fn avatar(name: &str, diameter: Pixels) -> impl IntoElement {
         )
 }
 
+/// The icon of the repository at `work_dir`, `size` square, once
+/// [`crate::project_icon::of`] has found one; until then, or if it has none
+/// or it cannot be decoded, `badge`, the square with its initial.
+pub fn repository_icon(
+    work_dir: &std::path::Path,
+    size: Pixels,
+    badge: impl Fn() -> Div + 'static,
+    cx: &App,
+) -> AnyElement {
+    match crate::project_icon::of(work_dir, cx) {
+        Some(icon) => img(icon)
+            .flex_none()
+            .size(size)
+            .rounded(size * 0.25)
+            .object_fit(ObjectFit::Contain)
+            .with_fallback(move || badge().into_any_element())
+            .into_any_element(),
+        None => badge().into_any_element(),
+    }
+}
+
 /// Up to two initials: the first letters of the first and last words.
 fn initials(name: &str) -> String {
     let mut words = name.split_whitespace();

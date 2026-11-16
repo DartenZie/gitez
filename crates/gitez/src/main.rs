@@ -55,6 +55,7 @@ fn main() -> ExitCode {
             theme::init(cx);
 
             recent::init(cx);
+            project_icon::init(cx);
             agent_threads::init(cx);
             settings_sheet::init(cx);
             menus::init(cx);

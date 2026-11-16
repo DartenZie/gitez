@@ -206,6 +206,7 @@ impl Composer {
         let images = cx.new(|_| PromptImages::new("composer"));
         let subscriptions = vec![
             cx.observe(&images, |_, _, cx| cx.notify()),
+            cx.observe_global::<crate::project_icon::Icons>(|_, cx| cx.notify()),
             cx.subscribe_in(&prompt, window, |this, _, event, window, cx| match event {
                 InputEvent::PressEnter {
                     secondary: true, ..
@@ -1334,7 +1335,15 @@ impl Composer {
                     .h_flex()
                     .gap(px(6.))
                     .map(|this| match &self.target {
-                        Some(_) => this.child(initial_square(&label, px(16.))),
+                        Some(target) => this.child({
+                            let label = label.clone();
+                            labels::repository_icon(
+                                &target.work_dir,
+                                px(16.),
+                                move || initial_square(&label, px(16.)),
+                                cx,
+                            )
+                        }),
                         None => this.child(
                             Icon::new(IconName::Folder)
                                 .size(px(13.))
@@ -1365,8 +1374,9 @@ impl Composer {
                     let shown = crate::recent::display(&path);
                     let picked = chosen.as_ref() == Some(&path);
                     let disabled = unavailable.is_some();
+                    let work_dir = path.clone();
                     menu = menu.item(
-                        PopupMenuItem::element(move |_, _| {
+                        PopupMenuItem::element(move |_, cx| {
                             div()
                                 .h_flex()
                                 // Long paths end in an ellipsis inside the
@@ -1375,7 +1385,15 @@ impl Composer {
                                 .overflow_hidden()
                                 .gap(px(10.))
                                 .when(unavailable.is_some(), |this| this.opacity(0.55))
-                                .child(initial_square(&name, px(20.)))
+                                .child({
+                                    let name = name.clone();
+                                    labels::repository_icon(
+                                        &work_dir,
+                                        px(20.),
+                                        move || initial_square(&name, px(20.)),
+                                        cx,
+                                    )
+                                })
                                 .child(
                                     div()
                                         .v_flex()

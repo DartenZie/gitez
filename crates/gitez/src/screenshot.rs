@@ -94,6 +94,7 @@ impl Shots {
             load_fonts(cx);
             crate::theme::init(cx);
             crate::recent::init_in_memory(cx);
+            crate::project_icon::init(cx);
             init_with(options, cx);
             cx.bind_keys(crate::workspace::key_bindings());
             // Live marks are caught at one point of their motion, so a shot
