@@ -1,6 +1,7 @@
 //! The "Ask an agent" composer: a prompt, the mode of the thread it starts
-//! (Discuss or Implement) and the pickers (agent, model, starting branch,
-//! sandbox network, secrets), as in the `C-1-Start` board. In a repository window it opens as a card
+//! (Discuss or Implement) and the pickers (agent, model, starting branch),
+//! as in the `C-1-Start` board; the sandbox network and the secrets are
+//! Settings' defaults. In a repository window it opens as a card
 //! under the "Ask an agent…" row of the history; Home shows it as its
 //! launcher (`C-5-Home`), with a Repository picker in front.
 //!
@@ -8,7 +9,6 @@
 //! it starts the thread with [`AgentThreads::start`]. Images pasted or
 //! dropped into it go with the prompt ([`PromptImages`]).
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -16,13 +16,11 @@ use gitez_agent::{AgentStatus, Availability, LoginStatus};
 use gitez_agent_thread::{Mode, PreparedImage, Start, slug, title_from_request};
 use gitez_git::Oid;
 use gitez_sandbox::NetworkProfile;
-use gitez_settings::{SecretScope, Settings};
+use gitez_settings::Settings;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::*;
-use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_kit::component::popover::Popover;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -180,10 +178,6 @@ pub struct Composer {
     origin: Option<(AgentThreadKey, SharedString)>,
     /// `None`: the branch checked out.
     from: Option<String>,
-    /// `None`: the default of the settings.
-    network: Option<NetworkProfile>,
-    /// `None`: the secrets given to new threads by default.
-    secrets: Option<BTreeSet<String>>,
     environment: Option<Environment>,
     /// The settings the environment was checked with, and
     /// [`AgentThreads::environment`] then.
@@ -249,8 +243,6 @@ impl Composer {
             thread_mode: None,
             origin: None,
             from: None,
-            network: None,
-            secrets: None,
             environment: None,
             checked_with: None,
             _checking: None,
@@ -304,7 +296,6 @@ impl Composer {
             .is_some_and(|known| known.common_dir == target.common_dir);
         if !same_repository {
             self.from = None;
-            self.secrets = None;
         }
         // A brief is for the repository it was discussed in.
         self.origin = self
@@ -588,51 +579,22 @@ impl Composer {
         })
     }
 
+    /// The network profile of new threads, as set in Settings.
     pub(crate) fn network(&self, cx: &App) -> NetworkProfile {
-        self.network
-            .unwrap_or_else(|| self.settings(cx).sandbox.default_network)
+        self.settings(cx).sandbox.default_network
     }
 
-    /// The secrets this repository's threads can have: (name, scope label,
-    /// given by default).
-    fn secret_choices(&self, cx: &App) -> Vec<(String, &'static str, bool)> {
+    /// The secrets Settings give new threads of this repository by default.
+    pub(crate) fn secrets(&self, cx: &App) -> Vec<String> {
         let Some(target) = &self.target else {
             return Vec::new();
         };
         self.settings(cx)
             .secrets_for(&target.common_dir)
             .into_iter()
-            .map(|entry| {
-                let scope = match entry.scope {
-                    SecretScope::All => "All repositories",
-                    SecretScope::Repository(_) => "This repository",
-                };
-                (entry.name.clone(), scope, entry.default)
-            })
+            .filter(|entry| entry.default)
+            .map(|entry| entry.name.clone())
             .collect()
-    }
-
-    /// The secrets picked, of those that exist.
-    pub(crate) fn secrets(&self, cx: &App) -> Vec<String> {
-        self.secret_choices(cx)
-            .into_iter()
-            .filter(|(name, _, default)| match &self.secrets {
-                Some(picked) => picked.contains(name),
-                None => *default,
-            })
-            .map(|(name, _, _)| name)
-            .collect()
-    }
-
-    fn toggle_secret(&mut self, name: &str, on: bool, cx: &mut Context<Self>) {
-        let mut picked: BTreeSet<String> = self.secrets(cx).into_iter().collect();
-        if on {
-            picked.insert(name.to_owned());
-        } else {
-            picked.remove(name);
-        }
-        self.secrets = Some(picked);
-        cx.notify();
     }
 
     /// The branch and tip a new thread of `mode` starts from: the branch
@@ -968,16 +930,6 @@ pub(crate) fn uncommitted_warning(branch: &str) -> Sentence {
         .plain("; your uncommitted changes are not included")
 }
 
-/// The one-line description of a network profile in its picker, in the
-/// words of Settings.
-fn network_description(profile: NetworkProfile) -> &'static str {
-    match profile {
-        NetworkProfile::AgentOnly => "Only the agent’s own API; package downloads fail",
-        NetworkProfile::Packages => "Agent API, package registries and this repository’s remotes",
-        NetworkProfile::Open => "Any host",
-    }
-}
-
 /// A picker: a small button with a dropdown caret.
 fn picker(id: &'static str) -> Button {
     Button::new(id)
@@ -1224,189 +1176,6 @@ impl Composer {
                     );
                 }
                 menu
-            })
-    }
-
-    fn render_sandbox_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let chosen = self.network(cx);
-        let view = cx.entity().downgrade();
-        picker("composer-sandbox")
-            .child(
-                div()
-                    .h_flex()
-                    .gap(px(6.))
-                    .child(
-                        Icon::new(IconName::ShieldCheck)
-                            .size(px(13.))
-                            .text_color(rgb(color::TEXT_MUTED)),
-                    )
-                    .child(picker_label("Network"))
-                    .child(chosen.label()),
-            )
-            .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
-                menu = menu
-                    .min_w(px(320.))
-                    .check_side(Side::Right)
-                    .label("Network for this thread");
-                for profile in NetworkProfile::ALL {
-                    let view = view.clone();
-                    menu = menu.item(
-                        PopupMenuItem::element(move |_, _| {
-                            two_lines(profile.label(), network_description(profile))
-                        })
-                        .checked(profile == chosen)
-                        .on_click(move |_, _, cx| {
-                            view.update(cx, |this, cx| {
-                                this.network = Some(profile);
-                                cx.notify();
-                            })
-                            .ok();
-                        }),
-                    );
-                }
-                menu.separator()
-                    .item(menu_note(
-                        "The agent writes only its worktree, its own temporary folder and its \
-                         own package caches. It reads the rest of the disk except hidden paths \
-                         such as ~/.ssh.",
-                    ))
-                    .item(menu_note(
-                        "With Packages or Open, the agent could send out whatever it can read, \
-                         its own login included.",
-                    ))
-                    .item(manage("Manage sandbox…"))
-            })
-    }
-
-    fn render_secrets_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let choices = self.secret_choices(cx);
-        let picked = self.secrets(cx);
-        let value = match (picked.len(), choices.len()) {
-            (_, 0) => "none".to_owned(),
-            (picked, all) => format!("{picked} of {all}"),
-        };
-        let view = cx.entity().downgrade();
-        let agent_name = self.agent_name(cx);
-        Popover::new("composer-secrets-popover")
-            .anchor(Anchor::TopLeft)
-            .trigger(
-                picker("composer-secrets").child(
-                    div()
-                        .h_flex()
-                        .gap(px(6.))
-                        .child(
-                            Icon::new(IconName::KeyRound)
-                                .size(px(13.))
-                                .text_color(rgb(color::TEXT_MUTED)),
-                        )
-                        .child(picker_label("Secrets"))
-                        .child(value),
-                ),
-            )
-            .content(move |_, _, cx| {
-                let Some(composer) = view.upgrade() else {
-                    return div();
-                };
-                let mono = cx.theme().mono_font_family.clone();
-                let (choices, picked) = {
-                    let composer = composer.read(cx);
-                    (composer.secret_choices(cx), composer.secrets(cx))
-                };
-                let heading = div()
-                    .px(px(4.))
-                    .pb(px(4.))
-                    .text_size(px(11.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(color::TEXT_FAINT))
-                    .child("SECRETS FOR THIS THREAD");
-                let separator = || div().my(px(4.)).h(px(1.)).bg(rgb(color::SEPARATOR));
-                let note = |text: &'static str| {
-                    div()
-                        .px(px(4.))
-                        .py(px(4.))
-                        .text_size(px(11.5))
-                        .line_height(relative(1.5))
-                        .text_color(rgb(color::TEXT_MUTED))
-                        .child(text)
-                };
-                let rows = choices.into_iter().map(|(name, scope, _)| {
-                    let on = picked.contains(&name);
-                    let composer = composer.downgrade();
-                    let toggled = name.clone();
-                    div()
-                        .h_flex()
-                        .gap(px(10.))
-                        .min_h(px(32.))
-                        .px(px(4.))
-                        .child(
-                            Checkbox::new(SharedString::from(format!("composer-secret-{name}")))
-                                .checked(on)
-                                .on_click(move |checked, _, cx| {
-                                    composer
-                                        .update(cx, |this, cx| {
-                                            this.toggle_secret(&toggled, *checked, cx)
-                                        })
-                                        .ok();
-                                }),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .font_family(mono.clone())
-                                .text_size(px(12.))
-                                .child(name),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(11.5))
-                                .text_color(rgb(color::TEXT_MUTED))
-                                .child(scope),
-                        )
-                });
-                let mut list = div().v_flex().w(px(330.)).child(heading);
-                let rows: Vec<Div> = rows.collect();
-                if rows.is_empty() {
-                    list = list.child(note(
-                        "No secrets yet. A secret is an environment variable whose value stays \
-                         in the keychain; add them in Settings.",
-                    ));
-                } else {
-                    list = list.children(rows);
-                }
-                list.child(separator())
-                    .child(
-                        div()
-                            .h_flex()
-                            .items_start()
-                            .gap(px(10.))
-                            .px(px(4.))
-                            .py(px(6.))
-                            .child(
-                                Icon::new(IconName::Lock)
-                                    .size(px(14.))
-                                    .mt(px(2.))
-                                    .text_color(rgb(color::TEXT_MUTED)),
-                            )
-                            .child(two_lines(
-                                format!("{agent_name}’s own login"),
-                                "The agent signs in with it; it is not one of your secrets",
-                            )),
-                    )
-                    .child(separator())
-                    .child(note(
-                        "Given as environment variables, never put in the prompt. GitEZ hides \
-                         the values where the agent prints them in the transcript.",
-                    ))
-                    .child(
-                        Button::new("composer-manage-secrets")
-                            .ghost()
-                            .compact()
-                            .text_color(rgb(color::TEXT_SECONDARY))
-                            .label("Manage secrets…")
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(OpenSettings.boxed_clone(), cx)
-                            }),
-                    )
             })
     }
 
@@ -1851,9 +1620,7 @@ impl Render for Composer {
             .child(self.render_agent_picker(cx))
             .child(self.render_model_picker(cx))
             // A discussion reads what is checked out.
-            .when(!discuss, |this| this.child(self.render_from_picker(cx)))
-            .child(self.render_sandbox_picker(cx))
-            .child(self.render_secrets_picker(cx));
+            .when(!discuss, |this| this.child(self.render_from_picker(cx)));
         let footer = div()
             .h_flex()
             .gap(px(10.))
@@ -2141,7 +1908,9 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn sending_emits_the_picked_branch_network_and_secrets(cx: &mut TestAppContext) {
+    fn sending_emits_the_picked_branch_and_the_default_network_and_secrets(
+        cx: &mut TestAppContext,
+    ) {
         let (composer, mut cx) = composer(cx);
         let sent: Arc<std::sync::Mutex<Vec<StartRequest>>> = Arc::default();
         cx.update(|_, cx| {
@@ -2160,10 +1929,7 @@ mod tests {
         });
         composer.update_in(&mut cx, |composer, window, cx| {
             composer.from = Some("main".into());
-            composer.network = Some(NetworkProfile::Packages);
             composer.model_alias = Some("haiku".into());
-            composer.toggle_secret("SENTRY_DSN", true, cx);
-            composer.toggle_secret("GITHUB_TOKEN", false, cx);
             composer.set_prompt("Fix the typo in README. Keep it short.".into(), window, cx);
         });
         cx.run_until_parked();
@@ -2208,8 +1974,8 @@ mod tests {
         };
         assert_eq!(request.start.branch, "main");
         assert_eq!(request.start.commit, oid(1).to_string());
-        assert_eq!(request.network, NetworkProfile::Packages);
-        assert_eq!(request.secrets, ["SENTRY_DSN"]);
+        assert_eq!(request.network, NetworkProfile::default());
+        assert_eq!(request.secrets, ["GITHUB_TOKEN"]);
         assert_eq!(request.model.as_deref(), Some("haiku"));
         assert_eq!(request.prompt, "Fix the typo in README. Keep it short.");
         assert_eq!(request.repository_name, "repo");
@@ -2268,7 +2034,7 @@ mod tests {
         cx.run_until_parked();
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert!(cx.debug_bounds("composer-from").is_none());
-        assert!(cx.debug_bounds("composer-sandbox").is_some());
+        assert!(cx.debug_bounds("composer-model").is_some());
         composer.update_in(&mut cx, |composer, window, cx| {
             assert_eq!(composer.thread_mode(cx), Mode::Discuss);
             assert_eq!(composer.problems(cx), []);

@@ -244,7 +244,7 @@ fn screenshot_composer_images() {
 }
 
 /// The pickers of the open composer, by the name their screenshots have.
-const PICKERS: [&str; 5] = ["agent", "model", "from", "sandbox", "secrets"];
+const PICKERS: [&str; 3] = ["agent", "model", "from"];
 
 /// Where picker `name` of the open composer is drawn.
 pub(crate) fn picker(
@@ -257,8 +257,6 @@ pub(crate) fn picker(
         "agent" => "composer-agent",
         "model" => "composer-model",
         "from" => "composer-from",
-        "sandbox" => "composer-sandbox",
-        "secrets" => "composer-secrets",
         _ => panic!("no picker {name}"),
     };
     shots

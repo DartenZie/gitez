@@ -605,7 +605,7 @@ fn screenshot_u6_home() {
     shots.save(window, "u6-home");
     let home = home_of(&mut shots, &workspace);
     // The pickers of the launcher, each opened once.
-    for name in ["repository", "agent", "model", "from", "sandbox", "secrets"] {
+    for name in ["repository", "agent", "model", "from"] {
         let place = picker(&mut shots, window, name);
         shots.click(window, place);
         shots.save(window, &format!("u6-picker-{name}"));

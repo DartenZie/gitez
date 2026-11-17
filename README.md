@@ -87,8 +87,8 @@ What follows describes an Implement thread, unless it says otherwise.
 - **Start a thread** from the "Ask an agent…" row under the uncommitted
   changes in the history (`⌘⇧A`, or File > Ask an Agent…), or from Home.
   Write the prompt, choose **Discuss** or **Implement**, and pick the agent,
-  the model, the branch to start from, the network profile (**Network**) and
-  the secrets the thread gets. An Implement thread starts from the branch's
+  the model and the branch to start from. The thread gets the network
+  profile and the default secrets set in Settings. An Implement thread starts from the branch's
   last commit; your uncommitted changes are not included. A Discuss thread
   reads the branch you have checked out, so it has no branch to pick and
   needs one checked out. GitEZ remembers the mode you used last. GitEZ
@@ -205,8 +205,8 @@ What follows describes an Implement thread, unless it says otherwise.
   - Secrets: named environment variables whose values are kept in the OS
     keychain (Keychain on macOS, the Secret Service on Linux), never in a
     file. A value is not shown again after you enter it. A secret is for all
-    repositories or one, and can be given to new threads by default; the
-    composer picks them per thread. In the transcripts and logs that GitEZ
+    repositories or one, and can be given to new threads by default; a
+    thread gets the secrets given by default. In the transcripts and logs that GitEZ
     writes, each value is replaced with `[secret NAME]`.
   - The repository's setup command, kept as `gitez.setupCommand` in its git
     config.
@@ -453,8 +453,7 @@ For an optimised build, run `cargo build --release`. The binary is
 1. Open Settings (`⌘,`). Check that Claude Code is signed in and that the
    sandbox is ready; click **Install** if it is not.
 2. In a repository, press `⌘⇧A`, or in Home, press `⌘N`.
-3. Write the prompt, pick the branch to start from and the network profile,
-   and press `⌘↵`.
+3. Write the prompt, pick the branch to start from, and press `⌘↵`.
 4. Follow the thread in its lane or in the Agents popover. When it has
    finished, review its local pull request, reply in the thread, or click
    **Complete**.
