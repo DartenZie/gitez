@@ -797,6 +797,9 @@ impl Review {
                     .mx(px(14.))
                     .max_h(px(430.))
                     .overflow_y_scroll()
+                    // GPUI lets the wheel event go on to the panel's own
+                    // scroll, which would move too: the box keeps it.
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                     .rounded(theme::RADIUS)
                     .border_1()
                     .border_color(rgb(color::DIFF_CARD_BORDER))
@@ -1058,6 +1061,7 @@ impl Review {
                                     .id("thread-message")
                                     .max_h(px(260.))
                                     .overflow_y_scroll()
+                                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                                     .text_size(px(12.5))
                                     .line_height(relative(1.5))
                                     .text_color(rgb(color::TEXT))
@@ -1318,6 +1322,7 @@ impl Review {
                     .v_flex()
                     .max_h(px(420.))
                     .overflow_y_scroll()
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                     .gap(px(8.))
                     .px(px(14.))
                     .py(px(12.))
