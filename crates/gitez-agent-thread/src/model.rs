@@ -584,7 +584,8 @@ impl AgentThread {
     }
 
     /// Records what came of the claimed brief of turn `index`: the
-    /// Implement thread started from it, or why none was.
+    /// Implement thread started from it, or why none was (ignored once a
+    /// thread was started: a thread that fails later says so itself).
     pub fn record_handoff(
         &mut self,
         index: usize,
@@ -597,7 +598,8 @@ impl AgentThread {
         {
             match outcome {
                 Ok(id) => handoff.thread = Some(id),
-                Err(problem) => handoff.problem = Some(problem),
+                Err(problem) if handoff.thread.is_none() => handoff.problem = Some(problem),
+                Err(_) => {}
             }
         }
     }

@@ -82,16 +82,23 @@ conversation that follows. Every thread runs in a
   and no pull request. Use it to ask a question, explore the code or agree
   on a plan.
 
+A third choice, **Auto**, lets the agent decide: the thread starts as a
+Discuss thread, and the agent reads the code before it answers. When your
+message is a clear request to change code and it is clear what to do, the
+agent writes a brief instead of an answer, and GitEZ starts an Implement
+thread from it at once. Otherwise it answers as a discussion does.
+
 What follows describes an Implement thread, unless it says otherwise.
 
 - **Start a thread** from the "Ask an agent…" row under the uncommitted
   changes in the history (`⌘⇧A`, or File > Ask an Agent…), or from Home.
-  Write the prompt, choose **Discuss** or **Implement**, and pick the agent,
+  Write the prompt, choose **Discuss**, **Auto** or **Implement**, and pick the agent,
   the model and the branch to start from. The thread gets the network
   profile and the default secrets set in Settings. An Implement thread starts from the branch's
   last commit; your uncommitted changes are not included. A Discuss thread
   reads the branch you have checked out, so it has no branch to pick and
-  needs one checked out. GitEZ remembers the mode you used last. GitEZ
+  needs one checked out; so does an Auto thread. GitEZ remembers the mode
+  you used last. GitEZ
   returns at once and the agent works in the background.
 - **From a discussion to an implementation**: **Implement…** in a Discuss
   thread asks the agent to write a brief of what you agreed, and opens the
@@ -99,6 +106,15 @@ What follows describes an Implement thread, unless it says otherwise.
   Implement thread starts from the brief alone, without the discussion's
   context, and each thread links to the other. The discussion stays open
   for more questions.
+- **Auto handoff**: in an Auto thread, any answer can be a brief, also one
+  to a reply such as "ok, do it". GitEZ starts one Implement thread from
+  each such brief, from the last commit of the branch the discussion read,
+  with the same agent, model, network profile and secrets, and the heading
+  of the brief as its title. The agent says in the brief when the change
+  depends on your uncommitted changes, which the new thread does not see.
+  If GitEZ was closed when the brief arrived, it starts the thread at its
+  next launch. If the branch is gone, it starts nothing and says so;
+  **Implement…** still opens the brief in the composer.
 - **Images**: paste images (`⌘V`) or drop image files into the prompt or a
   reply to show them to the agent, for example a screenshot of a bug. A
   prompt takes up to five images, as PNG, JPEG, GIF or WebP; GitEZ converts

@@ -1,5 +1,5 @@
 //! The "Ask an agent" composer: a prompt, the mode of the thread it starts
-//! (Discuss or Implement) and the pickers (agent, model, starting branch),
+//! (Discuss, Auto or Implement) and the pickers (agent, model, starting branch),
 //! as in the `C-1-Start` board; the sandbox network and the secrets are
 //! Settings' defaults. In a repository window it opens as a card
 //! under the "Ask an agent…" row of the history; Home shows it as its
@@ -147,6 +147,69 @@ impl From<String> for Sentence {
     }
 }
 
+/// What the composer's mode toggle offers: a thread [`Mode`], or Auto, a
+/// Discuss thread whose agent may hand off to an Implement thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadChoice {
+    Discuss,
+    Auto,
+    Implement,
+}
+
+impl ThreadChoice {
+    /// In the order of the toggle.
+    pub const ALL: [ThreadChoice; 3] = [Self::Discuss, Self::Auto, Self::Implement];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Discuss => "Discuss",
+            Self::Auto => "Auto",
+            Self::Implement => "Implement",
+        }
+    }
+
+    /// The mode of the thread it starts: Auto starts a Discuss thread.
+    pub fn mode(self) -> Mode {
+        match self {
+            Self::Implement => Mode::Implement,
+            Self::Discuss | Self::Auto => Mode::Discuss,
+        }
+    }
+
+    pub fn is_auto(self) -> bool {
+        self == Self::Auto
+    }
+
+    fn of_mode(mode: Mode) -> Self {
+        match mode {
+            Mode::Implement => Self::Implement,
+            Mode::Discuss => Self::Discuss,
+        }
+    }
+
+    /// The choice of the thread started last, as Settings remember it.
+    fn last(settings: &Settings) -> Self {
+        match settings.threads.last_mode {
+            Mode::Discuss if settings.threads.last_auto => Self::Auto,
+            mode => Self::of_mode(mode),
+        }
+    }
+
+    fn tooltip(self) -> &'static str {
+        match self {
+            Self::Discuss => "The agent reads your working tree and answers. It changes nothing.",
+            Self::Auto => {
+                "The agent reads your working tree and decides: it answers, or, when you ask \
+                 for a change, writes a brief and GitEZ starts an Implement thread from it."
+            }
+            Self::Implement => {
+                "The agent works on its own branch and worktree. Its commits become a local pull \
+                 request."
+            }
+        }
+    }
+}
+
 /// A repository in Home's Repository picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RepositoryChoice {
@@ -171,9 +234,9 @@ pub struct Composer {
     agent: String,
     /// `None`: the agent entry's default.
     model_alias: Option<String>,
-    /// What the thread is for; `None`: the mode of the thread started
+    /// What the thread is for; `None`: the choice of the thread started
     /// last.
-    thread_mode: Option<Mode>,
+    choice: Option<ThreadChoice>,
     /// The Discuss thread whose brief the prompt is, and its title.
     origin: Option<(AgentThreadKey, SharedString)>,
     /// `None`: the branch checked out.
@@ -240,7 +303,7 @@ impl Composer {
             focus_handle: cx.focus_handle(),
             agent,
             model_alias: None,
-            thread_mode: None,
+            choice: None,
             origin: None,
             from: None,
             environment: None,
@@ -334,15 +397,21 @@ impl Composer {
         cx.notify();
     }
 
-    /// What the thread started is for: the mode picked, else the mode of
-    /// the thread started last.
-    pub(crate) fn thread_mode(&self, cx: &App) -> Mode {
-        self.thread_mode
-            .unwrap_or_else(|| self.settings(cx).threads.last_mode)
+    /// What the thread started is for: the choice picked, else the choice
+    /// of the thread started last.
+    pub(crate) fn choice(&self, cx: &App) -> ThreadChoice {
+        self.choice
+            .unwrap_or_else(|| ThreadChoice::last(&self.settings(cx)))
     }
 
-    pub fn set_thread_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
-        self.thread_mode = Some(mode);
+    /// The mode of the thread started: Auto starts a discussion, and has
+    /// its requirements.
+    pub(crate) fn thread_mode(&self, cx: &App) -> Mode {
+        self.choice(cx).mode()
+    }
+
+    pub fn set_choice(&mut self, choice: ThreadChoice, cx: &mut Context<Self>) {
+        self.choice = Some(choice);
         cx.notify();
     }
 
@@ -373,7 +442,7 @@ impl Composer {
     /// an Implement thread that names it, for the user to read, change and
     /// send. Home picks the discussion's repository.
     pub fn hand_over(&mut self, handoff: &Handoff, window: &mut Window, cx: &mut Context<Self>) {
-        self.thread_mode = Some(Mode::Implement);
+        self.choice = Some(ThreadChoice::Implement);
         self.origin = Some((handoff.origin.clone(), handoff.title.clone()));
         let picked = self
             .target
@@ -788,7 +857,8 @@ impl Composer {
         if !self.can_send(cx) {
             return;
         }
-        let mode = self.thread_mode(cx);
+        let choice = self.choice(cx);
+        let mode = choice.mode();
         let (Some(target), Some((branch, tip))) = (self.target.clone(), self.start(mode)) else {
             return;
         };
@@ -803,6 +873,7 @@ impl Composer {
             agent: self.agent.clone(),
             model: (!model.is_empty()).then_some(model),
             mode,
+            auto: choice.is_auto(),
             start: Start {
                 branch,
                 commit: tip.to_string(),
@@ -1325,6 +1396,13 @@ impl Composer {
             .whitespace_nowrap()
             .text_size(px(11.5))
             .text_color(rgb(color::TEXT_MUTED));
+        if self.choice(cx) == ThreadChoice::Auto {
+            return line.child(if home {
+                "Reads the working tree, then answers or starts an Implement thread".to_owned()
+            } else {
+                format!("Reads your working tree, then answers or implements · {when}")
+            });
+        }
         if self.thread_mode(cx) == Mode::Discuss {
             return line.child(if home {
                 "Reads the repository’s working tree and changes nothing".to_owned()
@@ -1357,54 +1435,56 @@ impl Composer {
         }
     }
 
-    /// Discuss | Implement: what the thread is for. Two joined buttons
-    /// the height of the pickers, the mode chosen marked as on.
+    /// Discuss | Auto | Implement: what the thread is for. Three joined
+    /// buttons the height of the pickers, the choice made marked as on.
     fn render_mode_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let chosen = self.thread_mode(cx);
-        let segment = |id: &'static str, mode: Mode, tooltip: &'static str| {
-            let on = mode == chosen;
+        let chosen = ThreadChoice::ALL
+            .iter()
+            .position(|choice| *choice == self.choice(cx))
+            .unwrap_or_default();
+        let segment = |index: usize, choice: ThreadChoice| {
+            let id: &'static str = match choice {
+                ThreadChoice::Discuss => "composer-mode-discuss",
+                ThreadChoice::Auto => "composer-mode-auto",
+                ThreadChoice::Implement => "composer-mode-implement",
+            };
+            let on = index == chosen;
             Button::new(id)
                 .debug_selector(move || id.into())
                 .compact()
                 .h(px(28.))
                 .px(px(10.))
                 .text_size(px(12.))
-                .label(mode.label())
-                .tooltip(tooltip)
+                .label(choice.label())
+                .tooltip(choice.tooltip())
                 .selected(on)
                 .when(on, |this| {
                     this.bg(rgb(color::SELECTED))
                         .border_color(rgba(color::PICKER_ON_BORDER))
                         .text_color(rgb(color::ACCENT))
                 })
-                // The group draws the edge between the segments as Discuss's
-                // right one, in Discuss's colours. With Implement chosen the
-                // edge is Implement's left one instead, so the chosen
-                // segment's outline is whole and the group keeps its width.
-                .when(chosen == Mode::Implement, |this| match mode {
-                    Mode::Discuss => this.border_r_0(),
-                    Mode::Implement => this.border_l_1(),
-                })
+                // The group draws the edge between two segments as the left
+                // one's right edge, in its colours. Before the chosen segment
+                // that edge is the chosen one's left edge instead, so the
+                // chosen segment's outline is whole and the group keeps its
+                // width.
+                .when(chosen > 0 && index + 1 == chosen, |this| this.border_r_0())
+                .when(chosen > 0 && index == chosen, |this| this.border_l_1())
         };
-        ButtonGroup::new("composer-mode")
-            .child(segment(
-                "composer-mode-discuss",
-                Mode::Discuss,
-                "The agent reads your working tree and answers. It changes nothing.",
-            ))
-            .child(segment(
-                "composer-mode-implement",
-                Mode::Implement,
-                "The agent works on its own branch and worktree. Its commits become a local pull \
-                 request.",
-            ))
+        ThreadChoice::ALL
+            .into_iter()
+            .enumerate()
+            .fold(
+                ButtonGroup::new("composer-mode"),
+                |group, (index, choice)| group.child(segment(index, choice)),
+            )
             .on_click(cx.listener(|this, clicked: &Vec<usize>, _, cx| {
-                let mode = if clicked.contains(&1) {
-                    Mode::Implement
-                } else {
-                    Mode::Discuss
-                };
-                this.set_thread_mode(mode, cx)
+                if let Some(choice) = clicked
+                    .first()
+                    .and_then(|index| ThreadChoice::ALL.get(*index))
+                {
+                    this.set_choice(*choice, cx)
+                }
             }))
     }
 
@@ -1733,8 +1813,8 @@ mod tests {
 
     use gitez_agent_thread::Mode;
 
-    use super::{Composer, ComposerEvent, ComposerMode, Handoff, preview_branch};
-    use crate::agent_threads::{AgentThreadKey, Options, StartRequest, init_with};
+    use super::{Composer, ComposerEvent, ComposerMode, Handoff, ThreadChoice, preview_branch};
+    use crate::agent_threads::{AgentThreadKey, AgentThreads, Options, StartRequest, init_with};
 
     fn oid(n: u8) -> Oid {
         Oid::from_bytes_or_panic(&[n; 20])
@@ -2058,6 +2138,63 @@ mod tests {
         assert_eq!(request.origin, None);
     }
 
+    /// Auto starts a discussion marked as Auto: what is checked out, no
+    /// From picker. Starting it makes Auto the choice of the next composer.
+    #[gpui_kit::test]
+    fn auto_starts_a_marked_discussion_and_is_remembered(cx: &mut TestAppContext) {
+        let (composer, mut cx) = composer(cx);
+        let sent = requests(&composer, &mut cx);
+        composer.update_in(&mut cx, |composer, window, cx| {
+            ready(composer, gitez_agent::ClaudeCode::ID);
+            composer.from = Some("main".into());
+            composer.set_prompt("Could we make the sidebar narrower?".into(), window, cx);
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let auto = cx
+            .debug_bounds("composer-mode-auto")
+            .expect("the toggle has Auto");
+        cx.simulate_click(auto.center(), gpui_kit::Modifiers::none());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("composer-from").is_none());
+        composer.update_in(&mut cx, |composer, window, cx| {
+            assert_eq!(composer.choice(cx), ThreadChoice::Auto);
+            assert_eq!(composer.thread_mode(cx), Mode::Discuss);
+            assert_eq!(composer.problems(cx), []);
+            composer.send(window, cx);
+        });
+        let request = {
+            let sent = sent.lock().expect("lock");
+            let [request] = &sent[..] else {
+                panic!("one request, got {}", sent.len());
+            };
+            request.clone()
+        };
+        assert_eq!(request.mode, Mode::Discuss);
+        assert!(request.auto);
+        assert_eq!(request.start.branch, "feature");
+        assert_eq!(request.origin, None);
+
+        cx.update(|_, cx| {
+            AgentThreads::global(cx).update(cx, |model, cx| {
+                // The thread itself cannot start here (no repository).
+                model.start(request, cx).detach();
+                let threads = &model.settings().threads;
+                assert_eq!(
+                    (threads.last_mode, threads.last_auto),
+                    (Mode::Discuss, true)
+                );
+            });
+        });
+        composer.update(&mut cx, |composer, cx| {
+            composer.choice = None;
+            assert_eq!(composer.choice(cx), ThreadChoice::Auto);
+            // Another choice is remembered as it was.
+            composer.set_choice(ThreadChoice::Discuss, cx);
+        });
+        cx.run_until_parked();
+    }
+
     /// A discussion needs a branch checked out, even when Implement could
     /// start from a picked one.
     #[gpui_kit::test]
@@ -2079,7 +2216,7 @@ mod tests {
             composer.from = Some("main".into());
             composer.set_prompt("Where is blame read?".into(), window, cx);
             assert!(composer.can_send(cx), "{:?}", composer.problems(cx));
-            composer.set_thread_mode(Mode::Discuss, cx);
+            composer.set_choice(ThreadChoice::Discuss, cx);
             assert!(!composer.can_send(cx));
             assert!(composer.problems(cx).iter().any(|problem| {
                 problem.severity == super::Severity::Blocking
@@ -2108,7 +2245,7 @@ mod tests {
         };
         composer.update_in(&mut cx, |composer, window, cx| {
             ready(composer, gitez_agent::ClaudeCode::ID);
-            composer.set_thread_mode(Mode::Discuss, cx);
+            composer.set_choice(ThreadChoice::Discuss, cx);
             composer.hand_over(&handoff, window, cx);
             assert_eq!(composer.thread_mode(cx), Mode::Implement);
             assert_eq!(composer.origin(), Some(&origin));
@@ -2139,7 +2276,7 @@ mod tests {
         // A brief sent as a discussion implements nothing.
         composer.update_in(&mut cx, |composer, window, cx| {
             composer.hand_over(&handoff, window, cx);
-            composer.set_thread_mode(Mode::Discuss, cx);
+            composer.set_choice(ThreadChoice::Discuss, cx);
             composer.send(window, cx);
         });
         assert_eq!(sent.lock().expect("lock")[1].origin, None);

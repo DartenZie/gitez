@@ -269,6 +269,9 @@ pub struct AgentThreads {
     /// Threads being completed because their pull request was merged or
     /// closed, so a burst of file events completes each once.
     completing: HashSet<AgentThreadKey>,
+    /// Auto threads' briefs (by thread and turn) being handed on to an
+    /// Implement thread, so a burst of file events starts each once.
+    handing_off: HashSet<(AgentThreadKey, usize)>,
     /// File events and reload requests, read in order by one task.
     changes: mpsc::UnboundedSender<Vec<PathBuf>>,
     watch: bool,
@@ -370,6 +373,7 @@ impl AgentThreads {
             completion_problems: HashMap::new(),
             current: None,
             completing: HashSet::new(),
+            handing_off: HashSet::new(),
             changes,
             watch: options.watch,
             watched: Vec::new(),
@@ -698,14 +702,17 @@ impl AgentThreads {
             },
             cx,
         );
-        self.create_and_launch(request, cx)
+        self.create_and_launch(request, None, cx)
     }
 
-    /// [`start`](Self::start) without remembering the mode: for the
-    /// Implement thread GitEZ starts from an Auto thread's brief.
+    /// [`start`](Self::start) without remembering the mode. With
+    /// `handoff_turn`, the request is an Implement thread started from the
+    /// brief of that turn of its origin, an Auto thread: the origin records
+    /// the new thread as soon as it exists, before its supervisor starts.
     fn create_and_launch(
         &mut self,
         request: StartRequest,
+        handoff_turn: Option<usize>,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<AgentThreadKey>> {
         let launcher = self.launcher();
@@ -744,6 +751,19 @@ impl AgentThreads {
                 id: thread.id.clone(),
             };
             debug(|| format!("created {}", key.id));
+            if let (Some(index), Some(origin)) = (handoff_turn, thread.origin.as_ref()) {
+                let id = thread.id.clone();
+                store.update(origin, |origin| {
+                    origin.record_handoff(index, Ok(id));
+                    Ok(())
+                })?;
+                changes
+                    .unbounded_send(vec![thread_file(&AgentThreadKey {
+                        common_dir: request.common_dir.clone(),
+                        id: origin.clone(),
+                    })])
+                    .ok();
+            }
             let index = Index::new(&data_dir);
             let indexed = index.add(IndexedRepository {
                 common_dir: request.common_dir.clone(),
@@ -1169,6 +1189,7 @@ impl AgentThreads {
             changed.insert(repository.common_dir.clone());
         }
         self.complete_merged(&reread, &reread_threads, cx);
+        self.hand_off(&reread, &reread_threads, cx);
         for common_dir in changed {
             debug(|| format!("changed {}", common_dir.display()));
             cx.emit(AgentThreadsEvent::Changed { common_dir });
@@ -1896,6 +1917,177 @@ impl AgentThreads {
     }
 }
 
+// An Auto thread's agent that chose to implement answered with a brief
+// ([`AgentThread::pending_handoff`]). GitEZ starts the Implement thread
+// itself, whenever it reads such a thread: as the turn ends, or at the next
+// launch when GitEZ was closed then. The claim, under the discussion's
+// lock, comes first, so a brief starts at most one thread.
+
+/// A brief to hand on: the Auto thread `key` and its turn `turn`.
+struct DueHandoff {
+    key: AgentThreadKey,
+    turn: usize,
+    /// A working tree of the repository, to read the start branch in.
+    work_dir: PathBuf,
+    repository_name: String,
+}
+
+impl AgentThreads {
+    /// Starts an Implement thread from each pending brief among the
+    /// threads of the repositories `repositories` and the threads
+    /// `threads`.
+    fn hand_off(
+        &mut self,
+        repositories: &[PathBuf],
+        threads: &[AgentThreadKey],
+        cx: &mut Context<Self>,
+    ) {
+        let mut due = Vec::new();
+        for repository in &self.repositories {
+            let whole = repositories
+                .iter()
+                .any(|dir| *dir == repository.common_dir || *dir == repository.canonical);
+            for thread in &repository.threads {
+                let Some(turn) = thread.pending_handoff() else {
+                    continue;
+                };
+                let key = AgentThreadKey {
+                    common_dir: repository.common_dir.clone(),
+                    id: thread.id.clone(),
+                };
+                let named = threads.iter().any(|named| {
+                    named.id == key.id
+                        && (named.common_dir == repository.common_dir
+                            || named.common_dir == repository.canonical)
+                });
+                if (whole || named) && !self.handing_off.contains(&(key.clone(), turn)) {
+                    due.push(DueHandoff {
+                        key,
+                        turn,
+                        work_dir: repository.work_dir.clone(),
+                        repository_name: repository.name.to_string(),
+                    });
+                }
+            }
+        }
+        for due in due {
+            let handing = (due.key.clone(), due.turn);
+            self.handing_off.insert(handing.clone());
+            let changes = self.changes.clone();
+            let claim = cx
+                .background_executor()
+                .spawn(async move { claim_handoff(&due, Timestamp::now()).map(|req| (due, req)) });
+            cx.spawn(async move |this, cx| {
+                let (due, request) = match claim.await {
+                    Ok(claimed) => claimed,
+                    Err(error) => {
+                        // Nothing was claimed: the next read tries again.
+                        debug(|| format!("could not hand off a brief: {error:#}"));
+                        this.update(cx, |this, _| this.handing_off.remove(&handing))
+                            .ok();
+                        return;
+                    }
+                };
+                let outcome = match request {
+                    Ok(Some(request)) => {
+                        let started = this.update(cx, |this, cx| {
+                            this.create_and_launch(request, Some(due.turn), cx)
+                        });
+                        match started {
+                            Ok(task) => match task.await {
+                                Ok(key) => {
+                                    debug(|| format!("{} handed off to {}", due.key.id, key.id));
+                                    None
+                                }
+                                Err(error) => Some(format!(
+                                    "GitEZ could not start an Implement thread from the brief: \
+                                     {error:#}"
+                                )),
+                            },
+                            Err(_) => return,
+                        }
+                    }
+                    // Claimed by another window or process meanwhile.
+                    Ok(None) => None,
+                    Err(problem) => Some(problem),
+                };
+                if let Some(problem) = outcome {
+                    let key = due.key.clone();
+                    let recorded = cx
+                        .background_executor()
+                        .spawn(async move {
+                            Store::new(&key.common_dir).update(&key.id, |thread| {
+                                thread.record_handoff(due.turn, Err(problem));
+                                Ok(())
+                            })
+                        })
+                        .await;
+                    if let Err(error) = recorded {
+                        debug(|| format!("could not record a failed handoff: {error}"));
+                    }
+                    changes.unbounded_send(vec![thread_file(&due.key)]).ok();
+                }
+            })
+            .detach();
+        }
+    }
+}
+
+/// Claims the brief `due` names and makes the request that starts its
+/// Implement thread: `Ok(None)` when it was claimed already,
+/// `Ok(Err(problem))` when it was claimed but no thread can start, for
+/// the caller to record. Blocks.
+fn claim_handoff(
+    due: &DueHandoff,
+    now: Timestamp,
+) -> anyhow::Result<Result<Option<StartRequest>, String>> {
+    let store = Store::new(&due.key.common_dir);
+    let claimed = store.update(&due.key.id, |thread| {
+        match thread.claim_handoff(due.turn, now) {
+            Ok(brief) => Ok(Some((brief, thread.clone()))),
+            Err(gitez_agent_thread::Error::Refused(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    })?;
+    let Some((brief, discussion)) = claimed else {
+        return Ok(Ok(None));
+    };
+    let branch = discussion.start.branch.clone();
+    let tip = gitez_git::Repository::open(&due.work_dir)
+        .map_err(anyhow::Error::from)
+        .and_then(|repository| Ok(repository.resolve_commit(&format!("refs/heads/{branch}"))?));
+    let commit = match tip {
+        Ok(Some(commit)) => commit.to_string(),
+        Ok(None) => {
+            return Ok(Err(format!(
+                "The branch {branch} is gone, so GitEZ started no Implement thread from the \
+                 brief. Use “Implement…” to start one from another branch."
+            )));
+        }
+        Err(error) => {
+            return Ok(Err(format!(
+                "GitEZ could not read the branch {branch}, so it started no Implement thread \
+                 from the brief: {error:#}"
+            )));
+        }
+    };
+    Ok(Ok(Some(StartRequest {
+        work_dir: due.work_dir.clone(),
+        common_dir: due.key.common_dir.clone(),
+        repository_name: due.repository_name.clone(),
+        prompt: brief,
+        agent: discussion.agent,
+        model: discussion.model,
+        mode: Mode::Implement,
+        auto: false,
+        start: gitez_agent_thread::Start { branch, commit },
+        origin: Some(discussion.id),
+        network: discussion.network,
+        secrets: discussion.secrets,
+        images: Vec::new(),
+    })))
+}
+
 /// Whether `thread` completes when the pull request it created is in
 /// `state`: a finished thread does once the pull request is merged or
 /// closed. One still working completes when it finishes (it is checked
@@ -2032,8 +2224,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use gitez_agent_thread::{
-        AgentThread, AgentThreadId, Ending, Failure, Mode, Start, State, Timestamp, Turn, TurnKind,
-        TurnResult,
+        AgentThread, AgentThreadId, Ending, Failure, Handoff, Mode, Start, State, Timestamp, Turn,
+        TurnKind, TurnResult,
     };
     use gitez_sandbox::NetworkProfile;
     use gitez_secret::SecretStore as _;
@@ -2439,5 +2631,192 @@ mod tests {
             .load(&key.id)
             .expect("load");
         assert_eq!(thread.state, State::Finished);
+    }
+
+    /// A repository whose branch `feature` an Auto thread discussed, and
+    /// whose agent answered with a brief GitEZ has not handed on yet. The
+    /// branch moves on after the discussion started. Returns the main
+    /// working tree and the discussion's key.
+    fn auto_discussion(dir: &Path) -> (PathBuf, AgentThreadKey) {
+        let main = dir.join("repo");
+        std::fs::create_dir_all(&main).expect("folder");
+        git(&main, &["init", "-q", "-b", "main"]);
+        git(&main, &["config", "user.name", "Ada Lovelace"]);
+        git(&main, &["config", "user.email", "ada@example.com"]);
+        git(&main, &["config", "commit.gpgsign", "false"]);
+        git(&main, &["commit", "-q", "--allow-empty", "-m", "First"]);
+        git(&main, &["branch", "feature"]);
+        let start = git(&main, &["rev-parse", "HEAD"]);
+        let common_dir = gitez_git::Repository::open(&main)
+            .expect("open")
+            .common_dir();
+        let data_dir = dir.join("data");
+        let store = gitez_agent_thread::Store::new(&common_dir);
+        let created = store
+            .create(
+                gitez_agent_thread::NewAgentThread {
+                    prompt: "Could blame follow renames?".into(),
+                    agent: "claude-code".into(),
+                    model: Some("haiku".into()),
+                    start: Start {
+                        branch: "feature".into(),
+                        commit: start,
+                    },
+                    network: NetworkProfile::Packages,
+                    secrets: vec!["GITHUB_TOKEN".into()],
+                    mode: Mode::Discuss,
+                    auto: true,
+                    work_dir: Some(main.clone()),
+                    origin: None,
+                },
+                &data_dir,
+                "repo",
+                |_| false,
+                Timestamp::now(),
+            )
+            .expect("thread");
+        let now = Timestamp::now();
+        store
+            .update(&created.id, |thread| {
+                thread.state = State::Finished;
+                thread.ending = Some(Ending::Answer);
+                thread.session_id = Some("session".into());
+                let turn = &mut thread.turns[0];
+                turn.started = Some(now);
+                turn.ended = Some(now);
+                turn.result = Some(TurnResult {
+                    success: true,
+                    message: "# Follow renames in blame\n\nRead the rename from the diff.".into(),
+                    cost_usd: None,
+                    duration_ms: None,
+                    steps: 1,
+                    exit_code: Some(0),
+                    stopped: false,
+                    blocked_hosts: Vec::new(),
+                });
+                turn.handoff = Some(Handoff::default());
+                Ok(())
+            })
+            .expect("finish");
+        git(&main, &["commit", "-q", "--allow-empty", "-m", "Second"]);
+        git(&main, &["branch", "-f", "feature", "HEAD"]);
+        gitez_agent_thread::Index::new(&data_dir)
+            .add(gitez_agent_thread::IndexedRepository {
+                common_dir: common_dir.clone(),
+                work_dir: main.clone(),
+                name: "repo".into(),
+            })
+            .expect("index");
+        let key = AgentThreadKey {
+            common_dir,
+            id: created.id,
+        };
+        (main, key)
+    }
+
+    /// Reads every thread, as GitEZ does when it starts.
+    fn load_model(data_dir: &Path, cx: &mut gpui_kit::TestAppContext) {
+        cx.update(|cx| {
+            super::init_with(
+                super::Options {
+                    data_dir: Some(data_dir.to_owned()),
+                    sandbox: std::sync::Arc::new(gitez_sandbox::Passthrough),
+                    agents: gitez_agent::Registry::builtin(),
+                    secrets: std::sync::Arc::new(gitez_secret::Memory::default()),
+                    exe: Err("no supervisor in tests".into()),
+                    watch: false,
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+    }
+
+    /// The threads whose brief came from `origin`.
+    fn implementations(key: &AgentThreadKey) -> Vec<AgentThread> {
+        let (threads, errors) = gitez_agent_thread::Store::new(&key.common_dir).load_all();
+        assert!(errors.is_empty(), "{errors:?}");
+        threads
+            .into_iter()
+            .filter(|thread| thread.origin.as_ref() == Some(&key.id))
+            .collect()
+    }
+
+    #[gpui_kit::test]
+    fn a_brief_an_auto_thread_answered_with_starts_one_implement_thread(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (main, key) = auto_discussion(dir.path());
+        load_model(&dir.path().join("data"), cx);
+
+        let started = implementations(&key);
+        let [implement] = &started[..] else {
+            panic!("one Implement thread, got {started:#?}");
+        };
+        assert_eq!(implement.mode, Mode::Implement);
+        assert!(!implement.auto);
+        assert_eq!(implement.title, "Follow renames in blame");
+        assert_eq!(
+            implement.turns[0].prompt,
+            "# Follow renames in blame\n\nRead the rename from the diff."
+        );
+        // From the branch the discussion read, at its tip now.
+        assert_eq!(implement.start.branch, "feature");
+        assert_eq!(
+            implement.start.commit,
+            git(&main, &["rev-parse", "feature"])
+        );
+        // As the discussion ran.
+        assert_eq!(implement.model.as_deref(), Some("haiku"));
+        assert_eq!(implement.network, NetworkProfile::Packages);
+        assert_eq!(implement.secrets, ["GITHUB_TOKEN"]);
+
+        let discussion = gitez_agent_thread::Store::new(&key.common_dir)
+            .load(&key.id)
+            .expect("load");
+        let handoff = discussion.turns[0].handoff.clone().expect("a handoff");
+        assert!(handoff.claimed.is_some());
+        assert_eq!(handoff.thread.as_ref(), Some(&implement.id));
+        // Its supervisor could not start here; the new thread says so, not
+        // the discussion.
+        assert_eq!(handoff.problem, None);
+        assert_eq!(implement.ending, Some(Ending::Failed));
+        assert_eq!(discussion.pending_handoff(), None);
+        // The choice of the next composer is the user's, not this thread's.
+        cx.update(|cx| {
+            let threads = &super::AgentThreads::global(cx).read(cx).settings().threads;
+            assert_eq!(threads.last_mode, Mode::Implement);
+        });
+
+        // GitEZ starts again: nothing more.
+        load_model(&dir.path().join("data"), cx);
+        assert_eq!(implementations(&key).len(), 1);
+    }
+
+    #[gpui_kit::test]
+    fn a_brief_whose_branch_is_gone_starts_nothing_and_says_so(cx: &mut gpui_kit::TestAppContext) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (main, key) = auto_discussion(dir.path());
+        git(&main, &["branch", "-D", "feature"]);
+        load_model(&dir.path().join("data"), cx);
+
+        assert!(implementations(&key).is_empty());
+        let discussion = gitez_agent_thread::Store::new(&key.common_dir)
+            .load(&key.id)
+            .expect("load");
+        let handoff = discussion.turns[0].handoff.clone().expect("a handoff");
+        assert_eq!(handoff.thread, None);
+        assert!(
+            handoff
+                .problem
+                .as_deref()
+                .is_some_and(|problem| problem.starts_with("The branch feature is gone")),
+            "{handoff:?}"
+        );
+        // The brief is left for "Implement…", and tried once only.
+        assert!(discussion.brief().is_some());
+        load_model(&dir.path().join("data"), cx);
+        assert!(implementations(&key).is_empty());
     }
 }

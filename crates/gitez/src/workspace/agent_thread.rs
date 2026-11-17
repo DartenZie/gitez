@@ -877,6 +877,40 @@ fn can_implement(thread: &AgentThread) -> bool {
     thread.mode == Mode::Discuss && can_reply(thread)
 }
 
+/// Under an Auto thread's last answer, when its agent chose to implement:
+/// what GitEZ did with the brief.
+fn handoff_note(thread: &AgentThread) -> Option<Div> {
+    let handoff = thread.turns.last()?.handoff.as_ref()?;
+    let (text, colour) = match (&handoff.thread, &handoff.problem) {
+        (Some(_), _) => (
+            "GitEZ started an Implement thread from this brief.".to_owned(),
+            color::TEXT_MUTED,
+        ),
+        (None, Some(problem)) => (problem.clone(), color::THREAD_FAILED_TEXT),
+        (None, None) => (
+            "Starting an Implement thread from this brief…".to_owned(),
+            color::TEXT_MUTED,
+        ),
+    };
+    Some(
+        div()
+            .debug_selector(|| "thread-handoff".into())
+            .ml(px(28.))
+            .h_flex()
+            .gap(px(6.))
+            .text_size(px(12.))
+            .text_color(rgb(colour))
+            .items_start()
+            .child(
+                div()
+                    .flex_none()
+                    .pt(px(2.))
+                    .child(Icon::new(IconName::ArrowRight).size(px(12.))),
+            )
+            .child(div().flex_1().min_w_0().child(text)),
+    )
+}
+
 /// Whether `thread` is finished without a pull request, so Complete is
 /// offered; one with a pull request completes when it is merged or closed.
 pub fn can_complete(thread: &AgentThread) -> bool {
@@ -1583,12 +1617,13 @@ impl ThreadView {
                     .gap(px(6.))
                     .min_w_0()
                     .child(path(work_dir))
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_color(rgb(color::TEXT_MUTED))
-                            .child("read-only"),
-                    )
+                    .child(div().flex_none().text_color(rgb(color::TEXT_MUTED)).child(
+                        if thread.auto {
+                            "read-only · Auto"
+                        } else {
+                            "read-only"
+                        },
+                    ))
                     .into_any_element(),
             ));
         }
@@ -2295,7 +2330,8 @@ impl ThreadView {
                             )
                             .selectable(true),
                         ),
-                ),
+                )
+                .children(handoff_note(thread)),
         )
     }
 
@@ -2643,7 +2679,9 @@ impl ThreadView {
             // The detail panel has room for a word or two beside the
             // buttons.
             _ if thread.mode == Mode::Discuss => (
-                if self.wide {
+                if self.wide && thread.auto {
+                    "Continues the discussion · the agent answers, or hands off to implement"
+                } else if self.wide {
                     "Continues the discussion · the agent changes nothing"
                 } else {
                     "Changes nothing"
@@ -3154,6 +3192,35 @@ mod tests {
         let (_view, mut cx) = open(dir.path(), key, cx);
         assert!(cx.debug_bounds("thread-implement").is_none());
         assert!(cx.debug_bounds("thread-working-tree").is_some());
+    }
+
+    /// An Auto thread whose agent chose to implement shows its brief and
+    /// what GitEZ did with it; "Implement…" opens the same brief.
+    #[gpui_kit::test]
+    fn an_auto_discussion_says_what_became_of_its_brief(cx: &mut TestAppContext) {
+        let brief = "# Follow renames in blame\n\nRead the rename from the diff.";
+        let (dir, common_dir, id) = repository_with_discussion(|thread| {
+            thread.auto = true;
+            thread.state = State::Finished;
+            thread.ending = Some(Ending::Answer);
+            thread.session_id = Some("session".into());
+            thread.turns[0].result = Some(result(brief, true));
+            thread.turns[0].handoff = Some(gitez_agent_thread::Handoff {
+                claimed: Some(Timestamp::now()),
+                thread: None,
+                problem: Some("The branch main is gone.".into()),
+            });
+        });
+        let key = AgentThreadKey { common_dir, id };
+        let (view, mut cx) = open(dir.path(), key, cx);
+        assert!(cx.debug_bounds("thread-handoff").is_some());
+        assert!(cx.debug_bounds("thread-final-message").is_some());
+        let seen = handoffs(&view, &mut cx);
+        view.update_in(&mut cx, |view, window, cx| view.implement(window, cx));
+        cx.run_until_parked();
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].brief, brief);
     }
 
     /// The events `view` emits from now on.

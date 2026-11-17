@@ -197,6 +197,9 @@ fn screenshot_u2_composer() {
     // A discussion: no From picker, and what the agent may do.
     shots.click_id(window, "composer-mode-discuss");
     shots.save(window, "u2-composer-discuss");
+    // Auto: the same, and the agent decides; the middle segment is on.
+    shots.click_id(window, "composer-mode-auto");
+    shots.save(window, "u2-composer-auto");
     shots.click_id(window, "composer-mode-implement");
 }
 

@@ -138,6 +138,26 @@ Decided 2026-10-23; change only with the owner's agreement.
     `caches/` folders of its own (`scratch`). The composer remembers the
     mode used last (`threads.last_mode` in `settings.json`). An older GitEZ
     cannot read a Discuss record and leaves it alone; `version` stays 1.
+  - Auto (decided 2026-11-17) is a third composer choice, not a third
+    mode: it starts a Discuss thread marked `auto` in `thread.json`, with
+    Discuss's requirements and no From picker. The composer remembers it as
+    `threads.last_auto` beside `last_mode` (which stays `discuss`, so a
+    GitEZ without Auto still reads the file). Its agent's system prompt
+    adds one rule: when a message (the first or any reply) is a clear
+    request to change code and it is clear what to do, answer with the line
+    `HANDOFF_MARKER` (`[gitez:implement]`) and then a brief in the
+    `BRIEF_PROMPT` format, saying when it depends on uncommitted changes;
+    otherwise answer as a discussion does. The supervisor strips the marker
+    from the turn's message and marks the turn with `handoff`; the marker
+    is never shown. GitEZ then starts the Implement thread itself, without
+    asking, through `AgentThreads::start`'s path (the brief as prompt, its
+    `# heading` as title, `origin` set, the discussion's branch at its
+    current tip, its agent, model, network and secrets). It first claims
+    the turn's handoff under the thread's lock (`claim_handoff`), then
+    records the new thread's id (or why none started, such as a branch
+    that is gone) in it, so each marked turn starts at most one thread,
+    also when GitEZ was closed as the turn ended (it hands off at the next
+    launch). "Implement…" works as in any discussion.
   - Handoff: "Implement…" in a Discuss thread asks the agent for a brief
     (`BRIEF_PROMPT`, a turn of kind `brief`), then opens the composer with
     it as the prompt of a new Implement thread, which starts with a fresh
@@ -246,7 +266,9 @@ Decided 2026-10-23; change only with the owner's agreement.
   - Naming, in the UI and in code: the noun is "thread" (never "session",
     "task" or "job"); the verb is "Complete" (never "archive" or
     "dismiss"); the modes are "Discuss" and "Implement" (never "chat",
-    "plan" or "ask"), and what goes from one to the other is a "brief";
+    "plan" or "ask"), the composer's third choice is "Auto" (never
+    "smart" or "automatic"; in code `ThreadChoice::Auto` and `auto`), and
+    what goes from one to the other is a "brief";
     the states are one word each: Queued, Preparing, Running,
     Waiting, Finished, Completed, and a finished thread ended as a pull
     request, an answer, failed or stopped. In code an agent thread is

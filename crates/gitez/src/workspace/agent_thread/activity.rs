@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 
 use gitez_agent::AgentEvent;
-use gitez_agent_thread::TurnKind;
+use gitez_agent_thread::{TurnKind, without_handoff_marker};
 
 /// Tool steps in a row shown before the rest of the row collapses.
 pub const SHOWN_IN_A_RUN: usize = 2;
@@ -91,7 +91,14 @@ pub fn entries(turns: &[TurnEvents<'_>]) -> Vec<Entry> {
         let mut final_text = None;
         for event in turn.events {
             match event {
-                AgentEvent::Text(text) => entries.push(Entry::Text(text.clone())),
+                // An Auto thread's brief: the marker that made it one is
+                // GitEZ's, not for the user.
+                AgentEvent::Text(text) => {
+                    let text = without_handoff_marker(text);
+                    if !text.trim().is_empty() {
+                        entries.push(Entry::Text(text.to_owned()));
+                    }
+                }
                 AgentEvent::Tool { name, detail } => entries.push(Entry::Tool {
                     name: name.clone(),
                     detail: detail.clone(),
@@ -112,7 +119,9 @@ pub fn entries(turns: &[TurnEvents<'_>]) -> Vec<Entry> {
                         failure.get_or_insert_with(|| why.clone());
                     }
                 }
-                AgentEvent::Finished(finished) => final_text = Some(finished.text.trim()),
+                AgentEvent::Finished(finished) => {
+                    final_text = Some(without_handoff_marker(&finished.text).trim());
+                }
                 AgentEvent::Started { .. } | AgentEvent::UsageLimit(_) => {}
             }
         }
@@ -358,6 +367,39 @@ mod tests {
                 Entry::Text("Carrying on.".into()),
             ]
         );
+    }
+
+    /// An Auto thread's agent writes the marker before a brief; the list
+    /// never shows it.
+    #[test]
+    fn the_handoff_marker_is_never_shown() {
+        let marker = gitez_agent_thread::HANDOFF_MARKER;
+        let brief = format!("{marker}\n\n# Follow renames\n\nRead the diff.");
+        let first = leak(vec![
+            tool("Read", "blame.rs"),
+            text(marker),
+            text(&brief),
+            finished(&brief),
+        ]);
+        let entries = entries(&[turn(TurnKind::Start, "Follow renames", first)]);
+        assert_eq!(
+            entries,
+            [Entry::Tool {
+                name: "Read".into(),
+                detail: "blame.rs".into(),
+                failure: None
+            }]
+        );
+        let second = leak(vec![text(&format!("{marker}\n# Draft")), text("Done.")]);
+        let entries = entries_of(second);
+        assert_eq!(
+            entries,
+            [Entry::Text("# Draft".into()), Entry::Text("Done.".into())]
+        );
+    }
+
+    fn entries_of(events: &'static [AgentEvent]) -> Vec<Entry> {
+        entries(&[turn(TurnKind::Start, "", events)])
     }
 
     #[test]
