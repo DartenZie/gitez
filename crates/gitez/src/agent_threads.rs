@@ -193,6 +193,9 @@ pub struct StartRequest {
     pub agent: String,
     pub model: Option<String>,
     pub mode: Mode,
+    /// A Discuss thread started as Auto: its agent may hand off to an
+    /// Implement thread ([`AgentThread::auto`]).
+    pub auto: bool,
     pub start: gitez_agent_thread::Start,
     /// The Discuss thread whose brief the prompt is.
     pub origin: Option<AgentThreadId>,
@@ -680,14 +683,31 @@ impl AgentThreads {
     /// Creates the agent thread (queued), lists its repository in the
     /// index, reads its secrets from the keychain and starts its
     /// supervisor with `gitez supervise start`. Runs in the background.
-    /// The request's mode is the one the next composer starts with.
+    /// The request's mode (and whether it is Auto) is the one the next
+    /// composer starts with.
     pub fn start(
         &mut self,
         request: StartRequest,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<AgentThreadKey>> {
-        let mode = request.mode;
-        self.update_settings(|settings| settings.threads.last_mode = mode, cx);
+        let (mode, auto) = (request.mode, request.auto && request.mode == Mode::Discuss);
+        self.update_settings(
+            |settings| {
+                settings.threads.last_mode = mode;
+                settings.threads.last_auto = auto;
+            },
+            cx,
+        );
+        self.create_and_launch(request, cx)
+    }
+
+    /// [`start`](Self::start) without remembering the mode: for the
+    /// Implement thread GitEZ starts from an Auto thread's brief.
+    fn create_and_launch(
+        &mut self,
+        request: StartRequest,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<AgentThreadKey>> {
         let launcher = self.launcher();
         let data_dir = self.data_dir.clone();
         let changes = self.changes.clone();
@@ -702,6 +722,7 @@ impl AgentThreads {
                     agent: request.agent,
                     model: request.model,
                     mode: request.mode,
+                    auto: request.auto && request.mode == Mode::Discuss,
                     start: request.start,
                     work_dir: (request.mode == Mode::Discuss).then(|| request.work_dir.clone()),
                     origin: request.origin,
@@ -2040,6 +2061,7 @@ mod tests {
                 commit: "0".repeat(40),
             },
             mode: Mode::Implement,
+            auto: false,
             branch: Some(format!("agent/{id}")),
             worktree: Some(PathBuf::from("/nowhere").join(id)),
             work_dir: None,
@@ -2060,6 +2082,7 @@ mod tests {
                 transcript: None,
                 result: None::<TurnResult>,
                 images: Vec::new(),
+                handoff: None,
             }],
             activity: None,
             waiting_until: None,
@@ -2261,6 +2284,7 @@ mod tests {
                     network: NetworkProfile::AgentOnly,
                     secrets: Vec::new(),
                     mode: gitez_agent_thread::Mode::Implement,
+                    auto: false,
                     work_dir: None,
                     origin: None,
                 },

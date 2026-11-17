@@ -182,6 +182,29 @@ pub struct Turn {
     /// lists them again.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<TurnImage>,
+    /// Set when the agent of an Auto thread chose to implement: it
+    /// answered with [`HANDOFF_MARKER`] and a brief (the result's message,
+    /// without the marker), and GitEZ starts an Implement thread from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<Handoff>,
+}
+
+/// What became of a brief an Auto thread's agent answered with
+/// ([`Turn::handoff`]). GitEZ claims it before it starts the Implement
+/// thread, so each brief starts at most one, also after a restart.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Handoff {
+    /// When GitEZ took the brief to start an Implement thread; `None`
+    /// until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed: Option<Timestamp>,
+    /// The Implement thread started from the brief.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<AgentThreadId>,
+    /// Why no Implement thread was started, for the user: the brief is
+    /// left for "Implement…".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub problem: Option<String>,
 }
 
 /// How a turn's run ended.
@@ -305,6 +328,11 @@ pub struct AgentThread {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Mode::is_implement")]
     pub mode: Mode,
+    /// A Discuss thread started as Auto: its agent may answer with a brief
+    /// behind [`HANDOFF_MARKER`], and GitEZ then starts an Implement
+    /// thread from it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto: bool,
     pub state: State,
     /// Set when `state` is Finished or Completed.
     pub ending: Option<Ending>,
@@ -381,6 +409,8 @@ pub struct NewAgentThread {
     pub agent: String,
     pub model: Option<String>,
     pub mode: Mode,
+    /// For [`Mode::Discuss`]: started as Auto ([`AgentThread::auto`]).
+    pub auto: bool,
     pub start: Start,
     /// For [`Mode::Discuss`]: the working tree the agent reads. Unused
     /// for an Implement thread.
@@ -425,6 +455,40 @@ undecided, list it under \"Open questions\".
 
 Reply with the brief only: no preamble and no closing remarks.";
 
+/// The first line of an Auto thread's answer that is a brief to implement
+/// rather than an answer ([`AgentThread::auto`]). Never shown, and never
+/// part of the brief sent on.
+pub const HANDOFF_MARKER: &str = "[gitez:implement]";
+
+/// Whether `line` is [`HANDOFF_MARKER`], spaces and backticks around it
+/// allowed.
+fn is_marker(line: &str) -> bool {
+    line.trim().trim_matches('`').trim() == HANDOFF_MARKER
+}
+
+/// The brief in `message` if its first line that is not blank is
+/// [`HANDOFF_MARKER`]: the rest, trimmed. `None` when the message is not
+/// marked or nothing follows the marker.
+pub fn split_handoff(message: &str) -> Option<&str> {
+    let rest = message.trim_start();
+    let (line, rest) = rest.split_once('\n').unwrap_or((rest, ""));
+    if !is_marker(line) {
+        return None;
+    }
+    let brief = rest.trim();
+    (!brief.is_empty()).then_some(brief)
+}
+
+/// `message` without a [`HANDOFF_MARKER`] line at its start, as shown.
+pub fn without_handoff_marker(message: &str) -> &str {
+    let rest = message.trim_start();
+    match rest.split_once('\n') {
+        Some((line, rest)) if is_marker(line) => rest.trim_start(),
+        None if is_marker(rest) => "",
+        _ => message,
+    }
+}
+
 const STILL_WORKING: &str = "The agent is still working on this thread.";
 const COMPLETED: &str = "This thread is completed.";
 const NEVER_STARTED: &str = "Retry this thread first: the agent never started.";
@@ -461,17 +525,81 @@ impl AgentThread {
             Mode::Discuss if self.branch.is_some() || self.worktree.is_some() => {
                 Some("a Discuss thread with a branch or a worktree")
             }
+            Mode::Implement if self.auto => Some("an Implement thread started as Auto"),
             _ => None,
         }
     }
 
     /// The last turn's brief, if that turn is a [`TurnKind::Brief`] the
-    /// agent answered: what an Implement thread can start with.
+    /// agent answered, or one an Auto thread's agent chose to answer with
+    /// ([`Turn::handoff`]): what an Implement thread can start with.
     pub fn brief(&self) -> Option<&str> {
         let turn = self.turns.last()?;
         let result = turn.result.as_ref()?;
-        (turn.kind == TurnKind::Brief && result.success && !result.message.trim().is_empty())
-            .then_some(result.message.as_str())
+        ((turn.kind == TurnKind::Brief || turn.handoff.is_some())
+            && result.success
+            && !result.message.trim().is_empty())
+        .then_some(result.message.as_str())
+    }
+
+    /// The turn whose brief GitEZ should start an Implement thread with
+    /// now: in an Auto thread that is not completed, the first one the
+    /// agent answered with a brief that GitEZ has not claimed yet.
+    pub fn pending_handoff(&self) -> Option<usize> {
+        if !self.auto || self.mode != Mode::Discuss || self.state == State::Completed {
+            return None;
+        }
+        self.turns.iter().position(|turn| {
+            turn.handoff
+                .as_ref()
+                .is_some_and(|handoff| handoff.claimed.is_none())
+                && turn
+                    .result
+                    .as_ref()
+                    .is_some_and(|result| result.success && !result.message.trim().is_empty())
+        })
+    }
+
+    /// Takes the brief of turn `index` ([`pending_handoff`]) to start an
+    /// Implement thread with: marks it claimed and returns it, or
+    /// Err(Refused) if it is not pending (claimed already), so each brief
+    /// starts at most one thread. Call it under the thread's lock
+    /// ([`crate::Store::update`]).
+    ///
+    /// [`pending_handoff`]: Self::pending_handoff
+    pub fn claim_handoff(&mut self, index: usize, at: Timestamp) -> Result<String> {
+        if self.pending_handoff() != Some(index) {
+            return Err(Error::refused("This brief was handed on already."));
+        }
+        let turn = &mut self.turns[index];
+        let brief = turn
+            .result
+            .as_ref()
+            .map(|result| result.message.trim().to_owned())
+            .unwrap_or_default();
+        if let Some(handoff) = &mut turn.handoff {
+            handoff.claimed = Some(at);
+        }
+        Ok(brief)
+    }
+
+    /// Records what came of the claimed brief of turn `index`: the
+    /// Implement thread started from it, or why none was.
+    pub fn record_handoff(
+        &mut self,
+        index: usize,
+        outcome: std::result::Result<AgentThreadId, String>,
+    ) {
+        if let Some(handoff) = self
+            .turns
+            .get_mut(index)
+            .and_then(|turn| turn.handoff.as_mut())
+        {
+            match outcome {
+                Ok(id) => handoff.thread = Some(id),
+                Err(problem) => handoff.problem = Some(problem),
+            }
+        }
     }
 
     /// The newest turn's final message that is not empty.
@@ -704,6 +832,7 @@ impl Turn {
             transcript: None,
             result: None,
             images: Vec::new(),
+            handoff: None,
         }
     }
 

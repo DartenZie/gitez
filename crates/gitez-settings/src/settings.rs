@@ -88,6 +88,12 @@ pub struct ThreadSettings {
     /// The mode of the thread started last, which the composer starts
     /// with. Default: Implement.
     pub last_mode: Mode,
+    /// Whether that thread was started as Auto (a Discuss thread whose
+    /// agent may hand off to an Implement thread): the composer then starts
+    /// with Auto. Kept apart from `last_mode`, which stays Discuss, so a
+    /// GitEZ without Auto still reads the file. Written only when set.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub last_auto: bool,
 }
 
 /// What the sandbox of an agent thread allows.
@@ -174,6 +180,7 @@ impl Default for ThreadSettings {
         Self {
             max_running: DEFAULT_MAX_RUNNING,
             last_mode: Mode::default(),
+            last_auto: false,
         }
     }
 }
@@ -543,6 +550,40 @@ mod tests {
         assert!(
             settings.sandbox.writable_paths.is_empty(),
             "a file written before writable_paths existed has none"
+        );
+    }
+
+    #[test]
+    fn auto_is_remembered_beside_the_mode() {
+        let dir = tempfile::tempdir().expect("temporary folder");
+        let path = Settings::path(dir.path());
+        // A file written before Auto existed.
+        fs::write(
+            &path,
+            r#"{"version":1,"threads":{"max_running":2,"last_mode":"discuss"}}"#,
+        )
+        .expect("write");
+        let Loaded::Current(mut settings) = Settings::load(&path).expect("load") else {
+            panic!("version 1 is current");
+        };
+        assert_eq!(settings.threads.last_mode, Mode::Discuss);
+        assert!(!settings.threads.last_auto);
+
+        // Not written while unset, so such files stay as they were.
+        settings.save(&path).expect("save");
+        let text = fs::read_to_string(&path).expect("read");
+        assert!(!text.contains("last_auto"), "{text}");
+
+        // Auto: the mode stays Discuss, which a GitEZ without Auto reads.
+        settings.threads.last_auto = true;
+        settings.save(&path).expect("save");
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json");
+        assert_eq!(json["threads"]["last_mode"], "discuss");
+        assert_eq!(json["threads"]["last_auto"], true);
+        assert_eq!(
+            Settings::load(&path).expect("load"),
+            Loaded::Current(settings)
         );
     }
 

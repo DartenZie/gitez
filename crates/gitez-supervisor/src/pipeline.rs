@@ -20,9 +20,9 @@ use gitez_agent::{
     ImageInput, RunSpec, Stopper,
 };
 use gitez_agent_thread::{
-    Activity, AgentThread, AgentThreadId, CONTINUE_PROMPT, Ending, Mode, PrepareStep, RunHeader,
-    ScratchDirs, State, Step, Store, SupervisorInfo, Timestamp, Turn, TurnKind, TurnResult,
-    Uncommitted, title_from_message,
+    Activity, AgentThread, AgentThreadId, BRIEF_PROMPT, CONTINUE_PROMPT, Ending, HANDOFF_MARKER,
+    Handoff, Mode, PrepareStep, RunHeader, ScratchDirs, State, Step, Store, SupervisorInfo,
+    Timestamp, Turn, TurnKind, TurnResult, Uncommitted, split_handoff, title_from_message,
 };
 use gitez_git::{RefState, Repository};
 use gitez_sandbox::{Network, NetworkProfile, Sandbox as _, Status};
@@ -639,7 +639,11 @@ impl Pipeline<'_> {
             Work::Own { branch, .. } => {
                 system_prompt(branch, &self.thread.start.branch, self.thread.network)
             }
-            Work::ReadOnly { .. } => discuss_system_prompt(self.thread.network),
+            Work::ReadOnly { .. } => discuss_system_prompt(
+                self.thread.network,
+                self.thread.auto,
+                &self.thread.start.branch,
+            ),
         };
         let model = self
             .thread
@@ -846,12 +850,26 @@ impl Pipeline<'_> {
         let stopped = self.env.stop.load(Ordering::SeqCst);
         let success = finished.as_ref().is_some_and(|done| done.success) && !stopped;
         let ended = Timestamp::now();
+        let mut message = finished
+            .as_ref()
+            .map(|done| done.text.clone())
+            .unwrap_or_default();
+        // An Auto thread's agent chose to implement: the brief, without
+        // the marker, goes on to an Implement thread GitEZ starts.
+        let mut handoff = None;
+        if self.thread.auto
+            && self.thread.mode == Mode::Discuss
+            && let Some(brief) = split_handoff(&message)
+        {
+            message = brief.to_owned();
+            if success {
+                log(&self.id, "the agent answered with a brief to implement");
+                handoff = Some(Handoff::default());
+            }
+        }
         let result = TurnResult {
             success,
-            message: finished
-                .as_ref()
-                .map(|done| done.text.clone())
-                .unwrap_or_default(),
+            message,
             cost_usd: finished.as_ref().and_then(|done| done.cost_usd),
             duration_ms: finished.as_ref().and_then(|done| done.duration_ms),
             steps,
@@ -863,6 +881,7 @@ impl Pipeline<'_> {
             if let Some(turn) = thread.turns.get_mut(index) {
                 turn.ended = Some(ended);
                 turn.result = Some(result);
+                turn.handoff = handoff;
             }
             if let Some(supervisor) = &mut thread.supervisor {
                 supervisor.child_group = None;
@@ -947,6 +966,7 @@ impl Pipeline<'_> {
                 transcript: None,
                 result: None,
                 images,
+                handoff: None,
             });
             thread.waiting_until = None;
             thread.state = State::Queued;
@@ -1803,8 +1823,10 @@ fn network_note(network: NetworkProfile) -> &'static str {
 }
 
 /// What a Discuss thread's agent is told: where it is, that it changes
-/// nothing, and what the sandbox does about it.
-fn discuss_system_prompt(network: NetworkProfile) -> String {
+/// nothing, and what the sandbox does about it. In an Auto thread
+/// (`auto`), it is also told how to hand off to an Implement thread, which
+/// starts from the branch `start_branch`.
+fn discuss_system_prompt(network: NetworkProfile, auto: bool, start_branch: &str) -> String {
     let mut prompt = "You are in a discussion that GitEZ started in the user's own working tree, \
          with their uncommitted changes as they are. The user wants to ask, explore or plan, not \
          to have anything changed yet. Read the code, run commands that only read, and answer: \
@@ -1814,12 +1836,38 @@ fn discuss_system_prompt(network: NetworkProfile) -> String {
          fails anyway. $TMPDIR is yours for notes and scratch files: use it, not /tmp, and give \
          mktemp a template in it (mktemp \"$TMPDIR/name.XXXXXX\"). A build or test that writes \
          into the working tree fails here; if you need one, send its output to $TMPDIR (for \
-         example CARGO_TARGET_DIR=\"$TMPDIR/target\") or say what you could not run. If the user \
-         asks you to make the change, say what you would do and that \"Implement…\" in GitEZ \
-         starts an agent that does it on a branch of its own, from a brief you write then."
+         example CARGO_TARGET_DIR=\"$TMPDIR/target\") or say what you could not run."
         .to_owned();
+    if auto {
+        prompt.push_str(&auto_rule(start_branch));
+    } else {
+        prompt.push_str(
+            " If the user asks you to make the change, say what you would do and that \
+             \"Implement…\" in GitEZ starts an agent that does it on a branch of its own, from a \
+             brief you write then.",
+        );
+    }
     prompt.push_str(network_note(network));
     prompt
+}
+
+/// The rule an Auto thread's agent gets on top of a discussion's: it
+/// decides, after reading the code, whether a message asks for a change,
+/// and if so hands off with [`HANDOFF_MARKER`] and a brief.
+fn auto_rule(start_branch: &str) -> String {
+    format!(
+        " The user started this thread in Auto: you decide whether they want an answer or a \
+         change. Read the code before you decide. If a message (the first or a later reply) is \
+         a clear request to change code and it is clear what to do, do not make the change and \
+         do not ask for confirmation: reply with a line holding only {HANDOFF_MARKER}, then a \
+         brief, and GitEZ starts another agent that implements it on a branch of its own, from \
+         the last commit of {start_branch}. That agent sees only the brief, not this \
+         conversation and not the uncommitted changes in this working tree: if the change \
+         depends on them, say so in the brief. Write the brief as follows. {BRIEF_PROMPT} \
+         Otherwise, when the user asks, explores or plans, or when it is unclear what they \
+         want, answer as a discussion does, without {HANDOFF_MARKER}, and ask what you need to \
+         know. Never write {HANDOFF_MARKER} anywhere else."
+    )
 }
 
 /// How a state, ending or turn kind is written in thread.json.
@@ -1992,7 +2040,7 @@ mod tests {
 
     #[test]
     fn a_discussion_is_told_it_changes_nothing_and_how_to_hand_over() {
-        let prompt = discuss_system_prompt(NetworkProfile::Open);
+        let prompt = discuss_system_prompt(NetworkProfile::Open, false, "main");
         assert!(prompt.starts_with("You are in a discussion"));
         assert!(prompt.contains("Do not change, create or delete files"));
         assert!(prompt.contains("refuses every write outside $TMPDIR"));
@@ -2003,12 +2051,32 @@ mod tests {
         assert!(!prompt.contains("level-1 Markdown heading"));
         // The same words about the network as any thread.
         assert!(!prompt.contains("network"));
-        let offline = discuss_system_prompt(NetworkProfile::AgentOnly);
+        let offline = discuss_system_prompt(NetworkProfile::AgentOnly, false, "main");
         assert!(offline.contains("retry the thread with the Packages network profile"));
         assert!(
             system_prompt("agent/x", "main", NetworkProfile::AgentOnly)
                 .ends_with(network_note(NetworkProfile::AgentOnly))
         );
+    }
+
+    #[test]
+    fn an_auto_discussion_is_told_how_to_hand_off_and_a_plain_one_is_not() {
+        let plain = discuss_system_prompt(NetworkProfile::Open, false, "main");
+        assert!(!plain.contains(HANDOFF_MARKER), "{plain}");
+        assert!(!plain.contains("Auto"), "{plain}");
+
+        let auto = discuss_system_prompt(NetworkProfile::AgentOnly, true, "feature/blame");
+        assert!(auto.starts_with("You are in a discussion"));
+        assert!(auto.contains("Do not change, create or delete files"));
+        assert!(auto.contains(&format!("a line holding only {HANDOFF_MARKER}")));
+        // The brief is the one "Implement…" asks for.
+        assert!(auto.contains(BRIEF_PROMPT));
+        // Where the Implement thread starts, and what it does not see.
+        assert!(auto.contains("the last commit of feature/blame"));
+        assert!(auto.contains("uncommitted changes"));
+        // "Implement…" is the plain discussion's way to hand over.
+        assert!(!auto.contains("\"Implement…\" in GitEZ"));
+        assert!(auto.ends_with(network_note(NetworkProfile::AgentOnly)));
     }
 
     #[test]

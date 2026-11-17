@@ -1674,6 +1674,7 @@ mod tests {
                     network: NetworkProfile::AgentOnly,
                     secrets: Vec::new(),
                     mode: gitez_agent_thread::Mode::Implement,
+                    auto: false,
                     work_dir: None,
                     origin: None,
                 },

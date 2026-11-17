@@ -2980,6 +2980,7 @@ mod tests {
                     network: NetworkProfile::AgentOnly,
                     secrets: Vec::new(),
                     mode,
+                    auto: false,
                     work_dir: (mode == Mode::Discuss).then(|| work_dir.clone()),
                     origin: None,
                 },

@@ -191,6 +191,7 @@ fn start(
         agent: gitez_agent::ClaudeCode::ID.into(),
         model: model.map(str::to_owned),
         mode: gitez_agent_thread::Mode::Implement,
+        auto: false,
         start: gitez_agent_thread::Start {
             branch: "main".into(),
             commit: head,
@@ -814,6 +815,7 @@ fn screenshot_u5_thread_states() {
                 transcript: None,
                 result: Some(result("", false)),
                 images: Vec::new(),
+                handoff: None,
             });
             thread.fail(
                 Step::Agent,

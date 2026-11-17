@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use common::{Fixture, branch_of, git, worktree_of};
 use gitez_agent_thread::{
-    BRIEF_PROMPT, CONTINUE_PROMPT, Ending, Mode, RetryPlan, State, Step, Timestamp, TurnKind,
+    BRIEF_PROMPT, CONTINUE_PROMPT, Ending, HANDOFF_MARKER, Handoff, Mode, RetryPlan, State, Step,
+    Timestamp, TurnKind,
 };
 use gitez_supervisor::{Command, Error};
 
@@ -691,4 +692,70 @@ fn a_discuss_thread_whose_working_tree_is_gone_fails_before_the_agent() {
     assert_eq!(thread.ending, Some(Ending::Failed), "{thread:#?}");
     assert_eq!(thread.error.expect("an error").step, Step::Worktree);
     assert!(fixture.calls().is_empty());
+}
+
+#[test]
+fn an_auto_thread_records_a_marked_answer_as_a_brief_without_the_marker() {
+    let fixture = Fixture::new();
+    let before = branches_and_worktrees(&fixture);
+    let created = fixture.auto("HANDOFF: follow renames in blame");
+    assert_eq!((created.mode, created.auto), (Mode::Discuss, true));
+
+    let thread = fixture.run(&created.id, Command::Start);
+    // Still a discussion: an answer, nothing made.
+    assert_eq!(thread.state, State::Finished, "{thread:#?}");
+    assert_eq!(thread.ending, Some(Ending::Answer));
+    assert_eq!(branches_and_worktrees(&fixture), before);
+    let brief = "# Follow renames in blame\n\nRead the rename from the diff of each commit.";
+    assert_eq!(thread.brief(), Some(brief));
+    assert_eq!(thread.final_message(), Some(brief));
+    assert!(
+        !thread
+            .final_message()
+            .unwrap_or_default()
+            .contains(HANDOFF_MARKER)
+    );
+    assert_eq!(thread.turns[0].handoff, Some(Handoff::default()));
+    assert_eq!(thread.pending_handoff(), Some(0));
+
+    // The agent was told how to hand off.
+    let calls = fixture.calls();
+    assert!(calls[0].contains(HANDOFF_MARKER), "{}", calls[0]);
+}
+
+#[test]
+fn an_auto_thread_whose_agent_answers_hands_nothing_off() {
+    let fixture = Fixture::new();
+    let id = fixture.auto("What is the answer?").id;
+    let thread = fixture.run(&id, Command::Start);
+    assert_eq!(thread.ending, Some(Ending::Answer), "{thread:#?}");
+    assert_eq!(thread.final_message(), Some("The answer is 42."));
+    assert_eq!(thread.turns[0].handoff, None);
+    assert_eq!(thread.brief(), None);
+    assert_eq!(thread.pending_handoff(), None);
+
+    // A later reply can hand off ("ok, do it").
+    fixture
+        .store()
+        .update(&id, |thread| {
+            thread.request_turn(
+                TurnKind::Reply,
+                "HANDOFF: ok, do it".to_owned(),
+                Timestamp::now(),
+            )
+        })
+        .expect("reply");
+    let replied = fixture.run(&id, Command::Reply);
+    assert_eq!(replied.turns[1].handoff, Some(Handoff::default()));
+    assert_eq!(replied.pending_handoff(), Some(1));
+}
+
+#[test]
+fn a_plain_discussion_keeps_a_marker_it_was_never_told_about() {
+    let fixture = Fixture::new();
+    let id = fixture.discuss("HANDOFF: follow renames in blame").id;
+    let thread = fixture.run(&id, Command::Start);
+    assert_eq!(thread.turns[0].handoff, None);
+    assert_eq!(thread.brief(), None);
+    assert!(!fixture.calls()[0].contains(HANDOFF_MARKER));
 }

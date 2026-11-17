@@ -373,6 +373,7 @@ impl Toolchains {
                     agent: ClaudeCode::ID.to_owned(),
                     model: Some("haiku".to_owned()),
                     mode,
+                    auto: false,
                     start: Start {
                         branch: "main".to_owned(),
                         commit: self.fixture.head(),

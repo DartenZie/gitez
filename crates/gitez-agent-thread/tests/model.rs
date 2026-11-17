@@ -4,8 +4,9 @@ mod common;
 
 use common::{EXAMPLE, at, worktree_of};
 use gitez_agent_thread::{
-    AgentThread, AgentThreadId, BRIEF_PROMPT, CONTINUE_PROMPT, Ending, Error, Mode, RetryPlan,
-    State, Step, SupervisorInfo, TurnKind, TurnResult,
+    AgentThread, AgentThreadId, BRIEF_PROMPT, CONTINUE_PROMPT, Ending, Error, HANDOFF_MARKER,
+    Handoff, Mode, RetryPlan, State, Step, SupervisorInfo, TurnKind, TurnResult, split_handoff,
+    without_handoff_marker,
 };
 use gitez_sandbox::NetworkProfile;
 
@@ -555,4 +556,128 @@ fn a_mode_is_written_only_when_it_is_discuss() {
     let text = serde_json::to_string(&finished(Ending::Answer)).expect("json");
     assert!(!text.contains("\"mode\""), "{text}");
     assert_eq!(Mode::ALL.map(Mode::label), ["Discuss", "Implement"]);
+}
+
+#[test]
+fn the_handoff_marker_is_the_first_line_and_never_part_of_the_brief() {
+    let marked = format!("{HANDOFF_MARKER}\n\n# Cache parsed config files\n\nGoal: …\n");
+    assert_eq!(
+        split_handoff(&marked),
+        Some("# Cache parsed config files\n\nGoal: …")
+    );
+    // Blank lines, spaces and backticks around it are forgiven.
+    assert_eq!(
+        split_handoff(&format!("\n  `{HANDOFF_MARKER}`  \n# Title")),
+        Some("# Title")
+    );
+    // Not marked: anywhere but the first line, or nothing after it.
+    assert_eq!(split_handoff("# Title\n\nGoal: …"), None);
+    assert_eq!(
+        split_handoff(&format!("Sure.\n{HANDOFF_MARKER}\n# T")),
+        None
+    );
+    assert_eq!(split_handoff(&format!("{HANDOFF_MARKER}\n\n")), None);
+
+    assert_eq!(
+        without_handoff_marker(&marked),
+        "# Cache parsed config files\n\nGoal: …\n"
+    );
+    assert_eq!(without_handoff_marker(HANDOFF_MARKER), "");
+    assert_eq!(without_handoff_marker("Just an answer."), "Just an answer.");
+}
+
+/// A finished Auto thread whose first turn the agent answered with a
+/// brief.
+fn handed_off() -> AgentThread {
+    let mut thread = discussion();
+    thread.auto = true;
+    thread.turns[0].result.as_mut().expect("a result").message =
+        "# Cache parsed config files\n\nGoal: …".to_owned();
+    thread.turns[0].handoff = Some(Handoff::default());
+    thread
+}
+
+#[test]
+fn a_marked_turn_is_a_brief_claimed_at_most_once() {
+    let now = at("2026-11-13T10:05:00Z");
+    let mut thread = handed_off();
+    assert_eq!(
+        thread.brief(),
+        Some("# Cache parsed config files\n\nGoal: …")
+    );
+    assert_eq!(thread.pending_handoff(), Some(0));
+
+    assert_eq!(
+        thread.claim_handoff(0, now).expect("claimed"),
+        "# Cache parsed config files\n\nGoal: …"
+    );
+    assert_eq!(thread.pending_handoff(), None);
+    assert_eq!(
+        refusal(thread.claim_handoff(0, now)),
+        "This brief was handed on already."
+    );
+    let id = AgentThreadId::new("cache-parsed-config-files").expect("an id");
+    thread.record_handoff(0, Ok(id.clone()));
+    assert_eq!(
+        thread.turns[0].handoff,
+        Some(Handoff {
+            claimed: Some(now),
+            thread: Some(id),
+            problem: None,
+        })
+    );
+    // The brief stays for "Implement…".
+    assert!(thread.brief().is_some());
+
+    // A claim survives a reload, as GitEZ reads the file again after a
+    // restart.
+    let text = serde_json::to_string(&thread).expect("json");
+    let back: AgentThread = serde_json::from_str(&text).expect("parses");
+    assert_eq!(back.pending_handoff(), None);
+
+    // A later marked turn hands off once more.
+    thread
+        .request_turn(TurnKind::Reply, "And the other one".to_owned(), now)
+        .expect("a reply");
+    thread.state = State::Finished;
+    let mut turn = thread.turns[0].clone();
+    turn.kind = TurnKind::Reply;
+    turn.handoff = Some(Handoff::default());
+    thread.turns[1] = turn;
+    assert_eq!(thread.pending_handoff(), Some(1));
+}
+
+#[test]
+fn only_an_unclaimed_successful_brief_of_an_auto_discussion_is_pending() {
+    let mut failed = handed_off();
+    failed.turns[0].result.as_mut().expect("a result").success = false;
+    assert_eq!(failed.pending_handoff(), None);
+
+    let mut not_auto = handed_off();
+    not_auto.auto = false;
+    assert_eq!(not_auto.pending_handoff(), None);
+
+    let mut completed = handed_off();
+    completed.state = State::Completed;
+    assert_eq!(completed.pending_handoff(), None);
+}
+
+#[test]
+fn auto_is_written_only_when_set_and_older_records_read_as_before() {
+    let text = serde_json::to_string(&discussion()).expect("json");
+    assert!(!text.contains("\"auto\""), "{text}");
+    assert!(!text.contains("\"handoff\""), "{text}");
+    let back: AgentThread = serde_json::from_str(&text).expect("parses");
+    assert!(!back.auto);
+    assert_eq!(back.turns[0].handoff, None);
+
+    let text = serde_json::to_string(&handed_off()).expect("json");
+    assert!(text.contains("\"auto\":true"), "{text}");
+    assert!(text.contains("\"handoff\":{}"), "{text}");
+    let back: AgentThread = serde_json::from_str(&text).expect("parses");
+    assert_eq!(back, handed_off());
+
+    // The example is a record from before Auto.
+    assert!(!example().auto);
+    assert!(example().turns.iter().all(|turn| turn.handoff.is_none()));
 }

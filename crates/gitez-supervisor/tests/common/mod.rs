@@ -100,6 +100,9 @@ case "$prompt" in
   *MOVE*)
     init; tool "git update-ref"; git update-ref refs/heads/other HEAD
     result "Moved another branch." ;;
+  *HANDOFF*)
+    init; tool "grep -rn blame src"
+    result '[gitez:implement]\n\n# Follow renames in blame\n\nRead the rename from the diff of each commit.' ;;
   *WHERE*)
     init; result "cwd=$(pwd -P) locks=$GIT_OPTIONAL_LOCKS tmp=$TMPDIR" ;;
   *)
@@ -249,18 +252,24 @@ impl Fixture {
         secrets: &[&str],
         images: &[gitez_agent_thread::PreparedImage],
     ) -> AgentThread {
-        self.create_in(Mode::Implement, prompt, secrets, images)
+        self.create_in(Mode::Implement, false, prompt, secrets, images)
     }
 
     /// A queued Discuss thread for `prompt`, which reads the repository's
     /// own working tree.
     pub fn discuss(&self, prompt: &str) -> AgentThread {
-        self.create_in(Mode::Discuss, prompt, &[], &[])
+        self.create_in(Mode::Discuss, false, prompt, &[], &[])
+    }
+
+    /// A queued Discuss thread started as Auto, for `prompt`.
+    pub fn auto(&self, prompt: &str) -> AgentThread {
+        self.create_in(Mode::Discuss, true, prompt, &[], &[])
     }
 
     fn create_in(
         &self,
         mode: Mode,
+        auto: bool,
         prompt: &str,
         secrets: &[&str],
         images: &[gitez_agent_thread::PreparedImage],
@@ -272,6 +281,7 @@ impl Fixture {
                     agent: ClaudeCode::ID.to_owned(),
                     model: Some("haiku".to_owned()),
                     mode,
+                    auto,
                     start: Start {
                         branch: "main".to_owned(),
                         commit: self.head(),

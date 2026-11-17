@@ -40,8 +40,9 @@ pub use images::{
 pub use index::{Index, IndexReport, IndexedRepository};
 pub use model::{
     Activity, AgentThread, AgentThreadId, BRIEF_PROMPT, CONTINUE_PROMPT, DeletedBranch, Ending,
-    Failure, Mode, NewAgentThread, RetryPlan, Start, State, Step, SupervisorInfo, Turn, TurnKind,
-    TurnResult, Uncommitted, WorktreeRecord,
+    Failure, HANDOFF_MARKER, Handoff, Mode, NewAgentThread, RetryPlan, Start, State, Step,
+    SupervisorInfo, Turn, TurnKind, TurnResult, Uncommitted, WorktreeRecord, split_handoff,
+    without_handoff_marker,
 };
 pub use names::{
     clean_title, message_without_title, repository_key, slug, split_title, title_from_message,

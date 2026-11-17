@@ -262,6 +262,7 @@ impl Store {
             agent: new.agent,
             model: new.model,
             mode: new.mode,
+            auto: new.auto && discuss,
             state: State::Queued,
             ending: None,
             created: at,
