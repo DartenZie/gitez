@@ -1377,6 +1377,14 @@ impl Composer {
                         .border_color(rgba(color::PICKER_ON_BORDER))
                         .text_color(rgb(color::ACCENT))
                 })
+                // The group draws the edge between the segments as Discuss's
+                // right one, in Discuss's colours. With Implement chosen the
+                // edge is Implement's left one instead, so the chosen
+                // segment's outline is whole and the group keeps its width.
+                .when(chosen == Mode::Implement, |this| match mode {
+                    Mode::Discuss => this.border_r_0(),
+                    Mode::Implement => this.border_l_1(),
+                })
         };
         ButtonGroup::new("composer-mode")
             .child(segment(
