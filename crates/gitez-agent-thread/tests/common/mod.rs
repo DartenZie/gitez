@@ -114,6 +114,7 @@ impl Fixture {
             prompt: prompt.to_owned(),
             agent: "claude-code".to_owned(),
             model: Some("haiku".to_owned()),
+            account: None,
             mode: Mode::Implement,
             auto: false,
             start: Start {

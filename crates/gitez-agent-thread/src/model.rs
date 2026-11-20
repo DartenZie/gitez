@@ -314,6 +314,42 @@ pub struct DeletedBranch {
     pub at: Timestamp,
 }
 
+/// The Claude account a thread runs with: a configuration folder, which
+/// is where Claude Code keeps its login and the thread's conversation, and
+/// the name Settings gave it. Recorded when the thread is created; every
+/// later turn runs with it, whatever Settings or the repository choose
+/// then.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Account {
+    /// A label: the account is found again by its folder, so renaming it
+    /// in Settings does not lose its threads.
+    pub name: String,
+    /// The folder, as `CLAUDE_CONFIG_DIR` is set to it (verbatim, never
+    /// made canonical). `None`: Claude Code's default folder with the
+    /// variable unset, which is another login than the same folder named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<PathBuf>,
+}
+
+impl Account {
+    /// The name of the account GitEZ always has: the folder GitEZ found
+    /// before it had accounts (the agent entry's, else `CLAUDE_CONFIG_DIR`
+    /// in GitEZ's environment or the login shell, else Claude Code's
+    /// default). No account in Settings can take this name.
+    pub const DEFAULT_NAME: &str = "Default";
+
+    /// Whether this is the account GitEZ always has
+    /// ([`Account::DEFAULT_NAME`]), rather than one added in Settings.
+    pub fn is_default(&self) -> bool {
+        self.name == Self::DEFAULT_NAME
+    }
+
+    /// Whether `name` is [`Account::DEFAULT_NAME`], in any case.
+    pub fn is_default_name(name: &str) -> bool {
+        name.trim().eq_ignore_ascii_case(Self::DEFAULT_NAME)
+    }
+}
+
 /// A prompt given to a coding agent, and the conversation that follows: one
 /// `thread.json`. An Implement thread works on its own branch in its own
 /// worktree; a Discuss thread reads the user's working tree ([`Mode`]).
@@ -326,6 +362,14 @@ pub struct AgentThread {
     pub agent: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The account every turn runs with. `None` only in a record from
+    /// before accounts: it runs with the default account, which the
+    /// supervisor then records. A record naming another account is
+    /// written as version 2 ([`AgentThread::format_version`]), so an older
+    /// GitEZ, which would drop the field and run the next turn with the
+    /// default account, refuses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<Account>,
     #[serde(default, skip_serializing_if = "Mode::is_implement")]
     pub mode: Mode,
     /// A Discuss thread started as Auto: its agent may answer with a brief
@@ -408,6 +452,9 @@ pub struct NewAgentThread {
     pub prompt: String,
     pub agent: String,
     pub model: Option<String>,
+    /// Resolved from the repository's choice when the thread is created;
+    /// `None` leaves it to the supervisor (the default account).
+    pub account: Option<Account>,
     pub mode: Mode,
     /// For [`Mode::Discuss`]: started as Auto ([`AgentThread::auto`]).
     pub auto: bool,
@@ -494,6 +541,16 @@ const COMPLETED: &str = "This thread is completed.";
 const NEVER_STARTED: &str = "Retry this thread first: the agent never started.";
 
 impl AgentThread {
+    /// The format version its `thread.json` is written with: 2 when it
+    /// names an account other than the default, which an older GitEZ
+    /// would drop; 1 otherwise, so older GitEZ keep reading the rest.
+    pub fn format_version(&self) -> u32 {
+        match &self.account {
+            Some(account) if !account.is_default() => 2,
+            _ => 1,
+        }
+    }
+
     /// An Implement thread's branch and worktree; `None` for a Discuss
     /// thread, which has neither.
     pub fn own(&self) -> Option<(&str, &Path)> {

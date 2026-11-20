@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::lock::Lock;
 use crate::model::{AgentThread, AgentThreadId, Mode, NewAgentThread, State, Turn, TurnKind};
 use crate::{
-    Error, MAX_INPUT_BYTES, PreparedImage, Result, TurnImage, VERSION, repository_key,
+    Error, HEADER_VERSION, MAX_INPUT_BYTES, PreparedImage, Result, TurnImage, VERSION, repository_key,
     scratch_dirs, slug, title_from_request, worktree_path,
 };
 
@@ -261,6 +261,7 @@ impl Store {
             title,
             agent: new.agent,
             model: new.model,
+            account: new.account,
             mode: new.mode,
             auto: new.auto && discuss,
             state: State::Queued,
@@ -331,7 +332,7 @@ impl Store {
             Err(error) => return Err(Error::io(path)(error)),
         }
         let mut text = serde_json::to_string_pretty(&OnDisk {
-            version: VERSION,
+            version: thread.format_version(),
             thread,
         })
         .map_err(|source| Error::Invalid {
@@ -480,7 +481,7 @@ impl Store {
         };
         let line = serde_json::to_string(&HeaderLine {
             gitez: "run".to_owned(),
-            version: VERSION,
+            version: HEADER_VERSION,
             header,
         })
         .map_err(|source| Error::Invalid {
@@ -618,7 +619,7 @@ fn parse_header(path: &Path, line: &str) -> Result<RunHeader> {
         path: path.to_owned(),
         source,
     })?;
-    if header.version > VERSION {
+    if header.version > HEADER_VERSION {
         return Err(Error::TooNew {
             path: path.to_owned(),
             version: header.version,

@@ -14,7 +14,7 @@ mod process;
 mod registry;
 mod test_command;
 
-pub use claude_code::{ClaudeCode, ConfigDir, ConfigDirSource};
+pub use claude_code::{ClaudeCode, ConfigDir, ConfigDirSource, expand_home, login_command};
 pub use command::CommandSpec;
 pub use login_shell::login_shell_var;
 pub use process::{AgentProcess, Outcome, Stopper};
@@ -53,12 +53,34 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct AgentConfig {
     /// The binary; `None`: look on the PATH and in the usual install places.
     pub program: Option<std::path::PathBuf>,
-    /// Claude Code: `CLAUDE_CONFIG_DIR`. `None`: the agent's default, which
-    /// for Claude Code is resolved as [`ClaudeCode::config_dir`] says.
-    pub config_dir: Option<std::path::PathBuf>,
+    /// Claude Code: its configuration folder, `CLAUDE_CONFIG_DIR`, and so
+    /// the account it runs with. See [`ConfigDirChoice`].
+    pub config_dir: ConfigDirChoice,
     pub env: Vec<(String, String)>,
     /// Added after GitEZ's own arguments.
     pub args: Vec<String>,
+}
+
+/// Which configuration folder an agent runs with. Claude Code keeps its
+/// login per folder, so a folder is an account; and when
+/// `CLAUDE_CONFIG_DIR` is set it names its keychain item after the folder
+/// string, even when that string is its default `~/.claude`. So the
+/// default runs with the variable unset, and a folder is passed exactly as
+/// given.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ConfigDirChoice {
+    /// As GitEZ always resolved it: `CLAUDE_CONFIG_DIR` in GitEZ's
+    /// environment, else in the login shell, else the agent's default (the
+    /// variable left unset). See [`ClaudeCode::config_dir`].
+    #[default]
+    Inherit,
+    /// The agent's default folder: `CLAUDE_CONFIG_DIR` is removed from the
+    /// agent's environment, even when GitEZ inherited it.
+    Default,
+    /// This folder: `CLAUDE_CONFIG_DIR` is set to it verbatim, but for a
+    /// leading `~/`, which is the home folder. An empty path is
+    /// [`ConfigDirChoice::Inherit`].
+    Folder(std::path::PathBuf),
 }
 
 /// Which conversation a run belongs to.
