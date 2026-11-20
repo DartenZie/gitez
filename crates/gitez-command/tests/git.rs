@@ -758,6 +758,20 @@ fn publishes_fetches_and_pulls_a_branch() {
 }
 
 #[test]
+fn fetches_unattended() {
+    let (_dir, a, b) = remote_and_clones();
+    git(a.work_dir(), &["switch", "--quiet", "-c", "feature"]);
+    commit_file(&a, "f.txt", "f\n");
+    a.push("feature", Some("origin"), false).expect("publish");
+
+    b.fetch_unattended().expect("fetch");
+    assert_eq!(
+        git(b.work_dir(), &["rev-parse", "origin/feature"]),
+        git(a.work_dir(), &["rev-parse", "feature"])
+    );
+}
+
+#[test]
 fn pulls_and_pushes_a_branch_not_checked_out() {
     let (_dir, a, b) = remote_and_clones();
     git(a.work_dir(), &["switch", "--quiet", "-c", "feature"]);
@@ -848,6 +862,42 @@ fn a_rejected_push_says_why_and_can_be_forced() {
         PushRejection::of(&Error::Spawn(std::io::ErrorKind::Other.into())),
         None
     );
+}
+
+#[test]
+fn a_rejected_push_goes_through_after_a_rebasing_pull() {
+    let (_dir, a, b) = remote_and_clones();
+    commit_file(&a, "a.txt", "from a\n");
+    a.push("main", None, false).expect("push");
+    commit_file(&b, "b.txt", "from b\n");
+    let error = b.push("main", None, false).expect_err("not fetched");
+    assert_eq!(PushRejection::of(&error), Some(PushRejection::NotFetched));
+
+    assert_eq!(
+        b.pull(PullMethod::Rebase).expect("pull"),
+        PullOutcome::Pulled
+    );
+    // No merge commit: b's commit sits on top of a's.
+    assert_eq!(
+        git(b.work_dir(), &["rev-parse", "HEAD~1"]),
+        git(b.work_dir(), &["rev-parse", "origin/main"])
+    );
+    assert_eq!(git(b.work_dir(), &["rev-list", "--merges", "HEAD"]), "");
+    b.push("main", None, false)
+        .expect("push the rebased branch");
+}
+
+#[test]
+fn a_conflicting_rebasing_pull_stops_to_resolve() {
+    let (_dir, a, b) = remote_and_clones();
+    commit_file(&a, "a.txt", "from a\n");
+    a.push("main", None, false).expect("push");
+    commit_file(&b, "a.txt", "from b\n");
+    assert_eq!(
+        b.pull(PullMethod::Rebase).expect("pull"),
+        PullOutcome::Conflicts
+    );
+    assert_eq!(b.conflicted().expect("conflicts"), ["a.txt"]);
 }
 
 #[test]

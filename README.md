@@ -318,7 +318,7 @@ run in the same sandbox.
   and labels each line with its commit. Click a commit to read its message
   and see what it did to those lines.
 - **Cherry-pick**: select commits and pick them onto any branch. GitEZ does a
-  trial run against each branch first.
+  trial run against the branch you choose before it picks.
 - **Rewrite history**: reword, edit, squash, fixup, drop and reorder commits,
   and autosquash `fixup!` commits. The old tip is kept as `refs/gitez/backup/<branch>`.
 - **Branches, remotes, tags and stashes**: create, rename, delete, check out,
@@ -329,6 +329,17 @@ run in the same sandbox.
   are in the way, or when the worktree is missing or locked, and says which.
   An agent thread's branch is not pulled while it is checked out in the
   thread's worktree: GitEZ runs `git` there only inside the sandbox.
+  When a push of the branch checked out is rejected because the remote has
+  new commits, GitEZ offers to pull them first, by merge or by rebase, and
+  then pushes again. When the branches have diverged, it also offers to
+  force push.
+- **Automatic fetch**: GitEZ fetches from every remote in the background
+  when the last fetch is 5 minutes old, so new commits on the remotes show up
+  without asking. The status bar shows "Fetching…" while it runs. It gives
+  way to a fetch, pull or push you start. It never asks for a password: if a
+  remote needs one, GitEZ says once that the fetch failed. Turn it off with
+  `git config gitez.autoFetch false`. Change the interval with
+  `git config gitez.autoFetchMinutes 15`.
 - **Cancel a fetch, pull or push**: while one runs, **Cancel** is in the
   toolbar and on the branch's or remote's row in the sidebar. It ends `git`
   and every process it started, such as `ssh`: they are asked to stop and

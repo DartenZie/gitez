@@ -18,6 +18,8 @@ use crate::time;
 pub struct StatusBar {
     pub snapshot: Option<Arc<Snapshot>>,
     pub status: Option<Arc<WorkingTreeStatus>>,
+    /// Whether a fetch is running, in the background or not.
+    pub fetching: bool,
 }
 
 impl RenderOnce for StatusBar {
@@ -89,10 +91,14 @@ impl RenderOnce for StatusBar {
             }
         });
 
-        let fetched = snapshot.fetched.map(|seconds| {
-            let when = Timestamp { seconds, offset: 0 };
-            format!("Fetched {}", time::relative(when, time::now()))
-        });
+        let fetched = if self.fetching {
+            Some("Fetching…".to_owned())
+        } else {
+            snapshot.fetched.map(|seconds| {
+                let when = Timestamp { seconds, offset: 0 };
+                format!("Fetched {}", time::relative(when, time::now()))
+            })
+        };
 
         // The branch and its tracking give way to the path when space runs
         // out; the path itself is cut short only beyond half the bar.

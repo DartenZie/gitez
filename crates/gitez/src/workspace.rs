@@ -3,6 +3,7 @@
 
 mod agent_thread;
 mod agents;
+mod auto_fetch;
 mod branch;
 mod changes;
 mod cherry_pick;
@@ -73,6 +74,7 @@ use crate::repository::Snapshot;
 use crate::theme::{self, color};
 use crate::undo::{Direction, UndoLog};
 use agent_thread::{Handoff, ThreadView, ThreadViewEvent};
+use auto_fetch::{AutoFetch, RemoteLock};
 use branch::BranchForm;
 use changes::{ChangesEvent, ChangesPanel, LastCommit};
 use cherry_pick::{CherryPick, CherryPickEvent};
@@ -87,7 +89,7 @@ pub use home::NewThread;
 use home::{Home, HomeEvent};
 use new_pull_request::{FormEvent, NewPullRequestForm};
 use palette::{Palette, PaletteCommand, PaletteContext, PaletteEvent};
-use remote::{RemoteActions, RunningRemote};
+use remote::{RemoteActions, RemoteOp, RunningRemote};
 use remotes::RemoteForm;
 use review::{MergeDialog, MergeEvent, MergedPullRequest, Merging, Review, ReviewEvent, Tips};
 use rewrite::{Rewrite, RewriteEvent};
@@ -210,6 +212,10 @@ pub struct Workspace {
     git_command: Option<Task<()>>,
     /// The fetch, pull or push running, if one is.
     remote_op: Option<RunningRemote>,
+    /// Fetching in the background.
+    auto_fetch: AutoFetch,
+    /// Held while git talks to a remote.
+    remote_lock: RemoteLock,
     /// The command palette of the open repository, kept while hidden so a
     /// command run from it can finish.
     palette: Option<(Entity<Palette>, Subscription)>,
@@ -439,6 +445,8 @@ impl Workspace {
             rewrite: None,
             rewrite_command: None,
             remote_op: None,
+            auto_fetch: AutoFetch::default(),
+            remote_lock: RemoteLock::default(),
             branch_form: None,
             tag_form: None,
             remote_form: None,
@@ -581,6 +589,7 @@ impl Workspace {
             );
             return;
         }
+        self.cancel_auto_fetch();
         crate::recent::closed(cx);
         AgentThreads::global(cx).update(cx, |threads, cx| threads.set_current_repository(None, cx));
         window.set_window_title("GitEZ");
@@ -641,6 +650,7 @@ impl Workspace {
         self.open_changes_for(&snapshot, window, cx);
         self.open_palette_for(&snapshot, window, cx);
         self.watch(&snapshot, window, cx);
+        self.schedule_auto_fetch(window, cx);
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.set_snapshot(snapshot.clone(), cx));
         self.history
@@ -2399,6 +2409,8 @@ impl Render for Workspace {
             .child(status_bar::StatusBar {
                 snapshot,
                 status: self.status.clone(),
+                fetching: self.remote_op.as_ref().is_some_and(|running| running.op == RemoteOp::Fetch)
+                    || self.auto_fetching(),
             })
             })
             .when_some(

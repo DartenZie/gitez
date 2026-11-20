@@ -1,7 +1,7 @@
 //! Cherry-picking the commits picked in the history onto a branch, as in
 //! the panel of the `CherryPick.dc.html` artboard: the commits in the order
-//! they apply, the branches to put them on with a trial run against each,
-//! and git's options.
+//! they apply, the branches to put them on with a trial run against the one
+//! chosen, and git's options.
 
 use std::collections::HashMap;
 
@@ -44,6 +44,8 @@ pub struct CherryPick {
     /// The branch checked out, to return to if git stops.
     checked_out: Option<String>,
     /// How the commits would apply to each branch, by name, once tried.
+    /// Only the branch chosen is tried: trying every branch takes long in
+    /// a large repository.
     trials: HashMap<String, Result<PickTrial, SharedString>>,
     /// The branch chosen.
     target: Option<String>,
@@ -56,7 +58,8 @@ pub struct CherryPick {
     running: bool,
     /// Why the last attempt failed: git's own words.
     error: Option<SharedString>,
-    _trials: Task<()>,
+    /// The trial run against the branch chosen, while it runs.
+    _trial: Task<()>,
     _run: Option<Task<()>>,
     _filter: Subscription,
 }
@@ -102,68 +105,71 @@ impl CherryPick {
             uncommitted,
             running: false,
             error: None,
-            _trials: Task::ready(()),
+            _trial: Task::ready(()),
             _run: None,
             _filter: filter_changes,
         };
+        this.target = this.checked_out.clone();
         this.set_commits(commits, cx);
         this
     }
 
-    /// Applies `commits`, oldest first, instead, trying them against every
-    /// branch again.
+    /// Applies `commits`, oldest first, instead, trying them against the
+    /// branch chosen again.
     pub fn set_commits(&mut self, commits: Vec<Commit>, cx: &mut Context<Self>) {
         self.commits = commits;
         self.trials.clear();
         self.error = None;
-        let ids: Vec<Oid> = self.commits.iter().map(|commit| commit.id).collect();
-        let targets: Vec<(String, Oid)> = self
+        self.try_target(cx);
+        cx.notify();
+    }
+
+    /// Chooses the branch to put the commits onto, and tries them against
+    /// it unless that was done already.
+    fn choose(&mut self, name: String, cx: &mut Context<Self>) {
+        self.target = Some(name);
+        self.error = None;
+        self.try_target(cx);
+        cx.notify();
+    }
+
+    /// Tries the commits against the branch chosen in the background,
+    /// unless they were tried against it already. A trial still running
+    /// against another branch is dropped; it runs again if that branch is
+    /// chosen again.
+    fn try_target(&mut self, cx: &mut Context<Self>) {
+        self._trial = Task::ready(());
+        let Some(target) = self.target.clone() else {
+            return;
+        };
+        if self.trials.contains_key(&target) {
+            return;
+        }
+        let Some(tip) = self
             .targets
             .iter()
-            .map(|target| (target.name.clone(), target.tip))
-            .collect();
+            .find(|candidate| candidate.name == target)
+            .map(|candidate| candidate.tip)
+        else {
+            return;
+        };
+        let ids: Vec<Oid> = self.commits.iter().map(|commit| commit.id).collect();
         let repository = self.repository.clone();
-        self._trials = cx.spawn(async move |this, cx| {
-            let trials = cx
+        self._trial = cx.spawn(async move |this, cx| {
+            let trial = cx
                 .background_executor()
                 .spawn(async move {
-                    targets
-                        .into_iter()
-                        .map(|(name, tip)| {
-                            let trial = repository.cherry_pick_trial(tip, &ids).map_err(|error| {
-                                format!("{:#}", anyhow::Error::from(error)).into()
-                            });
-                            (name, trial)
-                        })
-                        .collect::<HashMap<_, _>>()
+                    repository
+                        .cherry_pick_trial(tip, &ids)
+                        .map_err(|error| format!("{:#}", anyhow::Error::from(error)).into())
                 })
                 .await;
             this.update(cx, |this, cx| {
-                this.trials = trials;
-                if this.target.is_none() {
-                    this.target = this.default_target();
-                }
+                this.trials.insert(target, trial);
                 cx.notify();
             })
             .ok();
         });
-        cx.notify();
-    }
-
-    /// The branch checked out if the commits apply to it, or else the
-    /// first branch they apply to.
-    fn default_target(&self) -> Option<String> {
-        let applies = |name: &String| {
-            matches!(
-                self.trials.get(name),
-                Some(Ok(PickTrial::Clean { applied, .. })) if !applied.is_empty()
-            )
-        };
-        self.checked_out
-            .iter()
-            .chain(self.targets.iter().map(|target| &target.name))
-            .find(|name| applies(name))
-            .cloned()
     }
 
     /// The merge commits picked: git needs to be told which parent to
@@ -275,7 +281,8 @@ impl CherryPick {
     fn render_target(&self, target: &Target, cx: &mut Context<Self>) -> impl IntoElement {
         let chosen = self.target.as_deref() == Some(target.name.as_str());
         let (status, status_color) = match self.trials.get(&target.name) {
-            None => ("checking…".to_owned(), color::TEXT_MUTED),
+            None if chosen => ("checking…".to_owned(), color::TEXT_MUTED),
+            None => (String::new(), color::TEXT_MUTED),
             Some(Err(_)) => ("could not try".to_owned(), color::TEXT_MUTED),
             Some(Ok(PickTrial::Clean { applied, .. })) if applied.is_empty() => {
                 ("already has them".to_owned(), color::TEXT_MUTED)
@@ -311,11 +318,7 @@ impl CherryPick {
                         .hover(|style| style.bg(rgb(color::PICK_TARGET_HOVER)))
                 }
             })
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.target = Some(name.clone());
-                this.error = None;
-                cx.notify();
-            }))
+            .on_click(cx.listener(move |this, _, _, cx| this.choose(name.clone(), cx)))
             .child(
                 div()
                     .flex_none()
