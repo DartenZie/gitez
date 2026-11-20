@@ -20,6 +20,11 @@ pub use settings::{
     accounts_problem, is_env_name, secret_value_problem,
 };
 
+/// The key in a repository's git config that names the Claude account
+/// its agents run with ([`Settings::account_for`]). Agents cannot write the
+/// repository's config, so a thread cannot change its own account.
+pub const ACCOUNT_KEY: &str = "gitez.agentAccount";
+
 /// The newest `settings.json` format this crate reads and writes.
 pub const VERSION: u32 = 1;
 

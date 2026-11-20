@@ -12,8 +12,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use gitez_agent::{AgentStatus, Availability, LoginStatus};
-use gitez_agent_thread::{Mode, PreparedImage, Start, slug, title_from_request};
+use gitez_agent::{AgentStatus, Availability, ClaudeCode, LoginStatus, login_command};
+use gitez_agent_thread::{Account, Mode, PreparedImage, Start, slug, title_from_request};
 use gitez_git::Oid;
 use gitez_sandbox::NetworkProfile;
 use gitez_settings::Settings;
@@ -28,7 +28,9 @@ use gpui_kit::*;
 use super::agent_thread::{Handoff, agent_mark, branch_chip, on_accent};
 use super::labels;
 use super::prompt_images::{self, Accepts, PromptImages};
-use crate::agent_threads::{AgentThreadKey, AgentThreads, OpenSettings, StartRequest};
+use crate::agent_threads::{
+    AgentThreadKey, AgentThreads, OpenSettings, StartRequest, resolve_account,
+};
 use crate::theme::{self, color};
 
 actions!(composer, [Cancel]);
@@ -87,6 +89,11 @@ struct Target {
 struct Environment {
     agents: Vec<AgentCheck>,
     sandbox: gitez_sandbox::Status,
+    /// The working tree whose Claude account was resolved, if any.
+    repository: Option<PathBuf>,
+    /// The Claude account its threads run with (from its git config), or
+    /// why there is none. Claude Code's login above is this account's.
+    account: Option<Result<Account, String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -245,6 +252,8 @@ pub struct Composer {
     /// The settings the environment was checked with, and
     /// [`AgentThreads::environment`] then.
     checked_with: Option<(Arc<Settings>, u64)>,
+    /// The working tree the last check was for.
+    checked_repository: Option<PathBuf>,
     _checking: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -308,6 +317,7 @@ impl Composer {
             from: None,
             environment: None,
             checked_with: None,
+            checked_repository: None,
             _checking: None,
             _subscriptions: subscriptions,
         };
@@ -347,9 +357,19 @@ impl Composer {
                 uncommitted,
             };
             self.set_target(target);
+            self.check_if_moved(cx);
         }
         self.mode = mode;
         cx.notify();
+    }
+
+    /// Checks again once a check was made, if it was for another
+    /// repository: each has its own Claude account.
+    fn check_if_moved(&mut self, cx: &mut Context<Self>) {
+        let repository = self.target.as_ref().map(|target| &target.work_dir);
+        if self.checked_with.is_some() && self.checked_repository.as_ref() != repository {
+            self.check(cx);
+        }
     }
 
     fn set_target(&mut self, target: Target) {
@@ -494,22 +514,34 @@ impl Composer {
     }
 
     /// Finds out again, in the background, which agents are installed and
-    /// signed in and whether the sandbox can run.
+    /// signed in, whether the sandbox can run, and which Claude account the
+    /// repository picked runs with (read from its git config).
     pub fn check(&mut self, cx: &mut Context<Self>) {
         let model = self.model.read(cx);
         let settings = model.settings().clone();
         let agents = model.agents().clone();
         let sandbox = model.sandbox().clone();
         self.checked_with = Some((settings.clone(), model.environment()));
+        let repository = self.target.as_ref().map(|target| target.work_dir.clone());
+        self.checked_repository = repository.clone();
         let checked = cx.background_executor().spawn(async move {
-            let statuses = agents.statuses(|id| settings.agent(id).config());
+            let account = repository
+                .as_deref()
+                .map(|work_dir| resolve_account(&settings, ClaudeCode::ID, work_dir));
+            // Claude Code in the account's folder, so its login is that
+            // account's.
+            let config = |id: &str| match &account {
+                Some(Ok(account)) if id == ClaudeCode::ID => settings.account_config(id, account),
+                _ => settings.agent(id).config(),
+            };
+            let statuses = agents.statuses(config);
             let agents = statuses
                 .into_iter()
                 .map(|status| {
                     let login = match &status.availability {
                         Availability::Installed { .. } => agents
                             .get(status.id)
-                            .map(|agent| agent.login_status(&settings.agent(status.id).config())),
+                            .map(|agent| agent.login_status(&config(status.id))),
                         Availability::Unavailable { .. } => None,
                     };
                     AgentCheck { status, login }
@@ -518,6 +550,8 @@ impl Composer {
             Environment {
                 agents,
                 sandbox: sandbox.status(),
+                repository,
+                account,
             }
         });
         self._checking = Some(cx.spawn(async move |this, cx| {
@@ -581,7 +615,10 @@ impl Composer {
             this.update(cx, |this, cx| {
                 this._loading = None;
                 match read {
-                    Ok(target) => this.set_target(target),
+                    Ok(target) => {
+                        this.set_target(target);
+                        this.check_if_moved(cx);
+                    }
                     Err(error) => {
                         this.target = None;
                         this.target_error = Some(
@@ -682,6 +719,26 @@ impl Composer {
             .cloned()
     }
 
+    /// The Claude account the thread will run with, once read for the
+    /// repository picked: `Some(Err)` when its git config names one
+    /// Settings do not have.
+    fn account(&self) -> Option<&Result<Account, String>> {
+        let environment = self.environment.as_ref()?;
+        let target = self.target.as_ref()?;
+        if environment.repository.as_ref() != Some(&target.work_dir) {
+            return None;
+        }
+        environment.account.as_ref()
+    }
+
+    /// The name of the account the thread will run with, once known.
+    pub(crate) fn account_name(&self) -> Option<&str> {
+        match self.account()? {
+            Ok(account) => Some(&account.name),
+            Err(_) => None,
+        }
+    }
+
     fn agent_check(&self) -> Option<&AgentCheck> {
         self.environment
             .as_ref()?
@@ -774,6 +831,21 @@ impl Composer {
                     );
                 }
                 let name = self.agent_name(cx);
+                let claude = self.agent == ClaudeCode::ID;
+                match self.account().filter(|_| claude) {
+                    Some(Err(problem)) => add(Severity::Blocking, problem.clone().into(), true),
+                    None if self.target.is_some() && claude => add(
+                        Severity::Hint,
+                        "Reading the repository’s Claude account…".to_owned().into(),
+                        false,
+                    ),
+                    _ => {}
+                }
+                // An account added in Settings, whose login is its own.
+                let added = self
+                    .account()
+                    .and_then(|account| account.as_ref().ok())
+                    .filter(|account| claude && !account.is_default());
                 match self.agent_check() {
                     None => add(
                         Severity::Blocking,
@@ -798,8 +870,17 @@ impl Composer {
                     }) => add(
                         Severity::Warning,
                         Sentence::default()
-                            .plain(&format!("{name} is not signed in: run "))
-                            .mono("claude auth login", None)
+                            .plain(&match added {
+                                Some(account) => format!(
+                                    "{name} is not signed in to the account “{}”: run ",
+                                    account.name
+                                ),
+                                None => format!("{name} is not signed in: run "),
+                            })
+                            .mono(
+                                &login_command(added.and_then(|account| account.folder.as_deref())),
+                                None,
+                            )
                             .plain(" in a terminal, or give the thread an ")
                             .mono("ANTHROPIC_API_KEY", None)
                             .plain(" secret."),
@@ -872,6 +953,11 @@ impl Composer {
             prompt,
             agent: self.agent.clone(),
             model: (!model.is_empty()).then_some(model),
+            account: self
+                .account()
+                .and_then(|account| account.as_ref().ok())
+                .filter(|_| self.agent == ClaudeCode::ID)
+                .cloned(),
             mode,
             auto: choice.is_auto(),
             start: Start {
@@ -1067,7 +1153,19 @@ impl Composer {
                     .h_flex()
                     .gap(px(6.))
                     .child(agent_mark(&self.agent).size(px(16.)).rounded(px(4.)))
-                    .child(self.agent_name(cx)),
+                    .child(self.agent_name(cx))
+                    .when_some(
+                        self.account_name()
+                            .filter(|_| self.agent == ClaudeCode::ID)
+                            .map(str::to_owned),
+                        |this, account| {
+                            this.child(
+                                div()
+                                    .text_color(rgb(color::TEXT_MUTED))
+                                    .child(format!("· {account}")),
+                            )
+                        },
+                    ),
             )
             .dropdown_menu(move |mut menu, _, _| {
                 menu = menu.min_w(px(300.)).check_side(Side::Right).label("Agent");

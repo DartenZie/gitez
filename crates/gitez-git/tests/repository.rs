@@ -2000,3 +2000,15 @@ fn conflict_history_finds_the_commits_that_changed_the_conflicting_lines() {
     );
     assert_eq!(change[2].new, Some(6));
 }
+
+#[test]
+fn a_config_value_says_whether_the_repository_sets_it() {
+    let fixture = Fixture::new();
+    fixture.commit("a.txt", "First");
+    assert_eq!(fixture.open().config_string_with_origin("gitez.agentAccount"), None);
+    fixture.git(&["config", "gitez.agentAccount", " Work "]);
+    assert_eq!(
+        fixture.open().config_string_with_origin("gitez.agentAccount"),
+        Some(("Work".to_owned(), true))
+    );
+}

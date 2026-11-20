@@ -19,6 +19,7 @@ use anyhow::{Context as _, bail};
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gitez_agent_thread::{
+    Account,
     AgentThread, AgentThreadId, CompleteReport, Ending, IfUncommitted, Index, IndexReport,
     IndexedRepository, Kept, Merged, Mode, NewAgentThread, State, Step, Store, Timestamp, TurnKind,
 };
@@ -192,6 +193,11 @@ pub struct StartRequest {
     pub prompt: String,
     pub agent: String,
     pub model: Option<String>,
+    /// The Claude account the thread runs with, resolved from the
+    /// repository's choice when it is created ([`resolve_account`]); every
+    /// later turn uses it. `None`: the default account, which the
+    /// supervisor records.
+    pub account: Option<Account>,
     pub mode: Mode,
     /// A Discuss thread started as Auto: its agent may hand off to an
     /// Implement thread ([`AgentThread::auto`]).
@@ -728,6 +734,7 @@ impl AgentThreads {
                     prompt: request.prompt,
                     agent: request.agent,
                     model: request.model,
+                    account: request.account,
                     mode: request.mode,
                     auto: request.auto && request.mode == Mode::Discuss,
                     start: request.start,
@@ -1790,6 +1797,22 @@ impl Launcher {
     }
 }
 
+/// The Claude account new runs of agent `agent` in the repository at
+/// `work_dir` use: the one its git config names (`gitez.agentAccount`),
+/// else the default account. A name Settings do not have is an error,
+/// never the default instead. Blocks: reads git config, and may ask the
+/// login shell.
+pub fn resolve_account(settings: &Settings, agent: &str, work_dir: &Path) -> Result<Account, String> {
+    let repository = gitez_git::Repository::open(work_dir).map_err(|error| {
+        format!(
+            "GitEZ could not read the repository’s git config to find its Claude account: {:#}",
+            anyhow::Error::from(error)
+        )
+    })?;
+    let choice = repository.config_string(gitez_settings::ACCOUNT_KEY);
+    settings.account_for(agent, choice.as_deref())
+}
+
 /// The values of the secrets `names` for a thread of the repository at
 /// `common_dir`, and a warning for each one that could not be given.
 fn resolve_secrets(
@@ -2078,6 +2101,8 @@ fn claim_handoff(
         prompt: brief,
         agent: discussion.agent,
         model: discussion.model,
+        // The conversation's account, as its agent, network and secrets.
+        account: discussion.account,
         mode: Mode::Implement,
         auto: false,
         start: gitez_agent_thread::Start { branch, commit },
@@ -2244,6 +2269,7 @@ mod tests {
             title: id.to_owned(),
             agent: "claude-code".to_owned(),
             model: None,
+            account: None,
             state,
             ending,
             created: at,
@@ -2469,6 +2495,7 @@ mod tests {
                     prompt: "Add b.txt".into(),
                     agent: "claude-code".into(),
                     model: None,
+                    account: None,
                     start: Start {
                         branch: "main".into(),
                         commit: start.clone(),
@@ -2658,6 +2685,7 @@ mod tests {
                     prompt: "Could blame follow renames?".into(),
                     agent: "claude-code".into(),
                     model: Some("haiku".into()),
+                    account: None,
                     start: Start {
                         branch: "feature".into(),
                         commit: start,
