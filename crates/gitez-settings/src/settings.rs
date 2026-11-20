@@ -7,7 +7,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
 
-use gitez_agent_thread::Mode;
+use gitez_agent::{ClaudeCode, ConfigDirChoice};
+use gitez_agent_thread::{Account, Mode};
 use gitez_sandbox::NetworkProfile;
 use serde::{Deserialize, Serialize};
 
@@ -76,6 +77,24 @@ pub struct Settings {
     /// By agent id, such as `claude-code`. A missing entry is the default.
     pub agents: BTreeMap<String, AgentEntry>,
     pub secrets: Vec<SecretEntry>,
+    /// Claude accounts besides the default one ([`Account::DEFAULT_NAME`]),
+    /// which is always there. A repository chooses one by name in its git
+    /// config (`gitez.agentAccount`); names and folders are unique
+    /// ([`accounts_problem`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub accounts: Vec<AccountEntry>,
+}
+
+/// A Claude account: a name and the configuration folder Claude Code keeps
+/// its login in. GitEZ never copies anything into the folder and never
+/// reads the login; signing in is Claude Code's own
+/// (`CLAUDE_CONFIG_DIR=<folder> claude auth login`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountEntry {
+    pub name: String,
+    /// As typed; a leading `~/` is the home folder. Passed to Claude Code
+    /// verbatim otherwise: a trailing `/` makes it another login.
+    pub folder: PathBuf,
 }
 
 /// How agent threads run.
@@ -305,6 +324,174 @@ impl Settings {
     }
 }
 
+impl Settings {
+    /// The account added in Settings named `name` (in any case).
+    pub fn account_named(&self, name: &str) -> Option<&AccountEntry> {
+        let name = name.trim();
+        self.accounts
+            .iter()
+            .find(|account| account.name.trim().eq_ignore_ascii_case(name))
+    }
+
+    /// The default account, as GitEZ found Claude Code's folder before it
+    /// had accounts: the agent entry's folder, else `CLAUDE_CONFIG_DIR` in
+    /// GitEZ's environment, else in the login shell, else Claude Code's
+    /// default with the variable unset (`folder` `None`). Blocks for a few
+    /// seconds the first time (the login shell).
+    pub fn default_account(&self, agent: &str) -> Account {
+        let found = ClaudeCode::config_dir(&self.agent(agent).config());
+        Account {
+            name: Account::DEFAULT_NAME.to_owned(),
+            folder: found.variable().map(Path::to_owned),
+        }
+    }
+
+    /// The account a new thread of a repository runs with, from the name
+    /// its git config gives (`gitez.agentAccount`; `None` or empty: the
+    /// default account). A name Settings do not have is refused, never
+    /// replaced by the default. Blocks as [`Settings::default_account`].
+    pub fn account_for(&self, agent: &str, choice: Option<&str>) -> Result<Account, String> {
+        let choice = choice.map(str::trim).filter(|choice| !choice.is_empty());
+        match choice {
+            None => Ok(self.default_account(agent)),
+            Some(name) if Account::is_default_name(name) => Ok(self.default_account(agent)),
+            Some(name) => match self.account_named(name) {
+                Some(entry) => Ok(entry.account()),
+                None => Err(format!(
+                    "This repository runs agents with the Claude account “{name}” \
+                     (gitez.agentAccount in its git config), which is not in Settings. Add \
+                     it in Settings → Agents, or choose another in Settings → Repository."
+                )),
+            },
+        }
+    }
+
+    /// Why `account`, recorded in a thread, cannot run its next turn: it
+    /// is no longer in Settings, or its folder there is another. Found by
+    /// folder, so a renamed account still runs. The default account always
+    /// runs, in the folder it recorded.
+    pub fn account_problem(&self, account: &Account) -> Option<String> {
+        if account.is_default() {
+            return None;
+        }
+        let Some(folder) = &account.folder else {
+            return None;
+        };
+        let same = |entry: &&AccountEntry| entry.account().folder.as_deref().map(Path::as_os_str)
+            == Some(folder.as_os_str());
+        if self.accounts.iter().any(|entry| same(&entry)) {
+            return None;
+        }
+        let name = &account.name;
+        let shown = folder.display();
+        Some(match self.account_named(name) {
+            Some(entry) => format!(
+                "This thread runs with the Claude account “{name}”, whose folder in Settings is \
+                 now {}. The thread’s conversation is in {shown}: set the account’s folder back \
+                 to it, or add an account with that folder, to continue the thread.",
+                entry.folder.display()
+            ),
+            None => format!(
+                "This thread runs with the Claude account “{name}”, which is no longer in \
+                 Settings. The thread’s conversation is in {shown}: add an account with that \
+                 folder in Settings → Agents to continue the thread."
+            ),
+        })
+    }
+
+    /// How agent `agent` runs with `account`: its entry, in the account's
+    /// folder (the default folder with `CLAUDE_CONFIG_DIR` unset when the
+    /// account names none).
+    pub fn account_config(&self, agent: &str, account: &Account) -> gitez_agent::AgentConfig {
+        gitez_agent::AgentConfig {
+            config_dir: match &account.folder {
+                Some(folder) => ConfigDirChoice::Folder(folder.clone()),
+                None => ConfigDirChoice::Default,
+            },
+            ..self.agent(agent).config()
+        }
+    }
+
+    /// The folders of the accounts other than `account`, the default one's
+    /// included, with `~` expanded: what a thread of `account` must not
+    /// read. A folder that holds `account`'s own is left out. Blocks as
+    /// [`Settings::default_account`].
+    pub fn other_account_folders(&self, agent: &str, account: &Account) -> Vec<PathBuf> {
+        let own = ClaudeCode::config_dir(&self.account_config(agent, account)).path;
+        let default = ClaudeCode::config_dir(
+            &self.account_config(agent, &self.default_account(agent)),
+        )
+        .path;
+        let mut folders: Vec<PathBuf> = Vec::new();
+        let added = self
+            .accounts
+            .iter()
+            .filter_map(|entry| entry.account().folder);
+        for folder in std::iter::once(default).chain(added) {
+            if !folder.is_absolute() || own.starts_with(&folder) || folders.contains(&folder) {
+                continue;
+            }
+            folders.push(folder);
+        }
+        folders
+    }
+}
+
+impl AccountEntry {
+    /// The account as a thread records it: its name, and its folder with
+    /// `~` expanded and otherwise as written.
+    pub fn account(&self) -> Account {
+        Account {
+            name: self.name.trim().to_owned(),
+            folder: Some(gitez_agent::expand_home(&self.folder, None)),
+        }
+    }
+}
+
+/// Why `accounts` cannot be saved, said for the user: a name that is
+/// empty, taken or the default account's, a folder that is empty, not
+/// absolute (`~/` allowed) or another account's.
+pub fn accounts_problem(accounts: &[AccountEntry]) -> Option<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut folders: Vec<PathBuf> = Vec::new();
+    for entry in accounts {
+        let name = entry.name.trim();
+        if name.is_empty() {
+            return Some("Every account needs a name.".to_owned());
+        }
+        if Account::is_default_name(name) {
+            return Some(format!(
+                "“{name}” is the name of the account GitEZ always has. Pick another name."
+            ));
+        }
+        if names.iter().any(|taken| taken.eq_ignore_ascii_case(name)) {
+            return Some(format!("Two accounts are named “{name}”."));
+        }
+        names.push(name.to_owned());
+        let text = entry.folder.to_string_lossy();
+        if text.trim().is_empty() {
+            return Some(format!("The account “{name}” needs a folder."));
+        }
+        if !(entry.folder.is_absolute() || text.starts_with("~/")) {
+            return Some(format!(
+                "The folder of “{name}” must be a full path, such as ~/.claude-{}.",
+                name.to_lowercase().replace(char::is_whitespace, "-")
+            ));
+        }
+        let folder = gitez_agent::expand_home(&entry.folder, None);
+        // Compared as folders: a trailing slash would be another login
+        // for Claude Code, but it is the same folder on disk.
+        if folders.iter().any(|taken| taken == &folder) {
+            return Some(format!(
+                "The folder {} is already another account’s.",
+                entry.folder.display()
+            ));
+        }
+        folders.push(folder);
+    }
+    None
+}
+
 impl SecretEntry {
     /// The keychain account: `all/<NAME>`, or `repo:<common dir>/<NAME>`.
     pub fn account(&self) -> String {
@@ -321,7 +508,11 @@ impl AgentEntry {
     pub fn config(&self) -> gitez_agent::AgentConfig {
         gitez_agent::AgentConfig {
             program: self.program.clone(),
-            config_dir: self.config_dir.clone(),
+            config_dir: self
+                .config_dir
+                .clone()
+                .filter(|dir| !dir.as_os_str().is_empty())
+                .map_or(ConfigDirChoice::Inherit, ConfigDirChoice::Folder),
             env: self
                 .env
                 .iter()
@@ -471,7 +662,126 @@ mod tests {
                 false,
             ),
         ];
+        settings.accounts = vec![account("Work", "~/.claude-work-2")];
         settings
+    }
+
+    fn account(name: &str, folder: &str) -> AccountEntry {
+        AccountEntry {
+            name: name.to_owned(),
+            folder: folder.into(),
+        }
+    }
+
+    #[test]
+    fn a_repository_chooses_its_account_by_name() {
+        let home = dirs::home_dir().expect("a home folder");
+        let settings = customised();
+        // The entry names a folder, so nothing is asked of the environment.
+        let default = Account {
+            name: Account::DEFAULT_NAME.to_owned(),
+            folder: Some("/Users/me/.claude-work".into()),
+        };
+        assert_eq!(settings.account_for("claude-code", None), Ok(default.clone()));
+        assert_eq!(settings.account_for("claude-code", Some(" ")), Ok(default.clone()));
+        assert_eq!(settings.account_for("claude-code", Some("default")), Ok(default));
+        let work = settings.account_for("claude-code", Some("work")).expect("found");
+        assert_eq!(work.name, "Work");
+        assert_eq!(work.folder, Some(home.join(".claude-work-2")));
+        let missing = settings
+            .account_for("claude-code", Some("Personal"))
+            .expect_err("not in Settings");
+        assert!(missing.contains("“Personal”"), "{missing}");
+
+        assert_eq!(
+            settings.account_config("claude-code", &work).config_dir,
+            ConfigDirChoice::Folder(home.join(".claude-work-2"))
+        );
+        let unset = Account {
+            name: Account::DEFAULT_NAME.to_owned(),
+            folder: None,
+        };
+        let config = settings.account_config("claude-code", &unset);
+        assert_eq!(config.config_dir, ConfigDirChoice::Default);
+        assert_eq!(config.program, Some("/opt/claude/bin/claude".into()));
+    }
+
+    #[test]
+    fn a_recorded_account_is_found_by_its_folder() {
+        let home = dirs::home_dir().expect("a home folder");
+        let mut settings = customised();
+        let work = settings.account_for("claude-code", Some("Work")).expect("found");
+        assert_eq!(settings.account_problem(&work), None);
+        // Renamed: still the same folder, the same login.
+        settings.accounts[0].name = "Employer".to_owned();
+        assert_eq!(settings.account_problem(&work), None);
+        // Its folder changed.
+        settings.accounts[0].name = "Work".to_owned();
+        settings.accounts[0].folder = "~/.claude-other".into();
+        let changed = settings.account_problem(&work).expect("refused");
+        assert!(changed.contains(".claude-work-2"), "{changed}");
+        assert!(changed.contains("now ~/.claude-other"), "{changed}");
+        // A trailing slash is another login.
+        settings.accounts[0].folder = home.join(".claude-work-2/");
+        assert!(settings.account_problem(&work).is_some());
+        // Removed.
+        settings.accounts.clear();
+        let removed = settings.account_problem(&work).expect("refused");
+        assert!(removed.contains("no longer in Settings"), "{removed}");
+        assert!(removed.contains(".claude-work-2"), "{removed}");
+        // The default account always runs.
+        let default = Account {
+            name: Account::DEFAULT_NAME.to_owned(),
+            folder: Some("/gone".into()),
+        };
+        assert_eq!(settings.account_problem(&default), None);
+    }
+
+    #[test]
+    fn a_thread_cannot_read_the_other_accounts_folders() {
+        let home = dirs::home_dir().expect("a home folder");
+        let mut settings = customised();
+        settings.accounts.push(account("Nested", "/Users/me/.claude-work/inner"));
+        let work = settings.account_for("claude-code", Some("Work")).expect("found");
+        assert_eq!(
+            settings.other_account_folders("claude-code", &work),
+            [
+                PathBuf::from("/Users/me/.claude-work"),
+                PathBuf::from("/Users/me/.claude-work/inner")
+            ]
+        );
+        let nested = settings.account_for("claude-code", Some("Nested")).expect("found");
+        // The default's folder holds the nested one, so it stays readable.
+        assert_eq!(
+            settings.other_account_folders("claude-code", &nested),
+            [home.join(".claude-work-2")]
+        );
+    }
+
+    #[test]
+    fn account_names_and_folders_are_unique() {
+        assert_eq!(accounts_problem(&[]), None);
+        assert_eq!(
+            accounts_problem(&[account("Work", "~/.claude-work"), account("Me", "/a/b")]),
+            None
+        );
+        for (accounts, expected) in [
+            (vec![account(" ", "/a")], "needs a name"),
+            (vec![account("default", "/a")], "always has"),
+            (
+                vec![account("Work", "/a"), account("work ", "/b")],
+                "Two accounts",
+            ),
+            (vec![account("Work", "")], "needs a folder"),
+            (vec![account("My Work", "claude")], "~/.claude-my-work"),
+            (
+                vec![account("Work", "/a/b"), account("Me", "/a/b/")],
+                "already another",
+            ),
+        ] {
+            let problem = accounts_problem(&accounts).expect("refused");
+            assert!(problem.contains(expected), "{problem}");
+        }
     }
 
     #[test]
@@ -768,7 +1078,10 @@ mod tests {
         let settings = customised();
         let config = settings.agent("claude-code").config();
         assert_eq!(config.program, Some("/opt/claude/bin/claude".into()));
-        assert_eq!(config.config_dir, Some("/Users/me/.claude-work".into()));
+        assert_eq!(
+            config.config_dir,
+            ConfigDirChoice::Folder("/Users/me/.claude-work".into())
+        );
         assert_eq!(config.args, ["--verbose"]);
 
         let mut entry = AgentEntry::default();
