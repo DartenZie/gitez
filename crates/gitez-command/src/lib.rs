@@ -184,6 +184,9 @@ pub enum PullMethod {
     Configured,
     /// A merge commit when the branches have diverged (`--no-rebase`).
     Merge,
+    /// The branch's own commits replayed on top of the upstream's
+    /// (`--rebase`).
+    Rebase,
     /// Only by moving the branch forward; refused, changing nothing, when
     /// the branch has commits its upstream lacks (`--ff-only`).
     FastForward,
@@ -771,6 +774,7 @@ impl Git {
         match method {
             PullMethod::Configured => {}
             PullMethod::Merge => args.push("--no-rebase"),
+            PullMethod::Rebase => args.push("--rebase"),
             PullMethod::FastForward => args.push("--ff-only"),
         }
         // No editor can open for a merge message.

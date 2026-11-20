@@ -89,6 +89,10 @@ tree, so it cannot be committed or pushed by accident. Linked worktrees share it
   worktree, GitEZ pulls it there, so that worktree's files follow; it changes
   nothing when the branch has commits of its own, when uncommitted changes
   are in the way, or when the worktree is missing or locked, and says which.
+  When a push of the branch checked out is rejected because the remote has
+  new commits, GitEZ offers to pull them first, by merge or by rebase, and
+  then pushes again. When the branches have diverged, it also offers to
+  force push.
 - **Cancel a fetch, pull or push**: while one runs, **Cancel** is in the
   toolbar and on the branch's or remote's row in the sidebar. It ends `git`
   and every process it started, such as `ssh`: they are asked to stop and

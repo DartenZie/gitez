@@ -237,10 +237,18 @@ impl Workspace {
     }
 
     pub(super) fn pull(&mut self, _: &Pull, window: &mut Window, cx: &mut Context<Self>) {
-        self.pull_with(PullMethod::Configured, window, cx);
+        self.pull_with(PullMethod::Configured, false, window, cx);
     }
 
-    fn pull_with(&mut self, method: PullMethod, window: &mut Window, cx: &mut Context<Self>) {
+    /// Pulls into the branch checked out the way `method` says; with
+    /// `then_push`, pushes it once the pull has brought everything in.
+    fn pull_with(
+        &mut self,
+        method: PullMethod,
+        then_push: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(snapshot) = &self.snapshot else {
             return;
         };
@@ -256,14 +264,18 @@ impl Workspace {
             RemoteTarget::Branch(name.clone()),
             Some(label),
             move |git| git.pull(method),
-            |this, result, step, window, cx| match result {
+            move |this, result, step, window, cx| match result {
+                Ok(PullOutcome::Pulled) if then_push => this.push_with(false, window, cx),
                 Ok(PullOutcome::Pulled) => {
                     this.notify_done(crate::toast::success("Pulled"), step, window, cx)
                 }
                 Ok(PullOutcome::Conflicts) => window.push_notification(
-                    crate::toast::warning(
-                        "The pull stopped on conflicts. Resolve them to finish it, or abort it.",
-                    ),
+                    crate::toast::warning(if then_push {
+                        "The pull stopped on conflicts. Resolve them to finish it, or abort \
+                         it, then push."
+                    } else {
+                        "The pull stopped on conflicts. Resolve them to finish it, or abort it."
+                    }),
                     cx,
                 ),
                 Err(error) if needs_pull_method(&error) => this.notify_with_action(
@@ -271,8 +283,8 @@ impl Workspace {
                         "The branch and its upstream have diverged, and git is not set to \
                          merge or rebase them (pull.rebase).",
                     ),
-                    "Merge them",
-                    |this, window, cx| this.pull_with(PullMethod::Merge, window, cx),
+                    "Merge or rebase…",
+                    move |this, window, cx| this.offer_pull(None, then_push, false, window, cx),
                     window,
                     cx,
                 ),
@@ -298,7 +310,7 @@ impl Workspace {
             return;
         };
         if checked_out(snapshot, &branch) {
-            return self.pull_with(PullMethod::Configured, window, cx);
+            return self.pull_with(PullMethod::Configured, false, window, cx);
         }
         let Some(upstream) = snapshot
             .refs
@@ -488,6 +500,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let (branch, publish_to) = (plan.branch.clone(), plan.publish.then(|| plan.to.clone()));
+        // Pulling needs the branch checked out here, with an upstream to
+        // pull from.
+        let pullable = checked_out && !plan.publish;
         self.run_remote(
             RemoteOp::Push,
             RemoteTarget::Branch(plan.branch.clone()),
@@ -506,6 +521,29 @@ impl Workspace {
                     window.push_notification(crate::toast::success(done), cx)
                 }
                 Err(error) => match PushRejection::of(&error) {
+                    // Checked out, the remote's commits can be merged or
+                    // rebased in here, and the push run again.
+                    Some(PushRejection::NotFetched) if pullable => this.offer_pull(
+                        Some(format!(
+                            "{} has commits {} does not have yet. Pull them in, then push.",
+                            plan.to, plan.branch
+                        )),
+                        true,
+                        false,
+                        window,
+                        cx,
+                    ),
+                    Some(PushRejection::Diverged) if pullable && !force => this.offer_pull(
+                        Some(format!(
+                            "{} has commits {} does not. Pull them in, then push, or force \
+                             push to replace them.",
+                            plan.to, plan.branch
+                        )),
+                        true,
+                        true,
+                        window,
+                        cx,
+                    ),
                     Some(PushRejection::NotFetched) => this.notify_with_action(
                         crate::toast::warning(format!(
                             "{} has commits not fetched yet. Pull them in, then push.",
@@ -544,6 +582,127 @@ impl Workspace {
             window,
             cx,
         );
+    }
+
+    /// Asks whether to bring the upstream's commits into the branch checked
+    /// out by merging or by rebasing, saying `why` first; with `then_push`,
+    /// the branch is pushed once they are in. With `offer_force`, it can
+    /// be force pushed instead.
+    pub(super) fn offer_pull(
+        &mut self,
+        why: Option<String>,
+        then_push: bool,
+        offer_force: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let Some(Head::Branch { name: branch, .. }) = snapshot.refs.head.clone() else {
+            return;
+        };
+        let upstream = snapshot
+            .tracking
+            .get(&branch)
+            .map(|tracking| tracking.upstream.clone())
+            .unwrap_or_else(|| "its upstream".to_owned());
+        let why = why.unwrap_or_else(|| {
+            format!("{branch} and {upstream} have diverged. Bring their commits together.")
+        });
+        let then = if then_push { " Then push." } else { "" };
+        let strategies = [
+            (
+                "Merge",
+                format!("Adds a merge commit that joins {upstream} into {branch}.{then}"),
+            ),
+            (
+                "Rebase",
+                format!(
+                    "Replays {branch}'s own commits on top of {upstream}, for a straight \
+                     history.{then}"
+                ),
+            ),
+        ];
+        let title = if then_push {
+            "Pull before pushing".to_owned()
+        } else {
+            format!("Pull into {branch}")
+        };
+        let workspace = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let pull = |id: &'static str, label: &'static str, method: PullMethod| {
+                let workspace = workspace.clone();
+                let label = if then_push {
+                    format!("{label} and push")
+                } else {
+                    label.to_owned()
+                };
+                Button::new(id).label(label).on_click(move |_, window, cx| {
+                    window.close_dialog(cx);
+                    workspace
+                        .update(cx, |this, cx| this.pull_with(method, then_push, window, cx))
+                        .ok();
+                })
+            };
+            let force = offer_force.then(|| {
+                let (workspace, branch) = (workspace.clone(), branch.clone());
+                Button::new("pull-force-push")
+                    .ghost()
+                    .label("Force push")
+                    .on_click(move |_, window, cx| {
+                        window.close_dialog(cx);
+                        workspace
+                            .update(cx, |this, cx| {
+                                this.push_branch(branch.clone(), true, window, cx)
+                            })
+                            .ok();
+                    })
+            });
+            dialog
+                .title(title.clone())
+                .w(px(480.))
+                .child(
+                    div()
+                        .v_flex()
+                        .gap(px(10.))
+                        .child(
+                            div()
+                                .text_color(rgb(crate::theme::color::TEXT_SECONDARY))
+                                .child(why.clone()),
+                        )
+                        .children(strategies.iter().map(|(name, about)| {
+                            div()
+                                .v_flex()
+                                .gap(px(2.))
+                                .child(
+                                    div()
+                                        .text_color(rgb(crate::theme::color::TEXT))
+                                        .child(*name),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(rgb(crate::theme::color::TEXT_MUTED))
+                                        .child(about.clone()),
+                                )
+                        })),
+                )
+                .footer(
+                    div()
+                        .h_flex()
+                        .justify_end()
+                        .gap(px(8.))
+                        .child(
+                            Button::new("pull-cancel")
+                                .ghost()
+                                .label("Cancel")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .children(force)
+                        .child(pull("pull-rebase", "Rebase", PullMethod::Rebase))
+                        .child(pull("pull-merge", "Merge", PullMethod::Merge).primary()),
+                )
+        });
     }
 
     /// Runs `command` off the UI thread as remote operation `op` on
