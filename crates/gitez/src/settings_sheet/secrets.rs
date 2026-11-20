@@ -1031,7 +1031,7 @@ impl SettingsSheet {
 }
 
 /// A square ghost button with an icon, named for screen readers.
-fn icon_button(id: impl Into<ElementId>, icon: IconName, label: String) -> Button {
+pub(super) fn icon_button(id: impl Into<ElementId>, icon: IconName, label: String) -> Button {
     Button::new(id)
         .ghost()
         .size(px(26.))

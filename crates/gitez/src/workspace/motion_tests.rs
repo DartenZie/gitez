@@ -153,6 +153,7 @@ pub(crate) fn live_thread(
                 prompt: prompt.into(),
                 agent: gitez_agent::ClaudeCode::ID.into(),
                 model: None,
+                account: None,
                 start: Start {
                     branch: "main".into(),
                     commit: head,

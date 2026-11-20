@@ -325,7 +325,10 @@ fn a_folder_is_kept_as_written() {
         expand_home(Path::new("/a/./b/"), home()).as_os_str(),
         "/a/./b/"
     );
-    assert_eq!(expand_home(Path::new("~"), home()), PathBuf::from("/Users/me"));
+    assert_eq!(
+        expand_home(Path::new("~"), home()),
+        PathBuf::from("/Users/me")
+    );
     assert_eq!(
         expand_home(Path::new("~other/x"), home()),
         PathBuf::from("~other/x")
@@ -334,8 +337,14 @@ fn a_folder_is_kept_as_written() {
         path: "/Users/me/.claude-work/".into(),
         source: ConfigDirSource::Settings,
     };
-    assert_eq!(dir.variable().map(Path::as_os_str), Some("/Users/me/.claude-work/".as_ref()));
-    assert_eq!(dir.choice(), ConfigDirChoice::Folder("/Users/me/.claude-work/".into()));
+    assert_eq!(
+        dir.variable().map(Path::as_os_str),
+        Some("/Users/me/.claude-work/".as_ref())
+    );
+    assert_eq!(
+        dir.choice(),
+        ConfigDirChoice::Folder("/Users/me/.claude-work/".into())
+    );
     let default = ConfigDir {
         path: "/Users/me/.claude".into(),
         source: ConfigDirSource::Default,
@@ -406,7 +415,11 @@ fn the_per_run_folders_follow_the_config_folder() {
         let mut config = config(&dir);
         config.config_dir = ConfigDirChoice::Folder(folder.clone());
         let needs = ClaudeCode.needs_for_run(&config, &spec);
-        assert!(needs.write_dirs.contains(&folder.join("projects").join(&name)));
+        assert!(
+            needs
+                .write_dirs
+                .contains(&folder.join("projects").join(&name))
+        );
         assert!(needs.write_dirs.contains(&folder.join("session-env/s-1")));
         assert!(needs.write_dirs.contains(&folder.join("file-history/s-1")));
     }

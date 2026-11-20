@@ -732,6 +732,7 @@ impl Composer {
     }
 
     /// The name of the account the thread will run with, once known.
+    #[cfg(test)]
     pub(crate) fn account_name(&self) -> Option<&str> {
         match self.account()? {
             Ok(account) => Some(&account.name),
@@ -1155,9 +1156,15 @@ impl Composer {
                     .child(agent_mark(&self.agent).size(px(16.)).rounded(px(4.)))
                     .child(self.agent_name(cx))
                     .when_some(
-                        self.account_name()
+                        self.account()
+                            .and_then(|account| account.as_ref().ok())
                             .filter(|_| self.agent == ClaudeCode::ID)
-                            .map(str::to_owned),
+                            .and_then(|account| {
+                                crate::agent_threads::account_label(
+                                    self.model.read(cx).settings(),
+                                    Some(account),
+                                )
+                            }),
                         |this, account| {
                             this.child(
                                 div()
@@ -2150,6 +2157,11 @@ mod tests {
                     program: "/bin/true".into(),
                     version: None,
                 },
+                repository: composer
+                    .target
+                    .as_ref()
+                    .map(|target| target.work_dir.clone()),
+                account: Some(Ok(default_account())),
             });
             assert!(composer.can_send(cx));
             composer.send(window, cx);
@@ -2466,6 +2478,133 @@ mod tests {
         });
     }
 
+    /// The thread runs with the Claude account the repository's git
+    /// config names, read when the composer is checked; a name Settings do
+    /// not have keeps Send disabled, never falling back to the default.
+    #[gpui_kit::test]
+    fn the_thread_takes_the_account_the_repository_chose(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let work_dir = dir.path().join("repo");
+        std::fs::create_dir_all(&work_dir).expect("folder");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&work_dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "Ada")
+                .env("GIT_AUTHOR_EMAIL", "ada@example.com")
+                .env("GIT_COMMITTER_NAME", "Ada")
+                .env("GIT_COMMITTER_EMAIL", "ada@example.com")
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "First"]);
+        git(&["config", "gitez.agentAccount", "work"]);
+        let data_dir = dir.path().join("data");
+        let settings = Settings {
+            agents: [(
+                gitez_agent::ClaudeCode::ID.to_owned(),
+                AgentEntry {
+                    program: Some("/nonexistent/claude".into()),
+                    config_dir: Some("/Users/me/.claude".into()),
+                    ..AgentEntry::default()
+                },
+            )]
+            .into(),
+            accounts: vec![gitez_settings::AccountEntry {
+                name: "Work".into(),
+                folder: "/Users/me/.claude-work".into(),
+            }],
+            ..Settings::default()
+        };
+        settings
+            .save(&Settings::path(&data_dir))
+            .expect("settings saved");
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+            crate::recent::init_in_memory(cx);
+            init_with(
+                Options {
+                    data_dir: Some(data_dir),
+                    sandbox: Arc::new(gitez_sandbox::Passthrough),
+                    agents: gitez_agent::Registry::builtin(),
+                    secrets: Arc::new(gitez_secret::Memory::default()),
+                    exe: Err("no supervisor in tests".into()),
+                    watch: false,
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let common_dir = work_dir.join(".git");
+        let mode = ComposerMode::Repository {
+            work_dir: work_dir.clone(),
+            common_dir,
+            name: "repo".into(),
+            branches: vec![("main".into(), oid(1))],
+            current: Some("main".into()),
+            bare: false,
+        };
+        let (window, composer) = cx
+            .update(|cx| {
+                gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| Composer::new(mode, window, cx))
+                })
+            })
+            .expect("window open");
+        let mut cx = VisualTestContext::from_window(window, cx);
+        composer.update(&mut cx, |composer, cx| composer.check(cx));
+        cx.run_until_parked();
+        composer.read_with(&cx, |composer, _| {
+            assert_eq!(composer.account_name(), Some("Work"));
+        });
+        let sent = requests(&composer, &mut cx);
+        composer.update_in(&mut cx, |composer, window, cx| {
+            let found = composer
+                .environment
+                .as_ref()
+                .and_then(|e| e.account.clone());
+            ready(composer, gitez_agent::ClaudeCode::ID);
+            if let Some(environment) = &mut composer.environment {
+                environment.account = found;
+            }
+            composer.set_prompt("Fix the typo in README.".into(), window, cx);
+            composer.send(window, cx);
+        });
+        let account = sent.lock().expect("lock")[0]
+            .account
+            .clone()
+            .expect("an account");
+        assert_eq!(account.name, "Work");
+        assert_eq!(account.folder, Some("/Users/me/.claude-work".into()));
+
+        git(&["config", "gitez.agentAccount", "Personal"]);
+        composer.update(&mut cx, |composer, cx| composer.check(cx));
+        cx.run_until_parked();
+        composer.update_in(&mut cx, |composer, _, cx| {
+            assert_eq!(composer.account_name(), None);
+            let problems = composer.problems(cx);
+            assert!(
+                problems
+                    .iter()
+                    .any(|problem| problem.severity == super::Severity::Blocking
+                        && problem.text.contains("“Personal”")),
+                "{problems:?}"
+            );
+        });
+    }
+
+    /// The default account, Claude Code's own folder.
+    fn default_account() -> gitez_agent_thread::Account {
+        gitez_agent_thread::Account {
+            name: gitez_agent_thread::Account::DEFAULT_NAME.into(),
+            folder: None,
+        }
+    }
+
     /// As if the agent were installed and signed in, and the sandbox ready.
     fn ready(composer: &mut Composer, agent: &'static str) {
         composer.environment = Some(super::Environment {
@@ -2483,6 +2622,11 @@ mod tests {
                 program: "/bin/true".into(),
                 version: None,
             },
+            repository: composer
+                .target
+                .as_ref()
+                .map(|target| target.work_dir.clone()),
+            account: Some(Ok(default_account())),
         });
     }
 

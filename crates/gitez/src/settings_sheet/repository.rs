@@ -1,6 +1,9 @@
 //! "In this repository": the setup command new worktrees run first
 //! (`gitez.setupCommand` in the repository's git config, written with the
-//! git CLI), and where the threads' worktrees live.
+//! git CLI), the Claude account its agents run with (`gitez.agentAccount`,
+//! which the user's global git config may also set, through an
+//! `includeIf "gitdir:…"` rule say), and where the threads' worktrees
+//! live.
 
 use std::path::PathBuf;
 
@@ -11,6 +14,11 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use gitez_agent_thread::Account;
+use gitez_settings::ACCOUNT_KEY;
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+
+use super::accounts::account_names;
 use super::edit::guess_setup_command;
 use super::{SAVE_AFTER, SettingsSheet, card, error_text, kv_row, muted};
 use crate::theme::color;
@@ -33,12 +41,18 @@ pub(super) struct RepositoryForm {
     saving: bool,
     /// `<data dir>/worktrees/<repository>`, and whether it exists yet.
     worktrees: Option<(PathBuf, bool)>,
+    /// The account named in git config, once read: `None` when unset,
+    /// else the name and whether the repository's own config sets it.
+    account: Option<Option<(String, bool)>>,
+    account_saving: bool,
+    account_error: Option<SharedString>,
     _loading: Option<Task<()>>,
 }
 
 /// What is read about the repository in the background.
 struct Read {
     setup: Option<String>,
+    account: Option<(String, bool)>,
     guess: Option<String>,
     error: Option<String>,
     worktrees_exist: bool,
@@ -84,12 +98,21 @@ impl SettingsSheet {
         let read = cx.background_executor().spawn({
             let (work_dir, worktrees) = (work_dir.clone(), worktrees.clone());
             async move {
-                let (setup, error) = match gitez_git::Repository::open(&work_dir) {
-                    Ok(repository) => (repository.config_string(SETUP_COMMAND_KEY), None),
-                    Err(error) => (None, Some(format!("{:#}", anyhow::Error::from(error)))),
+                let (setup, account, error) = match gitez_git::Repository::open(&work_dir) {
+                    Ok(repository) => (
+                        repository.config_string(SETUP_COMMAND_KEY),
+                        repository.config_string_with_origin(ACCOUNT_KEY),
+                        None,
+                    ),
+                    Err(error) => (
+                        None,
+                        None,
+                        Some(format!("{:#}", anyhow::Error::from(error))),
+                    ),
                 };
                 Read {
                     setup,
+                    account,
                     guess: guess_setup_command(|file| work_dir.join(file).exists()),
                     error,
                     worktrees_exist: worktrees.is_some_and(|dir| dir.is_dir()),
@@ -112,6 +135,7 @@ impl SettingsSheet {
                     input.set_value(text, window, cx);
                 });
                 form.saved = Some(read.setup);
+                form.account = Some(read.account);
                 form.guess = read.guess;
                 form.error = read.error.map(|error| {
                     format!("Could not read the repository’s git config: {error}").into()
@@ -133,6 +157,9 @@ impl SettingsSheet {
             generation: 0,
             saving: false,
             worktrees: worktrees.map(|dir| (dir, false)),
+            account: None,
+            account_saving: false,
+            account_error: None,
             _loading: Some(loading),
             _setup_changes: setup_changes,
         });
@@ -205,6 +232,144 @@ impl SettingsSheet {
         cx.notify();
     }
 
+    /// Makes `name` the account of the repository's agents, in its own git
+    /// config. The default account is written only when the user's global
+    /// config names another; otherwise the key is removed.
+    pub(super) fn choose_account(&mut self, name: String, cx: &mut Context<Self>) {
+        let Some(form) = &mut self.repository else {
+            return;
+        };
+        let work_dir = form.work_dir.clone();
+        form.account_saving = true;
+        form.account_error = None;
+        let saved = cx.background_executor().spawn(async move {
+            let git = Git::new(&work_dir);
+            if Account::is_default_name(&name) {
+                git.set_config(ACCOUNT_KEY, None)?;
+                let elsewhere = gitez_git::Repository::open(&work_dir)
+                    .ok()
+                    .and_then(|repository| repository.config_string(ACCOUNT_KEY));
+                if elsewhere.is_some_and(|other| !Account::is_default_name(&other)) {
+                    git.set_config(ACCOUNT_KEY, Some(Account::DEFAULT_NAME))?;
+                }
+            } else {
+                git.set_config(ACCOUNT_KEY, Some(&name))?;
+            }
+            let read = gitez_git::Repository::open(&work_dir)
+                .ok()
+                .and_then(|repository| repository.config_string_with_origin(ACCOUNT_KEY));
+            Ok::<_, gitez_command::Error>(read)
+        });
+        cx.spawn(async move |this, cx| {
+            let saved = saved.await;
+            this.update(cx, |this, cx| {
+                let Some(form) = &mut this.repository else {
+                    return;
+                };
+                form.account_saving = false;
+                match saved {
+                    Ok(read) => form.account = Some(read),
+                    Err(error) => {
+                        form.account_error = Some(
+                            format!(
+                                "Could not save the account: {:#}",
+                                anyhow::Error::from(error)
+                            )
+                            .into(),
+                        );
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// The "Claude account" row: the account the repository's threads
+    /// start with, where that comes from, and a picker.
+    fn render_repository_account(&self, form: &RepositoryForm, cx: &mut Context<Self>) -> Div {
+        let names = account_names(self.model.read(cx));
+        let settings = self.model.read(cx).settings().clone();
+        let view = cx.entity().downgrade();
+        let effective = form.account.as_ref().map(|read| match read {
+            Some((name, _)) if Account::is_default_name(name) => Account::DEFAULT_NAME.to_owned(),
+            Some((name, _)) => name.clone(),
+            None => Account::DEFAULT_NAME.to_owned(),
+        });
+        let unknown = effective.as_ref().is_some_and(|name| {
+            !Account::is_default_name(name) && settings.account_named(name).is_none()
+        });
+        let note: SharedString = match &form.account {
+            None => "Reading…".into(),
+            Some(None) => {
+                "Not set: new threads run with the default account. Kept in this repository’s \
+                 git config as gitez.agentAccount."
+                    .into()
+            }
+            Some(Some((_, true))) => {
+                "Set in this repository’s git config (gitez.agentAccount). Threads keep the \
+                 account they started with."
+                    .into()
+            }
+            Some(Some((_, false))) => {
+                "From your global git config (gitez.agentAccount), not this repository’s. \
+                 Picking one here sets it for this repository only."
+                    .into()
+            }
+        };
+        let chosen = effective.clone().unwrap_or_default();
+        let picker = Button::new("repository-account")
+            .compact()
+            .h(px(28.))
+            .px(px(8.))
+            .min_w(px(160.))
+            .text_size(px(12.))
+            .dropdown_caret(true)
+            .loading(form.account_saving)
+            .disabled(form.account.is_none())
+            .child(
+                div()
+                    .flex_1()
+                    .text_left()
+                    .child(effective.clone().unwrap_or_else(|| "…".to_owned())),
+            )
+            .dropdown_menu(move |mut menu, _, _| {
+                for name in &names {
+                    let view = view.clone();
+                    let pick = name.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(name.clone())
+                            .checked(name.eq_ignore_ascii_case(&chosen))
+                            .on_click(move |_, _, cx| {
+                                view.update(cx, |this, cx| this.choose_account(pick.clone(), cx))
+                                    .ok();
+                            }),
+                    );
+                }
+                menu
+            });
+        kv_row(
+            "Claude account",
+            div()
+                .v_flex()
+                .gap(px(4.))
+                .child(picker)
+                .child(muted(note).text_size(px(11.5)))
+                .when(unknown, |this| {
+                    this.child(error_text(format!(
+                        "Settings have no account “{}”: new threads cannot start here until \
+                         you add it or pick another.",
+                        effective.clone().unwrap_or_default()
+                    )))
+                })
+                .when_some(form.account_error.clone(), |this, error| {
+                    this.child(error_text(error))
+                }),
+        )
+    }
+
     pub(super) fn render_repository(
         &self,
         _window: &mut Window,
@@ -275,7 +440,13 @@ impl SettingsSheet {
             )
             .border_b_0()
         });
-        Some(card().child(kv_row("Setup", setup)).children(worktrees))
+        let account = self.render_repository_account(form, cx);
+        Some(
+            card()
+                .child(kv_row("Setup", setup))
+                .child(account)
+                .children(worktrees),
+        )
     }
 
     /// For tests: whether the setup command is still being read or saved.
@@ -283,6 +454,6 @@ impl SettingsSheet {
     pub(super) fn repository_busy(&self) -> bool {
         self.repository
             .as_ref()
-            .is_some_and(|form| form._loading.is_some() || form.saving)
+            .is_some_and(|form| form._loading.is_some() || form.saving || form.account_saving)
     }
 }

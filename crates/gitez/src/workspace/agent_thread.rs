@@ -1439,6 +1439,18 @@ impl ThreadView {
                     .text_color(rgb(color::TEXT_MUTED))
                     .child(name)
             }))
+            .children(
+                crate::agent_threads::account_label(
+                    self.model.read(cx).settings(),
+                    thread.account.as_ref(),
+                )
+                .map(|name| {
+                    div()
+                        .debug_selector(|| "thread-account".into())
+                        .text_color(rgb(color::TEXT_MUTED))
+                        .child(format!("· {name}"))
+                }),
+            )
             .child(state_chip(thread))
             .children(inline)
             .child(
@@ -3037,6 +3049,7 @@ mod tests {
                     prompt: prompt.into(),
                     agent: gitez_agent::ClaudeCode::ID.into(),
                     model: Some("opus".into()),
+                    account: None,
                     start: Start {
                         branch: "main".into(),
                         commit,

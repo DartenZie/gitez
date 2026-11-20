@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 use crate::lock::Lock;
 use crate::model::{AgentThread, AgentThreadId, Mode, NewAgentThread, State, Turn, TurnKind};
 use crate::{
-    Error, HEADER_VERSION, MAX_INPUT_BYTES, PreparedImage, Result, TurnImage, VERSION, repository_key,
-    scratch_dirs, slug, title_from_request, worktree_path,
+    Error, HEADER_VERSION, MAX_INPUT_BYTES, PreparedImage, Result, TurnImage, VERSION,
+    repository_key, scratch_dirs, slug, title_from_request, worktree_path,
 };
 
 const THREAD_FILE: &str = "thread.json";

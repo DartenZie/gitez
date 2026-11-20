@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use common::{EXAMPLE, Fixture, at, branch_of, worktree_of};
 use gitez_agent_thread::{
-    Account, AgentThreadId, Error, Index, IndexedRepository, Mode, RunHeader, State, Store, Timestamp,
-    TurnKind, repository_key,
+    Account, AgentThreadId, Error, Index, IndexedRepository, Mode, RunHeader, State, Store,
+    Timestamp, TurnKind, repository_key,
 };
 use gitez_sandbox::NetworkProfile;
 
@@ -182,7 +182,13 @@ fn a_new_thread_records_its_account() {
     });
     let thread = fixture
         .store()
-        .create(new, &fixture.data_dir, "my repo", |_| false, Timestamp::now())
+        .create(
+            new,
+            &fixture.data_dir,
+            "my repo",
+            |_| false,
+            Timestamp::now(),
+        )
         .expect("create thread");
     assert_eq!(
         thread.account.as_ref().map(|account| account.name.as_str()),

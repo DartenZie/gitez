@@ -19,8 +19,7 @@ use anyhow::{Context as _, bail};
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gitez_agent_thread::{
-    Account,
-    AgentThread, AgentThreadId, CompleteReport, Ending, IfUncommitted, Index, IndexReport,
+    Account, AgentThread, AgentThreadId, CompleteReport, Ending, IfUncommitted, Index, IndexReport,
     IndexedRepository, Kept, Merged, Mode, NewAgentThread, State, Step, Store, Timestamp, TurnKind,
 };
 use gitez_sandbox::NetworkProfile;
@@ -1797,12 +1796,25 @@ impl Launcher {
     }
 }
 
+/// The account name to show beside a thread or the composer's agent:
+/// only once Settings have accounts, or for an account other than the
+/// default, so nothing changes for someone who never adds one.
+pub fn account_label(settings: &Settings, account: Option<&Account>) -> Option<SharedString> {
+    let account = account?;
+    (!settings.accounts.is_empty() || !account.is_default())
+        .then(|| SharedString::from(account.name.clone()))
+}
+
 /// The Claude account new runs of agent `agent` in the repository at
 /// `work_dir` use: the one its git config names (`gitez.agentAccount`),
 /// else the default account. A name Settings do not have is an error,
 /// never the default instead. Blocks: reads git config, and may ask the
 /// login shell.
-pub fn resolve_account(settings: &Settings, agent: &str, work_dir: &Path) -> Result<Account, String> {
+pub fn resolve_account(
+    settings: &Settings,
+    agent: &str,
+    work_dir: &Path,
+) -> Result<Account, String> {
     let repository = gitez_git::Repository::open(work_dir).map_err(|error| {
         format!(
             "GitEZ could not read the repository’s git config to find its Claude account: {:#}",
@@ -2388,6 +2400,48 @@ mod tests {
     }
 
     #[test]
+    fn a_repository_chooses_its_account_in_its_git_config() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let main = dir.path().join("repo");
+        std::fs::create_dir_all(&main).expect("folder");
+        git(&main, &["init", "-q", "-b", "main"]);
+        let mut settings = Settings::default();
+        // An entry folder, so the default account asks nothing of the
+        // environment.
+        settings
+            .agents
+            .entry("claude-code".into())
+            .or_default()
+            .config_dir = Some("/Users/me/.claude".into());
+        settings.accounts.push(gitez_settings::AccountEntry {
+            name: "Work".into(),
+            folder: "/Users/me/.claude-work".into(),
+        });
+        let default = super::resolve_account(&settings, "claude-code", &main).expect("default");
+        assert!(default.is_default());
+        assert_eq!(default.folder, Some("/Users/me/.claude".into()));
+        // Shown only once Settings have accounts.
+        assert_eq!(
+            super::account_label(&Settings::default(), Some(&default)),
+            None
+        );
+        assert_eq!(
+            super::account_label(&settings, Some(&default)).as_deref(),
+            Some("Default")
+        );
+
+        git(&main, &["config", "gitez.agentAccount", "Work"]);
+        let work = super::resolve_account(&settings, "claude-code", &main).expect("work");
+        assert_eq!(work.name, "Work");
+        assert_eq!(work.folder, Some("/Users/me/.claude-work".into()));
+
+        git(&main, &["config", "gitez.agentAccount", "Personal"]);
+        let missing = super::resolve_account(&settings, "claude-code", &main)
+            .expect_err("never the default instead");
+        assert!(missing.contains("“Personal”"), "{missing}");
+    }
+
+    #[test]
     fn file_events_are_classified() {
         let mut plan = Plan::default();
         let common = Path::new("/r/.git");
@@ -2685,7 +2739,7 @@ mod tests {
                     prompt: "Could blame follow renames?".into(),
                     agent: "claude-code".into(),
                     model: Some("haiku".into()),
-                    account: None,
+                    account: Some(work_account()),
                     start: Start {
                         branch: "feature".into(),
                         commit: start,
@@ -2728,6 +2782,8 @@ mod tests {
             .expect("finish");
         git(&main, &["commit", "-q", "--allow-empty", "-m", "Second"]);
         git(&main, &["branch", "-f", "feature", "HEAD"]);
+        // The repository has chosen another account since.
+        git(&main, &["config", "gitez.agentAccount", "Other"]);
         gitez_agent_thread::Index::new(&data_dir)
             .add(gitez_agent_thread::IndexedRepository {
                 common_dir: common_dir.clone(),
@@ -2740,6 +2796,14 @@ mod tests {
             id: created.id,
         };
         (main, key)
+    }
+
+    /// The account the discussion of [`auto_discussion`] runs with.
+    fn work_account() -> gitez_agent_thread::Account {
+        gitez_agent_thread::Account {
+            name: "Work".into(),
+            folder: Some("/Users/me/.claude-work".into()),
+        }
     }
 
     /// Reads every thread, as GitEZ does when it starts.
@@ -2799,6 +2863,7 @@ mod tests {
         assert_eq!(implement.model.as_deref(), Some("haiku"));
         assert_eq!(implement.network, NetworkProfile::Packages);
         assert_eq!(implement.secrets, ["GITHUB_TOKEN"]);
+        assert_eq!(implement.account, Some(work_account()));
 
         let discussion = gitez_agent_thread::Store::new(&key.common_dir)
             .load(&key.id)

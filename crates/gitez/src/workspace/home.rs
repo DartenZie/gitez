@@ -1061,7 +1061,19 @@ impl Home {
             .min_w_0()
             .text_size(px(11.5))
             .text_color(rgb(color::TEXT_MUTED))
-            .child(repository);
+            .child(repository)
+            .children(
+                crate::agent_threads::account_label(
+                    self.model.read(cx).settings(),
+                    thread.account.as_ref(),
+                )
+                .map(|account| {
+                    div()
+                        .flex_none()
+                        .debug_selector(|| "home-thread-account".into())
+                        .child(format!("· {account}"))
+                }),
+            );
         let mut buttons = Vec::new();
         match kind {
             Kind::Finished => {
@@ -1631,6 +1643,7 @@ mod tests {
                     prompt: prompt.into(),
                     agent: gitez_agent::ClaudeCode::ID.into(),
                     model: None,
+                    account: None,
                     start: Start {
                         branch: "main".into(),
                         commit: "0".repeat(40),

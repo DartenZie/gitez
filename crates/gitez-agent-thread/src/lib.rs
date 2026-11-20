@@ -39,8 +39,8 @@ pub use images::{
 };
 pub use index::{Index, IndexReport, IndexedRepository};
 pub use model::{
-    Account, Activity, AgentThread, AgentThreadId, BRIEF_PROMPT, CONTINUE_PROMPT, DeletedBranch, Ending,
-    Failure, HANDOFF_MARKER, Handoff, Mode, NewAgentThread, RetryPlan, Start, State, Step,
+    Account, Activity, AgentThread, AgentThreadId, BRIEF_PROMPT, CONTINUE_PROMPT, DeletedBranch,
+    Ending, Failure, HANDOFF_MARKER, Handoff, Mode, NewAgentThread, RetryPlan, Start, State, Step,
     SupervisorInfo, Turn, TurnKind, TurnResult, Uncommitted, WorktreeRecord, split_handoff,
     without_handoff_marker,
 };

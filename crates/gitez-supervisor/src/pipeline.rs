@@ -16,13 +16,14 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use gitez_agent::{
-    Agent, AgentConfig, ClaudeCode, AgentEvent, AgentNeeds, AgentProcess, CommandSpec, Conversation, Finished,
-    ImageInput, RunSpec, Stopper,
+    Agent, AgentConfig, AgentEvent, AgentNeeds, AgentProcess, ClaudeCode, CommandSpec,
+    Conversation, Finished, ImageInput, RunSpec, Stopper,
 };
 use gitez_agent_thread::{
-    Account, Activity, AgentThread, AgentThreadId, BRIEF_PROMPT, CONTINUE_PROMPT, Ending, HANDOFF_MARKER,
-    Handoff, Mode, PrepareStep, RunHeader, ScratchDirs, State, Step, Store, SupervisorInfo,
-    Timestamp, Turn, TurnKind, TurnResult, Uncommitted, split_handoff, title_from_message,
+    Account, Activity, AgentThread, AgentThreadId, BRIEF_PROMPT, CONTINUE_PROMPT, Ending,
+    HANDOFF_MARKER, Handoff, Mode, PrepareStep, RunHeader, ScratchDirs, State, Step, Store,
+    SupervisorInfo, Timestamp, Turn, TurnKind, TurnResult, Uncommitted, split_handoff,
+    title_from_message,
 };
 use gitez_git::{RefState, Repository};
 use gitez_sandbox::{Network, NetworkProfile, Sandbox as _, Status};
@@ -317,12 +318,10 @@ impl Pipeline<'_> {
             &self.id,
             &format!(
                 "recorded the default account, {}",
-                account
-                    .folder
-                    .as_ref()
-                    .map_or_else(|| "Claude Code’s own folder".to_owned(), |folder| folder
-                        .display()
-                        .to_string())
+                account.folder.as_ref().map_or_else(
+                    || "Claude Code’s own folder".to_owned(),
+                    |folder| folder.display().to_string()
+                )
             ),
         );
         let recorded = account.clone();
@@ -2020,7 +2019,6 @@ pub(crate) fn log(id: &AgentThreadId, message: &str) {
     );
 }
 
-
 /// The folders of the accounts other than `account` that a thread running
 /// `program` must not read: [`Settings::other_account_folders`], but for
 /// one that holds the program itself, which must stay readable to run.
@@ -2047,7 +2045,10 @@ mod tests {
     #[test]
     fn a_thread_cannot_read_other_accounts_but_the_one_holding_claude() {
         let mut settings = Settings::default();
-        let entry = settings.agents.entry(ClaudeCode::ID.to_owned()).or_default();
+        let entry = settings
+            .agents
+            .entry(ClaudeCode::ID.to_owned())
+            .or_default();
         entry.config_dir = Some("/Users/me/.claude".into());
         settings.accounts = ["work", "personal"]
             .map(|name| gitez_settings::AccountEntry {

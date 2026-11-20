@@ -26,8 +26,7 @@ use crate::login_shell::{join_path, login_shell_var};
 use crate::process::find_program;
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentNeeds, CommandSpec, ConfigDirChoice, Conversation, Error,
-    Finished,
-    LoginStatus, ModelChoice, OptionalHost, Result, RunSpec, UsageLimit,
+    Finished, LoginStatus, ModelChoice, OptionalHost, Result, RunSpec, UsageLimit,
 };
 
 const PROGRAM: &str = "claude";

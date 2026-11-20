@@ -377,8 +377,9 @@ impl Settings {
         let Some(folder) = &account.folder else {
             return None;
         };
-        let same = |entry: &&AccountEntry| entry.account().folder.as_deref().map(Path::as_os_str)
-            == Some(folder.as_os_str());
+        let same = |entry: &&AccountEntry| {
+            entry.account().folder.as_deref().map(Path::as_os_str) == Some(folder.as_os_str())
+        };
         if self.accounts.iter().any(|entry| same(&entry)) {
             return None;
         }
@@ -418,10 +419,8 @@ impl Settings {
     /// [`Settings::default_account`].
     pub fn other_account_folders(&self, agent: &str, account: &Account) -> Vec<PathBuf> {
         let own = ClaudeCode::config_dir(&self.account_config(agent, account)).path;
-        let default = ClaudeCode::config_dir(
-            &self.account_config(agent, &self.default_account(agent)),
-        )
-        .path;
+        let default =
+            ClaudeCode::config_dir(&self.account_config(agent, &self.default_account(agent))).path;
         let mut folders: Vec<PathBuf> = Vec::new();
         let added = self
             .accounts
@@ -682,10 +681,21 @@ mod tests {
             name: Account::DEFAULT_NAME.to_owned(),
             folder: Some("/Users/me/.claude-work".into()),
         };
-        assert_eq!(settings.account_for("claude-code", None), Ok(default.clone()));
-        assert_eq!(settings.account_for("claude-code", Some(" ")), Ok(default.clone()));
-        assert_eq!(settings.account_for("claude-code", Some("default")), Ok(default));
-        let work = settings.account_for("claude-code", Some("work")).expect("found");
+        assert_eq!(
+            settings.account_for("claude-code", None),
+            Ok(default.clone())
+        );
+        assert_eq!(
+            settings.account_for("claude-code", Some(" ")),
+            Ok(default.clone())
+        );
+        assert_eq!(
+            settings.account_for("claude-code", Some("default")),
+            Ok(default)
+        );
+        let work = settings
+            .account_for("claude-code", Some("work"))
+            .expect("found");
         assert_eq!(work.name, "Work");
         assert_eq!(work.folder, Some(home.join(".claude-work-2")));
         let missing = settings
@@ -710,7 +720,9 @@ mod tests {
     fn a_recorded_account_is_found_by_its_folder() {
         let home = dirs::home_dir().expect("a home folder");
         let mut settings = customised();
-        let work = settings.account_for("claude-code", Some("Work")).expect("found");
+        let work = settings
+            .account_for("claude-code", Some("Work"))
+            .expect("found");
         assert_eq!(settings.account_problem(&work), None);
         // Renamed: still the same folder, the same login.
         settings.accounts[0].name = "Employer".to_owned();
@@ -741,8 +753,12 @@ mod tests {
     fn a_thread_cannot_read_the_other_accounts_folders() {
         let home = dirs::home_dir().expect("a home folder");
         let mut settings = customised();
-        settings.accounts.push(account("Nested", "/Users/me/.claude-work/inner"));
-        let work = settings.account_for("claude-code", Some("Work")).expect("found");
+        settings
+            .accounts
+            .push(account("Nested", "/Users/me/.claude-work/inner"));
+        let work = settings
+            .account_for("claude-code", Some("Work"))
+            .expect("found");
         assert_eq!(
             settings.other_account_folders("claude-code", &work),
             [
@@ -750,7 +766,9 @@ mod tests {
                 PathBuf::from("/Users/me/.claude-work/inner")
             ]
         );
-        let nested = settings.account_for("claude-code", Some("Nested")).expect("found");
+        let nested = settings
+            .account_for("claude-code", Some("Nested"))
+            .expect("found");
         // The default's folder holds the nested one, so it stays readable.
         assert_eq!(
             settings.other_account_folders("claude-code", &nested),

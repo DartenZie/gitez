@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use common::{Fixture, branch_of, git, worktree_of};
 use gitez_agent_thread::{
-    Account, BRIEF_PROMPT, CONTINUE_PROMPT, Ending, HANDOFF_MARKER, Handoff, Mode, RetryPlan, State, Step,
-    Timestamp, TurnKind,
+    Account, BRIEF_PROMPT, CONTINUE_PROMPT, Ending, HANDOFF_MARKER, Handoff, Mode, RetryPlan,
+    State, Step, Timestamp, TurnKind,
 };
 use gitez_supervisor::{Command, Error};
 
@@ -845,9 +845,11 @@ fn an_account_that_is_gone_or_moved_fails_before_the_agent_runs() {
             error.message
         );
         assert!(
-            error
-                .message
-                .contains(if moved { "folder in Settings" } else { "no longer in Settings" }),
+            error.message.contains(if moved {
+                "folder in Settings"
+            } else {
+                "no longer in Settings"
+            }),
             "{}",
             error.message
         );
