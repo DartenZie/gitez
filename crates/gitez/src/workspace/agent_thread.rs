@@ -920,6 +920,24 @@ pub fn can_complete(thread: &AgentThread) -> bool {
 /// The hosts the sandbox refused in `thread`'s last run that ended, split
 /// by its agent's [`gitez_agent::Agent::optional_hosts`]: only
 /// [`BlockedHosts::problems`] count, colour a line or change a suggestion.
+/// The model the thread runs with, as its agent names it ("Opus"), or the
+/// alias stored when the agent does not know it; `None` for a thread that
+/// recorded no model.
+pub fn model_label(agents: &Registry, thread: &AgentThread) -> Option<SharedString> {
+    let alias = thread.model.as_deref().filter(|alias| !alias.is_empty())?;
+    let label = agents
+        .get(&thread.agent)
+        .and_then(|agent| {
+            agent
+                .models()
+                .iter()
+                .find(|(known, _)| *known == alias)
+                .map(|(_, label)| *label)
+        })
+        .unwrap_or(alias);
+    Some(SharedString::from(label.to_owned()))
+}
+
 pub fn blocked_hosts<'a>(thread: &'a AgentThread, agents: &Registry) -> BlockedHosts<'a> {
     let hosts = thread
         .turns
@@ -1369,6 +1387,7 @@ impl ThreadView {
         &self,
         thread: &AgentThread,
         agent_name: SharedString,
+        model_name: Option<SharedString>,
         cx: &mut Context<Self>,
     ) -> Div {
         let busy = self.busy.as_ref().map(|(busy, _)| *busy);
@@ -1414,6 +1433,12 @@ impl ThreadView {
                     .text_color(rgb(color::TEXT_SECONDARY))
                     .child(agent_name),
             )
+            .children(model_name.map(|name| {
+                div()
+                    .debug_selector(|| "thread-model".into())
+                    .text_color(rgb(color::TEXT_MUTED))
+                    .child(name)
+            }))
             .child(state_chip(thread))
             .children(inline)
             .child(
@@ -2831,10 +2856,11 @@ impl Render for ThreadView {
             .get(&thread.agent)
             .map_or_else(|| thread.agent.clone(), |agent| agent.name().to_owned())
             .into();
+        let model_name = model_label(self.model.read(cx).agents(), &thread);
         let header = div()
             .v_flex()
             .gap(px(if self.wide { 12. } else { 10. }))
-            .child(self.render_header(&thread, agent_name.clone(), cx))
+            .child(self.render_header(&thread, agent_name.clone(), model_name, cx))
             .child(
                 div()
                     .text_size(px(if self.wide { 20. } else { 17. }))
@@ -2925,7 +2951,7 @@ mod tests {
     use gitez_sandbox::NetworkProfile;
     use gpui_kit::{Entity, TestAppContext, VisualTestContext, px, size};
 
-    use super::{AwaitedBrief, Entry, Handoff, ThreadView, ThreadViewEvent, duration};
+    use super::{AwaitedBrief, Entry, Handoff, ThreadView, ThreadViewEvent, duration, model_label};
     use crate::agent_threads::{AgentThreadKey, Options, init_with};
 
     fn git(dir: &Path, args: &[&str]) {
@@ -3010,7 +3036,7 @@ mod tests {
                 NewAgentThread {
                     prompt: prompt.into(),
                     agent: gitez_agent::ClaudeCode::ID.into(),
-                    model: None,
+                    model: Some("opus".into()),
                     start: Start {
                         branch: "main".into(),
                         commit,
@@ -3639,6 +3665,29 @@ mod tests {
             ];
             thread.turns[0].result = Some(failed);
         });
+    }
+
+    /// The header names the model as the agent does, an unknown alias as
+    /// stored, and nothing for a thread without one.
+    #[test]
+    fn model_label_names_the_model() {
+        let (_dir, common_dir, id) = repository_with_discussion(|_| {});
+        let mut thread = Store::new(&common_dir).load(&id).expect("load");
+        let agents = gitez_agent::Registry::builtin();
+        assert_eq!(
+            model_label(&agents, &thread).as_deref(),
+            Some("Opus"),
+            "a known alias"
+        );
+        thread.model = Some("claude-opus-5-5".into());
+        assert_eq!(
+            model_label(&agents, &thread).as_deref(),
+            Some("claude-opus-5-5")
+        );
+        thread.model = Some(String::new());
+        assert_eq!(model_label(&agents, &thread), None);
+        thread.model = None;
+        assert_eq!(model_label(&agents, &thread), None);
     }
 
     fn minutes_ago(minutes: i64) -> Timestamp {
