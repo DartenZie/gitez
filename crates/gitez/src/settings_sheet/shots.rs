@@ -24,8 +24,12 @@ use crate::screenshot::{Shots, git};
 use crate::workspace::Workspace;
 
 /// A stand-in `claude`: answers `auth status` as signed in unless
-/// `FAKE_SIGNED_IN=false`.
+/// `FAKE_SIGNED_IN=false`, or its configuration folder holds a file named
+/// `signed-out`.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
+if [ "$1" = auth ] && [ -n "$CLAUDE_CONFIG_DIR" ] && [ -e "$CLAUDE_CONFIG_DIR/signed-out" ]; then
+  printf '{"loggedIn": false}\n'; exit 0
+fi
 if [ "$1" = auth ]; then printf '{"loggedIn": %s}\n' "${FAKE_SIGNED_IN:-true}"; exit 0; fi
 exit 1
 "#;
@@ -327,6 +331,76 @@ fn screenshot_u4_sheet() {
     shots.save_region(window, sheet_region(), "u4-sheet-detail");
     shots.scroll(window, at(720., 500.), 30.);
     shots.save(window, "u4-sheet-scrolled");
+}
+
+/// Claude accounts: the default one and Work signed in, Client signed
+/// out, and this repository running its agents with Work, as its own git
+/// config says.
+#[test]
+fn screenshot_accounts() {
+    if !crate::screenshot::enabled() {
+        return;
+    }
+    let dir = scratch();
+    let setup = prepare(dir.path(), |_, base| {
+        let mut settings = Settings::default();
+        settings
+            .agents
+            .insert(gitez_agent::ClaudeCode::ID.into(), fake_agent(base, true));
+        for (name, folder) in [("Work", "claude-work"), ("Client", "claude-client")] {
+            std::fs::create_dir_all(base.join(folder)).expect("account folder");
+            settings.accounts.push(gitez_settings::AccountEntry {
+                name: name.into(),
+                folder: base.join(folder),
+            });
+        }
+        std::fs::write(base.join("claude-client/signed-out"), "").expect("signed out");
+        settings
+    });
+    git(&setup.work_dir, &["config", "gitez.agentAccount", "Work"]);
+    installed_srt(&setup.data_dir);
+    let data_dir = setup.data_dir.clone();
+    let mut shots = Shots::with_options(&setup.data_dir, |options| {
+        options.sandbox = gitez_sandbox::platform(&data_dir);
+    })
+    .expect("enabled");
+    let (window, _) = open_sheet(&mut shots, &setup.work_dir);
+    wait_for(&mut shots, Duration::from_secs(20), |shots| {
+        let sheet = sheet(shots);
+        shots.update(|cx| sheet.read(cx).accounts_checked())
+    });
+    shots.save(window, "accounts-sheet");
+    shots.scroll(window, at(450., 600.), 400.);
+    shots.save(window, "accounts-list");
+    shots.scroll(window, at(1000., 600.), 400.);
+    shots.save(window, "accounts-repository");
+
+    // A repository naming an account Settings do not have.
+    git(
+        &setup.work_dir,
+        &["config", "gitez.agentAccount", "Personal"],
+    );
+    let dir = scratch();
+    let other = prepare(dir.path(), |_, base| {
+        let mut settings = Settings::default();
+        settings
+            .agents
+            .insert(gitez_agent::ClaudeCode::ID.into(), fake_agent(base, true));
+        settings
+    });
+    git(
+        &other.work_dir,
+        &["config", "gitez.agentAccount", "Personal"],
+    );
+    installed_srt(&other.data_dir);
+    let data_dir = other.data_dir.clone();
+    let mut shots = Shots::with_options(&other.data_dir, |options| {
+        options.sandbox = gitez_sandbox::platform(&data_dir);
+    })
+    .expect("enabled");
+    let (window, _) = open_sheet(&mut shots, &other.work_dir);
+    shots.scroll(window, at(1000., 600.), 400.);
+    shots.save(window, "accounts-repository-unknown");
 }
 
 /// Empty and broken states: no secrets, srt not installed, Claude Code

@@ -462,3 +462,98 @@ fn exit_codes() {
     assert_eq!(failed.ending, Some(Ending::Failed));
     assert_eq!(failed.error.expect("error").step, Step::Supervisor);
 }
+
+/// Two repositories, one choosing the Work account in its git config and
+/// one choosing none: each thread, resolved as the GUI resolves it and run
+/// by its own supervisor process, gives its agent its own folder, and the
+/// default account none at all (even when GitEZ inherited one).
+#[test]
+fn each_repository_runs_its_agents_with_its_own_account() {
+    let fixture = Fixture::new();
+    let work_folder = fixture.base.join("claude work");
+    fixture.add_account("Work", &work_folder);
+    let other = fixture.base.join("other repo");
+    std::fs::create_dir_all(&other).expect("folder");
+    common::git(&other, &["init", "--quiet", "--initial-branch=main"]);
+    common::git(
+        &other,
+        &["commit", "--quiet", "--allow-empty", "-m", "First"],
+    );
+    common::git(&other, &["config", "gitez.agentAccount", "Work"]);
+
+    let settings =
+        match gitez_settings::Settings::load(&gitez_settings::Settings::path(&fixture.data_dir))
+            .expect("settings")
+        {
+            gitez_settings::Loaded::Current(settings) => settings,
+            gitez_settings::Loaded::TooNew => panic!("too new"),
+        };
+    let account_of = |dir: &Path| {
+        let choice = gitez_git::Repository::open(dir)
+            .expect("open")
+            .config_string(gitez_settings::ACCOUNT_KEY);
+        settings
+            .account_for(gitez_agent::ClaudeCode::ID, choice.as_deref())
+            .expect("an account")
+    };
+    let work = account_of(&other);
+    assert_eq!(work.folder.as_deref(), Some(work_folder.as_path()));
+    // The default account, with Claude Code's own folder: no variable.
+    let default = gitez_agent_thread::Account {
+        name: gitez_agent_thread::Account::DEFAULT_NAME.to_owned(),
+        folder: None,
+    };
+    assert!(account_of(&fixture.root).is_default());
+
+    let mine = fixture.create("What is the answer?").id;
+    fixture.record_account(&mine, default);
+    let other_common = other.join(".git");
+    let theirs = gitez_agent_thread::Store::new(&other_common)
+        .create(
+            gitez_agent_thread::NewAgentThread {
+                prompt: "And here?".to_owned(),
+                agent: gitez_agent::ClaudeCode::ID.to_owned(),
+                model: None,
+                account: Some(work),
+                mode: gitez_agent_thread::Mode::Implement,
+                auto: false,
+                start: gitez_agent_thread::Start {
+                    branch: "main".to_owned(),
+                    commit: common::git(&other, &["rev-parse", "HEAD"]),
+                },
+                work_dir: None,
+                origin: None,
+                network: Default::default(),
+                secrets: Vec::new(),
+            },
+            &fixture.data_dir,
+            "other repo",
+            |_| false,
+            Timestamp::now(),
+        )
+        .expect("create thread")
+        .id;
+
+    let exe = fixture.supervisor_exe();
+    gitez_supervisor::launch(gitez_supervisor::Launch {
+        exe: &exe,
+        prefix: &[],
+        command: Command::Start,
+        common_dir: &other_common,
+        thread: &theirs,
+        secrets: &Secrets::default(),
+    })
+    .expect("launch");
+    fixture.launch(&mine, Command::Start, &Secrets::default());
+    let mine = fixture.wait_for(&mine, LONG, is_done);
+    assert_eq!(mine.ending, Some(Ending::Answer), "{mine:#?}");
+    let store = gitez_agent_thread::Store::new(&other_common);
+    wait_until(LONG, "the other thread", || {
+        store.load(&theirs).is_ok_and(|thread| is_done(&thread))
+    });
+    let mut seen = fixture.config_dirs();
+    seen.sort();
+    let mut expected = vec!["<unset>".to_owned(), work_folder.display().to_string()];
+    expected.sort();
+    assert_eq!(seen, expected);
+}

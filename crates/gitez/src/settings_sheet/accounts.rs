@@ -195,24 +195,10 @@ impl SettingsSheet {
         cx.notify();
     }
 
-    /// For tests: shows `logins` (by account name) and the default
-    /// account's folder as if they were checked.
+    /// For tests: whether every account's login was checked.
     #[cfg(test)]
-    pub(super) fn set_account_logins(
-        &mut self,
-        default: ConfigDir,
-        logins: impl IntoIterator<Item = (String, LoginStatus)>,
-        cx: &mut Context<Self>,
-    ) {
-        let settings = self.model.read(cx).settings().clone();
-        self.accounts.checked_for =
-            Some((settings.accounts.clone(), settings.agent(ClaudeCode::ID)));
-        self.accounts._checking = None;
-        self.accounts.check = Some(AccountsCheck {
-            default: Some(default),
-            logins: logins.into_iter().collect(),
-        });
-        cx.notify();
+    pub(super) fn accounts_checked(&self) -> bool {
+        self.accounts._checking.is_none() && self.accounts.check.is_some()
     }
 }
 
