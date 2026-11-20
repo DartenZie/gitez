@@ -214,6 +214,17 @@ What follows describes an Implement thread, unless it says otherwise.
 - **Settings** (`⌘,`, the app menu, or the gear in the Agents popover):
   - Claude Code's binary, configuration folder, environment variables,
     launch arguments and default model, and whether it is signed in.
+  - Claude accounts. Claude Code keeps its login per configuration folder
+    (`CLAUDE_CONFIG_DIR`), so each folder is an account. The **Default**
+    account is the folder GitEZ always used: the one set for Claude Code,
+    else `CLAUDE_CONFIG_DIR` in GitEZ's environment or your login shell,
+    else Claude Code's own default, run with the variable unset. Add others
+    with a name and a folder, an existing one or a new empty one (GitEZ
+    suggests `~/.claude-<name>`, which also works from a terminal). Each
+    account shows whether it is signed in and the command that signs it in,
+    such as `CLAUDE_CONFIG_DIR=~/.claude-work claude auth login`, to copy
+    into a terminal. GitEZ never copies settings, MCP servers or logins
+    between folders.
   - How many agents run at once.
   - The sandbox: whether it is installed, the network profile new threads
     start with, the hosts the Packages profile adds, the paths hidden from
@@ -226,6 +237,19 @@ What follows describes an Implement thread, unless it says otherwise.
     writes, each value is replaced with `[secret NAME]`.
   - The repository's setup command, kept as `gitez.setupCommand` in its git
     config.
+  - The repository's Claude account, kept as `gitez.agentAccount` in its
+    git config. Settings say whether the repository's own config sets it or
+    your global config does (an `includeIf "gitdir:…"` rule, for example).
+    A repository that names no account uses the default one; one that names
+    an account Settings do not have cannot start threads until you add it.
+- **Accounts and threads**: a thread records its account when it starts,
+  and every later turn (replies, retries, review comments) runs with it,
+  whatever Settings or the repository choose later. If that account is
+  removed from Settings, or its folder changes, the thread stops with an
+  error that names the folder its conversation is in; renaming the account
+  is fine. "Send to Claude Code" from a local pull request uses the
+  repository's account. The composer, the thread header and Home name the
+  account once you have added one.
 
 Thread data is stored in `.git/gitez/threads`, beside the reviews.
 
@@ -260,7 +284,10 @@ run in the same sandbox.
   `~/.gnupg`, `~/.config/gh`, `~/.netrc`, `~/.kube`, `~/.docker/config.json`,
   `~/.git-credentials`, `~/.config/git/credentials`, `~/.npmrc`, `~/.pypirc`,
   `~/.cargo/credentials` and `~/.cargo/credentials.toml`. You can change the
-  list in Settings.
+  list in Settings. The configuration folders of the Claude accounts other
+  than the thread's are hidden too, unless `claude` itself is installed in
+  one; a skill symlinked from another account's folder therefore does not
+  load in a thread.
 - **git**: the agent's commits are not signed, because it cannot reach your
   signing keys, and git credential helpers are off for every command of a
   thread.
@@ -288,6 +315,10 @@ run in the same sandbox.
 > - The agent writes the thread's worktree. Treat it as an untrusted checkout
 >   when you open it in an editor, a terminal or another tool. GitEZ checks
 >   the worktree's git files before it runs git there.
+> - Hiding the other accounts' folders does not hide their logins. On
+>   macOS Claude Code keeps each login in the keychain, and the sandbox must
+>   let the agent reach the keychain to use its own, so an agent could ask
+>   the keychain for another account's login too.
 > - A Discuss thread runs in your working tree, so Claude Code keeps its
 >   conversation with your own Claude Code conversations for that folder:
 >   `claude --resume` there lists it. The agent cannot write the rest of
@@ -379,9 +410,11 @@ run in the same sandbox.
   prompts to an agent. GitEZ looks for `claude` on the `PATH` and in the
   installers' default locations, such as `~/.local/bin`.
 - For agent threads:
-  - Claude Code, signed in (`claude auth login`). GitEZ runs your own
-    `claude` with your own login and configuration, and never reads or
-    stores the login. A thread can instead get an `ANTHROPIC_API_KEY` secret.
+  - Claude Code, signed in (`claude auth login`, or for an account added in
+    Settings, `CLAUDE_CONFIG_DIR=<folder> claude auth login`). GitEZ runs
+    your own `claude` with your own login and configuration, and never reads
+    or stores the login. A thread can instead get an `ANTHROPIC_API_KEY`
+    secret.
   - [Node.js](https://nodejs.org) 22.12 or newer, with `npm`, for the
     sandbox. Settings installs the sandbox runtime
     (`@anthropic-ai/sandbox-runtime@0.0.82`) into GitEZ's own data folder

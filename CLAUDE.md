@@ -176,7 +176,8 @@ Decided 2026-10-23; change only with the owner's agreement.
     `$XDG_STATE_HOME/gitez` elsewhere. Tests use a data folder of their own,
     never the owner's.
   - Storage: `<git common dir>/gitez/threads/<id>/thread.json` (one JSON
-    document with a `version` field) and `runs/<UTC time>.jsonl` (one
+    document with a `version` field, 2 only for a record naming an account
+    other than Default; see Accounts) and `runs/<UTC time>.jsonl` (one
     transcript per turn: a GitEZ header line, then the agent's events), with
     the same lock-and-rename writes and refusal of a newer `version` as
     review storage. The `gitez-agent-thread` crate owns the format and the
@@ -251,6 +252,35 @@ Decided 2026-10-23; change only with the owner's agreement.
     Every command run for a thread gets `commit.gpgsign=false`, an empty
     `credential.helper`, `gc.auto=0` and `maintenance.auto=false` through
     `GIT_CONFIG_*`.
+  - Accounts (decided 2026-11-20): Claude Code keeps its login per
+    configuration folder, so a folder is an account. Settings hold named
+    accounts (`accounts` in `settings.json`: name and folder, both unique;
+    `gitez_settings::accounts_problem`) beside the implicit **Default**
+    account (`Account::DEFAULT_NAME`), which is the folder found as before:
+    the agent entry's, else `CLAUDE_CONFIG_DIR` in GitEZ's environment or
+    the login shell, else Claude Code's default. A repository chooses one
+    by name as `gitez.agentAccount` in its git config (read through gix, so
+    the global config may set it); unset is Default, an unknown name is
+    refused, never replaced by Default. `AgentConfig.config_dir` is
+    three-state (`ConfigDirChoice`): Inherit (the old resolution), Default
+    (`CLAUDE_CONFIG_DIR` removed even when inherited: set, even to
+    `~/.claude`, it names another keychain item) and Folder (set verbatim,
+    never made canonical, a trailing slash kept). The GUI resolves the
+    account when it creates a thread (`resolve_account`) and records it in
+    `thread.json` as `account` (name, and folder or none for the variable
+    unset); a handoff takes the discussion's. Every later turn uses the
+    recorded account. The supervisor refuses, at the agent step, an account
+    no longer in Settings or whose folder there changed (found by folder, so
+    a rename is fine), saying where the conversation is; it records Default
+    in a record from before accounts. A record naming another account than
+    Default is written as `version` 2, so an older GitEZ refuses it instead
+    of dropping the field; every other record stays at 1, and `VERSION` (the
+    newest read) is 2. Other accounts' folders go into the sandbox's
+    `deny_read`, unless `claude` lives inside one; their keychain items stay
+    reachable. Signing in is Claude Code's own: Settings show
+    `CLAUDE_CONFIG_DIR=<folder> claude auth login` to copy, and read only
+    `loggedIn`. GitEZ never copies or imports anything between folders.
+    Pull request runs use the repository's account.
   - Secrets: values only in the OS keychain (`gitez-secret`, service
     `GitEZ`, or `GITEZ_KEYCHAIN_SERVICE` in tests); names, scope and the
     default switch in `settings.json`; names only in `thread.json`. The GUI
