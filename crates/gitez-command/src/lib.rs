@@ -704,6 +704,23 @@ impl Git {
             .map(drop)
     }
 
+    /// [`Git::fetch`] with no one at the screen: nothing may ask for a
+    /// password or passphrase, so a remote that needs one fails at once
+    /// instead of opening a prompt.
+    pub fn fetch_unattended(&self) -> Result<()> {
+        self.run_with_env(
+            ["fetch", "--all", "--prune", "--quiet"],
+            None,
+            &[
+                // OpenSSH 8.4 and later: never run `SSH_ASKPASS`.
+                ("SSH_ASKPASS_REQUIRE", "never"),
+                // Git Credential Manager: never open a sign-in window.
+                ("GCM_INTERACTIVE", "never"),
+            ],
+        )
+        .map(drop)
+    }
+
     /// Fetches remote `name` alone, like `git fetch --prune <name>`.
     pub fn fetch_remote(&self, name: &str) -> Result<()> {
         self.run(["fetch", "--prune", "--quiet", name], None)

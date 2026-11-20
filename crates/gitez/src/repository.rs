@@ -4,6 +4,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use gitez_git::{Refs, Repository};
@@ -43,6 +44,9 @@ pub struct Snapshot {
     pub remote_urls: HashMap<String, String>,
     /// When this working tree last fetched, in seconds since the epoch.
     pub fetched: Option<i64>,
+    /// How often to fetch in the background, from `gitez.autoFetch` and
+    /// `gitez.autoFetchMinutes`; `None` when turned off.
+    pub auto_fetch: Option<Duration>,
 }
 
 /// How a local branch compares to its upstream.
@@ -106,6 +110,12 @@ impl Snapshot {
             .filter_map(|name| Some((name.clone(), repository.remote_url(name)?)))
             .collect();
         let fetched = repository.last_fetch();
+        let auto_fetch = auto_fetch_interval(
+            repository.config_string("gitez.autoFetch").as_deref(),
+            repository
+                .config_string("gitez.autoFetchMinutes")
+                .as_deref(),
+        );
         let name = repository.name();
         let icon = crate::project_icon::find(&repository, &name).map(Arc::new);
 
@@ -128,6 +138,7 @@ impl Snapshot {
             remotes,
             remote_urls,
             fetched,
+            auto_fetch,
         })
     }
 
@@ -139,6 +150,27 @@ impl Snapshot {
             .find(|branch| branch.name == name)
             .map(|branch| branch.target)
     }
+}
+
+/// How often GitEZ fetches when nothing is configured.
+pub const AUTO_FETCH_DEFAULT: Duration = Duration::from_secs(5 * 60);
+
+/// How often to fetch in the background, given `gitez.autoFetch` (a git
+/// boolean, on unless set false) and `gitez.autoFetchMinutes` (a whole
+/// number of minutes, at least 1). `None` turns it off. A value that is
+/// not understood counts as unset.
+fn auto_fetch_interval(enabled: Option<&str>, minutes: Option<&str>) -> Option<Duration> {
+    let enabled = enabled.map(str::to_ascii_lowercase);
+    if matches!(enabled.as_deref(), Some("false" | "no" | "off" | "0")) {
+        return None;
+    }
+    let interval = minutes
+        .and_then(|minutes| minutes.parse::<u64>().ok())
+        .filter(|&minutes| minutes > 0)
+        .map_or(AUTO_FETCH_DEFAULT, |minutes| {
+            Duration::from_secs(minutes.saturating_mul(60))
+        });
+    Some(interval)
 }
 
 /// Every pull request in `store` that can be read, sorted for the sidebar,
@@ -226,6 +258,20 @@ mod tests {
         assert_eq!(compare_natural("v1.2", "v1.2.1"), Ordering::Less);
         assert_eq!(compare_natural("release", "v1"), Ordering::Less);
         assert_eq!(compare_natural("a9", "a10"), Ordering::Less);
+    }
+
+    #[test]
+    fn auto_fetch_is_on_every_five_minutes_unless_configured() {
+        let minutes = |n: u64| Some(Duration::from_secs(n * 60));
+        assert_eq!(auto_fetch_interval(None, None), minutes(5));
+        assert_eq!(auto_fetch_interval(Some("true"), Some("15")), minutes(15));
+        assert_eq!(auto_fetch_interval(None, Some("1")), minutes(1));
+        assert_eq!(auto_fetch_interval(Some("False"), Some("15")), None);
+        assert_eq!(auto_fetch_interval(Some("off"), None), None);
+        assert_eq!(auto_fetch_interval(Some("0"), None), None);
+        // Not understood: the default.
+        assert_eq!(auto_fetch_interval(None, Some("0")), minutes(5));
+        assert_eq!(auto_fetch_interval(None, Some("soon")), minutes(5));
     }
 
     #[test]

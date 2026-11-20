@@ -749,9 +749,14 @@ impl Workspace {
         let operation =
             Operation::new().on_stalled(move |text| drop(said.unbounded_send(text.to_owned())));
         let record = label.is_some();
+        // The user's operation goes first: a background fetch gives way,
+        // and git starts once it has gone.
+        self.cancel_auto_fetch();
+        let lock = self.remote_lock.clone();
         let run = cx.background_executor().spawn({
             let operation = operation.clone();
             async move {
+                let _remotes = lock.lock();
                 let recorder = record.then(|| Recorder::start(&dir));
                 let result = command(Git::new(dir).with_operation(&operation));
                 let recorded = match (&result, recorder) {

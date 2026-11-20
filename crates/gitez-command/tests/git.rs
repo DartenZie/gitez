@@ -758,6 +758,20 @@ fn publishes_fetches_and_pulls_a_branch() {
 }
 
 #[test]
+fn fetches_unattended() {
+    let (_dir, a, b) = remote_and_clones();
+    git(a.work_dir(), &["switch", "--quiet", "-c", "feature"]);
+    commit_file(&a, "f.txt", "f\n");
+    a.push("feature", Some("origin"), false).expect("publish");
+
+    b.fetch_unattended().expect("fetch");
+    assert_eq!(
+        git(b.work_dir(), &["rev-parse", "origin/feature"]),
+        git(a.work_dir(), &["rev-parse", "feature"])
+    );
+}
+
+#[test]
 fn pulls_and_pushes_a_branch_not_checked_out() {
     let (_dir, a, b) = remote_and_clones();
     git(a.work_dir(), &["switch", "--quiet", "-c", "feature"]);

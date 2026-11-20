@@ -93,6 +93,13 @@ tree, so it cannot be committed or pushed by accident. Linked worktrees share it
   new commits, GitEZ offers to pull them first, by merge or by rebase, and
   then pushes again. When the branches have diverged, it also offers to
   force push.
+- **Automatic fetch**: GitEZ fetches from every remote in the background
+  when the last fetch is 5 minutes old, so new commits on the remotes show up
+  without asking. The status bar shows "Fetching…" while it runs. It gives
+  way to a fetch, pull or push you start. It never asks for a password: if a
+  remote needs one, GitEZ says once that the fetch failed. Turn it off with
+  `git config gitez.autoFetch false`. Change the interval with
+  `git config gitez.autoFetchMinutes 15`.
 - **Cancel a fetch, pull or push**: while one runs, **Cancel** is in the
   toolbar and on the branch's or remote's row in the sidebar. It ends `git`
   and every process it started, such as `ssh`: they are asked to stop and
