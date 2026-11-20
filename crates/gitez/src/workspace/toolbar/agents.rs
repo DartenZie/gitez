@@ -368,21 +368,9 @@ pub(crate) fn status_line(
             spans.push(Span::new(" · usage limit", muted));
         }
         State::Preparing | State::Running => {
-            let preparing = thread.state == State::Preparing;
+            // The state only: what the agent does now is the thread view's.
             let look = Look::of(thread);
             spans.push(Span::new(look.word(), look.text()));
-            let (tool, detail) = match &thread.activity {
-                Some(activity) => (activity.tool.clone(), activity.detail.clone()),
-                None if preparing => (None, "creating the worktree".to_owned()),
-                None => (None, "starting the agent".to_owned()),
-            };
-            spans.push(Span::new(" · ", muted));
-            if let Some(tool) = tool.filter(|tool| tool != "Setup") {
-                spans.push(Span::new(format!("{tool} "), muted));
-                spans.push(Span::mono(detail, muted));
-            } else {
-                spans.push(Span::new(detail, muted));
-            }
         }
         State::Finished => {
             let when = ago(finished_at(thread), now);

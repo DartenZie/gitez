@@ -1754,12 +1754,11 @@ impl History {
                         .child("Discussion"),
                 ),
             });
-        let mono = cx.theme().mono_font_family.clone();
         Some(
             row.when(self.drag_role(None).is_some(), |this| this.opacity(0.45))
                 .child(self.graph_column(refs, cell, cx))
                 .children(self.pick_cell(None))
-                .child(live.description(mono))
+                .child(live.description())
                 .child(live.agent_and_time(columns::AUTHOR + columns::GAP + columns::DATE))
                 .into_any_element(),
         )

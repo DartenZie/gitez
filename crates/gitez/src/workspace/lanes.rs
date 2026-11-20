@@ -5,8 +5,9 @@
 //! waiting, finished and completed threads have none.
 //!
 //! The board's lanes are two lines high; the history is a list of rows of
-//! one fixed height, so a lane is one line here: state, title, what the
-//! agent does now, agent and network, time and steps.
+//! one fixed height, so a lane is one line here: state, title, agent and
+//! network, time and steps. What the agent does now (its tool) is left to
+//! the thread view.
 
 use std::path::Path;
 
@@ -14,7 +15,6 @@ use gitez_agent_thread::{AgentThread, State, Timestamp};
 use gitez_git::{Branch, Oid};
 use gitez_sandbox::NetworkProfile;
 use gpui_kit::component::StyledExt as _;
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::agent_thread::{Look, agent_mark, chip, duration};
@@ -33,10 +33,6 @@ pub struct Lane {
     /// The commit the branch is at: its tip once it exists, else the commit
     /// the thread started from (always, for a Discuss thread).
     pub tip: Option<Oid>,
-    /// The tool the agent uses now, or "Setup" while preparing.
-    pub tool: Option<SharedString>,
-    /// What the tool works on.
-    pub detail: SharedString,
     /// The agent's name, such as "Claude Code".
     pub agent: SharedString,
     /// The agent's id, for its mark.
@@ -101,12 +97,6 @@ fn lane(
         .find(|branch| Some(&branch.name) == thread.branch.as_ref())
         .map(|branch| branch.target)
         .or_else(|| Oid::from_hex(thread.start.commit.as_bytes()).ok());
-    let preparing = thread.state == State::Preparing;
-    let (tool, detail) = match &thread.activity {
-        Some(activity) => (activity.tool.clone(), activity.detail.clone()),
-        None if preparing => (Some("Setup".to_owned()), "creating the worktree".to_owned()),
-        None => (None, "starting the agent".to_owned()),
-    };
     Lane {
         key: AgentThreadKey {
             common_dir,
@@ -116,8 +106,6 @@ fn lane(
         state: thread.state,
         branch: thread.branch.clone(),
         tip,
-        tool: tool.map(Into::into),
-        detail: detail.into(),
         agent,
         agent_id: thread.agent.clone().into(),
         network: thread.network,
@@ -145,9 +133,8 @@ impl Lane {
         }
     }
 
-    /// The description column: state, title, then the tool and what it
-    /// works on.
-    pub fn description(&self, mono: SharedString) -> Div {
+    /// The description column: state, then title.
+    pub fn description(&self) -> Div {
         let look = match self.state {
             State::Preparing => Look::Preparing,
             _ => Look::Running,
@@ -160,42 +147,13 @@ impl Lane {
             .child(chip(look, look.word().to_owned()))
             .child(
                 div()
-                    .flex_shrink(1.)
-                    .min_w(px(60.))
+                    .flex_1()
+                    .min_w_0()
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_ellipsis()
                     .font_weight(FontWeight::MEDIUM)
                     .child(self.title.clone()),
-            )
-            .when_some(self.tool.clone(), |this, tool| {
-                this.child(
-                    div()
-                        .flex_none()
-                        .h(px(17.))
-                        .px(px(5.))
-                        .h_flex()
-                        .rounded(px(4.))
-                        .border_1()
-                        .border_color(rgb(color::TOOL_CHIP_BORDER))
-                        .bg(rgb(color::TOOL_CHIP))
-                        .font_family(mono.clone())
-                        .text_size(px(10.5))
-                        .text_color(rgb(color::TEXT_SECONDARY))
-                        .child(tool),
-                )
-            })
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(40.))
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .font_family(mono)
-                    .text_size(px(11.))
-                    .text_color(rgb(color::TEXT_MUTED))
-                    .child(self.detail.clone()),
             )
     }
 

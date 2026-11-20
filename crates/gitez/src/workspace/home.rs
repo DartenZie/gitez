@@ -1025,7 +1025,6 @@ impl Home {
         let selected = self.shown_thread(cx).as_ref() == Some(&key);
         let fresh = !selected && self.started.as_ref() == Some(&key);
         let busy = self.busy.contains(&key);
-        let mono = cx.theme().mono_font_family.clone();
         let when = match kind {
             Kind::Finished => ago(finished_at(thread), now),
             Kind::Active => elapsed(thread, now),
@@ -1056,13 +1055,6 @@ impl Home {
             .text_color(rgb(color::TEXT_SECONDARY))
             .child(item.repository.clone());
         let dot = || div().flex_none().child("·");
-        let ellipsis = || {
-            div()
-                .min_w_0()
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_ellipsis()
-        };
         let mut second = div()
             .h_flex()
             .gap(px(6.))
@@ -1091,42 +1083,14 @@ impl Home {
                 }
             }
             Kind::Active => {
-                let preparing = thread.state == State::Preparing;
-                let (tool, detail) = match &thread.activity {
-                    Some(activity) => (activity.tool.clone(), activity.detail.clone()),
-                    None if preparing => (Some("Setup".to_owned()), "creating the worktree".into()),
-                    None => (None, "starting the agent".to_owned()),
-                };
+                // The state only: what the agent does now is the thread
+                // view's.
                 let look = Look::of(thread);
                 second = second.child(dot()).child(
                     div()
                         .flex_none()
                         .text_color(rgb(look.text()))
                         .child(look.word()),
-                );
-                if let Some(tool) = tool {
-                    second = second.child(
-                        div()
-                            .flex_none()
-                            .h(px(17.))
-                            .px(px(5.))
-                            .rounded(px(4.))
-                            .border_1()
-                            .border_color(rgb(color::TOOL_CHIP_BORDER))
-                            .bg(rgb(color::TOOL_CHIP))
-                            .font_family(mono.clone())
-                            .text_size(px(10.5))
-                            .line_height(px(15.))
-                            .text_color(rgb(color::TEXT_SECONDARY))
-                            .child(tool),
-                    );
-                }
-                second = second.child(
-                    ellipsis()
-                        .flex_1()
-                        .font_family(mono)
-                        .text_size(px(11.))
-                        .child(detail),
                 );
             }
             Kind::Waiting => {
