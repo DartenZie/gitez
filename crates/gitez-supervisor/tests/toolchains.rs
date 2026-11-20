@@ -372,6 +372,7 @@ impl Toolchains {
                     prompt: prompt.to_owned(),
                     agent: ClaudeCode::ID.to_owned(),
                     model: Some("haiku".to_owned()),
+                    account: None,
                     mode,
                     auto: false,
                     start: Start {

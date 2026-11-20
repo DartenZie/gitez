@@ -16,11 +16,11 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use gitez_agent::{
-    Agent, AgentConfig, AgentEvent, AgentNeeds, AgentProcess, CommandSpec, Conversation, Finished,
+    Agent, AgentConfig, ClaudeCode, AgentEvent, AgentNeeds, AgentProcess, CommandSpec, Conversation, Finished,
     ImageInput, RunSpec, Stopper,
 };
 use gitez_agent_thread::{
-    Activity, AgentThread, AgentThreadId, BRIEF_PROMPT, CONTINUE_PROMPT, Ending, HANDOFF_MARKER,
+    Account, Activity, AgentThread, AgentThreadId, BRIEF_PROMPT, CONTINUE_PROMPT, Ending, HANDOFF_MARKER,
     Handoff, Mode, PrepareStep, RunHeader, ScratchDirs, State, Step, Store, SupervisorInfo,
     Timestamp, Turn, TurnKind, TurnResult, Uncommitted, split_handoff, title_from_message,
 };
@@ -101,6 +101,7 @@ pub fn run(
         main_dir: None,
         place: None,
         worktree_ready: false,
+        hidden_accounts: Vec::new(),
         last_activity: None,
     };
     pipeline.save(|thread| {
@@ -157,6 +158,9 @@ struct Pipeline<'a> {
     place: Option<Place>,
     /// Whether step 3 checked or created the worktree.
     worktree_ready: bool,
+    /// The other accounts' folders, which every command of the thread is
+    /// kept from reading (found in step 1).
+    hidden_accounts: Vec<PathBuf>,
     last_activity: Option<Instant>,
 }
 
@@ -249,7 +253,11 @@ impl Pipeline<'_> {
             }
         };
         let entry = settings.agent(&self.thread.agent);
-        let config = entry.config();
+        let account = self.account(&settings);
+        let config = match &account {
+            Some(account) => settings.account_config(&self.thread.agent, account),
+            None => entry.config(),
+        };
         let agent = if self.thread.pending_turn().is_some() {
             let agent = self.env.agents.get(&self.thread.agent).ok_or_else(|| {
                 End::Failed(
@@ -257,9 +265,21 @@ impl Pipeline<'_> {
                     format!("GitEZ does not know the agent “{}”.", self.thread.agent),
                 )
             })?;
-            agent
+            // Never another account instead: the conversation, and the
+            // login the user chose for it, are in the recorded folder.
+            if let Some(problem) = account
+                .as_ref()
+                .and_then(|account| settings.account_problem(account))
+            {
+                return Err(End::Failed(Step::Agent, problem));
+            }
+            let program = agent
                 .locate(&config)
                 .map_err(|error| End::Failed(Step::Agent, error.to_string()))?;
+            if let Some(account) = &account {
+                self.hidden_accounts =
+                    hidden_account_folders(&settings, &self.thread.agent, account, &program);
+            }
             Some(agent)
         } else {
             None
@@ -280,6 +300,36 @@ impl Pipeline<'_> {
             config,
             model: entry.model.filter(|model| !model.is_empty()),
         })
+    }
+
+    /// The Claude account the thread runs with: the one it recorded, else
+    /// (a thread from before accounts) the default account, recorded now.
+    /// `None` for an agent other than Claude Code, which has none.
+    fn account(&mut self, settings: &Settings) -> Option<Account> {
+        if self.thread.agent != ClaudeCode::ID {
+            return None;
+        }
+        if let Some(account) = &self.thread.account {
+            return Some(account.clone());
+        }
+        let account = settings.default_account(&self.thread.agent);
+        log(
+            &self.id,
+            &format!(
+                "recorded the default account, {}",
+                account
+                    .folder
+                    .as_ref()
+                    .map_or_else(|| "Claude Code’s own folder".to_owned(), |folder| folder
+                        .display()
+                        .to_string())
+            ),
+        );
+        let recorded = account.clone();
+        self.save(|thread| {
+            thread.account.get_or_insert(recorded);
+        });
+        self.thread.account.clone().or(Some(account))
     }
 
     /// Step 2: wait for a running-agent slot.
@@ -1284,7 +1334,14 @@ status\n";
                 command.env.push((name, value));
             }
         }
-        let (policy, refused) = policy::policy(&place, needs, settings, network, profile);
+        let (policy, refused) = policy::policy(
+            &place,
+            needs,
+            settings,
+            &self.hidden_accounts,
+            network,
+            profile,
+        );
         for path in refused {
             let warning = format!(
                 "{} is a symbolic link, so the sandbox did not make it writable. Make the folder \
@@ -1963,9 +2020,59 @@ pub(crate) fn log(id: &AgentThreadId, message: &str) {
     );
 }
 
+
+/// The folders of the accounts other than `account` that a thread running
+/// `program` must not read: [`Settings::other_account_folders`], but for
+/// one that holds the program itself, which must stay readable to run.
+fn hidden_account_folders(
+    settings: &Settings,
+    agent: &str,
+    account: &Account,
+    program: &Path,
+) -> Vec<PathBuf> {
+    let real_program = policy::real(program);
+    settings
+        .other_account_folders(agent, account)
+        .into_iter()
+        .filter(|folder| {
+            !program.starts_with(folder) && !real_program.starts_with(policy::real(folder))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_thread_cannot_read_other_accounts_but_the_one_holding_claude() {
+        let mut settings = Settings::default();
+        let entry = settings.agents.entry(ClaudeCode::ID.to_owned()).or_default();
+        entry.config_dir = Some("/Users/me/.claude".into());
+        settings.accounts = ["work", "personal"]
+            .map(|name| gitez_settings::AccountEntry {
+                name: name.to_owned(),
+                folder: format!("/Users/me/.claude-{name}").into(),
+            })
+            .into();
+        let work = settings
+            .account_for(ClaudeCode::ID, Some("work"))
+            .expect("found");
+        // Claude Code installed inside the default account's folder.
+        let program = Path::new("/Users/me/.claude/local/claude");
+        assert_eq!(
+            hidden_account_folders(&settings, ClaudeCode::ID, &work, program),
+            [PathBuf::from("/Users/me/.claude-personal")]
+        );
+        let elsewhere = Path::new("/opt/homebrew/bin/claude");
+        assert_eq!(
+            hidden_account_folders(&settings, ClaudeCode::ID, &work, elsewhere),
+            [
+                PathBuf::from("/Users/me/.claude"),
+                PathBuf::from("/Users/me/.claude-personal")
+            ]
+        );
+    }
 
     #[test]
     fn changed_names_include_added_and_removed() {

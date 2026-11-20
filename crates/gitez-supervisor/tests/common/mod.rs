@@ -22,7 +22,8 @@ use gitez_settings::{AgentEntry, Settings};
 use gitez_supervisor::{Command, Environment, Launch, Secrets};
 
 /// The fake agent. It logs its arguments to `$FAKE_LOG/calls` (one line
-/// per run) and its standard input to `$FAKE_LOG/stdin-<run>` (from 1),
+/// per run), its `CLAUDE_CONFIG_DIR` to `$FAKE_LOG/config-dirs` (`<unset>`
+/// when it has none), and its standard input to `$FAKE_LOG/stdin-<run>` (from 1),
 /// reads the prompt from stdin and acts on a keyword in it.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 log="$FAKE_LOG"
@@ -33,6 +34,7 @@ for arg in "$@"; do
   prev="$arg"
 done
 printf '%s\n' "$*" >> "$log/calls"
+printf '%s\n' "${CLAUDE_CONFIG_DIR-<unset>}" >> "$log/config-dirs"
 prompt=$(cat)
 run=$(wc -l < "$log/calls" | tr -d ' ')
 printf '%s' "$prompt" > "$log/stdin-$run"
@@ -280,6 +282,7 @@ impl Fixture {
                     prompt: prompt.to_owned(),
                     agent: ClaudeCode::ID.to_owned(),
                     model: Some("haiku".to_owned()),
+                    account: None,
                     mode,
                     auto,
                     start: Start {
@@ -332,6 +335,53 @@ impl Fixture {
     pub fn stdin(&self, run: usize) -> String {
         std::fs::read_to_string(self.fake_log.join(format!("stdin-{run}")))
             .unwrap_or_else(|error| panic!("no standard input of run {run}: {error}"))
+    }
+
+    /// The `CLAUDE_CONFIG_DIR` of each run of the fake agent, `<unset>`
+    /// when it had none.
+    pub fn config_dirs(&self) -> Vec<String> {
+        std::fs::read_to_string(self.fake_log.join("config-dirs"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The default account's folder: the agent entry's.
+    pub fn default_config_dir(&self) -> PathBuf {
+        self.base.join("claude config")
+    }
+
+    /// Changes the settings saved for the supervisor.
+    pub fn change_settings(&self, change: impl FnOnce(&mut Settings)) {
+        let path = Settings::path(&self.data_dir);
+        let mut settings = match Settings::load(&path).expect("load settings") {
+            gitez_settings::Loaded::Current(settings) => settings,
+            gitez_settings::Loaded::TooNew => panic!("settings too new"),
+        };
+        change(&mut settings);
+        settings.save(&path).expect("save settings");
+    }
+
+    /// Adds account `name` with `folder` to the settings.
+    pub fn add_account(&self, name: &str, folder: &Path) {
+        self.change_settings(|settings| {
+            settings.accounts.push(gitez_settings::AccountEntry {
+                name: name.to_owned(),
+                folder: folder.to_owned(),
+            });
+        });
+    }
+
+    /// Records `account` in the queued thread `id`, as the GUI does when
+    /// it creates it.
+    pub fn record_account(&self, id: &AgentThreadId, account: gitez_agent_thread::Account) {
+        self.store()
+            .update(id, |thread| {
+                thread.account = Some(account);
+                Ok(())
+            })
+            .expect("record the account");
     }
 
     /// The fake agent's command lines, one per run.
