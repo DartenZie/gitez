@@ -130,6 +130,10 @@ pub struct AgentEntry {
     pub args: Vec<String>,
     /// Default model alias; `None`: the agent's default.
     pub model: Option<String>,
+    /// Default effort level, such as `high`; `None`: the agent's default
+    /// for the model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 /// A secret's name and scope. Its value is in the OS keychain, under
@@ -316,8 +320,8 @@ impl SecretEntry {
 }
 
 impl AgentEntry {
-    /// The entry as the agent takes it. `model` is not part of it: it is
-    /// chosen per run.
+    /// The entry as the agent takes it. `model` and `effort` are not part
+    /// of it: they are chosen per run.
     pub fn config(&self) -> gitez_agent::AgentConfig {
         gitez_agent::AgentConfig {
             program: self.program.clone(),
@@ -461,6 +465,7 @@ mod tests {
                 env: BTreeMap::from([("A".to_owned(), "1".to_owned())]),
                 args: vec!["--verbose".to_owned()],
                 model: Some("haiku".to_owned()),
+                effort: Some("high".to_owned()),
             },
         );
         settings.secrets = vec![
@@ -613,6 +618,7 @@ mod tests {
             "/Users/me/repos/gitez/.git"
         );
         assert_eq!(json["agents"]["claude-code"]["model"], "haiku");
+        assert_eq!(json["agents"]["claude-code"]["effort"], "high");
 
         // Saving again replaces the file.
         let mut changed = settings;

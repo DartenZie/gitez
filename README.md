@@ -93,7 +93,8 @@ What follows describes an Implement thread, unless it says otherwise.
 - **Start a thread** from the "Ask an agent…" row under the uncommitted
   changes in the history (`⌘⇧A`, or File > Ask an Agent…), or from Home.
   Write the prompt, choose **Discuss**, **Auto** or **Implement**, and pick the agent,
-  the model and the branch to start from. The thread gets the network
+  the model, the effort level (Claude Code's `--effort`; **Default** leaves
+  it to the model) and the branch to start from. The thread gets the network
   profile and the default secrets set in Settings. An Implement thread starts from the branch's
   last commit; your uncommitted changes are not included. A Discuss thread
   reads the branch you have checked out, so it has no branch to pick and
@@ -109,7 +110,7 @@ What follows describes an Implement thread, unless it says otherwise.
 - **Auto handoff**: in an Auto thread, any answer can be a brief, also one
   to a reply such as "ok, do it". GitEZ starts one Implement thread from
   each such brief, from the last commit of the branch the discussion read,
-  with the same agent, model, network profile and secrets, and the heading
+  with the same agent, model, effort, network profile and secrets, and the heading
   of the brief as its title. The agent says in the brief when the change
   depends on your uncommitted changes, which the new thread does not see.
   If GitEZ was closed when the brief arrived, it starts the thread at its
@@ -213,7 +214,8 @@ What follows describes an Implement thread, unless it says otherwise.
   repository where it is now to list its threads again.
 - **Settings** (`⌘,`, the app menu, or the gear in the Agents popover):
   - Claude Code's binary, configuration folder, environment variables,
-    launch arguments and default model, and whether it is signed in.
+    launch arguments, default model and default effort level, and whether it
+    is signed in.
   - How many agents run at once.
   - The sandbox: whether it is installed, the network profile new threads
     start with, the hosts the Packages profile adds, the paths hidden from

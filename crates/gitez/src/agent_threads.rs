@@ -192,6 +192,7 @@ pub struct StartRequest {
     pub prompt: String,
     pub agent: String,
     pub model: Option<String>,
+    pub effort: Option<String>,
     pub mode: Mode,
     /// A Discuss thread started as Auto: its agent may hand off to an
     /// Implement thread ([`AgentThread::auto`]).
@@ -728,6 +729,7 @@ impl AgentThreads {
                     prompt: request.prompt,
                     agent: request.agent,
                     model: request.model,
+                    effort: request.effort,
                     mode: request.mode,
                     auto: request.auto && request.mode == Mode::Discuss,
                     start: request.start,
@@ -2078,6 +2080,7 @@ fn claim_handoff(
         prompt: brief,
         agent: discussion.agent,
         model: discussion.model,
+        effort: discussion.effort,
         mode: Mode::Implement,
         auto: false,
         start: gitez_agent_thread::Start { branch, commit },
@@ -2244,6 +2247,7 @@ mod tests {
             title: id.to_owned(),
             agent: "claude-code".to_owned(),
             model: None,
+            effort: None,
             state,
             ending,
             created: at,
@@ -2469,6 +2473,7 @@ mod tests {
                     prompt: "Add b.txt".into(),
                     agent: "claude-code".into(),
                     model: None,
+                    effort: None,
                     start: Start {
                         branch: "main".into(),
                         commit: start.clone(),
@@ -2658,6 +2663,7 @@ mod tests {
                     prompt: "Could blame follow renames?".into(),
                     agent: "claude-code".into(),
                     model: Some("haiku".into()),
+                    effort: None,
                     start: Start {
                         branch: "feature".into(),
                         commit: start,

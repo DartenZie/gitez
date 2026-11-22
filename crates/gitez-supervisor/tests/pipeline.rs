@@ -66,6 +66,7 @@ fn start_creates_the_worktree_runs_setup_and_the_agent_and_opens_a_pull_request(
     assert!(!resumed);
     assert_eq!(thread.session_id.as_deref(), Some(session.as_str()));
     assert!(calls[0].contains("--model haiku"));
+    assert!(calls[0].contains("--effort low"));
     assert!(calls[0].contains("--append-system-prompt You are working in a git worktree"));
     // The transcript: GitEZ's header, then the agent's lines.
     let transcripts = fixture.transcripts(&id);

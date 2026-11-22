@@ -326,6 +326,10 @@ pub struct AgentThread {
     pub agent: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The effort level asked for, such as `high`; `None`: the agent's
+    /// default for the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     #[serde(default, skip_serializing_if = "Mode::is_implement")]
     pub mode: Mode,
     /// A Discuss thread started as Auto: its agent may answer with a brief
@@ -408,6 +412,7 @@ pub struct NewAgentThread {
     pub prompt: String,
     pub agent: String,
     pub model: Option<String>,
+    pub effort: Option<String>,
     pub mode: Mode,
     /// For [`Mode::Discuss`]: started as Auto ([`AgentThread::auto`]).
     pub auto: bool,

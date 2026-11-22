@@ -152,7 +152,7 @@ Decided 2026-10-23; change only with the owner's agreement.
     is never shown. GitEZ then starts the Implement thread itself, without
     asking, through `AgentThreads::start`'s path (the brief as prompt, its
     `# heading` as title, `origin` set, the discussion's branch at its
-    current tip, its agent, model, network and secrets). It first claims
+    current tip, its agent, model, effort, network and secrets). It first claims
     the turn's handoff under the thread's lock (`claim_handoff`), then
     records the new thread's id (or why none started, such as a branch
     that is gone) in it, so each marked turn starts at most one thread,

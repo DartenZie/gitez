@@ -1419,6 +1419,8 @@ struct Launch {
     agent: Arc<dyn Agent>,
     config: AgentConfig,
     model: Option<String>,
+    /// The entry's default effort; `None`: the agent's own default.
+    effort: Option<String>,
 }
 
 impl Launch {
@@ -1438,6 +1440,7 @@ impl Launch {
                             .unwrap_or_else(|| agent.default_model().to_owned()),
                     )
                     .filter(|alias| !alias.is_empty()),
+                    effort: entry.effort.filter(|effort| !effort.is_empty()),
                     agent,
                 })
             }
@@ -1445,6 +1448,7 @@ impl Launch {
                 let agent = Registry::builtin().get(id)?;
                 Some(Self {
                     model: Some(agent.default_model().to_owned()).filter(|alias| !alias.is_empty()),
+                    effort: None,
                     agent,
                     config: AgentConfig::default(),
                 })
@@ -1491,6 +1495,7 @@ impl AgentRun {
                 thread_agent.as_ref(),
                 &launch.config,
                 launch.model.as_deref(),
+                launch.effort.as_deref(),
                 &prompt,
                 &dir,
             ) {
@@ -1654,6 +1659,7 @@ fn start(
     agent: &dyn Agent,
     config: &AgentConfig,
     model: Option<&str>,
+    effort: Option<&str>,
     prompt: &str,
     dir: &std::path::Path,
 ) -> gitez_agent::Result<AgentProcess> {
@@ -1666,6 +1672,7 @@ fn start(
             cwd: dir,
             shared_folder: false,
             model,
+            effort,
             conversation: Conversation::New {
                 session_id: &session_id,
             },
@@ -1705,6 +1712,7 @@ mod tests {
             env: BTreeMap::from([("HTTPS_PROXY".to_owned(), "http://proxy:3128".to_owned())]),
             args: vec!["--verbose".into()],
             model: Some("haiku".into()),
+            effort: None,
         };
         Settings {
             agents: BTreeMap::from([(gitez_agent::ClaudeCode::ID.to_owned(), entry.clone())]),

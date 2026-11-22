@@ -142,6 +142,8 @@ struct Context {
     config: AgentConfig,
     /// The agent entry's default model, when the thread has none.
     model: Option<String>,
+    /// The agent entry's default effort, when the thread has none.
+    effort: Option<String>,
 }
 
 struct Pipeline<'a> {
@@ -279,6 +281,7 @@ impl Pipeline<'_> {
             agent,
             config,
             model: entry.model.filter(|model| !model.is_empty()),
+            effort: entry.effort.filter(|effort| !effort.is_empty()),
         })
     }
 
@@ -651,6 +654,12 @@ impl Pipeline<'_> {
             .clone()
             .filter(|model| !model.is_empty())
             .or_else(|| context.model.clone());
+        let effort = self
+            .thread
+            .effort
+            .clone()
+            .filter(|effort| !effort.is_empty())
+            .or_else(|| context.effort.clone());
         // The images go with the prompt, read from the thread's folder.
         if !turn.images.is_empty() && !agent.accepts_images(model.as_deref()) {
             return Err(failed(format!(
@@ -688,6 +697,7 @@ impl Pipeline<'_> {
             // tree too.
             shared_folder: place.read_only(),
             model: model.as_deref(),
+            effort: effort.as_deref(),
             conversation,
             system_prompt: Some(&system_prompt),
         };
@@ -725,6 +735,7 @@ impl Pipeline<'_> {
                     session_id: Some(session_id.clone()),
                     resume: turn.resume,
                     model: model.clone(),
+                    effort: effort.clone(),
                     network: self.thread.network,
                     images: turn.images.iter().map(|image| image.name.clone()).collect(),
                 },

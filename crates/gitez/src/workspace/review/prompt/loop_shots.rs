@@ -190,6 +190,7 @@ fn start(
         prompt: prompt.into(),
         agent: gitez_agent::ClaudeCode::ID.into(),
         model: model.map(str::to_owned),
+        effort: None,
         mode: gitez_agent_thread::Mode::Implement,
         auto: false,
         start: gitez_agent_thread::Start {

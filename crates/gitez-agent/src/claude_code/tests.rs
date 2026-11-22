@@ -143,6 +143,7 @@ fn run<'a>(conversation: Conversation<'a>, cwd: &'a Path) -> RunSpec<'a> {
         cwd,
         shared_folder: false,
         model: Some("haiku"),
+        effort: Some("high"),
         conversation,
         system_prompt: Some("Commit as you go."),
     }
@@ -172,6 +173,8 @@ fn a_new_conversation_has_its_arguments_in_order() {
             r#"{"sandbox":{"enabled":false}}"#,
             "--model",
             "haiku",
+            "--effort",
+            "high",
             "--session-id",
             "s-1",
             "--append-system-prompt",
@@ -208,6 +211,8 @@ fn a_resumed_conversation_without_extras() {
     config.env.clear();
     let mut run = run(Conversation::Resume { session_id: "s-1" }, dir.path());
     run.model = Some("");
+    // A level Claude Code does not know is left out, not passed on.
+    run.effort = Some("extreme");
     run.system_prompt = None;
     let command = ClaudeCode.command(&config, &run).expect("command");
     assert_eq!(
@@ -215,6 +220,7 @@ fn a_resumed_conversation_without_extras() {
         ["--resume", "s-1"]
     );
     run.model = None;
+    run.effort = None;
     let command = ClaudeCode.command(&config, &run).expect("command");
     assert_eq!(
         command.args[ARGS.len() + SANDBOX_OFF.len()..],

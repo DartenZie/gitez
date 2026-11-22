@@ -334,6 +334,7 @@ pub(crate) fn thread_in_mode(
                 prompt: prompt.into(),
                 agent: gitez_agent::ClaudeCode::ID.into(),
                 model: None,
+                effort: None,
                 start: Start {
                     branch: "main".into(),
                     commit: head,

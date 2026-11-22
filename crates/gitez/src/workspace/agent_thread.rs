@@ -917,27 +917,41 @@ pub fn can_complete(thread: &AgentThread) -> bool {
     thread.state == State::Finished && thread.pull_request.is_none()
 }
 
+/// The model the thread runs with, as its agent names it ("Opus"), or the
+/// alias stored when the agent does not know it, followed by the effort
+/// level asked for ("Opus · High effort"); `None` for a thread that
+/// recorded neither.
+pub fn model_label(agents: &Registry, thread: &AgentThread) -> Option<SharedString> {
+    let agent = agents.get(&thread.agent);
+    let named = |value: &Option<String>, choices: &[(&'static str, &'static str)]| {
+        let value = value.as_deref().filter(|value| !value.is_empty())?;
+        Some(
+            choices
+                .iter()
+                .find(|(known, _)| *known == value)
+                .map_or(value, |(_, label)| *label)
+                .to_owned(),
+        )
+    };
+    let model = named(
+        &thread.model,
+        agent.as_ref().map_or(&[], |agent| agent.models()),
+    );
+    let effort = named(
+        &thread.effort,
+        agent.as_ref().map_or(&[], |agent| agent.efforts()),
+    )
+    .map(|effort| format!("{effort} effort"));
+    let label = match (model, effort) {
+        (Some(model), Some(effort)) => format!("{model} · {effort}"),
+        (model, effort) => model.or(effort)?,
+    };
+    Some(label.into())
+}
+
 /// The hosts the sandbox refused in `thread`'s last run that ended, split
 /// by its agent's [`gitez_agent::Agent::optional_hosts`]: only
 /// [`BlockedHosts::problems`] count, colour a line or change a suggestion.
-/// The model the thread runs with, as its agent names it ("Opus"), or the
-/// alias stored when the agent does not know it; `None` for a thread that
-/// recorded no model.
-pub fn model_label(agents: &Registry, thread: &AgentThread) -> Option<SharedString> {
-    let alias = thread.model.as_deref().filter(|alias| !alias.is_empty())?;
-    let label = agents
-        .get(&thread.agent)
-        .and_then(|agent| {
-            agent
-                .models()
-                .iter()
-                .find(|(known, _)| *known == alias)
-                .map(|(_, label)| *label)
-        })
-        .unwrap_or(alias);
-    Some(SharedString::from(label.to_owned()))
-}
-
 pub fn blocked_hosts<'a>(thread: &'a AgentThread, agents: &Registry) -> BlockedHosts<'a> {
     let hosts = thread
         .turns
@@ -3037,6 +3051,7 @@ mod tests {
                     prompt: prompt.into(),
                     agent: gitez_agent::ClaudeCode::ID.into(),
                     model: Some("opus".into()),
+                    effort: None,
                     start: Start {
                         branch: "main".into(),
                         commit,
@@ -3065,6 +3080,7 @@ mod tests {
                     session_id: None,
                     resume: false,
                     model: None,
+                    effort: None,
                     network: NetworkProfile::AgentOnly,
                     images: Vec::new(),
                 },
@@ -3688,6 +3704,17 @@ mod tests {
         assert_eq!(model_label(&agents, &thread), None);
         thread.model = None;
         assert_eq!(model_label(&agents, &thread), None);
+        // The effort asked for follows the model.
+        thread.effort = Some("xhigh".into());
+        assert_eq!(
+            model_label(&agents, &thread).as_deref(),
+            Some("Extra high effort")
+        );
+        thread.model = Some("opus".into());
+        assert_eq!(
+            model_label(&agents, &thread).as_deref(),
+            Some("Opus · Extra high effort")
+        );
     }
 
     fn minutes_ago(minutes: i64) -> Timestamp {
