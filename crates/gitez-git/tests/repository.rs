@@ -1651,6 +1651,51 @@ fn merge_preview_finds_the_files_that_would_conflict() {
     assert_eq!(fixture.git(&["status", "--porcelain"]), "");
 }
 
+/// What a squash credits: the other authors of the branch's commits and
+/// their co-authors, each once, oldest first, never the user.
+#[test]
+fn merge_preview_lists_who_else_wrote_the_branch() {
+    let fixture = Fixture::new();
+    fixture.git(&["config", "user.name", "Ada Lovelace"]);
+    fixture.git(&["config", "user.email", "ada@example.com"]);
+    fixture.commit(
+        "shared.txt",
+        "shared\n\nCo-authored-by: Linus <linus@example.com>",
+    );
+    let base = fixture.rev("HEAD");
+    fixture.git(&["checkout", "--quiet", "-b", "feature"]);
+    fixture.commit(
+        "a.txt",
+        "Ada's\n\nCo-authored-by: Claude <noreply@anthropic.com>\n\
+         Co-authored-by: Ada L. <ADA@example.com>",
+    );
+    std::fs::write(fixture.root.join("b.txt"), "b\n").expect("write");
+    fixture.git(&["add", "b.txt"]);
+    fixture.git(&[
+        "commit",
+        "--quiet",
+        "--author",
+        "Grace Hopper <grace@example.com>",
+        "-m",
+        "Grace's\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+    ]);
+    let head = fixture.rev("HEAD");
+
+    let preview = fixture.open().merge_preview(base, head).expect("preview");
+    let people: Vec<(&str, &str)> = preview
+        .co_authors
+        .iter()
+        .map(|person| (person.name.as_str(), person.email.as_str()))
+        .collect();
+    assert_eq!(
+        people,
+        [
+            ("Claude", "noreply@anthropic.com"),
+            ("Grace Hopper", "grace@example.com")
+        ]
+    );
+}
+
 #[test]
 fn a_merge_stopped_by_conflicts_is_read() {
     let fixture = Fixture::new();

@@ -6,7 +6,8 @@ use gix::merge::tree::TreatAsUnresolved;
 use gix::object::tree::EntryMode;
 use gix::object::tree::diff::Change;
 
-use crate::{Error, Oid, Repository, Result};
+use crate::details::{add_co_author, add_co_authors};
+use crate::{CoAuthor, Error, Oid, Order, Repository, Result};
 
 /// How a branch compares to the branch it would be merged into.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +22,11 @@ pub struct MergePreview {
     pub files: usize,
     /// The files a merge would leave with conflicts, in path order.
     pub conflicts: Vec<String>,
+    /// Who else wrote the branch's commits, oldest first: their authors
+    /// and the people their `Co-authored-by` trailers credit, but not the
+    /// user, who authors a squash. A squash commit credits them, as
+    /// GitHub's does.
+    pub co_authors: Vec<CoAuthor>,
 }
 
 impl Repository {
@@ -56,7 +62,46 @@ impl Repository {
             behind,
             files: self.changed_files(base, head)?,
             conflicts,
+            co_authors: self.co_authors_since(base, head)?,
         })
+    }
+
+    /// The authors and co-authors of the commits of `head` that `base`
+    /// lacks, oldest first, without the user (the author git gives a new
+    /// commit: `user.name` and `user.email`, or `GIT_AUTHOR_*`).
+    fn co_authors_since(&self, base: Oid, head: Oid) -> Result<Vec<CoAuthor>> {
+        let commits = self
+            .walk_excluding([head], [base], Order::Topo)?
+            .collect::<Result<Vec<_>>>()?;
+        let repo = self.local();
+        let mut co_authors = Vec::new();
+        // The user goes in first so that nobody with their email is added,
+        // and is taken out at the end.
+        if let Some(Ok(user)) = repo.author() {
+            add_co_author(
+                &mut co_authors,
+                CoAuthor {
+                    name: user.name.to_str_lossy().into_owned(),
+                    email: user.email.to_str_lossy().into_owned(),
+                },
+            );
+        }
+        let user = co_authors.len();
+        for commit in commits.into_iter().rev() {
+            add_co_author(
+                &mut co_authors,
+                CoAuthor {
+                    name: commit.author.name,
+                    email: commit.author.email,
+                },
+            );
+            let object = repo.find_commit(commit.id)?;
+            if let Some(body) = object.decode()?.message().body() {
+                add_co_authors(&mut co_authors, &body);
+            }
+        }
+        co_authors.drain(..user);
+        Ok(co_authors)
     }
 
     /// How many files commit `head` changes since it left commit `base`,

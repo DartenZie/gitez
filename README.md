@@ -60,6 +60,9 @@ changes nothing until you tell it to implement.
   transcript of each run.
 - Merge into the base with a merge commit, a squash, a rebase or a
   fast-forward. GitEZ warns you about conflicting files before the merge starts.
+  A squash commit credits the other authors of the branch's commits, and the
+  people in their `Co-authored-by` trailers, with `Co-authored-by` trailers of
+  its own.
 - The sidebar lists and counts only the pull requests in review. Merged and
   closed ones are finished and are not shown. A closed pull request that you
   reopen, or a merge that you undo, puts it back in the list.
