@@ -165,6 +165,18 @@ What follows describes an Implement thread, unless it says otherwise.
   count means that the agent or a command could not reach a host that it
   probably needed, such as a package registry; **Retry with Packages** is
   then offered when the Packages profile allows that host.
+- **Change a thread's network**: the profile in the sandbox line is a menu.
+  Pick another profile to continue the thread where it left off, in the same
+  conversation, instead of starting it again. The agent is told that the
+  network changed, and to try again what was blocked:
+  - **Continue with …** for a thread that ended with a pull request or an
+    answer (for example, one that could not download its dependencies).
+  - **Retry with …** for a thread that failed or was stopped, as Retry does.
+  - **Restart with …** for a thread that is queued or running: GitEZ stops it,
+    then continues it under the new profile.
+
+  The hosts that Packages allows come from Settings when the run starts, so
+  after you correct that list, continuing a thread uses the new list.
 - At most three agents run at once across all repositories (you can change
   the limit in Settings); other threads wait as Queued. A thread that reaches
   the agent's usage limit waits and continues by itself after the reset.

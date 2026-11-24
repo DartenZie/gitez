@@ -222,6 +222,15 @@ Decided 2026-10-23; change only with the owner's agreement.
     namespace on Linux, untested). Claude Code's own Bash sandbox is turned
     off (`--settings '{"sandbox":{"enabled":false}}'`): it cannot nest. No
     JavaScript ships with GitEZ; `srt` is an external program.
+  - A thread's network can change after it started (decided 2026-11-24),
+    from the profile in the thread view's sandbox line. The change never
+    starts over: `AgentThread::request_network_change` sets `network` and
+    queues a Retry turn that resumes the conversation with
+    `network_changed_prompt` (for a failed or stopped thread it is
+    `request_retry`, with that prompt when it continues). An active thread
+    is stopped first (`AgentThreads::change_network` waits up to 60 s for
+    it to end), then continued. A completed thread, or one that ended
+    without a conversation, cannot change.
   - A thread's worktree is hostile once the agent has run in it. The policy
     lets the agent write its worktree, the object store, its own branch's
     ref, reflog and lock, `packed-refs.lock`, its own `tmp/` and `caches/`
