@@ -191,6 +191,7 @@ fn start(
         agent: gitez_agent::ClaudeCode::ID.into(),
         model: model.map(str::to_owned),
         account: None,
+        effort: None,
         mode: gitez_agent_thread::Mode::Implement,
         auto: false,
         start: gitez_agent_thread::Start {

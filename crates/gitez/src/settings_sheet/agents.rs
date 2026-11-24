@@ -1,12 +1,14 @@
 //! Agent entries: for each agent GitEZ knows, whether it is installed and
 //! signed in, and the fields of its entry (binary, configuration folder,
-//! environment, launch arguments, default model). GitEZ never handles the
+//! environment, launch arguments, default model and effort). GitEZ never handles the
 //! login: it asks the agent (`claude auth status --json`, only whether it
 //! is signed in) and says how to sign in.
 
 use std::path::PathBuf;
 
-use gitez_agent::{Availability, ClaudeCode, ConfigDir, ConfigDirSource, LoginStatus, ModelChoice};
+use gitez_agent::{
+    Availability, ClaudeCode, ConfigDir, ConfigDirSource, EffortChoice, LoginStatus, ModelChoice,
+};
 use gitez_settings::AgentEntry;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::*;
@@ -27,6 +29,8 @@ pub(super) struct AgentForm {
     models: &'static [ModelChoice],
     /// The model used while Settings name none.
     default_model: &'static str,
+    /// Empty: the agent takes no effort level.
+    efforts: &'static [EffortChoice],
     program: Entity<InputState>,
     config_dir: Entity<InputState>,
     env: Entity<TextareaState>,
@@ -131,6 +135,7 @@ impl AgentForm {
                     name: agent.name(),
                     models: agent.models(),
                     default_model: agent.default_model(),
+                    efforts: agent.efforts(),
                     program,
                     config_dir,
                     env,
@@ -215,6 +220,17 @@ impl SettingsSheet {
         self.model.update(cx, |threads, cx| {
             threads.update_settings(
                 |settings| settings.agents.entry(id.to_owned()).or_default().model = model,
+                cx,
+            );
+        });
+    }
+
+    /// Empty `level`: none, the agent picks one for the model.
+    fn set_agent_effort(&mut self, id: &'static str, level: &str, cx: &mut Context<Self>) {
+        let effort = (!level.is_empty()).then(|| level.to_owned());
+        self.model.update(cx, |threads, cx| {
+            threads.update_settings(
+                |settings| settings.agents.entry(id.to_owned()).or_default().effort = effort,
                 cx,
             );
         });
@@ -530,6 +546,7 @@ impl SettingsSheet {
             .find(|(alias, _)| *alias == chosen)
             .map_or_else(|| chosen.clone(), |(_, label)| (*label).to_owned());
         let models = form.models;
+        let effort_view = view.clone();
         let id = form.id;
         let model_picker = Button::new(("agent-model", index))
             .compact()
@@ -551,6 +568,47 @@ impl SettingsSheet {
                 }
                 menu
             });
+        let effort_picker = (!form.efforts.is_empty()).then(|| {
+            let efforts = form.efforts;
+            let chosen = self
+                .model
+                .read(cx)
+                .settings()
+                .agent(id)
+                .effort
+                .filter(|effort| efforts.iter().any(|(level, _)| level == effort))
+                .unwrap_or_default();
+            let chosen_label = efforts
+                .iter()
+                .find(|(level, _)| *level == chosen)
+                .map_or("Agent’s default", |(_, label)| *label);
+            let view = effort_view;
+            Button::new(("agent-effort", index))
+                .compact()
+                .h(px(28.))
+                .px(px(8.))
+                .min_w(px(160.))
+                .text_size(px(12.))
+                .dropdown_caret(true)
+                .child(div().flex_1().text_left().child(chosen_label))
+                .dropdown_menu(move |mut menu, _, _| {
+                    let choices =
+                        std::iter::once(("", "Agent’s default")).chain(efforts.iter().copied());
+                    for (level, label) in choices {
+                        let view = view.clone();
+                        menu =
+                            menu.item(PopupMenuItem::new(label).checked(level == chosen).on_click(
+                                move |_, _, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.set_agent_effort(id, level, cx)
+                                    })
+                                    .ok();
+                                },
+                            ));
+                    }
+                    menu
+                })
+        });
 
         card()
             .child(header)
@@ -582,6 +640,7 @@ impl SettingsSheet {
             ))
             .child(kv_row("Arguments", input(&form.args)))
             .child(kv_row("Default model", model_picker))
+            .children(effort_picker.map(|picker| kv_row("Default effort", picker)))
             .when_some(form.error.clone(), |this, error| {
                 this.child(div().px(px(12.)).py(px(8.)).child(error_text(error)))
             })

@@ -7,6 +7,7 @@ use gitez_git::{
     ChangeKind, CoAuthor, Commit, CommitDetails, FileChange, LineCounts, Oid, RefLabel, Repository,
 };
 use gpui_kit::assets::IconName;
+use gpui_kit::base::SelectableText;
 use gpui_kit::component::button::*;
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::tooltip::Tooltip;
@@ -336,7 +337,10 @@ fn header(
                 .text_size(px(17.))
                 .line_height(relative(1.35))
                 .font_weight(FontWeight::SEMIBOLD)
-                .child(commit.summary.clone()),
+                .child(SelectableText::new(
+                    SharedString::from(format!("commit-summary-{}", commit.id)),
+                    commit.summary.clone(),
+                )),
         )
         .when_some(body, |this, body| {
             this.child(
@@ -620,4 +624,113 @@ fn file_row(
                     .children(count("−", lines.removed, color::DIFF_REMOVED)),
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    // Not everything: `gpui_kit::test` would replace `#[test]`.
+    use gitez_git::{Commit, CommitDetails, Oid, Signature, Timestamp};
+    use gpui_kit::component::Root;
+    use gpui_kit::{
+        AppContext as _, Context, FocusHandle, InteractiveElement as _, IntoElement, Modifiers,
+        MouseButton, ParentElement as _, Render, Styled as _, TestAppContext, VisualTestContext,
+        Window, div, point, px, size,
+    };
+
+    use super::header;
+
+    const SUMMARY: &str = "Fix the frobnicator";
+    const BODY: &str = "It no longer frobs twice.";
+
+    /// A window with the header of one commit alone.
+    struct Host {
+        focus: FocusHandle,
+        commit: Commit,
+        details: CommitDetails,
+    }
+
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().track_focus(&self.focus).w(px(800.)).child(header(
+                &self.commit,
+                &[],
+                Some(&self.details),
+                "JetBrains Mono".into(),
+            ))
+        }
+    }
+
+    fn open(cx: &mut TestAppContext) -> VisualTestContext {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+        });
+        let id = Oid::from_hex(b"0123456789abcdef0123456789abcdef01234567").expect("valid id");
+        let signature = Signature {
+            name: "Ada".into(),
+            email: "ada@example.com".into(),
+            time: Timestamp::default(),
+        };
+        let window = cx.open_window(size(px(800.), px(400.)), |window, cx| {
+            let focus = cx.focus_handle();
+            window.focus(&focus, cx);
+            let host = cx.new(|_| Host {
+                focus,
+                commit: Commit {
+                    id,
+                    parents: Vec::new(),
+                    summary: SUMMARY.into(),
+                    author: signature.clone(),
+                    committed: Timestamp::default(),
+                },
+                details: CommitDetails {
+                    id,
+                    body: BODY.into(),
+                    committer: signature,
+                    co_authors: Vec::new(),
+                    signed: false,
+                    files: Vec::new(),
+                },
+            });
+            Root::new(host, window, cx)
+        });
+        VisualTestContext::from_window(window.into(), cx)
+    }
+
+    /// Drags across the line at `y`, copies the selection and returns it.
+    fn copy_line(cx: &mut VisualTestContext, y: f32) -> Option<String> {
+        cx.run_until_parked();
+        cx.simulate_mouse_down(
+            point(px(19.), px(y)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_move(
+            point(px(780.), px(y)),
+            Some(MouseButton::Left),
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            point(px(780.), px(y)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-c");
+        cx.read_from_clipboard().and_then(|item| item.text())
+    }
+
+    #[gpui_kit::test]
+    fn the_summary_can_be_selected_and_copied(cx: &mut TestAppContext) {
+        let mut cx = open(cx);
+        // Below the 16 px padding, the 24 px SHA row and the 12 px gap.
+        assert_eq!(copy_line(&mut cx, 63.).as_deref(), Some(SUMMARY));
+    }
+
+    #[gpui_kit::test]
+    fn the_description_can_be_selected_and_copied(cx: &mut TestAppContext) {
+        let mut cx = open(cx);
+        // Below the summary line and another 12 px gap.
+        assert_eq!(copy_line(&mut cx, 96.).as_deref(), Some(BODY));
+    }
 }

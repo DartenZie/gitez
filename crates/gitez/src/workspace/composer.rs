@@ -226,6 +226,9 @@ struct RepositoryChoice {
     unavailable: Option<SharedString>,
 }
 
+/// The effort picker's choice that asks for no level.
+const DEFAULT_EFFORT: &str = "Default";
+
 /// The "Ask an agent" composer.
 pub struct Composer {
     mode: ComposerMode,
@@ -241,6 +244,9 @@ pub struct Composer {
     agent: String,
     /// `None`: the agent entry's default.
     model_alias: Option<String>,
+    /// `None`: the agent entry's default; empty: the agent's own default
+    /// for the model (none asked for).
+    effort: Option<String>,
     /// What the thread is for; `None`: the choice of the thread started
     /// last.
     choice: Option<ThreadChoice>,
@@ -312,6 +318,7 @@ impl Composer {
             focus_handle: cx.focus_handle(),
             agent,
             model_alias: None,
+            effort: None,
             choice: None,
             origin: None,
             from: None,
@@ -686,6 +693,25 @@ impl Composer {
     }
 
     /// The network profile of new threads, as set in Settings.
+    /// The effort level asked for: the one picked, else the one Settings
+    /// name; empty: none, the agent picks one for the model. Always empty
+    /// for an agent that takes no effort level, or a level it does not
+    /// offer.
+    pub(super) fn effort(&self, cx: &App) -> String {
+        let effort = self
+            .effort
+            .clone()
+            .or_else(|| self.settings(cx).agent(&self.agent).effort)
+            .unwrap_or_default();
+        let offered = self
+            .model
+            .read(cx)
+            .agents()
+            .get(&self.agent)
+            .is_some_and(|agent| agent.efforts().iter().any(|(level, _)| *level == effort));
+        if offered { effort } else { String::new() }
+    }
+
     pub(crate) fn network(&self, cx: &App) -> NetworkProfile {
         self.settings(cx).sandbox.default_network
     }
@@ -946,6 +972,7 @@ impl Composer {
         };
         let prompt = self.prompt.read(cx).value().trim().to_owned();
         let model = self.model_alias(cx);
+        let effort = self.effort(cx);
         let images = self.images.update(cx, |images, cx| images.take(cx));
         let request = StartRequest {
             work_dir: target.work_dir,
@@ -959,6 +986,7 @@ impl Composer {
                 .and_then(|account| account.as_ref().ok())
                 .filter(|_| self.agent == ClaudeCode::ID)
                 .cloned(),
+            effort: (!effort.is_empty()).then_some(effort),
             mode,
             auto: choice.is_auto(),
             start: Start {
@@ -1196,6 +1224,7 @@ impl Composer {
                             view.update(cx, |this, cx| {
                                 this.agent = id.to_owned();
                                 this.model_alias = None;
+                                this.effort = None;
                                 cx.notify();
                             })
                             .ok();
@@ -1266,6 +1295,55 @@ impl Composer {
                 }
                 menu
             })
+    }
+
+    /// "Effort": the agent's levels, and "Default" (none asked for). Left
+    /// out for an agent that takes no effort level.
+    fn render_effort_picker(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let efforts: Vec<(&'static str, &'static str)> = self
+            .model
+            .read(cx)
+            .agents()
+            .get(&self.agent)
+            .map(|agent| agent.efforts().to_vec())
+            .unwrap_or_default();
+        if efforts.is_empty() {
+            return None;
+        }
+        let chosen = self.effort(cx);
+        let label = efforts
+            .iter()
+            .find(|(level, _)| *level == chosen)
+            .map_or(DEFAULT_EFFORT, |(_, label)| *label);
+        let view = cx.entity().downgrade();
+        Some(
+            picker("composer-effort")
+                .child(
+                    div()
+                        .h_flex()
+                        .gap(px(6.))
+                        .child(picker_label("Effort"))
+                        .child(label),
+                )
+                .dropdown_menu(move |mut menu, _, _| {
+                    menu = menu.min_w(px(240.)).check_side(Side::Right).label("Effort");
+                    let choices = std::iter::once(("", DEFAULT_EFFORT)).chain(efforts.clone());
+                    for (level, label) in choices {
+                        let view = view.clone();
+                        menu =
+                            menu.item(PopupMenuItem::new(label).checked(level == chosen).on_click(
+                                move |_, _, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.effort = Some(level.to_owned());
+                                        cx.notify();
+                                    })
+                                    .ok();
+                                },
+                            ));
+                    }
+                    menu
+                }),
+        )
     }
 
     fn render_from_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1812,6 +1890,7 @@ impl Render for Composer {
             .when(home, |this| this.child(self.render_repository_picker(cx)))
             .child(self.render_agent_picker(cx))
             .child(self.render_model_picker(cx))
+            .children(self.render_effort_picker(cx))
             // A discussion reads what is checked out.
             .when(!discuss, |this| this.child(self.render_from_picker(cx)));
         let footer = div()
@@ -2122,7 +2201,10 @@ mod tests {
         });
         composer.update_in(&mut cx, |composer, window, cx| {
             composer.from = Some("main".into());
+            // Settings name no effort: none is asked for until one is picked.
+            assert_eq!(composer.effort(cx), "");
             composer.model_alias = Some("haiku".into());
+            composer.effort = Some("max".into());
             composer.set_prompt("Fix the typo in README. Keep it short.".into(), window, cx);
         });
         cx.run_until_parked();
@@ -2175,11 +2257,27 @@ mod tests {
         assert_eq!(request.network, NetworkProfile::default());
         assert_eq!(request.secrets, ["GITHUB_TOKEN"]);
         assert_eq!(request.model.as_deref(), Some("haiku"));
+        assert_eq!(request.effort.as_deref(), Some("max"));
         assert_eq!(request.prompt, "Fix the typo in README. Keep it short.");
         assert_eq!(request.repository_name, "repo");
         // The prompt is emptied for the next thread.
         composer.read_with(&cx, |composer, cx| {
             assert!(composer.prompt.read(cx).value().is_empty());
+        });
+    }
+
+    /// "Default" asks for no effort level, and a level the agent does not
+    /// offer (from an edited settings file) is never passed on.
+    #[gpui_kit::test]
+    fn the_effort_is_one_the_agent_offers_or_none(cx: &mut TestAppContext) {
+        let (composer, mut cx) = composer(cx);
+        composer.update_in(&mut cx, |composer, _, cx| {
+            composer.effort = Some("low".into());
+            assert_eq!(composer.effort(cx), "low");
+            composer.effort = Some(String::new());
+            assert_eq!(composer.effort(cx), "");
+            composer.effort = Some("extreme".into());
+            assert_eq!(composer.effort(cx), "");
         });
     }
 
@@ -2233,6 +2331,7 @@ mod tests {
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert!(cx.debug_bounds("composer-from").is_none());
         assert!(cx.debug_bounds("composer-model").is_some());
+        assert!(cx.debug_bounds("composer-effort").is_some());
         composer.update_in(&mut cx, |composer, window, cx| {
             assert_eq!(composer.thread_mode(cx), Mode::Discuss);
             assert_eq!(composer.problems(cx), []);

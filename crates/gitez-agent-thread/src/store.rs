@@ -50,6 +50,8 @@ pub struct RunHeader {
     pub session_id: Option<String>,
     pub resume: bool,
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     pub network: NetworkProfile,
     /// The names of the images sent with the prompt (never their data).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -262,6 +264,7 @@ impl Store {
             agent: new.agent,
             model: new.model,
             account: new.account,
+            effort: new.effort,
             mode: new.mode,
             auto: new.auto && discuss,
             state: State::Queued,

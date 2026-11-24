@@ -370,6 +370,10 @@ pub struct AgentThread {
     /// default account, refuses it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<Account>,
+    /// The effort level asked for, such as `high`; `None`: the agent's
+    /// default for the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     #[serde(default, skip_serializing_if = "Mode::is_implement")]
     pub mode: Mode,
     /// A Discuss thread started as Auto: its agent may answer with a brief
@@ -455,6 +459,7 @@ pub struct NewAgentThread {
     /// Resolved from the repository's choice when the thread is created;
     /// `None` leaves it to the supervisor (the default account).
     pub account: Option<Account>,
+    pub effort: Option<String>,
     pub mode: Mode,
     /// For [`Mode::Discuss`]: started as Auto ([`AgentThread::auto`]).
     pub auto: bool,
@@ -484,6 +489,30 @@ pub enum RetryPlan {
 /// conversation.
 pub const CONTINUE_PROMPT: &str =
     "GitEZ stopped your last run before it finished. Continue the task where you left off.";
+
+/// The prompt of a Retry turn that continues the conversation after the
+/// user changed the thread's network from `from` to `to`.
+pub fn network_changed_prompt(from: NetworkProfile, to: NetworkProfile) -> String {
+    let mut prompt = format!(
+        "GitEZ changed the network of your sandbox from {} to {}. Continue the task where you \
+         left off.",
+        from.label(),
+        to.label()
+    );
+    if network_rank(to) > network_rank(from) {
+        prompt.push_str(" Try again what the network blocked before.");
+    }
+    prompt
+}
+
+/// Orders the profiles by how much network they allow.
+fn network_rank(network: NetworkProfile) -> u8 {
+    match network {
+        NetworkProfile::AgentOnly => 0,
+        NetworkProfile::Packages => 1,
+        NetworkProfile::Open => 2,
+    }
+}
 
 /// The prompt of a [`TurnKind::Brief`] turn: what "Implement…" asks a
 /// Discuss thread for. The answer becomes the first prompt of an Implement
@@ -803,6 +832,9 @@ impl AgentThread {
                     {
                         (turn.prompt.clone(), turn.images.clone())
                     }
+                    _ if network != self.network => {
+                        (network_changed_prompt(self.network, network), Vec::new())
+                    }
                     _ => (CONTINUE_PROMPT.to_owned(), Vec::new()),
                 };
                 let mut turn = Turn::requested(TurnKind::Retry, prompt, true, at);
@@ -813,6 +845,39 @@ impl AgentThread {
         self.network = network;
         self.queue();
         Ok(plan)
+    }
+
+    /// Continues a Finished thread under another network. One that failed
+    /// or was stopped is retried ([`request_retry`](Self::request_retry));
+    /// one that ended as a pull request or an answer gets a Retry turn that
+    /// continues its conversation ([`network_changed_prompt`]), so the
+    /// agent picks up where it left off, now with what the old network
+    /// blocked. Refused when the network is the same, when the thread is
+    /// not Finished, or when the agent never started.
+    pub fn request_network_change(
+        &mut self,
+        network: NetworkProfile,
+        at: Timestamp,
+    ) -> Result<RetryPlan> {
+        self.check_finished()?;
+        if network == self.network {
+            return Err(Error::refused(format!(
+                "The thread already uses {}.",
+                network.label()
+            )));
+        }
+        if matches!(self.ending, Some(Ending::Failed | Ending::Stopped)) {
+            return self.request_retry(network, at);
+        }
+        if self.session_id.is_none() {
+            return Err(Error::refused(NEVER_STARTED));
+        }
+        let prompt = network_changed_prompt(self.network, network);
+        self.turns
+            .push(Turn::requested(TurnKind::Retry, prompt, true, at));
+        self.network = network;
+        self.queue();
+        Ok(RetryPlan::Continue)
     }
 
     /// Back to Queued for the supervisor to pick up.

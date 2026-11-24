@@ -197,6 +197,7 @@ pub struct StartRequest {
     /// later turn uses it. `None`: the default account, which the
     /// supervisor records.
     pub account: Option<Account>,
+    pub effort: Option<String>,
     pub mode: Mode,
     /// A Discuss thread started as Auto: its agent may hand off to an
     /// Implement thread ([`AgentThread::auto`]).
@@ -227,6 +228,33 @@ impl Global for AgentThreadsGlobal {}
 const WATCH_BATCH: Duration = Duration::from_millis(150);
 /// How often supervisors of active threads are checked for being alive.
 const LIVENESS_EVERY: Duration = Duration::from_secs(5);
+/// How often a network change checks whether the thread it stopped has
+/// ended.
+const RESTART_POLL: Duration = Duration::from_millis(250);
+/// How long a network change waits for the thread it stopped to end: the
+/// supervisor kills the agent 20 s after asking it to stop, then commits
+/// what it left.
+const RESTART_WAIT: Duration = Duration::from_secs(60);
+
+/// Asks the supervisor of `thread` (just loaded from `store`) to stop it.
+fn stop_thread(store: &Store, key: &AgentThreadKey, thread: &AgentThread) -> anyhow::Result<()> {
+    if !thread.state.is_active() {
+        bail!("The thread is not running.");
+    }
+    let Some(supervisor) = &thread.supervisor else {
+        bail!("The thread’s supervisor is still starting. Try again in a moment.");
+    };
+    match gitez_supervisor::stop(&store.thread_dir(&key.id), supervisor) {
+        Ok(()) => Ok(()),
+        Err(gitez_supervisor::StopError::NotRunning) => {
+            // It died: say so on the thread rather than wait for the next
+            // liveness check.
+            gitez_supervisor::reap_if_dead(store, &key.id, Timestamp::now())?;
+            bail!("The thread’s supervisor is not running any more.")
+        }
+        Err(error) => Err(error.into()),
+    }
+}
 /// Liveness checks between redraws that advance elapsed times (30 s).
 const REDRAW_EVERY_CHECKS: u32 = 6;
 /// Set to log what the model reads and reaps, to standard error.
@@ -734,6 +762,7 @@ impl AgentThreads {
                     agent: request.agent,
                     model: request.model,
                     account: request.account,
+                    effort: request.effort,
                     mode: request.mode,
                     auto: request.auto && request.mode == Mode::Discuss,
                     start: request.start,
@@ -862,22 +891,53 @@ impl AgentThreads {
         cx.background_executor().spawn(async move {
             let store = Store::new(&key.common_dir);
             let thread = store.load(&key.id)?;
-            if !thread.state.is_active() {
-                bail!("The thread is not running.");
+            stop_thread(&store, &key, &thread)
+        })
+    }
+
+    /// Continues the agent thread under `network`, where it left off
+    /// (`request_network_change`, then `gitez supervise retry`). A thread
+    /// that is still active is stopped first, and continues once its
+    /// supervisor has ended it; if that takes longer than
+    /// [`RESTART_WAIT`], it stays stopped and can be retried.
+    pub fn change_network(
+        &mut self,
+        key: &AgentThreadKey,
+        network: NetworkProfile,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        let launcher = self.launcher();
+        let changes = self.changes.clone();
+        let executor = cx.background_executor().clone();
+        let key = key.clone();
+        cx.background_executor().spawn(async move {
+            let store = Store::new(&key.common_dir);
+            let thread = store.load(&key.id)?;
+            if thread.network == network {
+                bail!("The thread already uses {}.", network.label());
             }
-            let Some(supervisor) = &thread.supervisor else {
-                bail!("The thread’s supervisor is still starting. Try again in a moment.");
-            };
-            match gitez_supervisor::stop(&store.thread_dir(&key.id), supervisor) {
-                Ok(()) => Ok(()),
-                Err(gitez_supervisor::StopError::NotRunning) => {
-                    // It died: say so on the thread rather than wait for
-                    // the next liveness check.
-                    gitez_supervisor::reap_if_dead(&store, &key.id, Timestamp::now())?;
-                    bail!("The thread’s supervisor is not running any more.")
+            if thread.state.is_active() {
+                stop_thread(&store, &key, &thread)?;
+                let started = std::time::Instant::now();
+                loop {
+                    executor.timer(RESTART_POLL).await;
+                    if !store.load(&key.id)?.state.is_active() {
+                        break;
+                    }
+                    if started.elapsed() > RESTART_WAIT {
+                        bail!(
+                            "The thread is taking long to stop. Retry it with {} once it has.",
+                            network.label()
+                        );
+                    }
                 }
-                Err(error) => Err(error.into()),
             }
+            let thread = store.update(&key.id, |thread| {
+                thread.request_network_change(network, Timestamp::now())?;
+                Ok(thread.clone())
+            })?;
+            changes.unbounded_send(vec![thread_file(&key)]).ok();
+            launcher.launch(&store, Command::Retry, &key, &thread)
         })
     }
 
@@ -2115,6 +2175,7 @@ fn claim_handoff(
         model: discussion.model,
         // The conversation's account, as its agent, network and secrets.
         account: discussion.account,
+        effort: discussion.effort,
         mode: Mode::Implement,
         auto: false,
         start: gitez_agent_thread::Start { branch, commit },
@@ -2282,6 +2343,7 @@ mod tests {
             agent: "claude-code".to_owned(),
             model: None,
             account: None,
+            effort: None,
             state,
             ending,
             created: at,
@@ -2550,6 +2612,7 @@ mod tests {
                     agent: "claude-code".into(),
                     model: None,
                     account: None,
+                    effort: None,
                     start: Start {
                         branch: "main".into(),
                         commit: start.clone(),
@@ -2740,6 +2803,7 @@ mod tests {
                     agent: "claude-code".into(),
                     model: Some("haiku".into()),
                     account: Some(work_account()),
+                    effort: None,
                     start: Start {
                         branch: "feature".into(),
                         commit: start,

@@ -171,26 +171,37 @@ impl Repository {
 
 /// The co-authors in the trailers of `body`, each person once.
 fn co_authors(body: &BodyRef<'_>) -> Vec<CoAuthor> {
-    let mut co_authors: Vec<CoAuthor> = Vec::new();
+    let mut co_authors = Vec::new();
+    add_co_authors(&mut co_authors, body);
+    co_authors
+}
+
+/// Adds the people credited in the `Co-authored-by` trailers of `body` to
+/// `co_authors`, leaving out those already in it.
+pub(crate) fn add_co_authors(co_authors: &mut Vec<CoAuthor>, body: &BodyRef<'_>) {
     for trailer in body.trailers() {
         if !trailer.token.eq_ignore_ascii_case(b"co-authored-by") {
             continue;
         }
-        let Some(co_author) = parse_co_author(&trailer.value.to_str_lossy()) else {
-            continue;
-        };
-        let known = co_authors.iter().any(|other| {
-            if co_author.email.is_empty() {
-                other.name == co_author.name
-            } else {
-                other.email.eq_ignore_ascii_case(&co_author.email)
-            }
-        });
-        if !known {
-            co_authors.push(co_author);
+        if let Some(co_author) = parse_co_author(&trailer.value.to_str_lossy()) {
+            add_co_author(co_authors, co_author);
         }
     }
-    co_authors
+}
+
+/// Adds `co_author` to `co_authors` unless someone with the same email (or,
+/// without one, the same name) is already in it.
+pub(crate) fn add_co_author(co_authors: &mut Vec<CoAuthor>, co_author: CoAuthor) {
+    let known = co_authors.iter().any(|other| {
+        if co_author.email.is_empty() {
+            other.name == co_author.name
+        } else {
+            other.email.eq_ignore_ascii_case(&co_author.email)
+        }
+    });
+    if !known {
+        co_authors.push(co_author);
+    }
 }
 
 /// Reads the value of a trailer, normally `Name <email>`.

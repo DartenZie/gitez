@@ -77,6 +77,9 @@ enum Busy {
     Completing,
     Replying,
     Retrying,
+    /// Continuing under another network, after stopping the thread when it
+    /// was still active.
+    ChangingNetwork,
     /// Asking a Discuss thread for its brief.
     Briefing,
 }
@@ -746,6 +749,21 @@ impl ThreadView {
         );
     }
 
+    fn change_network(
+        &mut self,
+        network: NetworkProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.run(
+            Busy::ChangingNetwork,
+            window,
+            cx,
+            move |model, key, cx| model.change_network(key, network, cx),
+            |this, _, _| this.retry_network = None,
+        );
+    }
+
     /// Whether the thread's agent and model take images, as the agent
     /// says.
     fn accepts_images(&self, thread: &AgentThread, cx: &App) -> Accepts {
@@ -917,27 +935,41 @@ pub fn can_complete(thread: &AgentThread) -> bool {
     thread.state == State::Finished && thread.pull_request.is_none()
 }
 
+/// The model the thread runs with, as its agent names it ("Opus"), or the
+/// alias stored when the agent does not know it, followed by the effort
+/// level asked for ("Opus · High effort"); `None` for a thread that
+/// recorded neither.
+pub fn model_label(agents: &Registry, thread: &AgentThread) -> Option<SharedString> {
+    let agent = agents.get(&thread.agent);
+    let named = |value: &Option<String>, choices: &[(&'static str, &'static str)]| {
+        let value = value.as_deref().filter(|value| !value.is_empty())?;
+        Some(
+            choices
+                .iter()
+                .find(|(known, _)| *known == value)
+                .map_or(value, |(_, label)| *label)
+                .to_owned(),
+        )
+    };
+    let model = named(
+        &thread.model,
+        agent.as_ref().map_or(&[], |agent| agent.models()),
+    );
+    let effort = named(
+        &thread.effort,
+        agent.as_ref().map_or(&[], |agent| agent.efforts()),
+    )
+    .map(|effort| format!("{effort} effort"));
+    let label = match (model, effort) {
+        (Some(model), Some(effort)) => format!("{model} · {effort}"),
+        (model, effort) => model.or(effort)?,
+    };
+    Some(label.into())
+}
+
 /// The hosts the sandbox refused in `thread`'s last run that ended, split
 /// by its agent's [`gitez_agent::Agent::optional_hosts`]: only
 /// [`BlockedHosts::problems`] count, colour a line or change a suggestion.
-/// The model the thread runs with, as its agent names it ("Opus"), or the
-/// alias stored when the agent does not know it; `None` for a thread that
-/// recorded no model.
-pub fn model_label(agents: &Registry, thread: &AgentThread) -> Option<SharedString> {
-    let alias = thread.model.as_deref().filter(|alias| !alias.is_empty())?;
-    let label = agents
-        .get(&thread.agent)
-        .and_then(|agent| {
-            agent
-                .models()
-                .iter()
-                .find(|(known, _)| *known == alias)
-                .map(|(_, label)| *label)
-        })
-        .unwrap_or(alias);
-    Some(SharedString::from(label.to_owned()))
-}
-
 pub fn blocked_hosts<'a>(thread: &'a AgentThread, agents: &Registry) -> BlockedHosts<'a> {
     let hosts = thread
         .turns
@@ -967,6 +999,29 @@ pub fn suggested_retry(
     } else {
         thread.network
     }
+}
+
+/// What picking `network` in the sandbox strip's menu does to `thread`,
+/// as the menu item says it: "Restart with …" while it is active (it is
+/// stopped, then continued), "Retry with …" when it failed or was
+/// stopped, "Continue with …" when it ended otherwise. `None` when it
+/// cannot continue: completed, or an ending other than a failure or a
+/// stop without a conversation to continue.
+pub fn network_change_label(thread: &AgentThread, network: NetworkProfile) -> Option<String> {
+    let verb = match thread.state {
+        State::Completed => return None,
+        State::Finished => {
+            if matches!(thread.ending, Some(Ending::Failed | Ending::Stopped)) {
+                "Retry"
+            } else if thread.session_id.is_some() {
+                "Continue"
+            } else {
+                return None;
+            }
+        }
+        _ => "Restart",
+    };
+    Some(format!("{verb} with {}", network.label()))
 }
 
 /// The strip's count of blocked requests: only the hosts the run may have
@@ -1722,6 +1777,64 @@ impl ThreadView {
         self.blocked_open.unwrap_or(!blocked.problems.is_empty())
     }
 
+    /// The thread's network profile: a menu that continues the thread
+    /// under another one ([`network_change_label`]), or only its name when
+    /// it cannot change (completed, or never started).
+    fn render_network(&self, thread: &AgentThread, cx: &mut Context<Self>) -> AnyElement {
+        let current = thread.network;
+        let choices: Vec<(NetworkProfile, String)> = NetworkProfile::ALL
+            .into_iter()
+            .filter(|&profile| profile != current)
+            .filter_map(|profile| {
+                network_change_label(thread, profile).map(|label| (profile, label))
+            })
+            .collect();
+        if choices.is_empty() {
+            return div().child(current.label()).into_any_element();
+        }
+        let busy = self.busy.as_ref().map(|(busy, _)| *busy);
+        let view = cx.entity().downgrade();
+        let mut tooltip = "Change the network and continue the thread where it left off, in the \
+                           same conversation"
+            .to_owned();
+        if let Some(warning) =
+            crate::workspace::toolbar::agents::wider_network_warning(current, NetworkProfile::Open)
+                .filter(|_| current != NetworkProfile::Open)
+        {
+            tooltip.push_str(". ");
+            tooltip.push_str(warning);
+        }
+        Button::new("thread-network")
+            .debug_selector(|| "thread-network".into())
+            .ghost()
+            .xsmall()
+            .label(current.label())
+            .dropdown_caret(true)
+            .loading(busy == Some(Busy::ChangingNetwork))
+            .disabled(busy.is_some())
+            .tooltip(tooltip)
+            .dropdown_menu(move |mut menu, _, _| {
+                menu = menu.min_w(px(240.)).label("Continue under");
+                menu = menu.item(
+                    PopupMenuItem::new(current.label())
+                        .checked(true)
+                        .disabled(true),
+                );
+                for (profile, label) in &choices {
+                    let view = view.clone();
+                    let profile = *profile;
+                    menu = menu.item(PopupMenuItem::new(label.clone()).on_click(
+                        move |_, window, cx| {
+                            view.update(cx, |this, cx| this.change_network(profile, window, cx))
+                                .ok();
+                        },
+                    ));
+                }
+                menu
+            })
+            .into_any_element()
+    }
+
     /// Sandbox profile, secrets and blocked requests. Only the hosts the
     /// run may have needed are counted, in the warning colour; the hosts
     /// the agent contacts on its own and does not need are listed apart,
@@ -1782,7 +1895,7 @@ impl ThreadView {
                             .text_color(rgb(color::TEXT_MUTED)),
                     )
                     .child(div().text_color(rgb(color::TEXT_MUTED)).child("Sandbox"))
-                    .child(thread.network.label()),
+                    .child(self.render_network(thread, cx)),
             )
             .when(!thread.secrets.is_empty(), |this| {
                 this.child(div().h_flex().flex_wrap().gap(px(6.)).children(
@@ -3050,6 +3163,7 @@ mod tests {
                     agent: gitez_agent::ClaudeCode::ID.into(),
                     model: Some("opus".into()),
                     account: None,
+                    effort: None,
                     start: Start {
                         branch: "main".into(),
                         commit,
@@ -3078,6 +3192,7 @@ mod tests {
                     session_id: None,
                     resume: false,
                     model: None,
+                    effort: None,
                     network: NetworkProfile::AgentOnly,
                     images: Vec::new(),
                 },
@@ -3386,6 +3501,87 @@ mod tests {
                 })
             ));
         });
+    }
+
+    /// The sandbox strip's menu names what changing the network does.
+    #[test]
+    fn the_network_menu_says_what_a_change_does() {
+        let (_dir, common_dir, id) = repository_with_thread(|_| {});
+        let mut thread = Store::new(&common_dir).load(&id).expect("load");
+        let open = NetworkProfile::Open;
+        thread.state = State::Running;
+        assert_eq!(
+            super::network_change_label(&thread, open).as_deref(),
+            Some("Restart with Open")
+        );
+        thread.state = State::Finished;
+        thread.ending = Some(Ending::PullRequest);
+        thread.session_id = Some("session".into());
+        assert_eq!(
+            super::network_change_label(&thread, open).as_deref(),
+            Some("Continue with Open")
+        );
+        thread.session_id = None;
+        assert_eq!(super::network_change_label(&thread, open), None);
+        thread.ending = Some(Ending::Failed);
+        assert_eq!(
+            super::network_change_label(&thread, open).as_deref(),
+            Some("Retry with Open")
+        );
+        thread.state = State::Completed;
+        assert_eq!(super::network_change_label(&thread, open), None);
+    }
+
+    /// A thread that ended with an answer continues its conversation under
+    /// the network picked in the sandbox strip.
+    #[gpui_kit::test]
+    fn changing_the_network_continues_a_finished_thread(cx: &mut TestAppContext) {
+        let (dir, common_dir, id) = repository_with_thread(|thread| {
+            thread.state = State::Finished;
+            thread.ending = Some(Ending::Answer);
+            thread.session_id = Some("session".into());
+            thread.turns[0].result = Some(result("cargo could not reach crates.io.", true));
+        });
+        let key = AgentThreadKey {
+            common_dir: common_dir.clone(),
+            id: id.clone(),
+        };
+        let (view, mut cx) = open_in_root(dir.path(), key, cx);
+        assert!(cx.debug_bounds("thread-network").is_some());
+        view.update_in(&mut cx, |view, window, cx| {
+            view.change_network(NetworkProfile::Packages, window, cx)
+        });
+        cx.run_until_parked();
+        // The turn is recorded. Tests have no supervisor to launch, so it
+        // fails at that step.
+        let thread = Store::new(&common_dir).load(&id).expect("load");
+        assert_eq!(thread.network, NetworkProfile::Packages);
+        let [_, retry] = &thread.turns[..] else {
+            panic!("two turns, got {}", thread.turns.len());
+        };
+        assert_eq!(retry.kind, TurnKind::Retry);
+        assert!(retry.resume);
+        assert_eq!(
+            retry.prompt,
+            gitez_agent_thread::network_changed_prompt(
+                NetworkProfile::AgentOnly,
+                NetworkProfile::Packages
+            )
+        );
+    }
+
+    /// A completed thread shows its network without a menu.
+    #[gpui_kit::test]
+    fn a_completed_thread_cannot_change_its_network(cx: &mut TestAppContext) {
+        let (dir, common_dir, id) = repository_with_thread(|thread| {
+            thread.state = State::Completed;
+            thread.ending = Some(Ending::Answer);
+            thread.session_id = Some("session".into());
+            thread.turns[0].result = Some(result("Done.", true));
+        });
+        let key = AgentThreadKey { common_dir, id };
+        let (_view, mut cx) = open(dir.path(), key, cx);
+        assert!(cx.debug_bounds("thread-network").is_none());
     }
 
     /// A thread whose commit a hook refused says what it left, why, and
@@ -3701,6 +3897,17 @@ mod tests {
         assert_eq!(model_label(&agents, &thread), None);
         thread.model = None;
         assert_eq!(model_label(&agents, &thread), None);
+        // The effort asked for follows the model.
+        thread.effort = Some("xhigh".into());
+        assert_eq!(
+            model_label(&agents, &thread).as_deref(),
+            Some("Extra high effort")
+        );
+        thread.model = Some("opus".into());
+        assert_eq!(
+            model_label(&agents, &thread).as_deref(),
+            Some("Opus · Extra high effort")
+        );
     }
 
     fn minutes_ago(minutes: i64) -> Timestamp {

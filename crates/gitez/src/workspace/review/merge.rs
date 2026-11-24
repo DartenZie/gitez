@@ -4,7 +4,7 @@
 //! when a branch is dropped on another in the history.
 
 use gitez_command::{Git, MergeMethod, MergeOutcome, ResetMode, WorktreeProblem};
-use gitez_git::{Head, MergePreview, Oid, RefKind, RefLabel, Repository};
+use gitez_git::{CoAuthor, Head, MergePreview, Oid, RefKind, RefLabel, Repository};
 use gitez_review::{PullRequest, State, Store, Timestamp};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::*;
@@ -148,7 +148,11 @@ impl MergeDialog {
         let merging = &self.merging;
         let number = merging.pull_request.as_ref().map(|pr| pr.number);
         let (head, base) = (merging.head.clone(), merging.base.clone());
-        let message = how.map(|how| message(merging, how, self.ahead()));
+        let co_authors = match &self.preview {
+            Some(Ok(preview)) => preview.co_authors.as_slice(),
+            _ => &[],
+        };
+        let message = how.map(|how| message(merging, how, self.ahead(), co_authors));
         let base_before = merging.base_tip;
         let label = match how {
             Some(_) => match number {
@@ -772,8 +776,9 @@ pub(crate) fn record_merge(
 }
 
 /// The commit message for merging `merging` the way `how` says, with
-/// `ahead` commits.
-fn message(merging: &Merging, how: MergeMethod, ahead: usize) -> String {
+/// `ahead` commits; a squash credits `co_authors` in `Co-authored-by`
+/// trailers, since the commits that named them are not kept.
+fn message(merging: &Merging, how: MergeMethod, ahead: usize, co_authors: &[CoAuthor]) -> String {
     let (head, base) = (&merging.head, &merging.base);
     let pull_request = merging.pull_request.as_ref();
     let description = pull_request.map_or("", |pull_request| pull_request.description.trim());
@@ -804,6 +809,15 @@ fn message(merging: &Merging, how: MergeMethod, ahead: usize) -> String {
             count(ahead, "commit", "commits"),
             head
         ));
+        if !co_authors.is_empty() {
+            message.push('\n');
+        }
+        for co_author in co_authors {
+            message.push_str(&match co_author.email.as_str() {
+                "" => format!("\nCo-authored-by: {}", co_author.name),
+                email => format!("\nCo-authored-by: {} <{email}>", co_author.name),
+            });
+        }
     }
     message
 }
@@ -824,7 +838,7 @@ mod tests {
     use std::path::Path;
 
     use gitez_command::{Git, MergeMethod};
-    use gitez_git::{Oid, Repository};
+    use gitez_git::{CoAuthor, Oid, Repository};
     use gitez_review::{NewPullRequest, State, Store, Timestamp, Tip};
 
     use super::{Carry, Done, MergedPullRequest, Merging, carry_out, message};
@@ -1012,14 +1026,38 @@ mod tests {
     #[test]
     fn merge_messages_name_the_pull_request() {
         assert_eq!(
-            message(&merging(""), MergeMethod::Merge, 2),
+            message(&merging(""), MergeMethod::Merge, 2, &[]),
             "Merge branch 'feature/review'\n\nLocal pull request #3: Anchor comments to hunks"
         );
         assert_eq!(
-            message(&merging("Why.\n"), MergeMethod::Squash, 2),
+            message(&merging("Why.\n"), MergeMethod::Squash, 2, &[]),
             "Anchor comments to hunks (#3)\n\nWhy.\n\nSquashed from 2 commits on feature/review."
         );
-        assert_eq!(message(&merging("Why."), MergeMethod::Rebase, 2), "");
+        assert_eq!(message(&merging("Why."), MergeMethod::Rebase, 2, &[]), "");
+    }
+
+    #[test]
+    fn a_squash_credits_the_co_authors_in_trailers() {
+        let co_authors = [
+            CoAuthor {
+                name: "Claude".into(),
+                email: "noreply@anthropic.com".into(),
+            },
+            CoAuthor {
+                name: "Grace Hopper".into(),
+                email: String::new(),
+            },
+        ];
+        assert_eq!(
+            message(&merging(""), MergeMethod::Squash, 2, &co_authors),
+            "Anchor comments to hunks (#3)\n\nSquashed from 2 commits on feature/review.\n\n\
+             Co-authored-by: Claude <noreply@anthropic.com>\nCo-authored-by: Grace Hopper"
+        );
+        // A merge commit keeps the commits that credit them.
+        assert_eq!(
+            message(&merging(""), MergeMethod::Merge, 2, &co_authors),
+            "Merge branch 'feature/review'\n\nLocal pull request #3: Anchor comments to hunks"
+        );
     }
 
     #[test]
@@ -1027,16 +1065,16 @@ mod tests {
         let mut branches = merging("");
         branches.pull_request = None;
         assert_eq!(
-            message(&branches, MergeMethod::Merge, 2),
+            message(&branches, MergeMethod::Merge, 2, &[]),
             "Merge branch 'feature/review'"
         );
         assert_eq!(
-            message(&branches, MergeMethod::Squash, 2),
+            message(&branches, MergeMethod::Squash, 2, &[]),
             "Squash branch 'feature/review'\n\nSquashed from 2 commits on feature/review."
         );
         branches.base = "develop".into();
         assert_eq!(
-            message(&branches, MergeMethod::Merge, 1),
+            message(&branches, MergeMethod::Merge, 1, &[]),
             "Merge branch 'feature/review' into develop"
         );
     }

@@ -25,8 +25,9 @@ use serde_json::{Value, json};
 use crate::login_shell::{join_path, login_shell_var};
 use crate::process::find_program;
 use crate::{
-    Agent, AgentConfig, AgentEvent, AgentNeeds, CommandSpec, ConfigDirChoice, Conversation, Error,
-    Finished, LoginStatus, ModelChoice, OptionalHost, Result, RunSpec, UsageLimit,
+    Agent, AgentConfig, AgentEvent, AgentNeeds, CommandSpec, ConfigDirChoice, Conversation,
+    EffortChoice, Error, Finished, LoginStatus, ModelChoice, OptionalHost, Result, RunSpec,
+    UsageLimit,
 };
 
 const PROGRAM: &str = "claude";
@@ -98,6 +99,16 @@ const MODELS: [ModelChoice; 4] = [
     ("opus", "Opus"),
     ("sonnet", "Sonnet"),
     ("haiku", "Haiku"),
+];
+
+/// What `claude --effort` takes (Claude Code 2.1.329). Without it Claude
+/// Code uses the model's default, or the user's own setting.
+const EFFORTS: [EffortChoice; 5] = [
+    ("low", "Low"),
+    ("medium", "Medium"),
+    ("high", "High"),
+    ("xhigh", "Extra high"),
+    ("max", "Max"),
 ];
 
 /// Claude Code's command-line agent.
@@ -251,6 +262,10 @@ impl Agent for ClaudeCode {
         "opus"
     }
 
+    fn efforts(&self) -> &'static [EffortChoice] {
+        &EFFORTS
+    }
+
     /// The agent entry's program; else `claude` on the `PATH` or where its
     /// installers put it. An app started from Finder does not get the
     /// shell's `PATH`.
@@ -298,6 +313,13 @@ impl Agent for ClaudeCode {
         }
         if let Some(model) = run.model.filter(|model| !model.is_empty()) {
             args.extend(["--model".into(), model.into()]);
+        }
+        // Only a level it knows: anything else would fail the run.
+        if let Some(effort) = run
+            .effort
+            .filter(|effort| EFFORTS.iter().any(|(level, _)| level == effort))
+        {
+            args.extend(["--effort".into(), effort.into()]);
         }
         match run.conversation {
             Conversation::New { session_id } => {

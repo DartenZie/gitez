@@ -128,6 +128,9 @@ pub struct RunSpec<'a> {
     pub shared_folder: bool,
     /// A model alias such as `haiku`; `None`: the agent's default.
     pub model: Option<&'a str>,
+    /// An effort level as in [`Agent::efforts`], such as `high`; `None`:
+    /// the agent's default for the model.
+    pub effort: Option<&'a str>,
     pub conversation: Conversation<'a>,
     /// Appended to the agent's system prompt, if it has one.
     pub system_prompt: Option<&'a str>,
@@ -164,6 +167,10 @@ pub enum LoginStatus {
 
 /// A model the agent can be asked for: (alias, label).
 pub type ModelChoice = (&'static str, &'static str);
+
+/// An effort level the agent can be asked for: (level, label), such as
+/// `("high", "High")`.
+pub type EffortChoice = (&'static str, &'static str);
 
 /// A host an agent contacts on its own that it does not need to do its
 /// work. The sandbox keeps blocking it; a blocked request to it is recorded
@@ -217,6 +224,12 @@ pub trait Agent: Send + Sync {
     /// [`Agent::models`], or empty (no model asked for) without any.
     fn default_model(&self) -> &'static str {
         self.models().first().map_or("", |(alias, _)| alias)
+    }
+    /// The effort levels offered, lowest first. Empty: the agent takes no
+    /// effort level, and [`RunSpec::effort`] is ignored. Not asking for
+    /// one leaves it to the agent, which picks one for the model.
+    fn efforts(&self) -> &'static [EffortChoice] {
+        &[]
     }
     /// The binary to run, or why there is none.
     fn locate(&self, config: &AgentConfig) -> Result<std::path::PathBuf>;

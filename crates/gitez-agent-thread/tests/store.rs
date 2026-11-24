@@ -426,6 +426,7 @@ fn header(started: &str) -> RunHeader {
         session_id: Some("6f1c2b8e".to_owned()),
         resume: false,
         model: Some("sonnet".to_owned()),
+        effort: Some("high".to_owned()),
         network: NetworkProfile::Packages,
         images: Vec::new(),
     }
@@ -472,7 +473,7 @@ fn transcripts_are_written_sorted_and_followed() {
         text,
         "{\"gitez\":\"run\",\"version\":1,\"started\":\"2026-11-13T09:41:31Z\",\"agent\":\"claude-code\",\
          \"prompt\":\"Add a blame view…\",\"kind\":\"start\",\"session_id\":\"6f1c2b8e\",\"resume\":false,\
-         \"model\":\"sonnet\",\"network\":\"packages\"}\n"
+         \"model\":\"sonnet\",\"effort\":\"high\",\"network\":\"packages\"}\n"
     );
 
     // Following the transcript while it is written.

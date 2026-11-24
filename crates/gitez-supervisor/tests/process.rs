@@ -514,6 +514,7 @@ fn each_repository_runs_its_agents_with_its_own_account() {
                 prompt: "And here?".to_owned(),
                 agent: gitez_agent::ClaudeCode::ID.to_owned(),
                 model: None,
+                effort: None,
                 account: Some(work),
                 mode: gitez_agent_thread::Mode::Implement,
                 auto: false,

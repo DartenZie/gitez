@@ -1644,6 +1644,7 @@ mod tests {
                     agent: gitez_agent::ClaudeCode::ID.into(),
                     model: None,
                     account: None,
+                    effort: None,
                     start: Start {
                         branch: "main".into(),
                         commit: "0".repeat(40),

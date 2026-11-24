@@ -195,6 +195,8 @@ impl Fixture {
                     "FAKE_LOG".to_owned(),
                     fake_log.to_string_lossy().into_owned(),
                 )]),
+                // Threads ask for none: the entry's is used.
+                effort: Some("low".to_owned()),
                 ..AgentEntry::default()
             },
         );
@@ -283,6 +285,7 @@ impl Fixture {
                     agent: ClaudeCode::ID.to_owned(),
                     model: Some("haiku".to_owned()),
                     account: None,
+                    effort: None,
                     mode,
                     auto,
                     start: Start {

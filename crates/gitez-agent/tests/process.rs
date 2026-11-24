@@ -42,6 +42,7 @@ fn command(dir: &TempDir, script: &Path, prompt: &str) -> CommandSpec {
                 cwd: dir.path(),
                 shared_folder: false,
                 model: None,
+                effort: None,
                 conversation: Conversation::New { session_id: "s-1" },
                 system_prompt: None,
             },
@@ -341,6 +342,7 @@ fn another_agent_runs_through_the_registry() {
         cwd: dir.path(),
         shared_folder: false,
         model: None,
+        effort: None,
         conversation: Conversation::New { session_id: "s-1" },
         system_prompt: None,
     };

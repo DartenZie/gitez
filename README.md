@@ -60,6 +60,9 @@ changes nothing until you tell it to implement.
   transcript of each run.
 - Merge into the base with a merge commit, a squash, a rebase or a
   fast-forward. GitEZ warns you about conflicting files before the merge starts.
+  A squash commit credits the other authors of the branch's commits, and the
+  people in their `Co-authored-by` trailers, with `Co-authored-by` trailers of
+  its own.
 - The sidebar lists and counts only the pull requests in review. Merged and
   closed ones are finished and are not shown. A closed pull request that you
   reopen, or a merge that you undo, puts it back in the list.
@@ -93,7 +96,8 @@ What follows describes an Implement thread, unless it says otherwise.
 - **Start a thread** from the "Ask an agent…" row under the uncommitted
   changes in the history (`⌘⇧A`, or File > Ask an Agent…), or from Home.
   Write the prompt, choose **Discuss**, **Auto** or **Implement**, and pick the agent,
-  the model and the branch to start from. The thread gets the network
+  the model, the effort level (Claude Code's `--effort`; **Default** leaves
+  it to the model) and the branch to start from. The thread gets the network
   profile and the default secrets set in Settings. An Implement thread starts from the branch's
   last commit; your uncommitted changes are not included. A Discuss thread
   reads the branch you have checked out, so it has no branch to pick and
@@ -109,7 +113,7 @@ What follows describes an Implement thread, unless it says otherwise.
 - **Auto handoff**: in an Auto thread, any answer can be a brief, also one
   to a reply such as "ok, do it". GitEZ starts one Implement thread from
   each such brief, from the last commit of the branch the discussion read,
-  with the same agent, model, network profile and secrets, and the heading
+  with the same agent, model, effort, network profile and secrets, and the heading
   of the brief as its title. The agent says in the brief when the change
   depends on your uncommitted changes, which the new thread does not see.
   If GitEZ was closed when the brief arrived, it starts the thread at its
@@ -161,6 +165,18 @@ What follows describes an Implement thread, unless it says otherwise.
   count means that the agent or a command could not reach a host that it
   probably needed, such as a package registry; **Retry with Packages** is
   then offered when the Packages profile allows that host.
+- **Change a thread's network**: the profile in the sandbox line is a menu.
+  Pick another profile to continue the thread where it left off, in the same
+  conversation, instead of starting it again. The agent is told that the
+  network changed, and to try again what was blocked:
+  - **Continue with …** for a thread that ended with a pull request or an
+    answer (for example, one that could not download its dependencies).
+  - **Retry with …** for a thread that failed or was stopped, as Retry does.
+  - **Restart with …** for a thread that is queued or running: GitEZ stops it,
+    then continues it under the new profile.
+
+  The hosts that Packages allows come from Settings when the run starts, so
+  after you correct that list, continuing a thread uses the new list.
 - At most three agents run at once across all repositories (you can change
   the limit in Settings); other threads wait as Queued. A thread that reaches
   the agent's usage limit waits and continues by itself after the reset.
@@ -213,7 +229,8 @@ What follows describes an Implement thread, unless it says otherwise.
   repository where it is now to list its threads again.
 - **Settings** (`⌘,`, the app menu, or the gear in the Agents popover):
   - Claude Code's binary, configuration folder, environment variables,
-    launch arguments and default model, and whether it is signed in.
+    launch arguments, default model and default effort level, and whether it
+    is signed in.
   - Claude accounts. Claude Code keeps its login per configuration folder
     (`CLAUDE_CONFIG_DIR`), so each folder is an account. The **Default**
     account is the folder GitEZ always used: the one set for Claude Code,

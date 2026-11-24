@@ -5,8 +5,8 @@ mod common;
 use common::{EXAMPLE, at, worktree_of};
 use gitez_agent_thread::{
     AgentThread, AgentThreadId, BRIEF_PROMPT, CONTINUE_PROMPT, Ending, Error, HANDOFF_MARKER,
-    Handoff, Mode, RetryPlan, State, Step, SupervisorInfo, TurnKind, TurnResult, split_handoff,
-    without_handoff_marker,
+    Handoff, Mode, RetryPlan, State, Step, SupervisorInfo, TurnKind, TurnResult,
+    network_changed_prompt, split_handoff, without_handoff_marker,
 };
 use gitez_sandbox::NetworkProfile;
 
@@ -274,7 +274,10 @@ fn the_retry_plan_follows_the_failed_step_and_the_conversation() {
             RetryPlan::Continue => {
                 let turn = &thread.turns[1];
                 assert_eq!(turn.kind, TurnKind::Retry);
-                assert_eq!(turn.prompt, CONTINUE_PROMPT);
+                assert_eq!(
+                    turn.prompt,
+                    network_changed_prompt(NetworkProfile::Packages, NetworkProfile::Open)
+                );
                 assert!(turn.resume);
             }
         }
@@ -292,6 +295,73 @@ fn the_retry_plan_follows_the_failed_step_and_the_conversation() {
             expected
         );
     }
+}
+
+#[test]
+fn a_network_change_continues_a_finished_thread() {
+    let now = at("2026-11-13T10:05:00Z");
+    for ending in [Ending::PullRequest, Ending::Answer] {
+        let mut thread = finished(ending);
+        assert_eq!(thread.network, NetworkProfile::Packages);
+        assert_eq!(
+            thread
+                .request_network_change(NetworkProfile::Open, now)
+                .expect("a finished thread can change its network"),
+            RetryPlan::Continue
+        );
+        assert_eq!(thread.state, State::Queued);
+        assert_eq!(thread.ending, None);
+        assert_eq!(thread.network, NetworkProfile::Open);
+        let turn = thread.turns.last().expect("a turn");
+        assert_eq!(turn.kind, TurnKind::Retry);
+        assert!(turn.resume);
+        assert_eq!(
+            turn.prompt,
+            network_changed_prompt(NetworkProfile::Packages, NetworkProfile::Open)
+        );
+        assert!(turn.prompt.contains("Try again what the network blocked"));
+        assert_eq!(thread.pending_turn(), Some(1));
+    }
+
+    // Less network says nothing about what was blocked.
+    let narrower = network_changed_prompt(NetworkProfile::Open, NetworkProfile::AgentOnly);
+    assert!(
+        narrower.contains("from Open to Agent API only"),
+        "{narrower}"
+    );
+    assert!(!narrower.contains("blocked"), "{narrower}");
+
+    // A failed or stopped thread is retried under the new network.
+    let mut thread = finished(Ending::Answer);
+    thread.fail(Step::Agent, "It broke.", now);
+    assert_eq!(
+        thread
+            .request_network_change(NetworkProfile::Open, now)
+            .expect("retry"),
+        RetryPlan::Continue
+    );
+    assert_eq!(thread.network, NetworkProfile::Open);
+    assert_eq!(
+        thread.turns.last().expect("a turn").prompt,
+        network_changed_prompt(NetworkProfile::Packages, NetworkProfile::Open)
+    );
+
+    // Refusals: the same network, a running or completed thread, and a
+    // conversation that never started.
+    let mut thread = finished(Ending::Answer);
+    assert!(
+        refusal(thread.request_network_change(NetworkProfile::Packages, now))
+            .contains("already uses Packages")
+    );
+    let mut running = example();
+    refusal(running.request_network_change(NetworkProfile::Open, now));
+    thread.mark_completed(now).expect("complete");
+    refusal(thread.request_network_change(NetworkProfile::Open, now));
+    let mut thread = finished(Ending::Answer);
+    thread.session_id = None;
+    refusal(thread.request_network_change(NetworkProfile::Open, now));
+    assert_eq!(thread.network, NetworkProfile::Packages);
+    assert_eq!(thread.turns.len(), 1);
 }
 
 #[test]
@@ -452,7 +522,7 @@ fn a_retry_sends_the_images_of_the_prompt_it_sends_again() {
     let mut thread = finished(Ending::Stopped);
     thread.turns[0].images = vec![image("c-1.png")];
     thread
-        .request_retry(NetworkProfile::AgentOnly, now)
+        .request_retry(NetworkProfile::Packages, now)
         .expect("retry");
     let retry = thread.turns.last().expect("a turn");
     assert_eq!(retry.prompt, CONTINUE_PROMPT);
