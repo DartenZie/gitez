@@ -834,3 +834,22 @@ fn a_long_temporary_folder_gives_way_to_tmp() {
     let long = PathBuf::from(format!("/Users/someone/{}", "deep/".repeat(20)));
     assert_eq!(short_base(long), Path::new("/tmp"));
 }
+
+#[test]
+fn hosts_srt_cannot_read_are_left_out() {
+    let hosts = [
+        "api.anthropic.com".to_owned(),
+        "github-work".to_owned(),
+        "::1".to_owned(),
+        "[::1]".to_owned(),
+    ];
+    let settings = settings(
+        &policy(Vec::new(), Network::Hosts(hosts.to_vec())),
+        &hosts,
+        Os::Mac,
+    );
+    assert_eq!(
+        settings["network"]["allowedDomains"],
+        json!(["api.anthropic.com", "[::1]"])
+    );
+}

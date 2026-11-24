@@ -366,7 +366,8 @@ run in the same sandbox.
   and labels each line with its commit. Click a commit to read its message
   and see what it did to those lines.
 - **Cherry-pick**: select commits and pick them onto any branch. GitEZ does a
-  trial run against the branch you choose before it picks.
+  trial run against the branch you choose before it picks. A branch checked
+  out in another worktree is picked onto in that worktree.
 - **Rewrite history**: reword, edit, squash, fixup, drop and reorder commits,
   and autosquash `fixup!` commits. The old tip is kept as `refs/gitez/backup/<branch>`.
 - **Branches, remotes, tags and stashes**: create, rename, delete, check out,

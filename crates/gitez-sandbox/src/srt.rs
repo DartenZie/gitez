@@ -460,7 +460,9 @@ fn package_version(cli: &Path) -> Option<String> {
     Some(manifest.get("version")?.as_str()?.to_owned())
 }
 
-/// The srt settings file for `policy` with network limited to `hosts`.
+/// The srt settings file for `policy` with network limited to `hosts`,
+/// leaving out a host srt cannot read (see [`crate::allowed_host`]), which
+/// would make it refuse the whole file.
 ///
 /// On macOS a folder is a path and a file is a literal entry (srt then never
 /// reads it as a pattern); a path with `*` stays a pattern. On Linux srt
@@ -484,7 +486,10 @@ fn settings(policy: &Policy, hosts: &[String], os: Os) -> Value {
     };
     let mut settings = json!({
         "network": {
-            "allowedDomains": hosts,
+            "allowedDomains": hosts
+                .iter()
+                .filter(|host| crate::allowed_host(host))
+                .collect::<Vec<_>>(),
             "deniedDomains": [],
         },
         "filesystem": {

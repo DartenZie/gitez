@@ -12,7 +12,7 @@ mod policy;
 mod seatbelt;
 mod srt;
 
-pub use network::NetworkProfile;
+pub use network::{NetworkProfile, allowed_host};
 pub use passthrough::{Passthrough, TEST_SANDBOX_ENV, passthrough_from_env, passthrough_requested};
 pub use policy::{Network, Policy, WritePath};
 pub use srt::{SRT_PACKAGE, Srt};

@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use gitez_agent::AgentNeeds;
-use gitez_sandbox::{Network, NetworkProfile, Policy, WritePath};
+use gitez_sandbox::{Network, NetworkProfile, Policy, WritePath, allowed_host};
 use gitez_settings::Settings;
 
 use crate::Secrets;
@@ -214,17 +214,20 @@ pub(crate) fn downloads(profile: Option<NetworkProfile>) -> bool {
 
 /// The hosts a network profile allows: the agent's own; with Packages also
 /// the package registries in Settings and the hosts of the repository's
-/// remotes.
+/// remotes, an SSH remote's through `ssh_hostname` (its host may be an alias
+/// in `~/.ssh/config`). A host the sandbox cannot list is left out (see
+/// [`allowed_host`]).
 pub(crate) fn network(
     profile: NetworkProfile,
     agent_hosts: &[String],
     settings: &Settings,
     remote_urls: &[String],
+    ssh_hostname: &dyn Fn(&str) -> Option<String>,
 ) -> Network {
     let mut hosts: Vec<String> = Vec::new();
     let mut add = |host: &str| {
         let host = host.trim();
-        if !host.is_empty() && !hosts.iter().any(|known| known == host) {
+        if allowed_host(host) && !hosts.iter().any(|known| known == host) {
             hosts.push(host.to_owned());
         }
     };
@@ -238,13 +241,76 @@ pub(crate) fn network(
                 .package_hosts
                 .iter()
                 .for_each(|host| add(host));
-            remote_urls
-                .iter()
-                .filter_map(|url| remote_host(url))
-                .for_each(|host| add(&host));
+            for remote in remote_urls.iter().filter_map(|url| remote_host(url)) {
+                let host = match remote.ssh {
+                    true => ssh_hostname(remote.host.trim_start_matches('[').trim_end_matches(']'))
+                        .map(|resolved| url_host(&resolved))
+                        .unwrap_or(remote.host),
+                    false => remote.host,
+                };
+                add(&host);
+            }
         }
     }
     Network::Hosts(hosts)
+}
+
+/// The host `ssh` connects to for `alias`: the `hostname` line of `ssh -G`,
+/// which applies `~/.ssh/config` (`Host github-work` with `HostName
+/// github.com`). `None` when `ssh` fails, takes longer than 5 s, or `alias`
+/// does not look like a host name.
+pub(crate) fn ssh_hostname(alias: &str) -> Option<String> {
+    let plain = !alias.starts_with('-')
+        && alias
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'));
+    if alias.is_empty() || !plain {
+        return None;
+    }
+    let mut child = std::process::Command::new("ssh")
+        .args(["-G", "--", alias])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    ssh_config_hostname(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The `hostname` line of `ssh -G`'s output.
+fn ssh_config_hostname(config: &str) -> Option<String> {
+    config.lines().find_map(|line| {
+        let (key, value) = line.split_once(' ')?;
+        let value = value.trim();
+        (key.eq_ignore_ascii_case("hostname") && !value.is_empty())
+            .then(|| value.to_ascii_lowercase())
+    })
+}
+
+/// `host` as the sandbox lists it: an IPv6 address in brackets.
+fn url_host(host: &str) -> String {
+    match host.parse::<std::net::Ipv6Addr>() {
+        Ok(_) => format!("[{host}]"),
+        Err(_) => host.to_owned(),
+    }
 }
 
 /// The environment GitEZ adds to every command it runs for a thread, after
@@ -273,22 +339,38 @@ pub(crate) fn env(tmp_dir: &Path, secrets: &Secrets) -> Vec<(String, String)> {
     env
 }
 
+/// The host of a git remote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteHost {
+    /// Lowercase; an IPv6 address in brackets.
+    pub(crate) host: String,
+    /// Reached over SSH (`ssh://` or scp-like), so the host may be an alias
+    /// in `~/.ssh/config`.
+    pub(crate) ssh: bool,
+}
+
 /// The host of a git remote URL: `https://host/…`, `ssh://user@host:22/…`,
 /// or scp-like `user@host:path`. `None` for local paths.
-pub(crate) fn remote_host(url: &str) -> Option<String> {
+pub(crate) fn remote_host(url: &str) -> Option<RemoteHost> {
     let url = url.trim();
-    let authority = if let Some((scheme, rest)) = url.split_once("://") {
+    let (authority, ssh) = if let Some((scheme, rest)) = url.split_once("://") {
         if scheme == "file" {
             return None;
         }
-        rest.split('/').next()?
+        let ssh = matches!(scheme, "ssh" | "git+ssh" | "ssh+git");
+        (rest.split('/').next()?, ssh)
     } else {
-        // scp-like: a colon before any slash.
-        let (host, _) = url.split_once(':')?;
+        // scp-like: a colon before any slash, after a bracketed address.
+        let from = match (url.find('['), url.find(':')) {
+            (Some(open), Some(colon)) if open < colon => url[open..].find(']')? + open,
+            _ => 0,
+        };
+        let colon = url[from..].find(':')? + from;
+        let host = &url[..colon];
         if host.contains('/') {
             return None;
         }
-        host
+        (host, true)
     };
     let host = authority.rsplit('@').next()?;
     let host = if let Some(v6) = host.strip_prefix('[') {
@@ -296,7 +378,10 @@ pub(crate) fn remote_host(url: &str) -> Option<String> {
     } else {
         host.split(':').next()?
     };
-    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+    (!host.is_empty()).then(|| RemoteHost {
+        host: url_host(&host.to_ascii_lowercase()),
+        ssh,
+    })
 }
 
 /// `path` with the symbolic links of its folders resolved as far as they
@@ -333,27 +418,46 @@ fn real_all(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    fn remote(host: &str, ssh: bool) -> Option<RemoteHost> {
+        Some(RemoteHost {
+            host: host.to_owned(),
+            ssh,
+        })
+    }
+
     #[test]
     fn remote_hosts() {
         assert_eq!(
-            remote_host("https://github.com/a/b.git").as_deref(),
-            Some("github.com")
+            remote_host("https://github.com/a/b.git"),
+            remote("github.com", false)
         );
         assert_eq!(
-            remote_host("ssh://git@GitLab.example.com:2222/a/b").as_deref(),
-            Some("gitlab.example.com")
+            remote_host("ssh://git@GitLab.example.com:2222/a/b"),
+            remote("gitlab.example.com", true)
         );
         assert_eq!(
-            remote_host("git@github.com:a/b.git").as_deref(),
-            Some("github.com")
+            remote_host("git@github.com:a/b.git"),
+            remote("github.com", true)
         );
         assert_eq!(
-            remote_host("https://user:pw@[::1]:8080/x").as_deref(),
-            Some("::1")
+            remote_host("git@github-work:PALAXO/repo.git"),
+            remote("github-work", true)
+        );
+        assert_eq!(
+            remote_host("https://user:pw@[::1]:8080/x"),
+            remote("[::1]", false)
+        );
+        assert_eq!(
+            remote_host("git@[2001:db8::1]:me/repo.git"),
+            remote("[2001:db8::1]", true)
         );
         assert_eq!(remote_host("/srv/git/repo.git"), None);
         assert_eq!(remote_host("../other"), None);
         assert_eq!(remote_host("file:///srv/repo"), None);
+    }
+
+    fn no_ssh_config(_: &str) -> Option<String> {
+        None
     }
 
     #[test]
@@ -362,21 +466,80 @@ mod tests {
         let agent = vec!["api.anthropic.com".to_owned()];
         let remotes = vec!["git@example.org:me/repo.git".to_owned()];
         assert_eq!(
-            network(NetworkProfile::AgentOnly, &agent, &settings, &remotes),
+            network(
+                NetworkProfile::AgentOnly,
+                &agent,
+                &settings,
+                &remotes,
+                &no_ssh_config
+            ),
             Network::Hosts(agent.clone())
         );
-        let Network::Hosts(packages) =
-            network(NetworkProfile::Packages, &agent, &settings, &remotes)
-        else {
+        let Network::Hosts(packages) = network(
+            NetworkProfile::Packages,
+            &agent,
+            &settings,
+            &remotes,
+            &no_ssh_config,
+        ) else {
             panic!("packages is a host list");
         };
         assert_eq!(packages[0], "api.anthropic.com");
         assert!(packages.iter().any(|host| host == "crates.io"));
         assert!(packages.iter().any(|host| host == "example.org"));
         assert_eq!(
-            network(NetworkProfile::Open, &agent, &settings, &remotes),
+            network(
+                NetworkProfile::Open,
+                &agent,
+                &settings,
+                &remotes,
+                &no_ssh_config
+            ),
             Network::Open
         );
+    }
+
+    #[test]
+    fn ssh_aliases_resolve_and_unlistable_hosts_are_left_out() {
+        let mut settings = Settings::default();
+        settings.sandbox.package_hosts = vec!["registry.npmjs.org".into(), "intranet".into()];
+        let agent = vec!["api.anthropic.com".to_owned()];
+        let remotes = vec![
+            "git@github-work:me/repo.git".to_owned(),
+            "ssh://git@other-alias/me/repo.git".to_owned(),
+            "https://alias-like/me/repo.git".to_owned(),
+            "git@[2001:db8::1]:me/repo.git".to_owned(),
+        ];
+        let resolve = |alias: &str| match alias {
+            "github-work" => Some("github.com".to_owned()),
+            "other-alias" => Some("other-alias".to_owned()),
+            "2001:db8::1" => Some("2001:db8::1".to_owned()),
+            _ => None,
+        };
+        assert_eq!(
+            network(
+                NetworkProfile::Packages,
+                &agent,
+                &settings,
+                &remotes,
+                &resolve
+            ),
+            Network::Hosts(vec![
+                "api.anthropic.com".to_owned(),
+                "registry.npmjs.org".to_owned(),
+                "github.com".to_owned(),
+                "[2001:db8::1]".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn the_hostname_of_ssh_config() {
+        let config = "user git\nhostname github.com\nport 22\n";
+        assert_eq!(ssh_config_hostname(config).as_deref(), Some("github.com"));
+        assert_eq!(ssh_config_hostname("user git\n"), None);
+        assert_eq!(ssh_hostname("-oProxyCommand=touch /tmp/x"), None);
+        assert_eq!(ssh_hostname(""), None);
     }
 
     #[test]
