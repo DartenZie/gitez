@@ -341,6 +341,7 @@ pub(crate) fn thread_in_mode(
                     commit: head,
                 },
                 network: NetworkProfile::AgentOnly,
+                local_ports: false,
                 secrets: Vec::new(),
                 mode,
                 auto: false,

@@ -121,6 +121,12 @@ pub struct ThreadSettings {
 pub struct SandboxSettings {
     /// The network profile a new thread starts with.
     pub default_network: NetworkProfile,
+    /// Whether a new thread starts with local ports open (its agent may
+    /// listen on and connect to ports on this computer's localhost; see
+    /// `gitez_sandbox::Policy::local_ports`). Default: off. Written only
+    /// when set.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub default_local_ports: bool,
     /// The hosts "Packages" adds. Default: [`DEFAULT_PACKAGE_HOSTS`].
     pub package_hosts: Vec<String>,
     /// Paths hidden from the agent, `~` for the home folder. Default:
@@ -212,6 +218,7 @@ impl Default for SandboxSettings {
     fn default() -> Self {
         Self {
             default_network: NetworkProfile::default(),
+            default_local_ports: false,
             package_hosts: strings(DEFAULT_PACKAGE_HOSTS),
             hidden_paths: strings(DEFAULT_HIDDEN_PATHS),
             writable_paths: Vec::new(),
@@ -644,6 +651,7 @@ mod tests {
         settings.threads.max_running = 5;
         settings.threads.last_mode = Mode::Discuss;
         settings.sandbox.default_network = NetworkProfile::Packages;
+        settings.sandbox.default_local_ports = true;
         settings.sandbox.package_hosts = vec!["crates.io".to_owned()];
         settings.sandbox.hidden_paths = vec!["~/.ssh".to_owned()];
         settings.sandbox.writable_paths = vec!["~/.gradle/caches".to_owned()];
@@ -819,6 +827,7 @@ mod tests {
         );
         assert_eq!(settings.sandbox.hidden_paths, strings(DEFAULT_HIDDEN_PATHS));
         assert!(settings.sandbox.writable_paths.is_empty());
+        assert!(!settings.sandbox.default_local_ports);
         assert!(settings.writable_paths().is_empty());
         assert!(settings.agents.is_empty());
         assert!(settings.secrets.is_empty());
@@ -883,6 +892,30 @@ mod tests {
         assert!(
             settings.sandbox.writable_paths.is_empty(),
             "a file written before writable_paths existed has none"
+        );
+        assert!(
+            !settings.sandbox.default_local_ports,
+            "a file written before local ports existed keeps them closed"
+        );
+    }
+
+    #[test]
+    fn local_ports_are_written_only_when_open() {
+        let dir = tempfile::tempdir().expect("temporary folder");
+        let path = Settings::path(dir.path());
+        let mut settings = Settings::default();
+        settings.save(&path).expect("save");
+        let text = fs::read_to_string(&path).expect("read");
+        assert!(!text.contains("default_local_ports"), "{text}");
+
+        settings.sandbox.default_local_ports = true;
+        settings.save(&path).expect("save");
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json");
+        assert_eq!(json["sandbox"]["default_local_ports"], true);
+        assert_eq!(
+            Settings::load(&path).expect("load"),
+            Loaded::Current(settings)
         );
     }
 

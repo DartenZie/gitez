@@ -1650,6 +1650,7 @@ mod tests {
                         commit: "0".repeat(40),
                     },
                     network: NetworkProfile::AgentOnly,
+                    local_ports: false,
                     secrets: Vec::new(),
                     mode: gitez_agent_thread::Mode::Implement,
                     auto: false,

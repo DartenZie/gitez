@@ -274,6 +274,7 @@ impl Store {
             start: new.start,
             prepared: false,
             network: new.network,
+            local_ports: new.local_ports,
             secrets: new.secrets,
             session_id: None,
             pull_request: None,

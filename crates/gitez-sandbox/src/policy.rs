@@ -49,6 +49,16 @@ pub struct Policy {
     /// out. srt calls it `enableWeakerNetworkIsolation`. The Open profile
     /// always allows it; Linux has no such service.
     pub certificate_service: bool,
+    /// Whether the command may listen on local ports and connect to ports
+    /// on localhost, so that it can run a server and test it. On macOS this
+    /// opens every service on the computer's localhost (databases, Docker,
+    /// a browser's debugging port, local proxies that reach further than
+    /// the host list), and a server listening on every address can be
+    /// reached from the network. srt calls it `allowLocalBinding`. The Open
+    /// profile always allows it; on Linux srt runs the command in a network
+    /// namespace of its own, whose loopback is always usable and reaches
+    /// nothing of the host's.
+    pub local_ports: bool,
 }
 
 /// Whether `path` is a pattern rather than a name.

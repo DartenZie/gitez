@@ -160,6 +160,7 @@ pub(crate) fn live_thread(
                     commit: head,
                 },
                 network: NetworkProfile::Packages,
+                local_ports: false,
                 secrets: Vec::new(),
                 mode: gitez_agent_thread::Mode::Implement,
                 auto: false,

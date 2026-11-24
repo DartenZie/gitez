@@ -20,7 +20,8 @@ use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gitez_agent_thread::{
     Account, AgentThread, AgentThreadId, CompleteReport, Ending, IfUncommitted, Index, IndexReport,
-    IndexedRepository, Kept, Merged, Mode, NewAgentThread, State, Step, Store, Timestamp, TurnKind,
+    IndexedRepository, Kept, Merged, Mode, NewAgentThread, SandboxChange, State, Step, Store,
+    Timestamp, TurnKind,
 };
 use gitez_sandbox::NetworkProfile;
 use gitez_secret::SecretStore;
@@ -206,6 +207,8 @@ pub struct StartRequest {
     /// The Discuss thread whose brief the prompt is.
     pub origin: Option<AgentThreadId>,
     pub network: NetworkProfile,
+    /// Whether the agent may use local ports ([`AgentThread::local_ports`]).
+    pub local_ports: bool,
     pub secrets: Vec<String>,
     /// Sent with the prompt, made fit to send.
     pub images: Vec<Arc<gitez_agent_thread::PreparedImage>>,
@@ -222,6 +225,12 @@ pub struct CurrentRepository {
 struct AgentThreadsGlobal(Entity<AgentThreads>);
 
 impl Global for AgentThreadsGlobal {}
+
+/// What "Local ports" allows, wherever it can be turned on: it must say
+/// plainly what else it opens.
+pub const LOCAL_PORTS_HELP: &str = "Lets the agent run servers on local ports and test them. It \
+    can then reach every service on this Mac’s localhost (databases, Docker, a browser’s \
+    debugging port), and the servers it starts can accept connections from the network.";
 
 /// How long to keep collecting file events after the first, so a burst of
 /// writes is read once.
@@ -769,6 +778,7 @@ impl AgentThreads {
                     work_dir: (request.mode == Mode::Discuss).then(|| request.work_dir.clone()),
                     origin: request.origin,
                     network: request.network,
+                    local_ports: request.local_ports,
                     secrets: request.secrets,
                 },
                 &request.images,
@@ -896,14 +906,26 @@ impl AgentThreads {
     }
 
     /// Continues the agent thread under `network`, where it left off
-    /// (`request_network_change`, then `gitez supervise retry`). A thread
-    /// that is still active is stopped first, and continues once its
-    /// supervisor has ended it; if that takes longer than
-    /// [`RESTART_WAIT`], it stays stopped and can be retried.
+    /// ([`Self::change_sandbox`]).
     pub fn change_network(
         &mut self,
         key: &AgentThreadKey,
         network: NetworkProfile,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        self.change_sandbox(key, SandboxChange::Network(network), cx)
+    }
+
+    /// Continues the agent thread with its sandbox changed (its network,
+    /// or its local ports), where it left off (`request_sandbox_change`,
+    /// then `gitez supervise retry`): the sandbox is set when the agent
+    /// starts. A thread that is still active is stopped first, and
+    /// continues once its supervisor has ended it; if that takes longer
+    /// than [`RESTART_WAIT`], it stays stopped and can be retried.
+    pub fn change_sandbox(
+        &mut self,
+        key: &AgentThreadKey,
+        change: SandboxChange,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<()>> {
         let launcher = self.launcher();
@@ -913,8 +935,8 @@ impl AgentThreads {
         cx.background_executor().spawn(async move {
             let store = Store::new(&key.common_dir);
             let thread = store.load(&key.id)?;
-            if thread.network == network {
-                bail!("The thread already uses {}.", network.label());
+            if thread.has(change) {
+                bail!(change.unchanged());
             }
             if thread.state.is_active() {
                 stop_thread(&store, &key, &thread)?;
@@ -925,15 +947,21 @@ impl AgentThreads {
                         break;
                     }
                     if started.elapsed() > RESTART_WAIT {
-                        bail!(
-                            "The thread is taking long to stop. Retry it with {} once it has.",
-                            network.label()
-                        );
+                        match change {
+                            SandboxChange::Network(network) => bail!(
+                                "The thread is taking long to stop. Retry it with {} once it has.",
+                                network.label()
+                            ),
+                            SandboxChange::LocalPorts(_) => bail!(
+                                "The thread is taking long to stop. Change its local ports again \
+                                 once it has."
+                            ),
+                        }
                     }
                 }
             }
             let thread = store.update(&key.id, |thread| {
-                thread.request_network_change(network, Timestamp::now())?;
+                thread.request_sandbox_change(change, Timestamp::now())?;
                 Ok(thread.clone())
             })?;
             changes.unbounded_send(vec![thread_file(&key)]).ok();
@@ -2181,6 +2209,7 @@ fn claim_handoff(
         start: gitez_agent_thread::Start { branch, commit },
         origin: Some(discussion.id),
         network: discussion.network,
+        local_ports: discussion.local_ports,
         secrets: discussion.secrets,
         images: Vec::new(),
     })))
@@ -2361,6 +2390,7 @@ mod tests {
             origin: None,
             prepared: true,
             network: NetworkProfile::AgentOnly,
+            local_ports: false,
             secrets: Vec::new(),
             session_id: None,
             pull_request: None,
@@ -2617,6 +2647,7 @@ mod tests {
                         branch: "main".into(),
                         commit: start.clone(),
                     },
+                    local_ports: false,
                     network: NetworkProfile::AgentOnly,
                     secrets: Vec::new(),
                     mode: gitez_agent_thread::Mode::Implement,
@@ -2809,6 +2840,7 @@ mod tests {
                         commit: start,
                     },
                     network: NetworkProfile::Packages,
+                    local_ports: false,
                     secrets: vec!["GITHUB_TOKEN".into()],
                     mode: Mode::Discuss,
                     auto: true,

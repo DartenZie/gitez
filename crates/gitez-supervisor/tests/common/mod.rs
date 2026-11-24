@@ -295,6 +295,7 @@ impl Fixture {
                     work_dir: (mode == Mode::Discuss).then(|| self.root.clone()),
                     origin: None,
                     network: Default::default(),
+                    local_ports: false,
                     secrets: secrets.iter().map(|name| (*name).to_owned()).collect(),
                 },
                 images,

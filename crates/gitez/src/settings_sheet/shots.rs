@@ -309,6 +309,7 @@ fn screenshot_u4_sheet() {
             .insert(gitez_agent::ClaudeCode::ID.into(), agent);
         settings.sandbox.default_network = NetworkProfile::Packages;
         settings.threads.max_running = 4;
+        settings.sandbox.default_local_ports = true;
         settings
     });
     git(

@@ -200,6 +200,7 @@ fn start(
         },
         origin: None,
         network: NetworkProfile::AgentOnly,
+        local_ports: false,
         secrets: Vec::new(),
         images: Vec::new(),
     };

@@ -28,6 +28,7 @@ fn policy(write: Vec<WritePath>, network: Network) -> Policy {
         deny_read: Vec::new(),
         network,
         certificate_service: false,
+        local_ports: false,
     }
 }
 
@@ -193,6 +194,21 @@ fn the_certificate_service_is_opened_only_when_asked_and_only_on_macos() {
     assert_eq!(open["enableWeakerNetworkIsolation"], json!(true));
     let linux = settings(&policy, &["pypi.org".to_owned()], Os::Linux);
     assert!(linux.get("enableWeakerNetworkIsolation").is_none());
+}
+
+#[test]
+fn local_ports_are_opened_only_when_asked() {
+    let mut policy = policy(Vec::new(), Network::Hosts(Vec::new()));
+    for os in [Os::Mac, Os::Linux] {
+        let closed = settings(&policy, &[], os);
+        assert!(closed["network"].get("allowLocalBinding").is_none());
+    }
+    policy.local_ports = true;
+    for os in [Os::Mac, Os::Linux] {
+        let open = settings(&policy, &[], os);
+        assert_eq!(open["network"]["allowLocalBinding"], json!(true));
+        assert!(open.get("allowLocalBinding").is_none(), "a network setting");
+    }
 }
 
 #[test]
@@ -649,6 +665,7 @@ impl Repo {
             ],
             network,
             certificate_service: false,
+            local_ports: false,
         }
     }
 
@@ -782,6 +799,47 @@ fn real_network_profiles() {
     assert!(allowed && blocked.is_empty());
     let (allowed, blocked) = curl(&srt, Network::Open);
     assert!(allowed && blocked.is_empty());
+}
+
+/// Listens on a free port of 127.0.0.1 and connects to it, under srt with
+/// "Agent API only" (no host at all): whether both worked.
+#[cfg(target_os = "macos")]
+fn local_server(srt: &Srt, local_ports: bool) -> bool {
+    const SERVER: &str = r#"
+use IO::Socket::INET;
+my $server = IO::Socket::INET->new(LocalAddr => "127.0.0.1", LocalPort => 0, Listen => 1)
+    or die "listen: $!\n";
+my $client = IO::Socket::INET->new(
+    PeerAddr => "127.0.0.1", PeerPort => $server->sockport, Timeout => 5)
+    or die "connect: $!\n";
+$server->accept or die "accept: $!\n";
+print "connected\n";
+"#;
+    let cwd = tempfile::tempdir().expect("a temporary folder");
+    let mut policy = policy(Vec::new(), Network::Hosts(Vec::new()));
+    policy.local_ports = local_ports;
+    let wrapped = srt
+        .wrap(spec("/usr/bin/perl", &["-e", SERVER], cwd.path()), &policy)
+        .expect("it wraps");
+    let output = run(&wrapped.command);
+    eprintln!(
+        "local ports {local_ports}: {} {}",
+        text(&output.stdout),
+        text(&output.stderr)
+    );
+    text(&output.stdout).contains("connected")
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "needs srt installed in GITEZ_SANDBOX_TEST_DATA_DIR"]
+fn real_srt_local_ports() {
+    let srt = real_srt();
+    assert!(
+        !local_server(&srt, false),
+        "local ports are closed by default"
+    );
+    assert!(local_server(&srt, true), "local ports open when asked");
 }
 
 #[test]

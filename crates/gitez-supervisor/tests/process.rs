@@ -525,6 +525,7 @@ fn each_repository_runs_its_agents_with_its_own_account() {
                 work_dir: None,
                 origin: None,
                 network: Default::default(),
+                local_ports: false,
                 secrets: Vec::new(),
             },
             &fixture.data_dir,
