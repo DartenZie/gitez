@@ -501,6 +501,72 @@ fn cherry_picks_onto_a_branch_and_gives_up_on_a_conflict() {
     assert_eq!(status(root), "");
 }
 
+#[test]
+fn cherry_picks_onto_a_branch_checked_out_in_another_worktree() {
+    use gitez_command::PickOptions;
+
+    // main is checked out in a linked worktree: the pick happens there,
+    // and this one stays on feature with its changes untouched.
+    let dir = diverged("feature");
+    let root = dir.path();
+    let b = git(root, &["rev-parse", "feature"]);
+    let linked = tempfile::tempdir().expect("temporary folder");
+    let other = linked.path().join("main");
+    git(
+        root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            other.to_str().expect("utf-8"),
+            "main",
+        ],
+    );
+    std::fs::write(root.join("a.txt"), "edited\n").expect("write");
+    let options = PickOptions {
+        stash: true,
+        ..PickOptions::default()
+    };
+    let worktree = Git::new(root)
+        .cherry_pick(std::slice::from_ref(&b), "main", options, Some("feature"))
+        .expect("cherry-pick")
+        .expect("picked in the other worktree");
+    assert_eq!(
+        worktree.canonicalize().expect("exists"),
+        other.canonicalize().expect("exists")
+    );
+    assert_eq!(git(&other, &["log", "--format=%s", "main"]), "b\nc\na");
+    assert_eq!(status(&other), "");
+    assert_eq!(git(root, &["branch", "--show-current"]), "feature");
+    assert_eq!(status(root), "M a.txt");
+
+    // Staged changes there stop it before anything changes.
+    let dir = diverged("feature");
+    let root = dir.path();
+    let b = git(root, &["rev-parse", "feature"]);
+    let linked = tempfile::tempdir().expect("temporary folder");
+    let other = linked.path().join("main");
+    git(
+        root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            other.to_str().expect("utf-8"),
+            "main",
+        ],
+    );
+    std::fs::write(other.join("a.txt"), "staged\n").expect("write");
+    git(&other, &["add", "a.txt"]);
+    let main = git(root, &["rev-parse", "main"]);
+    let error = Git::new(root)
+        .cherry_pick(&[b], "main", PickOptions::default(), Some("feature"))
+        .expect_err("staged changes");
+    assert!(error.to_string().contains("staged changes"), "{error}");
+    assert_eq!(git(root, &["rev-parse", "main"]), main);
+    assert_eq!(status(&other), "M  a.txt");
+}
+
 /// A repository whose main has commits a to e, each adding its own file
 /// with the commit's name in it.
 fn five_commits() -> (tempfile::TempDir, Vec<String>) {

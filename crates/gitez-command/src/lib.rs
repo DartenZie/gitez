@@ -649,34 +649,54 @@ impl Git {
     /// branch checked out before, is checked out again. Stashed changes come
     /// back either way; if they cannot, they stay in the stash and that is
     /// the error.
+    ///
+    /// A branch checked out in another worktree cannot be checked out here,
+    /// so the commits are applied in that worktree instead, where the branch
+    /// is checked out already; nothing is stashed, and that worktree is
+    /// returned. That fails, changing nothing, when the worktree is missing
+    /// or locked ([`Error::WorktreeUnavailable`]) or has staged changes,
+    /// which giving the cherry-pick up could not tell from its own.
     pub fn cherry_pick(
         &self,
         commits: &[String],
         onto: &str,
         options: PickOptions,
         return_to: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<Option<PathBuf>> {
         if commits.is_empty() {
-            return Ok(());
+            return Ok(None);
+        }
+        if let Some(worktree) = self.worktree_of(onto)?
+            && !same_folder(&worktree.path, &self.work_dir)
+        {
+            if let Some(problem) = worktree.problem {
+                return Err(Error::WorktreeUnavailable {
+                    branch: onto.to_owned(),
+                    path: worktree.path,
+                    problem,
+                });
+            }
+            let there = self.in_work_dir(&worktree.path);
+            if let Err(error) = there.run(["diff", "--cached", "--quiet"], None) {
+                let Error::Failed { command, .. } = error else {
+                    return Err(error);
+                };
+                return Err(Error::Failed {
+                    command,
+                    output: format!(
+                        "{onto} is checked out in the worktree at {}, which has staged \
+                         changes. Commit or unstage them there, then cherry-pick again.",
+                        worktree.path.display()
+                    ),
+                });
+            }
+            there.pick_here(commits, options)?;
+            return Ok(Some(worktree.path));
         }
         let stashed = options.stash && self.stash_push("GitEZ: before cherry-picking")?;
-        let mut picked = self.switch(onto).and_then(|()| {
-            let mut args = vec!["cherry-pick"];
-            if options.note_source {
-                args.push("-x");
-            }
-            if options.no_commit {
-                args.push("--no-commit");
-            }
-            args.extend(commits.iter().map(String::as_str));
-            let picked = self.run(args, None).map(drop);
-            let undo = self.undoing();
-            if picked.is_err() && undo.run(["cherry-pick", "--abort"], None).is_err() {
-                // Nothing to abort after `--no-commit`: undo what it staged.
-                undo.run(["reset", "--quiet", "--merge"], None).ok();
-            }
-            picked
-        });
+        let mut picked = self
+            .switch(onto)
+            .and_then(|()| self.pick_here(commits, options));
         if picked.is_err()
             && let Some(branch) = return_to
         {
@@ -693,6 +713,26 @@ impl Git {
                  stash.\n{output}"
             );
             picked = picked.and(Err(Error::Failed { command, output }));
+        }
+        picked.map(|()| None)
+    }
+
+    /// Applies `commits` to the branch checked out, giving the cherry-pick
+    /// up when git cannot finish.
+    fn pick_here(&self, commits: &[String], options: PickOptions) -> Result<()> {
+        let mut args = vec!["cherry-pick"];
+        if options.note_source {
+            args.push("-x");
+        }
+        if options.no_commit {
+            args.push("--no-commit");
+        }
+        args.extend(commits.iter().map(String::as_str));
+        let picked = self.run(args, None).map(drop);
+        let undo = self.undoing();
+        if picked.is_err() && undo.run(["cherry-pick", "--abort"], None).is_err() {
+            // Nothing to abort after `--no-commit`: undo what it staged.
+            undo.run(["reset", "--quiet", "--merge"], None).ok();
         }
         picked
     }
@@ -1535,6 +1575,12 @@ fn describe<S: AsRef<OsStr>>(args: &[S]) -> String {
         command.push_str(&arg.as_ref().to_string_lossy());
     }
     command
+}
+
+/// Whether `path` and `other` are the same folder, however they are written.
+fn same_folder(path: &Path, other: &Path) -> bool {
+    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_owned());
+    canonical(path) == canonical(other)
 }
 
 /// The working trees in `output`, what `git worktree list --porcelain`

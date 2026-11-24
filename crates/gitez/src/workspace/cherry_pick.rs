@@ -228,19 +228,33 @@ impl CherryPick {
                 .spawn(async move {
                     let recorder = Recorder::start(git.work_dir());
                     git.cherry_pick(&ids, &target, options, return_to.as_deref())
-                        .map(|()| recorder.finish(ResetMode::Keep))
+                        .map(|worktree| {
+                            let recorded = recorder.finish(ResetMode::Keep);
+                            (worktree, recorded)
+                        })
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.running = false;
                 match picked {
-                    Ok(recorded) => {
+                    Ok((None, recorded)) => {
                         let step = undo::record(cx, recorded, label);
                         cx.emit(CherryPickEvent::Done {
                             message: done.into(),
                             step,
                         });
                     }
+                    // Picked in the branch's own worktree. No undo step:
+                    // undo moves a branch checked out elsewhere without its
+                    // files.
+                    Ok((Some(worktree), _)) => cx.emit(CherryPickEvent::Done {
+                        message: format!(
+                            "{done}, in its worktree {}",
+                            crate::recent::display(&worktree)
+                        )
+                        .into(),
+                        step: None,
+                    }),
                     Err(error) => this.error = Some(error.to_string().into()),
                 }
                 cx.notify();
@@ -396,57 +410,25 @@ impl CherryPick {
             )
     }
 
-    /// What the trial run against the chosen branch found.
+    /// Why the commits cannot go onto the chosen branch, if the trial run
+    /// against it found a reason. A clean trial shows only in the branch's
+    /// row.
     fn render_trial(&self) -> Option<Div> {
         let target = self.target.as_deref()?;
-        let merges = self.merges();
-        let (text, clean) = if let Some(merge) = merges.first() {
-            (
-                format!(
-                    "{} “{}” is a merge commit, which GitEZ cannot cherry-pick; \
-                     leave it out with ⌘-click.",
-                    short(merge.id),
-                    merge.summary
-                ),
-                false,
+        let text = if let Some(merge) = self.merges().first() {
+            format!(
+                "{} “{}” is a merge commit, which GitEZ cannot cherry-pick; \
+                 leave it out with ⌘-click.",
+                short(merge.id),
+                merge.summary
             )
         } else {
             match self.trials.get(target)? {
-                Err(error) => (format!("The trial run failed: {error}"), false),
-                Ok(PickTrial::Clean { applied, .. }) if applied.is_empty() => (
-                    format!("{target} already has these changes; there is nothing to pick."),
-                    false,
-                ),
-                Ok(PickTrial::Clean { applied, skipped }) => {
-                    let n = applied.len();
-                    let what = match n {
-                        1 => "the commit applies".to_owned(),
-                        2 => "both commits apply".to_owned(),
-                        n => format!("all {n} commits apply"),
-                    };
-                    let mut text =
-                        format!("Trial run in memory: {what} to {target} without conflicts.");
-                    if *skipped > 0 {
-                        text.push_str(&format!(
-                            " {} already on {target} and left out.",
-                            count(*skipped, "commit is", "commits are")
-                        ));
-                    }
-                    let tip = self
-                        .targets
-                        .iter()
-                        .find(|candidate| candidate.name == target)
-                        .map(|candidate| short(candidate.tip));
-                    if self.no_commit {
-                        text.push_str(&format!(" The changes will be staged on {target}."));
-                    } else if let Some(tip) = tip {
-                        text.push_str(&format!(
-                            " {target} will move from {tip} to {}.",
-                            count(n, "new commit", "new commits")
-                        ));
-                    }
-                    (text, true)
+                Err(error) => format!("The trial run failed: {error}"),
+                Ok(PickTrial::Clean { applied, .. }) if applied.is_empty() => {
+                    format!("{target} already has these changes; there is nothing to pick.")
                 }
+                Ok(PickTrial::Clean { .. }) => return None,
                 Ok(PickTrial::Conflict { commit, files }) => {
                     let summary = self
                         .commits
@@ -454,15 +436,12 @@ impl CherryPick {
                         .find(|candidate| candidate.id == *commit)
                         .map(|candidate| candidate.summary.as_str())
                         .unwrap_or_default();
-                    (
-                        format!(
-                            "Trial run in memory: {} “{summary}” conflicts with {target} in \
-                             {}. GitEZ gives a cherry-pick up when it conflicts, so choose \
-                             another branch, or merge instead.",
-                            short(*commit),
-                            files.join(", ")
-                        ),
-                        false,
+                    format!(
+                        "Trial run in memory: {} “{summary}” conflicts with {target} in \
+                         {}. GitEZ gives a cherry-pick up when it conflicts, so choose \
+                         another branch, or merge instead.",
+                        short(*commit),
+                        files.join(", ")
                     )
                 }
             }
@@ -478,30 +457,14 @@ impl CherryPick {
                 .border_1()
                 .text_size(px(12.5))
                 .line_height(relative(1.5))
-                .map(|this| {
-                    if clean {
-                        this.bg(rgb(color::TRIAL_CLEAN))
-                            .border_color(rgb(color::TRIAL_CLEAN_BORDER))
-                            .text_color(rgb(color::TRIAL_CLEAN_TEXT))
-                    } else {
-                        this.bg(rgb(color::TRIAL_CONFLICT))
-                            .border_color(rgb(color::PICK_TARGET_BORDER))
-                            .text_color(rgb(color::CHIP_TEXT))
-                    }
-                })
+                .bg(rgb(color::TRIAL_CONFLICT))
+                .border_color(rgb(color::PICK_TARGET_BORDER))
+                .text_color(rgb(color::CHIP_TEXT))
                 .child(
-                    Icon::new(if clean {
-                        IconName::Check
-                    } else {
-                        IconName::CircleAlert
-                    })
-                    .size(px(16.))
-                    .mt(px(2.))
-                    .text_color(rgb(if clean {
-                        color::DIFF_ADDED
-                    } else {
-                        color::CHIP_TEXT
-                    })),
+                    Icon::new(IconName::CircleAlert)
+                        .size(px(16.))
+                        .mt(px(2.))
+                        .text_color(rgb(color::CHIP_TEXT)),
                 )
                 .child(div().flex_1().min_w_0().child(text)),
         )

@@ -90,9 +90,6 @@ pub mod color {
     pub const PICK_TARGET_HOVER: u32 = 0x22_22_26;
     pub const PICK_COMMIT: u32 = 0x1b_1b_1e;
     pub const PICK_COMMIT_BORDER: u32 = 0x29_29_2e;
-    pub const TRIAL_CLEAN: u32 = 0x17_20_1a;
-    pub const TRIAL_CLEAN_BORDER: u32 = 0x28_40_33;
-    pub const TRIAL_CLEAN_TEXT: u32 = 0xb9_dc_c5;
     pub const TRIAL_CONFLICT: u32 = 0x22_1d_14;
 
     /// Rewriting history: a reworded commit's card, a commit's chosen
