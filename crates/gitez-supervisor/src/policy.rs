@@ -96,6 +96,7 @@ pub(crate) fn policy(
     settings: &Settings,
     network: Network,
     profile: Option<NetworkProfile>,
+    local_ports: bool,
 ) -> (Policy, Vec<PathBuf>) {
     let common = real(&place.common_dir);
     let data = real(&place.data_dir);
@@ -175,6 +176,7 @@ pub(crate) fn policy(
             .collect(),
         network,
         certificate_service: downloads(profile),
+        local_ports,
     };
     (
         policy,
@@ -565,6 +567,7 @@ mod tests {
             &settings,
             Network::Hosts(Vec::new()),
             Some(NetworkProfile::AgentOnly),
+            false,
         );
         assert!(refused.is_empty());
         let has = |write: WritePath| policy.write.contains(&write);
@@ -640,6 +643,7 @@ mod tests {
             &settings,
             Network::Hosts(Vec::new()),
             Some(NetworkProfile::AgentOnly),
+            false,
         );
         assert!(refused.is_empty());
         // Its own scratch folders and the agent's conversation: all of it.
@@ -698,6 +702,7 @@ mod tests {
                 &Settings::default(),
                 Network::Hosts(Vec::new()),
                 profile,
+                false,
             )
             .0
             .certificate_service
@@ -706,6 +711,35 @@ mod tests {
         assert!(!open(Some(NetworkProfile::AgentOnly)));
         assert!(open(Some(NetworkProfile::Packages)));
         assert!(open(Some(NetworkProfile::Open)));
+    }
+
+    #[test]
+    fn local_ports_follow_the_thread_choice() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let base = dir.path().canonicalize().expect("canonical");
+        let place = Place {
+            common_dir: base.join("repo/.git"),
+            work: Work::ReadOnly {
+                work_dir: base.join("repo"),
+            },
+            tmp_dir: base.join("data/tmp/repo-x"),
+            caches_dir: base.join("data/caches/repo-x"),
+            data_dir: base.join("data"),
+        };
+        let local_ports = |open| {
+            policy(
+                &place,
+                &AgentNeeds::default(),
+                &Settings::default(),
+                Network::Hosts(Vec::new()),
+                Some(NetworkProfile::AgentOnly),
+                open,
+            )
+            .0
+            .local_ports
+        };
+        assert!(!local_ports(false));
+        assert!(local_ports(true));
     }
 
     /// (e) A writable folder replaced by a link is not made writable: the
@@ -742,6 +776,7 @@ mod tests {
             &Settings::default(),
             Network::Hosts(Vec::new()),
             None,
+            false,
         );
         assert_eq!(refused, [tmp.clone(), lock.clone()]);
         for write in &policy.write {

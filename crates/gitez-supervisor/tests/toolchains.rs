@@ -382,6 +382,7 @@ impl Toolchains {
                     work_dir: (mode == Mode::Discuss).then(|| self.fixture.root.clone()),
                     origin: None,
                     network,
+                    local_ports: false,
                     secrets: Vec::new(),
                 },
                 &self.fixture.data_dir,

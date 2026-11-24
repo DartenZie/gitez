@@ -89,6 +89,7 @@ mod tests {
             deny_read: Vec::new(),
             network: Network::Hosts(Vec::new()),
             certificate_service: false,
+            local_ports: false,
         };
         let wrapped = Passthrough
             .wrap(command.clone(), &policy)

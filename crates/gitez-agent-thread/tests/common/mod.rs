@@ -124,6 +124,7 @@ impl Fixture {
             work_dir: None,
             origin: None,
             network: Default::default(),
+            local_ports: false,
             secrets: vec!["GITHUB_TOKEN".to_owned()],
         }
     }

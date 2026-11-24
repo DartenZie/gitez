@@ -6,6 +6,7 @@ use gitez_sandbox::{NetworkProfile, SRT_PACKAGE, Srt, Status};
 use gitez_settings::{DEFAULT_HIDDEN_PATHS, DEFAULT_PACKAGE_HOSTS};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::*;
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -173,6 +174,12 @@ impl SettingsSheet {
     fn set_default_network(&mut self, profile: NetworkProfile, cx: &mut Context<Self>) {
         self.model.update(cx, |model, cx| {
             model.update_settings(|settings| settings.sandbox.default_network = profile, cx);
+        });
+    }
+
+    fn set_default_local_ports(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.model.update(cx, |model, cx| {
+            model.update_settings(|settings| settings.sandbox.default_local_ports = open, cx);
         });
     }
 
@@ -486,6 +493,7 @@ impl SettingsSheet {
             .child(self.render_sandbox_status(name, cx))
             .child(label("Network for new threads").mt(px(4.)))
             .child(self.render_network(window, cx))
+            .child(self.render_local_ports(cx))
             .child(label("Files").mt(px(6.)))
             .child(self.render_files(cx))
     }
@@ -720,6 +728,54 @@ impl SettingsSheet {
                         ),
                 ),
         )
+    }
+
+    /// Whether new threads start with local ports open: a checkbox card
+    /// under the network profiles, off by default.
+    fn render_local_ports(&self, cx: &mut Context<Self>) -> Div {
+        let on = self.model.read(cx).settings().sandbox.default_local_ports;
+        div()
+            .h_flex()
+            .items_start()
+            .gap(px(10.))
+            .px(px(12.))
+            .py(px(10.))
+            .rounded(px(8.))
+            .border_1()
+            .map(|this| {
+                if on {
+                    this.border_color(rgba(color::PICKER_ON_BORDER))
+                        .bg(rgb(color::OPTION_ON))
+                } else {
+                    this.border_color(rgb(color::CARD_BORDER))
+                        .bg(rgb(color::PANEL))
+                }
+            })
+            .child(
+                Checkbox::new("default-local-ports")
+                    .debug_selector(|| "default-local-ports".into())
+                    .checked(on)
+                    .mt(px(2.))
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                        this.set_default_local_ports(*checked, cx)
+                    })),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .v_flex()
+                    .gap(px(3.))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("Local ports for new threads"),
+                    )
+                    .child(muted(crate::agent_threads::LOCAL_PORTS_HELP))
+                    .child(muted(
+                        "Off by default. A thread can turn it on or off from its sandbox line.",
+                    )),
+            )
     }
 
     fn render_host_chips(&self, cx: &mut Context<Self>) -> Div {

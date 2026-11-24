@@ -1,7 +1,8 @@
 //! The "Ask an agent" composer: a prompt, the mode of the thread it starts
 //! (Discuss, Auto or Implement) and the pickers (agent, model, starting branch),
-//! as in the `C-1-Start` board; the sandbox network and the secrets are
-//! Settings' defaults. In a repository window it opens as a card
+//! as in the `C-1-Start` board, and whether the agent may use local ports
+//! (Settings' default until picked); the sandbox network and the secrets
+//! are Settings' defaults. In a repository window it opens as a card
 //! under the "Ask an agent…" row of the history; Home shows it as its
 //! launcher (`C-5-Home`), with a Repository picker in front.
 //!
@@ -240,6 +241,8 @@ pub struct Composer {
     /// `None`: the agent entry's default; empty: the agent's own default
     /// for the model (none asked for).
     effort: Option<String>,
+    /// Whether the agent may use local ports; `None`: Settings' default.
+    local_ports: Option<bool>,
     /// What the thread is for; `None`: the choice of the thread started
     /// last.
     choice: Option<ThreadChoice>,
@@ -310,6 +313,7 @@ impl Composer {
             agent,
             model_alias: None,
             effort: None,
+            local_ports: None,
             choice: None,
             origin: None,
             from: None,
@@ -679,6 +683,13 @@ impl Composer {
         self.settings(cx).sandbox.default_network
     }
 
+    /// Whether the agent may use local ports: as picked, else Settings'
+    /// default for new threads.
+    pub(crate) fn local_ports(&self, cx: &App) -> bool {
+        self.local_ports
+            .unwrap_or_else(|| self.settings(cx).sandbox.default_local_ports)
+    }
+
     /// The secrets Settings give new threads of this repository by default.
     pub(crate) fn secrets(&self, cx: &App) -> Vec<String> {
         let Some(target) = &self.target else {
@@ -913,6 +924,7 @@ impl Composer {
                 .map(|(origin, _)| origin.id)
                 .filter(|_| mode == Mode::Implement),
             network: self.network(cx),
+            local_ports: self.local_ports(cx),
             secrets: self.secrets(cx),
             images,
         };
@@ -1239,6 +1251,44 @@ impl Composer {
                     menu
                 }),
         )
+    }
+
+    /// "Local ports Off/On": whether the thread's agent may run servers on
+    /// local ports. Beside the network rather than in it: it is a switch
+    /// of its own, kept with any profile, and the network is Settings'.
+    fn render_local_ports_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let open = self.local_ports(cx);
+        let view = cx.entity().downgrade();
+        picker("composer-local-ports")
+            .child(
+                div()
+                    .h_flex()
+                    .gap(px(6.))
+                    .child(picker_label("Local ports"))
+                    .child(if open { "On" } else { "Off" }),
+            )
+            .dropdown_menu(move |mut menu, _, _| {
+                menu = menu
+                    .min_w(px(240.))
+                    .check_side(Side::Right)
+                    .label("Local ports");
+                for (choice, label) in [(false, "Off"), (true, "On")] {
+                    let view = view.clone();
+                    menu = menu.item(PopupMenuItem::new(label).checked(choice == open).on_click(
+                        move |_, _, cx| {
+                            view.update(cx, |this, cx| {
+                                this.local_ports = Some(choice);
+                                cx.notify();
+                            })
+                            .ok();
+                        },
+                    ));
+                }
+                menu.separator()
+                    .item(menu_note(crate::agent_threads::LOCAL_PORTS_HELP))
+                    .separator()
+                    .item(manage("Set the default in Settings…"))
+            })
     }
 
     fn render_from_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1786,6 +1836,7 @@ impl Render for Composer {
             .child(self.render_agent_picker(cx))
             .child(self.render_model_picker(cx))
             .children(self.render_effort_picker(cx))
+            .child(self.render_local_ports_picker(cx))
             // A discussion reads what is checked out.
             .when(!discuss, |this| this.child(self.render_from_picker(cx)));
         let footer = div()
@@ -2099,6 +2150,9 @@ mod tests {
             // Settings name no effort: none is asked for until one is picked.
             assert_eq!(composer.effort(cx), "");
             composer.model_alias = Some("haiku".into());
+            // Settings keep local ports closed; the picker opens them.
+            assert!(!composer.local_ports(cx));
+            composer.local_ports = Some(true);
             composer.effort = Some("max".into());
             composer.set_prompt("Fix the typo in README. Keep it short.".into(), window, cx);
         });
@@ -2145,6 +2199,7 @@ mod tests {
         assert_eq!(request.start.branch, "main");
         assert_eq!(request.start.commit, oid(1).to_string());
         assert_eq!(request.network, NetworkProfile::default());
+        assert!(request.local_ports);
         assert_eq!(request.secrets, ["GITHUB_TOKEN"]);
         assert_eq!(request.model.as_deref(), Some("haiku"));
         assert_eq!(request.effort.as_deref(), Some("max"));

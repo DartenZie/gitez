@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use gitez_agent::{AgentEvent, BlockedHosts, Registry};
 use gitez_agent_thread::{
-    AgentThread, BRIEF_PROMPT, Ending, Mode, State, Store, Timestamp, TurnImage, TurnKind,
+    AgentThread, BRIEF_PROMPT, Ending, Mode, SandboxChange, State, Store, Timestamp, TurnImage,
+    TurnKind,
 };
 use gitez_git::{DiffOptions, Oid};
 use gitez_sandbox::NetworkProfile;
@@ -80,6 +81,8 @@ enum Busy {
     /// Continuing under another network, after stopping the thread when it
     /// was still active.
     ChangingNetwork,
+    /// Continuing with local ports opened or closed, the same way.
+    ChangingLocalPorts,
     /// Asking a Discuss thread for its brief.
     Briefing,
 }
@@ -764,6 +767,16 @@ impl ThreadView {
         );
     }
 
+    fn change_local_ports(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.run(
+            Busy::ChangingLocalPorts,
+            window,
+            cx,
+            move |model, key, cx| model.change_sandbox(key, SandboxChange::LocalPorts(open), cx),
+            |_, _, _| {},
+        );
+    }
+
     /// Whether the thread's agent and model take images, as the agent
     /// says.
     fn accepts_images(&self, thread: &AgentThread, cx: &App) -> Accepts {
@@ -1008,20 +1021,37 @@ pub fn suggested_retry(
 /// cannot continue: completed, or an ending other than a failure or a
 /// stop without a conversation to continue.
 pub fn network_change_label(thread: &AgentThread, network: NetworkProfile) -> Option<String> {
-    let verb = match thread.state {
-        State::Completed => return None,
+    sandbox_change_verb(thread).map(|verb| format!("{verb} with {}", network.label()))
+}
+
+/// What opening (`open`) or closing the local ports does to `thread`, as
+/// the menu item says it; `None` when it cannot continue, as for
+/// [`network_change_label`].
+pub fn local_ports_change_label(thread: &AgentThread, open: bool) -> Option<String> {
+    sandbox_change_verb(thread).map(|verb| {
+        format!(
+            "{verb} with local ports {}",
+            if open { "on" } else { "off" }
+        )
+    })
+}
+
+/// How a change of the sandbox continues `thread`: "Restart", "Retry" or
+/// "Continue"; `None` when it cannot.
+fn sandbox_change_verb(thread: &AgentThread) -> Option<&'static str> {
+    match thread.state {
+        State::Completed => None,
         State::Finished => {
             if matches!(thread.ending, Some(Ending::Failed | Ending::Stopped)) {
-                "Retry"
+                Some("Retry")
             } else if thread.session_id.is_some() {
-                "Continue"
+                Some("Continue")
             } else {
-                return None;
+                None
             }
         }
-        _ => "Restart",
-    };
-    Some(format!("{verb} with {}", network.label()))
+        _ => Some("Restart"),
+    }
 }
 
 /// The strip's count of blocked requests: only the hosts the run may have
@@ -1823,6 +1853,46 @@ impl ThreadView {
             .into_any_element()
     }
 
+    /// Whether the thread's agent may use local ports: a menu that turns
+    /// them on or off and continues the thread ([`local_ports_change_label`]),
+    /// or only what they are when that cannot change. Beside the network
+    /// profile, as a switch of its own.
+    fn render_local_ports(&self, thread: &AgentThread, cx: &mut Context<Self>) -> AnyElement {
+        let open = thread.local_ports;
+        let current = if open {
+            "Local ports on"
+        } else {
+            "Local ports off"
+        };
+        let Some(label) = local_ports_change_label(thread, !open) else {
+            return div().child(current).into_any_element();
+        };
+        let busy = self.busy.as_ref().map(|(busy, _)| *busy);
+        let view = cx.entity().downgrade();
+        Button::new("thread-local-ports")
+            .debug_selector(|| "thread-local-ports".into())
+            .ghost()
+            .xsmall()
+            .label(current)
+            .dropdown_caret(true)
+            .loading(busy == Some(Busy::ChangingLocalPorts))
+            .disabled(busy.is_some())
+            .tooltip(crate::agent_threads::LOCAL_PORTS_HELP)
+            .dropdown_menu(move |menu, _, _| {
+                let view = view.clone();
+                menu.min_w(px(240.))
+                    .label("Local ports")
+                    .item(PopupMenuItem::new(current).checked(true).disabled(true))
+                    .item(
+                        PopupMenuItem::new(label.clone()).on_click(move |_, window, cx| {
+                            view.update(cx, |this, cx| this.change_local_ports(!open, window, cx))
+                                .ok();
+                        }),
+                    )
+            })
+            .into_any_element()
+    }
+
     /// Sandbox profile, secrets and blocked requests. Only the hosts the
     /// run may have needed are counted, in the warning colour; the hosts
     /// the agent contacts on its own and does not need are listed apart,
@@ -1883,7 +1953,8 @@ impl ThreadView {
                             .text_color(rgb(color::TEXT_MUTED)),
                     )
                     .child(div().text_color(rgb(color::TEXT_MUTED)).child("Sandbox"))
-                    .child(self.render_network(thread, cx)),
+                    .child(self.render_network(thread, cx))
+                    .child(self.render_local_ports(thread, cx)),
             )
             .when(!thread.secrets.is_empty(), |this| {
                 this.child(div().h_flex().flex_wrap().gap(px(6.)).children(
@@ -3156,6 +3227,7 @@ mod tests {
                         commit,
                     },
                     network: NetworkProfile::AgentOnly,
+                    local_ports: false,
                     secrets: Vec::new(),
                     mode,
                     auto: false,
@@ -3557,6 +3629,49 @@ mod tests {
         );
     }
 
+    /// Opening local ports from the sandbox strip continues a thread that
+    /// ended with an answer, and the menu says how.
+    #[gpui_kit::test]
+    fn opening_local_ports_continues_a_finished_thread(cx: &mut TestAppContext) {
+        let (dir, common_dir, id) = repository_with_thread(|thread| {
+            thread.state = State::Finished;
+            thread.ending = Some(Ending::Answer);
+            thread.session_id = Some("session".into());
+            thread.turns[0].result = Some(result("The dev server could not listen.", true));
+        });
+        let thread = Store::new(&common_dir).load(&id).expect("load");
+        assert_eq!(
+            super::local_ports_change_label(&thread, true).as_deref(),
+            Some("Continue with local ports on")
+        );
+        let key = AgentThreadKey {
+            common_dir: common_dir.clone(),
+            id: id.clone(),
+        };
+        let (view, mut cx) = open_in_root(dir.path(), key, cx);
+        assert!(cx.debug_bounds("thread-local-ports").is_some());
+        view.update_in(&mut cx, |view, window, cx| {
+            view.change_local_ports(true, window, cx)
+        });
+        cx.run_until_parked();
+        let thread = Store::new(&common_dir).load(&id).expect("load");
+        assert!(thread.local_ports);
+        assert_eq!(
+            thread.network,
+            NetworkProfile::AgentOnly,
+            "the network stays"
+        );
+        let [_, retry] = &thread.turns[..] else {
+            panic!("two turns, got {}", thread.turns.len());
+        };
+        assert_eq!(retry.kind, TurnKind::Retry);
+        assert!(retry.resume);
+        assert_eq!(
+            retry.prompt,
+            gitez_agent_thread::local_ports_changed_prompt(true)
+        );
+    }
+
     /// A completed thread shows its network without a menu.
     #[gpui_kit::test]
     fn a_completed_thread_cannot_change_its_network(cx: &mut TestAppContext) {
@@ -3569,6 +3684,7 @@ mod tests {
         let key = AgentThreadKey { common_dir, id };
         let (_view, mut cx) = open(dir.path(), key, cx);
         assert!(cx.debug_bounds("thread-network").is_none());
+        assert!(cx.debug_bounds("thread-local-ports").is_none());
     }
 
     /// A thread whose commit a hook refused says what it left, why, and
@@ -4097,6 +4213,7 @@ mod tests {
     fn screenshot_thread_answer() {
         shoot("answer", false, |thread| {
             thread.state = State::Finished;
+            thread.local_ports = true;
             thread.ending = Some(Ending::Answer);
             thread.session_id = Some("session".into());
             let turn = &mut thread.turns[0];

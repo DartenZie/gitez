@@ -366,6 +366,11 @@ pub struct AgentThread {
     /// setup command run).
     pub prepared: bool,
     pub network: NetworkProfile,
+    /// Whether the agent may listen on local ports and connect to ports on
+    /// localhost (`gitez_sandbox::Policy::local_ports`). Left out when off,
+    /// so older records read as off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local_ports: bool,
     /// Names only; values are in the keychain.
     #[serde(default)]
     pub secrets: Vec<String>,
@@ -423,6 +428,8 @@ pub struct NewAgentThread {
     /// The Discuss thread whose brief this thread starts with.
     pub origin: Option<AgentThreadId>,
     pub network: NetworkProfile,
+    /// See [`AgentThread::local_ports`].
+    pub local_ports: bool,
     pub secrets: Vec<String>,
 }
 
@@ -456,6 +463,42 @@ pub fn network_changed_prompt(from: NetworkProfile, to: NetworkProfile) -> Strin
         prompt.push_str(" Try again what the network blocked before.");
     }
     prompt
+}
+
+/// The prompt of a Retry turn that continues the conversation after the
+/// user opened (`open`) or closed the thread's local ports.
+pub fn local_ports_changed_prompt(open: bool) -> String {
+    if open {
+        "GitEZ opened local ports in your sandbox: you may now run a server on localhost and \
+         connect to it to check your work. Continue the task where you left off, and try again \
+         what needed a local port before."
+            .to_owned()
+    } else {
+        "GitEZ closed local ports in your sandbox: servers on localhost can no longer be run or \
+         reached. Continue the task where you left off."
+            .to_owned()
+    }
+}
+
+/// A change to a started thread's sandbox. The sandbox is set when the
+/// agent starts, so it takes effect in a Retry turn that continues the
+/// conversation ([`AgentThread::request_sandbox_change`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxChange {
+    Network(NetworkProfile),
+    /// Local ports open (`true`) or closed.
+    LocalPorts(bool),
+}
+
+impl SandboxChange {
+    /// Why a change to what the thread already has is refused.
+    pub fn unchanged(self) -> String {
+        match self {
+            Self::Network(network) => format!("The thread already uses {}.", network.label()),
+            Self::LocalPorts(true) => "The thread’s local ports are already open.".to_owned(),
+            Self::LocalPorts(false) => "The thread’s local ports are already closed.".to_owned(),
+        }
+    }
 }
 
 /// Orders the profiles by how much network they allow.
@@ -734,6 +777,12 @@ impl AgentThread {
     /// turn's prompt, so the user's words are not lost). A prompt sent again
     /// takes its images along.
     pub fn request_retry(&mut self, network: NetworkProfile, at: Timestamp) -> Result<RetryPlan> {
+        self.retry_with(SandboxChange::Network(network), at)
+    }
+
+    /// [`request_retry`](Self::request_retry) that also makes `change`; a
+    /// continued conversation is told about it when it changes anything.
+    fn retry_with(&mut self, change: SandboxChange, at: Timestamp) -> Result<RetryPlan> {
         self.check_finished()?;
         if !matches!(self.ending, Some(Ending::Failed | Ending::Stopped)) {
             return Err(Error::refused(
@@ -775,9 +824,7 @@ impl AgentThread {
                     {
                         (turn.prompt.clone(), turn.images.clone())
                     }
-                    _ if network != self.network => {
-                        (network_changed_prompt(self.network, network), Vec::new())
-                    }
+                    _ if !self.has(change) => (self.changed_prompt(change), Vec::new()),
                     _ => (CONTINUE_PROMPT.to_owned(), Vec::new()),
                 };
                 let mut turn = Turn::requested(TurnKind::Retry, prompt, true, at);
@@ -785,7 +832,7 @@ impl AgentThread {
                 self.turns.push(turn);
             }
         }
-        self.network = network;
+        self.apply(change);
         self.queue();
         Ok(plan)
     }
@@ -802,25 +849,58 @@ impl AgentThread {
         network: NetworkProfile,
         at: Timestamp,
     ) -> Result<RetryPlan> {
+        self.request_sandbox_change(SandboxChange::Network(network), at)
+    }
+
+    /// Continues a Finished thread with its sandbox changed, as
+    /// [`request_network_change`](Self::request_network_change) does for
+    /// the network; a change of local ports is told with
+    /// [`local_ports_changed_prompt`]. Refused when it changes nothing,
+    /// when the thread is not Finished, or when the agent never started.
+    pub fn request_sandbox_change(
+        &mut self,
+        change: SandboxChange,
+        at: Timestamp,
+    ) -> Result<RetryPlan> {
         self.check_finished()?;
-        if network == self.network {
-            return Err(Error::refused(format!(
-                "The thread already uses {}.",
-                network.label()
-            )));
+        if self.has(change) {
+            return Err(Error::refused(change.unchanged()));
         }
         if matches!(self.ending, Some(Ending::Failed | Ending::Stopped)) {
-            return self.request_retry(network, at);
+            return self.retry_with(change, at);
         }
         if self.session_id.is_none() {
             return Err(Error::refused(NEVER_STARTED));
         }
-        let prompt = network_changed_prompt(self.network, network);
+        let prompt = self.changed_prompt(change);
         self.turns
             .push(Turn::requested(TurnKind::Retry, prompt, true, at));
-        self.network = network;
+        self.apply(change);
         self.queue();
         Ok(RetryPlan::Continue)
+    }
+
+    /// Whether the thread's sandbox is already as `change` would make it.
+    pub fn has(&self, change: SandboxChange) -> bool {
+        match change {
+            SandboxChange::Network(network) => self.network == network,
+            SandboxChange::LocalPorts(open) => self.local_ports == open,
+        }
+    }
+
+    fn apply(&mut self, change: SandboxChange) {
+        match change {
+            SandboxChange::Network(network) => self.network = network,
+            SandboxChange::LocalPorts(open) => self.local_ports = open,
+        }
+    }
+
+    /// What the agent is told when `change` is made (before it is).
+    fn changed_prompt(&self, change: SandboxChange) -> String {
+        match change {
+            SandboxChange::Network(network) => network_changed_prompt(self.network, network),
+            SandboxChange::LocalPorts(open) => local_ports_changed_prompt(open),
+        }
     }
 
     /// Back to Queued for the supervisor to pick up.

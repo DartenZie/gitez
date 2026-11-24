@@ -5,8 +5,8 @@ mod common;
 use common::{EXAMPLE, at, worktree_of};
 use gitez_agent_thread::{
     AgentThread, AgentThreadId, BRIEF_PROMPT, CONTINUE_PROMPT, Ending, Error, HANDOFF_MARKER,
-    Handoff, Mode, RetryPlan, State, Step, SupervisorInfo, TurnKind, TurnResult,
-    network_changed_prompt, split_handoff, without_handoff_marker,
+    Handoff, Mode, RetryPlan, SandboxChange, State, Step, SupervisorInfo, TurnKind, TurnResult,
+    local_ports_changed_prompt, network_changed_prompt, split_handoff, without_handoff_marker,
 };
 use gitez_sandbox::NetworkProfile;
 
@@ -361,6 +361,115 @@ fn a_network_change_continues_a_finished_thread() {
     thread.session_id = None;
     refusal(thread.request_network_change(NetworkProfile::Open, now));
     assert_eq!(thread.network, NetworkProfile::Packages);
+    assert_eq!(thread.turns.len(), 1);
+}
+
+#[test]
+fn local_ports_are_left_out_when_off_and_kept_when_on() {
+    // The example predates local ports: off.
+    let mut thread = example();
+    assert!(!thread.local_ports);
+    let json = serde_json::to_value(&thread).expect("serialise");
+    assert!(json.get("local_ports").is_none(), "{json}");
+
+    thread.local_ports = true;
+    let json = serde_json::to_value(&thread).expect("serialise");
+    assert_eq!(json["local_ports"], true);
+    let back: AgentThread = serde_json::from_value(json).expect("parse");
+    assert_eq!(back, thread);
+}
+
+#[test]
+fn a_local_ports_change_continues_a_thread() {
+    let now = at("2026-11-13T10:05:00Z");
+    // Waiting or ended with an answer: continued, told what changed.
+    for ending in [Ending::PullRequest, Ending::Answer] {
+        let mut thread = finished(ending);
+        assert_eq!(
+            thread
+                .request_sandbox_change(SandboxChange::LocalPorts(true), now)
+                .expect("a finished thread can open its local ports"),
+            RetryPlan::Continue
+        );
+        assert!(thread.local_ports);
+        assert_eq!(
+            thread.network,
+            NetworkProfile::Packages,
+            "the network stays"
+        );
+        assert_eq!(thread.state, State::Queued);
+        let turn = thread.turns.last().expect("a turn");
+        assert_eq!(turn.kind, TurnKind::Retry);
+        assert!(turn.resume);
+        assert_eq!(turn.prompt, local_ports_changed_prompt(true));
+        assert_eq!(thread.pending_turn(), Some(1));
+    }
+    assert!(local_ports_changed_prompt(true).contains("opened local ports"));
+    assert!(local_ports_changed_prompt(false).contains("closed local ports"));
+
+    // A failed or stopped thread is retried with them.
+    for ending in [Ending::Failed, Ending::Stopped] {
+        let mut thread = finished(Ending::Answer);
+        if ending == Ending::Failed {
+            thread.fail(Step::Agent, "It broke.", now);
+        } else {
+            thread.ending = Some(Ending::Stopped);
+        }
+        assert_eq!(
+            thread
+                .request_sandbox_change(SandboxChange::LocalPorts(true), now)
+                .expect("retry"),
+            RetryPlan::Continue
+        );
+        assert!(thread.local_ports);
+        assert_eq!(thread.state, State::Queued);
+        assert_eq!(
+            thread.turns.last().expect("a turn").prompt,
+            local_ports_changed_prompt(true)
+        );
+    }
+
+    // A failed thread whose agent never started runs its first prompt
+    // again, now with local ports.
+    let mut thread = finished(Ending::Answer);
+    thread.session_id = None;
+    thread.fail(Step::Agent, "It broke.", now);
+    assert_eq!(
+        thread
+            .request_sandbox_change(SandboxChange::LocalPorts(true), now)
+            .expect("retry"),
+        RetryPlan::RunAgain
+    );
+    assert!(thread.local_ports);
+
+    // Closing them again.
+    let mut thread = finished(Ending::Answer);
+    thread.local_ports = true;
+    thread
+        .request_sandbox_change(SandboxChange::LocalPorts(false), now)
+        .expect("close");
+    assert!(!thread.local_ports);
+    assert_eq!(
+        thread.turns.last().expect("a turn").prompt,
+        local_ports_changed_prompt(false)
+    );
+
+    // Refusals: no change, a running or completed thread, and a
+    // conversation that never started.
+    let mut thread = finished(Ending::Answer);
+    assert!(
+        refusal(thread.request_sandbox_change(SandboxChange::LocalPorts(false), now))
+            .contains("already closed")
+    );
+    let mut running = example();
+    refusal(running.request_sandbox_change(SandboxChange::LocalPorts(true), now));
+    assert!(!running.local_ports);
+    thread.mark_completed(now).expect("complete");
+    refusal(thread.request_sandbox_change(SandboxChange::LocalPorts(true), now));
+    let mut thread = finished(Ending::Answer);
+    thread.session_id = None;
+    refusal(thread.request_sandbox_change(SandboxChange::LocalPorts(true), now));
+    assert!(!thread.local_ports);
     assert_eq!(thread.turns.len(), 1);
 }
 

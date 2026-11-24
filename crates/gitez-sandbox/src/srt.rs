@@ -26,6 +26,12 @@
 //!   `TMPDIR` set to the private run folder, kept short (see
 //!   [`run_dir`]); the command still gets its own through
 //!   `CLAUDE_CODE_TMPDIR`.
+//! - `network.allowLocalBinding` (a policy's `local_ports`) lets the
+//!   command bind and accept on any local address and port and connect to
+//!   localhost, on macOS only; on Linux the command has its own network
+//!   namespace and srt ignores it. srt then makes Java prefer IPv4
+//!   (`JAVA_TOOL_OPTIONS`), as its rule reaches `127.0.0.1` and `::1` but
+//!   not `::ffff:127.0.0.1`.
 //! - The **Open** network profile cannot be written in an srt settings file
 //!   (`allowedDomains` is required and `*` is refused). It runs under a
 //!   GitEZ-generated Seatbelt profile on macOS and under bubblewrap without
@@ -500,6 +506,10 @@ fn settings(policy: &Policy, hosts: &[String], os: Os) -> Value {
     });
     if policy.certificate_service && os == Os::Mac {
         settings["enableWeakerNetworkIsolation"] = Value::Bool(true);
+    }
+    if policy.local_ports {
+        // srt ignores it on Linux, where the command has its own loopback.
+        settings["network"]["allowLocalBinding"] = Value::Bool(true);
     }
     settings
 }

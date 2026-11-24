@@ -638,7 +638,7 @@ impl Pipeline<'_> {
                 "The worktree is not ready.".to_owned(),
             ));
         };
-        let system_prompt = match &place.work {
+        let mut system_prompt = match &place.work {
             Work::Own { branch, .. } => {
                 system_prompt(branch, &self.thread.start.branch, self.thread.network)
             }
@@ -648,6 +648,10 @@ impl Pipeline<'_> {
                 &self.thread.start.branch,
             ),
         };
+        system_prompt.push_str(local_ports_note(
+            self.thread.network,
+            self.thread.local_ports,
+        ));
         let model = self
             .thread
             .model
@@ -1295,7 +1299,11 @@ status\n";
                 command.env.push((name, value));
             }
         }
-        let (policy, refused) = policy::policy(&place, needs, settings, network, profile);
+        // Only the agent gets the local ports the user opened, to run and
+        // test servers; the setup command and GitEZ's commit never do.
+        let local_ports = kind == Kind::Agent && self.thread.local_ports;
+        let (policy, refused) =
+            policy::policy(&place, needs, settings, network, profile, local_ports);
         for path in refused {
             let warning = format!(
                 "{} is a symbolic link, so the sandbox did not make it writable. Make the folder \
@@ -1839,6 +1847,23 @@ fn network_note(network: NetworkProfile) -> &'static str {
     }
 }
 
+/// What the agent is told about local ports ("" for Open, which allows
+/// them anyway, and on Linux, where the sandbox has a loopback of its own).
+fn local_ports_note(network: NetworkProfile, local_ports: bool) -> &'static str {
+    if network == NetworkProfile::Open {
+        ""
+    } else if local_ports {
+        " Local ports are open: you may run a server on localhost (a dev server, for example) \
+         and connect to it to check your work. Stop the servers you started before you finish."
+    } else if cfg!(target_os = "macos") {
+        " The sandbox refuses listening on ports and connecting to localhost, so a dev server, \
+         or a test that starts one, fails here. If checking your work needs one, say so in your \
+         summary: the user can continue the thread with Local ports on."
+    } else {
+        ""
+    }
+}
+
 /// What a Discuss thread's agent is told: where it is, that it changes
 /// nothing, and what the sandbox does about it. In an Auto thread
 /// (`auto`), it is also told how to hand off to an Implement thread, which
@@ -2112,5 +2137,20 @@ mod tests {
         assert!(packages.contains("retry the thread with the Open network profile"));
         let open = system_prompt("agent/x", "main", NetworkProfile::Open);
         assert!(!open.contains("network profile"));
+    }
+
+    #[test]
+    fn the_agent_is_told_about_local_ports() {
+        assert_eq!(local_ports_note(NetworkProfile::Open, false), "");
+        assert_eq!(local_ports_note(NetworkProfile::Open, true), "");
+        for profile in [NetworkProfile::AgentOnly, NetworkProfile::Packages] {
+            assert!(local_ports_note(profile, true).contains("Local ports are open"));
+            let closed = local_ports_note(profile, false);
+            if cfg!(target_os = "macos") {
+                assert!(closed.contains("with Local ports on"), "{closed}");
+            } else {
+                assert_eq!(closed, "");
+            }
+        }
     }
 }

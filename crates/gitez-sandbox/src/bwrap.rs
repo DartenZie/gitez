@@ -127,6 +127,7 @@ mod tests {
             deny_read: vec!["/h/.ssh".into(), "/h/.netrc".into(), "/h/.aws".into()],
             network: Network::Open,
             certificate_service: false,
+            local_ports: false,
         };
         let exists = |path: &Path| match path.to_str() {
             Some("/h/.ssh") | Some("/w/wt") | Some("/w/repo/.git/refs/heads/agent") => Some(true),
@@ -176,6 +177,7 @@ mod tests {
             deny_read: Vec::new(),
             network: Network::Open,
             certificate_service: false,
+            local_ports: false,
         };
         let dirs = write_dirs(&policy);
         assert_eq!(

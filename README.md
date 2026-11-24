@@ -97,7 +97,9 @@ What follows describes an Implement thread, unless it says otherwise.
   changes in the history (`⌘⇧A`, or File > Ask an Agent…), or from Home.
   Write the prompt, choose **Discuss**, **Auto** or **Implement**, and pick the agent,
   the model, the effort level (Claude Code's `--effort`; **Default** leaves
-  it to the model) and the branch to start from. The thread gets the network
+  it to the model) and the branch to start from. **Local ports** says whether
+  the agent may run servers on localhost (see Network below); it starts as set
+  in Settings. The thread gets the network
   profile and the default secrets set in Settings. An Implement thread starts from the branch's
   last commit; your uncommitted changes are not included. A Discuss thread
   reads the branch you have checked out, so it has no branch to pick and
@@ -113,7 +115,7 @@ What follows describes an Implement thread, unless it says otherwise.
 - **Auto handoff**: in an Auto thread, any answer can be a brief, also one
   to a reply such as "ok, do it". GitEZ starts one Implement thread from
   each such brief, from the last commit of the branch the discussion read,
-  with the same agent, model, effort, network profile and secrets, and the heading
+  with the same agent, model, effort, network profile, local ports and secrets, and the heading
   of the brief as its title. The agent says in the brief when the change
   depends on your uncommitted changes, which the new thread does not see.
   If GitEZ was closed when the brief arrived, it starts the thread at its
@@ -177,6 +179,10 @@ What follows describes an Implement thread, unless it says otherwise.
 
   The hosts that Packages allows come from Settings when the run starts, so
   after you correct that list, continuing a thread uses the new list.
+- **Local ports of a thread**: beside the profile, the sandbox line says
+  **Local ports on** or **off**, and is a menu that turns them on or off the
+  same way, continuing, retrying or restarting the thread in the same
+  conversation. The agent is told what changed.
 - At most three agents run at once across all repositories (you can change
   the limit in Settings); other threads wait as Queued. A thread that reaches
   the agent's usage limit waits and continues by itself after the reset.
@@ -233,7 +239,7 @@ What follows describes an Implement thread, unless it says otherwise.
     is signed in.
   - How many agents run at once.
   - The sandbox: whether it is installed, the network profile new threads
-    start with, the hosts the Packages profile adds, the paths hidden from
+    start with, whether they start with local ports on (off by default), the hosts the Packages profile adds, the paths hidden from
     the agent, and extra folders the agent may write in every thread.
   - Secrets: named environment variables whose values are kept in the OS
     keychain (Keychain on macOS, the Secret Service on Linux), never in a
@@ -288,6 +294,18 @@ run in the same sandbox.
   | Agent API only (default) | The agent's own API (`api.anthropic.com`, `platform.claude.com`). Downloads fail; Cargo and Go run offline. |
   | Packages | Also package registries and code hosts (crates.io, npm, PyPI, GitHub, the Go module proxy and others, editable in Settings), and the hosts of the repository's remotes. The setup command always runs with this profile. |
   | Open | Any host. |
+
+  **Local ports** (off by default) lets the agent listen on local ports and
+  connect to localhost, so it can run a project's dev server and test it with
+  `curl` or a test runner. On macOS this opens every service on your Mac's
+  localhost to the agent, not only its own servers (databases without a
+  password, Docker's API, a browser's debugging port, a local proxy that could
+  carry data past the network profile), and a server it starts on all
+  addresses can be reached from your network. The Open profile allows all of
+  this anyway. On Linux the sandbox has a loopback of its own, which works
+  without the switch and reaches nothing of your computer's. Only the agent
+  gets local ports, never the setup command. The agent is asked to stop the
+  servers it started before it finishes its turn.
 
 > [!CAUTION]
 > Know the limits of the sandbox:

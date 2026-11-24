@@ -222,6 +222,18 @@ Decided 2026-10-23; change only with the owner's agreement.
     namespace on Linux, untested). Claude Code's own Bash sandbox is turned
     off (`--settings '{"sandbox":{"enabled":false}}'`): it cannot nest. No
     JavaScript ships with GitEZ; `srt` is an external program.
+  - Local ports (decided 2026-11-24): a per-thread switch, off by default,
+    that lets the agent (never the setup command or the commit) listen on
+    local ports and connect to localhost, to run a dev server and test it
+    (`Policy::local_ports`, srt's `network.allowLocalBinding`). It is all
+    or nothing: on macOS it opens every service on the user's localhost
+    (and with it any local proxy past the host list), and binds `*:*`, so
+    the UI says so wherever it is turned on. Open allows it anyway; on
+    Linux srt ignores it (the namespace has its own loopback). `local_ports`
+    in `thread.json` and `sandbox.default_local_ports` in `settings.json`
+    are left out when off. The composer has a Local ports picker beside the
+    others (not inside the network, which is Settings'); an Auto handoff
+    keeps the discussion's choice.
   - A thread's network can change after it started (decided 2026-11-24),
     from the profile in the thread view's sandbox line. The change never
     starts over: `AgentThread::request_network_change` sets `network` and
@@ -230,7 +242,10 @@ Decided 2026-10-23; change only with the owner's agreement.
     `request_retry`, with that prompt when it continues). An active thread
     is stopped first (`AgentThreads::change_network` waits up to 60 s for
     it to end), then continued. A completed thread, or one that ended
-    without a conversation, cannot change.
+    without a conversation, cannot change. Local ports change the same way,
+    from the switch beside the profile: both are a `SandboxChange`
+    (`request_sandbox_change`, `AgentThreads::change_sandbox`), and a
+    local ports change is told with `local_ports_changed_prompt`.
   - A thread's worktree is hostile once the agent has run in it. The policy
     lets the agent write its worktree, the object store, its own branch's
     ref, reflog and lock, `packed-refs.lock`, its own `tmp/` and `caches/`
