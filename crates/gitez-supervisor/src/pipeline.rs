@@ -1431,7 +1431,13 @@ status\n";
                     .collect()
             })
             .unwrap_or_default();
-        policy::network(profile, &needs.hosts, settings, &remotes)
+        policy::network(
+            profile,
+            &needs.hosts,
+            settings,
+            &remotes,
+            &policy::ssh_hostname,
+        )
     }
 
     /// The main worktree of the repository.
