@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use common::{Fixture, branch_of, git, worktree_of};
 use gitez_agent_thread::{
-    BRIEF_PROMPT, CONTINUE_PROMPT, Ending, HANDOFF_MARKER, Handoff, Mode, RetryPlan, State, Step,
-    Timestamp, TurnKind,
+    Account, BRIEF_PROMPT, CONTINUE_PROMPT, Ending, HANDOFF_MARKER, Handoff, Mode, RetryPlan,
+    State, Step, Timestamp, TurnKind,
 };
 use gitez_supervisor::{Command, Error};
 
@@ -759,4 +759,117 @@ fn a_plain_discussion_keeps_a_marker_it_was_never_told_about() {
     assert_eq!(thread.turns[0].handoff, None);
     assert_eq!(thread.brief(), None);
     assert!(!fixture.calls()[0].contains(HANDOFF_MARKER));
+}
+
+fn work_account(fixture: &Fixture) -> Account {
+    Account {
+        name: "Work".to_owned(),
+        folder: Some(fixture.base.join("claude work")),
+    }
+}
+
+#[test]
+fn a_thread_from_before_accounts_runs_with_the_default_account_and_records_it() {
+    let fixture = Fixture::new();
+    let id = fixture.create("What is the answer?").id;
+    assert_eq!(fixture.load(&id).account, None);
+    let thread = fixture.run(&id, Command::Start);
+    assert_eq!(thread.ending, Some(Ending::Answer), "{thread:#?}");
+    let default = fixture.default_config_dir();
+    assert_eq!(
+        thread.account,
+        Some(Account {
+            name: Account::DEFAULT_NAME.to_owned(),
+            folder: Some(default.clone()),
+        })
+    );
+    assert_eq!(fixture.config_dirs(), [default.display().to_string()]);
+    let text = std::fs::read_to_string(fixture.thread_dir(&id).join("thread.json")).expect("read");
+    assert!(text.starts_with("{\n  \"version\": 1,"), "{text}");
+}
+
+#[test]
+fn a_reply_after_settings_changed_runs_with_the_recorded_account() {
+    let fixture = Fixture::new();
+    let work = work_account(&fixture);
+    let folder = work.folder.clone().expect("a folder");
+    fixture.add_account("Work", &folder);
+    let id = fixture.create("What is the answer?").id;
+    fixture.record_account(&id, work.clone());
+    let first = fixture.run(&id, Command::Start);
+    assert_eq!(first.ending, Some(Ending::Answer), "{first:#?}");
+
+    // Renamed, and the default account moved: the thread stays where its
+    // conversation is.
+    fixture.change_settings(|settings| {
+        settings.accounts[0].name = "Employer".to_owned();
+        settings
+            .agents
+            .get_mut(gitez_agent::ClaudeCode::ID)
+            .expect("entry")
+            .config_dir = Some(fixture.base.join("elsewhere"));
+    });
+    fixture
+        .store()
+        .update(&id, |thread| {
+            thread.request_turn(TurnKind::Reply, "And now?".to_owned(), Timestamp::now())
+        })
+        .expect("reply");
+    let thread = fixture.run(&id, Command::Reply);
+    assert_eq!(thread.ending, Some(Ending::Answer), "{thread:#?}");
+    assert_eq!(thread.account, Some(work));
+    let shown = folder.display().to_string();
+    assert_eq!(fixture.config_dirs(), [shown.clone(), shown]);
+    let calls = fixture.calls();
+    assert!(session_of(&calls[1]).1, "resumed: {}", calls[1]);
+}
+
+#[test]
+fn an_account_that_is_gone_or_moved_fails_before_the_agent_runs() {
+    for moved in [false, true] {
+        let fixture = Fixture::new();
+        let work = work_account(&fixture);
+        let folder = work.folder.clone().expect("a folder");
+        if moved {
+            fixture.add_account("Work", &fixture.base.join("claude other"));
+        }
+        let id = fixture.create("What is the answer?").id;
+        fixture.record_account(&id, work);
+        let thread = fixture.run(&id, Command::Start);
+        assert_eq!(thread.state, State::Finished);
+        assert_eq!(thread.ending, Some(Ending::Failed), "{thread:#?}");
+        let error = thread.error.expect("an error");
+        assert_eq!(error.step, Step::Agent);
+        assert!(
+            error.message.contains(&folder.display().to_string()),
+            "names the conversation's folder: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains(if moved {
+                "folder in Settings"
+            } else {
+                "no longer in Settings"
+            }),
+            "{}",
+            error.message
+        );
+        assert!(fixture.calls().is_empty(), "the agent never ran");
+    }
+}
+
+#[test]
+fn the_default_account_runs_with_the_variable_unset() {
+    let fixture = Fixture::new();
+    let id = fixture.create("What is the answer?").id;
+    fixture.record_account(
+        &id,
+        Account {
+            name: Account::DEFAULT_NAME.to_owned(),
+            folder: None,
+        },
+    );
+    let thread = fixture.run(&id, Command::Start);
+    assert_eq!(thread.ending, Some(Ending::Answer), "{thread:#?}");
+    assert_eq!(fixture.config_dirs(), ["<unset>"]);
 }

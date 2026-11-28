@@ -1419,8 +1419,26 @@ struct Launch {
     agent: Arc<dyn Agent>,
     config: AgentConfig,
     model: Option<String>,
+    /// To find the repository's Claude account when the run starts (off
+    /// the UI thread); `None` in tests without the model.
+    settings: Option<Arc<gitez_settings::Settings>>,
     /// The entry's default effort; `None`: the agent's own default.
     effort: Option<String>,
+}
+
+impl Launch {
+    /// The configuration the run in `dir` uses: Claude Code in the
+    /// repository's account (`gitez.agentAccount`), as its threads. Blocks.
+    fn config_in(&self, dir: &std::path::Path) -> Result<AgentConfig, String> {
+        let id = self.agent.id();
+        match &self.settings {
+            Some(settings) if id == gitez_agent::ClaudeCode::ID => {
+                let account = crate::agent_threads::resolve_account(settings, id, dir)?;
+                Ok(settings.account_config(id, &account))
+            }
+            _ => Ok(self.config.clone()),
+        }
+    }
 }
 
 impl Launch {
@@ -1434,6 +1452,7 @@ impl Launch {
                 let agent = model.agents().get(id)?;
                 Some(Self {
                     config: entry.config(),
+                    settings: Some(model.settings().clone()),
                     model: Some(
                         entry
                             .model
@@ -1451,6 +1470,7 @@ impl Launch {
                     effort: None,
                     agent,
                     config: AgentConfig::default(),
+                    settings: None,
                 })
             }
         }
@@ -1476,6 +1496,13 @@ impl AgentRun {
         // as the agent works.
         std::thread::spawn(move || {
             let send = |message| sender.unbounded_send(message).is_ok();
+            let config = match launch.config_in(&dir) {
+                Ok(config) => config,
+                Err(problem) => {
+                    send(Message::Ended(Err(problem)));
+                    return;
+                }
+            };
             let header = RunHeader {
                 started,
                 agent: thread_agent.id().to_owned(),
@@ -1493,7 +1520,7 @@ impl AgentRun {
             };
             let mut session = match start(
                 thread_agent.as_ref(),
-                &launch.config,
+                &config,
                 launch.model.as_deref(),
                 launch.effort.as_deref(),
                 &prompt,

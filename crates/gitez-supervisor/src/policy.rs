@@ -81,6 +81,11 @@ impl Place {
 /// moved, replaced or hard linked, and blocks moving the folders above
 /// them, the worktree folder included.
 ///
+/// The folders of Claude accounts other than the thread's
+/// (`hidden_accounts`) cannot be read, as the paths hidden in Settings.
+/// This keeps the agent from their files, not from their logins: the
+/// sandbox keeps the keychain reachable for the agent's own.
+///
 /// A Discuss thread ([`Work::ReadOnly`]) may write only its temporary
 /// folder, its caches and what the agent needs: nothing in the working
 /// tree it reads, nothing in the repository's git dir, and not the folders
@@ -94,6 +99,7 @@ pub(crate) fn policy(
     place: &Place,
     needs: &AgentNeeds,
     settings: &Settings,
+    hidden_accounts: &[PathBuf],
     network: Network,
     profile: Option<NetworkProfile>,
     local_ports: bool,
@@ -172,6 +178,7 @@ pub(crate) fn policy(
         deny_read: settings
             .hidden_paths()
             .iter()
+            .chain(hidden_accounts)
             .map(|path| real(path))
             .collect(),
         network,
@@ -561,15 +568,19 @@ mod tests {
         };
         let mut settings = Settings::default();
         settings.sandbox.writable_paths = vec![base.join("gradle").to_string_lossy().into_owned()];
+        let other_account = base.join("claude-personal");
         let (policy, refused) = policy(
             &place,
             &needs,
             &settings,
+            std::slice::from_ref(&other_account),
             Network::Hosts(Vec::new()),
             Some(NetworkProfile::AgentOnly),
             false,
         );
         assert!(refused.is_empty());
+        // Another account's folder is hidden, as the paths of Settings are.
+        assert!(policy.deny_read.contains(&other_account));
         let has = |write: WritePath| policy.write.contains(&write);
         assert!(has(WritePath::Tree(base.join("wt"))));
         assert!(has(WritePath::Tree(common.join("objects"))));
@@ -641,6 +652,7 @@ mod tests {
             &place,
             &needs,
             &settings,
+            &[],
             Network::Hosts(Vec::new()),
             Some(NetworkProfile::AgentOnly),
             false,
@@ -700,6 +712,7 @@ mod tests {
                 &place,
                 &AgentNeeds::default(),
                 &Settings::default(),
+                &[],
                 Network::Hosts(Vec::new()),
                 profile,
                 false,
@@ -731,6 +744,7 @@ mod tests {
                 &place,
                 &AgentNeeds::default(),
                 &Settings::default(),
+                &[],
                 Network::Hosts(Vec::new()),
                 Some(NetworkProfile::AgentOnly),
                 open,
@@ -774,6 +788,7 @@ mod tests {
             &place,
             &needs,
             &Settings::default(),
+            &[],
             Network::Hosts(Vec::new()),
             None,
             false,

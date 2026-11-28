@@ -27,7 +27,7 @@ fn fake_agent(body: &str) -> (TempDir, PathBuf) {
 fn config(dir: &TempDir, script: &Path) -> AgentConfig {
     AgentConfig {
         program: Some(script.to_owned()),
-        config_dir: Some(dir.path().join("config")),
+        config_dir: gitez_agent::ConfigDirChoice::Folder(dir.path().join("config")),
         ..AgentConfig::default()
     }
 }

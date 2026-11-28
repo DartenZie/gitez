@@ -39,9 +39,9 @@ pub use images::{
 };
 pub use index::{Index, IndexReport, IndexedRepository};
 pub use model::{
-    Activity, AgentThread, AgentThreadId, BRIEF_PROMPT, CONTINUE_PROMPT, DeletedBranch, Ending,
-    Failure, HANDOFF_MARKER, Handoff, Mode, NewAgentThread, RetryPlan, SandboxChange, Start, State,
-    Step, SupervisorInfo, Turn, TurnKind, TurnResult, Uncommitted, WorktreeRecord,
+    Account, Activity, AgentThread, AgentThreadId, BRIEF_PROMPT, CONTINUE_PROMPT, DeletedBranch,
+    Ending, Failure, HANDOFF_MARKER, Handoff, Mode, NewAgentThread, RetryPlan, SandboxChange,
+    Start, State, Step, SupervisorInfo, Turn, TurnKind, TurnResult, Uncommitted, WorktreeRecord,
     local_ports_changed_prompt, network_changed_prompt, split_handoff, without_handoff_marker,
 };
 pub use names::{
@@ -60,5 +60,10 @@ pub use worktree::{
 /// Times are RFC 3339 UTC, as in gitez-review.
 pub use jiff::Timestamp;
 
-/// The newest `thread.json` format this crate reads and writes.
-pub const VERSION: u32 = 1;
+/// The newest `thread.json` format this crate reads. A record is written
+/// with the oldest version that holds it ([`AgentThread::format_version`]):
+/// 2 only for one naming an account other than the default.
+pub const VERSION: u32 = 2;
+
+/// The version of a transcript's header line, which holds no account.
+pub(crate) const HEADER_VERSION: u32 = 1;

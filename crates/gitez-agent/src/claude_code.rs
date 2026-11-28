@@ -25,8 +25,9 @@ use serde_json::{Value, json};
 use crate::login_shell::{join_path, login_shell_var};
 use crate::process::find_program;
 use crate::{
-    Agent, AgentConfig, AgentEvent, AgentNeeds, CommandSpec, Conversation, EffortChoice, Error,
-    Finished, LoginStatus, ModelChoice, OptionalHost, Result, RunSpec, UsageLimit,
+    Agent, AgentConfig, AgentEvent, AgentNeeds, CommandSpec, ConfigDirChoice, Conversation,
+    EffortChoice, Error, Finished, LoginStatus, ModelChoice, OptionalHost, Result, RunSpec,
+    UsageLimit,
 };
 
 const PROGRAM: &str = "claude";
@@ -126,28 +127,76 @@ pub struct ConfigDir {
 /// looks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigDirSource {
-    /// The agent entry in Settings.
+    /// Chosen by GitEZ ([`ConfigDirChoice::Folder`]): an account, or the
+    /// agent entry in Settings.
     Settings,
     /// `CLAUDE_CONFIG_DIR` in GitEZ's own environment.
     Environment,
     /// `CLAUDE_CONFIG_DIR` in the user's login shell.
     LoginShell,
-    /// Claude Code's default, `~/.claude`.
+    /// Claude Code's default, `~/.claude`, with `CLAUDE_CONFIG_DIR` unset.
     Default,
+}
+
+impl ConfigDir {
+    /// The folder as a choice that runs in it again whatever GitEZ's
+    /// environment is then: [`ConfigDirChoice::Default`] for Claude
+    /// Code's default (the variable unset), else this folder.
+    pub fn choice(&self) -> ConfigDirChoice {
+        match self.source {
+            ConfigDirSource::Default => ConfigDirChoice::Default,
+            _ => ConfigDirChoice::Folder(self.path.clone()),
+        }
+    }
+
+    /// The value of `CLAUDE_CONFIG_DIR` for it; `None`: unset.
+    pub fn variable(&self) -> Option<&Path> {
+        (self.source != ConfigDirSource::Default).then_some(self.path.as_path())
+    }
+}
+
+/// The command that signs Claude Code in with the folder `config_dir`
+/// (`None`: its default): `claude auth login`, with `CLAUDE_CONFIG_DIR=…`
+/// before it for any other folder. The folder is quoted for a POSIX shell
+/// when it needs it.
+pub fn login_command(config_dir: Option<&Path>) -> String {
+    match config_dir {
+        None => "claude auth login".to_owned(),
+        Some(dir) => format!(
+            "{CONFIG_DIR_VAR}={} claude auth login",
+            shell_quote(&dir.to_string_lossy())
+        ),
+    }
+}
+
+/// `text` as one word for a POSIX shell.
+fn shell_quote(text: &str) -> String {
+    let plain = !text.is_empty()
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/._-+:@%,=".contains(&b));
+    if plain {
+        text.to_owned()
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
 }
 
 impl ClaudeCode {
     pub const ID: &'static str = "claude-code";
 
-    /// The configuration folder runs with `config` use: the agent entry's
-    /// folder; else `CLAUDE_CONFIG_DIR` in GitEZ's environment; else in the
-    /// user's login shell (asked once per process; an app started from
-    /// Finder does not inherit it); else `~/.claude`. A leading `~/` is
-    /// the home folder. May block for a few seconds the first time.
+    /// The configuration folder runs with `config` use: the folder chosen
+    /// ([`ConfigDirChoice::Folder`], an account's or the agent entry's);
+    /// `~/.claude` for [`ConfigDirChoice::Default`]; else (for
+    /// [`ConfigDirChoice::Inherit`]) `CLAUDE_CONFIG_DIR` in GitEZ's
+    /// environment, else in the user's login shell (asked once per
+    /// process; an app started from Finder does not inherit it), else
+    /// `~/.claude`. A leading `~/` is the home folder. May block for a few
+    /// seconds the first time.
     pub fn config_dir(config: &AgentConfig) -> ConfigDir {
         resolve_config_dir(
-            config.config_dir.as_deref(),
-            std::env::var_os(CONFIG_DIR_VAR),
+            &config.config_dir,
+            || std::env::var_os(CONFIG_DIR_VAR),
             || login_shell_var(CONFIG_DIR_VAR),
             home().as_deref(),
         )
@@ -166,21 +215,33 @@ impl ClaudeCode {
         }
     }
 
-    /// The environment every `claude` GitEZ starts gets, on top of its own.
-    fn env(config: &AgentConfig, program: &Path) -> Vec<(String, String)> {
+    /// The environment every `claude` GitEZ starts gets, on top of its own,
+    /// and the variables removed from its own first. Claude Code's default
+    /// folder runs with `CLAUDE_CONFIG_DIR` removed: set, even to
+    /// `~/.claude`, it names another keychain item, another login.
+    fn env(config: &AgentConfig, program: &Path) -> (Vec<(String, String)>, Vec<String>) {
         let mut env = Vec::new();
+        let mut remove: Vec<String> = ENV_REMOVE.map(str::to_owned).into();
         let config_dir = Self::config_dir(config);
-        if config_dir.source != ConfigDirSource::Default {
-            env.push((
+        match config_dir.variable() {
+            Some(path) => env.push((
                 CONFIG_DIR_VAR.to_owned(),
-                config_dir.path.to_string_lossy().into_owned(),
-            ));
+                path.to_string_lossy().into_owned(),
+            )),
+            None => remove.push(CONFIG_DIR_VAR.to_owned()),
         }
         if let Some(path) = agent_path(program) {
             env.push(("PATH".to_owned(), path.to_string_lossy().into_owned()));
         }
-        env.extend(config.env.iter().cloned());
-        env
+        // The account decides the folder; the entry's own variables do not.
+        env.extend(
+            config
+                .env
+                .iter()
+                .filter(|(name, _)| name != CONFIG_DIR_VAR)
+                .cloned(),
+        );
+        (env, remove)
     }
 }
 
@@ -214,7 +275,7 @@ impl Agent for ClaudeCode {
             .as_ref()
             .filter(|p| !p.as_os_str().is_empty())
         {
-            let program = expand_home(program, home().as_deref());
+            let program = expand_home(program, None);
             return if program.is_file() {
                 Ok(program)
             } else {
@@ -272,11 +333,12 @@ impl Agent for ClaudeCode {
             args.extend(["--append-system-prompt".into(), prompt.into()]);
         }
         args.extend(config.args.iter().cloned());
+        let (env, env_remove) = Self::env(config, &program);
         Ok(CommandSpec {
-            env: Self::env(config, &program),
+            env,
             program,
             args,
-            env_remove: ENV_REMOVE.map(str::to_owned).into(),
+            env_remove,
             cwd: run.cwd.to_owned(),
             stdin: Some(if run.images.is_empty() {
                 run.prompt.to_owned()
@@ -393,10 +455,11 @@ impl Agent for ClaudeCode {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        for name in ENV_REMOVE {
+        let (env, remove) = Self::env(config, &program);
+        for name in remove {
             command.env_remove(name);
         }
-        command.envs(Self::env(config, &program));
+        command.envs(env);
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut command, 0);
         let mut child = match command.spawn() {
@@ -561,19 +624,32 @@ fn omit_long_data(line: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// The configuration folder, from the first of these that is set.
+/// The configuration folder `choice` names; for
+/// [`ConfigDirChoice::Inherit`], the first of these that is set.
 fn resolve_config_dir(
-    configured: Option<&Path>,
-    environment: Option<OsString>,
+    choice: &ConfigDirChoice,
+    environment: impl FnOnce() -> Option<OsString>,
     login_shell: impl FnOnce() -> Option<OsString>,
     home: Option<&Path>,
 ) -> ConfigDir {
-    let set = |path: PathBuf| (!path.as_os_str().is_empty()).then(|| expand_home(&path, home));
+    let set = |path: PathBuf| {
+        (!path.as_os_str().is_empty()).then(|| expand_home(&path, home.map(Path::to_owned)))
+    };
+    let configured = match choice {
+        ConfigDirChoice::Folder(path) => Some(path),
+        ConfigDirChoice::Default => {
+            return ConfigDir {
+                path: home.unwrap_or(Path::new("/")).join(".claude"),
+                source: ConfigDirSource::Default,
+            };
+        }
+        ConfigDirChoice::Inherit => None,
+    };
     let found = configured
         .and_then(|path| set(path.to_owned()))
         .map(|path| (path, ConfigDirSource::Settings))
         .or_else(|| {
-            environment
+            environment()
                 .and_then(|path| set(path.into()))
                 .map(|path| (path, ConfigDirSource::Environment))
         })
@@ -591,11 +667,26 @@ fn resolve_config_dir(
     }
 }
 
-/// `path` with a leading `~/` (or a lone `~`) replaced by `home`.
-fn expand_home(path: &Path, home: Option<&Path>) -> PathBuf {
-    match (path.strip_prefix("~"), home) {
-        (Ok(rest), Some(home)) => home.join(rest),
-        _ => path.to_owned(),
+/// `path` with a leading `~/` (or a lone `~`) replaced by `home`
+/// (`None`: `$HOME`). The rest is kept as written, a trailing `/`
+/// included: Claude Code names its keychain item after the exact string.
+pub fn expand_home(path: &Path, home: Option<PathBuf>) -> PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+    let rest = match text.strip_prefix("~") {
+        Some("") => None,
+        Some(rest) if rest.starts_with('/') => Some(rest.to_owned()),
+        _ => return path.to_owned(),
+    };
+    let Some(home) = home.or_else(self::home) else {
+        return path.to_owned();
+    };
+    match rest {
+        None => home,
+        Some(rest) => {
+            let mut joined = home.into_os_string();
+            joined.push(rest);
+            PathBuf::from(joined)
+        }
     }
 }
 

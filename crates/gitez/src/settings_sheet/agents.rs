@@ -321,6 +321,9 @@ impl SettingsSheet {
         for (index, form) in self.agents.iter().enumerate() {
             section = section.child(self.render_agent(index, form, cx));
         }
+        if self.agents.iter().any(|form| form.id == ClaudeCode::ID) {
+            section = section.child(self.render_accounts(cx));
+        }
         section.child(
             div()
                 .h_flex()

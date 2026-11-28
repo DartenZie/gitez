@@ -127,7 +127,7 @@ fn config(dir: &tempfile::TempDir) -> AgentConfig {
     std::fs::write(&program, "").expect("write program");
     AgentConfig {
         program: Some(program),
-        config_dir: Some(dir.path().join("config")),
+        config_dir: ConfigDirChoice::Folder(dir.path().join("config")),
         env: vec![
             ("FOO".to_owned(), "1".to_owned()),
             ("BAR".to_owned(), "2".to_owned()),
@@ -260,37 +260,51 @@ fn a_configured_program_must_be_a_file() {
 fn the_config_dir_comes_from_the_first_place_that_sets_it() {
     let home = Path::new("/Users/me");
     let shell = || Some(OsString::from("/from/shell"));
-    let resolve = |configured: Option<&str>, environment: Option<&str>| {
+    let resolve = |choice: ConfigDirChoice, environment: Option<&str>| {
         resolve_config_dir(
-            configured.map(Path::new),
-            environment.map(OsString::from),
+            &choice,
+            || environment.map(OsString::from),
             shell,
             Some(home),
         )
     };
+    let folder = |path: &str| ConfigDirChoice::Folder(path.into());
     assert_eq!(
-        resolve(Some("~/.config/claude"), Some("/from/env")),
+        resolve(folder("~/.config/claude"), Some("/from/env")),
         ConfigDir {
             path: "/Users/me/.config/claude".into(),
             source: ConfigDirSource::Settings
         }
     );
     assert_eq!(
-        resolve(Some(""), Some("/from/env")),
+        resolve(folder(""), Some("/from/env")),
         ConfigDir {
             path: "/from/env".into(),
             source: ConfigDirSource::Environment
         }
     );
     assert_eq!(
-        resolve(None, Some("")),
+        resolve(ConfigDirChoice::Inherit, Some("")),
         ConfigDir {
             path: "/from/shell".into(),
             source: ConfigDirSource::LoginShell
         }
     );
     assert_eq!(
-        resolve_config_dir(None, None, || None, Some(home)),
+        resolve_config_dir(&ConfigDirChoice::Inherit, || None, || None, Some(home)),
+        ConfigDir {
+            path: "/Users/me/.claude".into(),
+            source: ConfigDirSource::Default
+        }
+    );
+    // The default is the default whatever GitEZ inherited.
+    assert_eq!(
+        resolve_config_dir(
+            &ConfigDirChoice::Default,
+            || panic!("read the environment"),
+            || panic!("asked the login shell"),
+            Some(home)
+        ),
         ConfigDir {
             path: "/Users/me/.claude".into(),
             source: ConfigDirSource::Default
@@ -298,11 +312,123 @@ fn the_config_dir_comes_from_the_first_place_that_sets_it() {
     );
     // The login shell is not asked when something else set it.
     resolve_config_dir(
-        None,
-        Some("/from/env".into()),
+        &ConfigDirChoice::Inherit,
+        || Some("/from/env".into()),
         || panic!("asked the login shell"),
         Some(home),
     );
+}
+
+#[test]
+fn a_folder_is_kept_as_written() {
+    let home = || Some(PathBuf::from("/Users/me"));
+    // A trailing slash changes the keychain item Claude Code uses.
+    assert_eq!(
+        expand_home(Path::new("~/.claude-work/"), home()),
+        PathBuf::from("/Users/me/.claude-work/")
+    );
+    assert_eq!(
+        expand_home(Path::new("/a/./b/"), home()).as_os_str(),
+        "/a/./b/"
+    );
+    assert_eq!(
+        expand_home(Path::new("~"), home()),
+        PathBuf::from("/Users/me")
+    );
+    assert_eq!(
+        expand_home(Path::new("~other/x"), home()),
+        PathBuf::from("~other/x")
+    );
+    let dir = ConfigDir {
+        path: "/Users/me/.claude-work/".into(),
+        source: ConfigDirSource::Settings,
+    };
+    assert_eq!(
+        dir.variable().map(Path::as_os_str),
+        Some("/Users/me/.claude-work/".as_ref())
+    );
+    assert_eq!(
+        dir.choice(),
+        ConfigDirChoice::Folder("/Users/me/.claude-work/".into())
+    );
+    let default = ConfigDir {
+        path: "/Users/me/.claude".into(),
+        source: ConfigDirSource::Default,
+    };
+    assert_eq!(default.variable(), None);
+    assert_eq!(default.choice(), ConfigDirChoice::Default);
+}
+
+#[test]
+fn the_login_command_names_the_folder_unless_it_is_the_default() {
+    assert_eq!(login_command(None), "claude auth login");
+    assert_eq!(
+        login_command(Some(Path::new("/Users/me/.claude-work"))),
+        "CLAUDE_CONFIG_DIR=/Users/me/.claude-work claude auth login"
+    );
+    assert_eq!(
+        login_command(Some(Path::new("/Users/me/My Claude/it's"))),
+        "CLAUDE_CONFIG_DIR='/Users/me/My Claude/it'\\''s' claude auth login"
+    );
+}
+
+#[test]
+fn each_choice_sets_or_removes_the_variable() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let cwd = dir.path().join("wt");
+    std::fs::create_dir(&cwd).expect("worktree");
+    let spec = run(Conversation::New { session_id: "s-1" }, &cwd);
+    let variable = |command: &CommandSpec| {
+        command
+            .env
+            .iter()
+            .filter(|(name, _)| name == "CLAUDE_CONFIG_DIR")
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>()
+    };
+    let removed = |command: &CommandSpec| {
+        command
+            .env_remove
+            .iter()
+            .any(|name| name == "CLAUDE_CONFIG_DIR")
+    };
+
+    let folder = dir.path().join("work/");
+    let mut config = config(&dir);
+    config.config_dir = ConfigDirChoice::Folder(folder.clone());
+    // The entry's own variable cannot move the run to another folder.
+    config
+        .env
+        .push(("CLAUDE_CONFIG_DIR".to_owned(), "/elsewhere".to_owned()));
+    let command = ClaudeCode.command(&config, &spec).expect("command");
+    assert_eq!(variable(&command), [folder.to_string_lossy().into_owned()]);
+    assert!(!removed(&command));
+
+    config.config_dir = ConfigDirChoice::Default;
+    let command = ClaudeCode.command(&config, &spec).expect("command");
+    assert!(variable(&command).is_empty());
+    assert!(removed(&command), "{:?}", command.env_remove);
+}
+
+#[test]
+fn the_per_run_folders_follow_the_config_folder() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let cwd = dir.path().join("wt");
+    std::fs::create_dir(&cwd).expect("worktree");
+    let spec = run(Conversation::New { session_id: "s-1" }, &cwd);
+    let name = sanitise(&std::fs::canonicalize(&cwd).expect("real").to_string_lossy());
+    for folder in [dir.path().join("work"), dir.path().join("personal")] {
+        let mut config = config(&dir);
+        config.config_dir = ConfigDirChoice::Folder(folder.clone());
+        let needs = ClaudeCode.needs_for_run(&config, &spec);
+        assert!(
+            needs
+                .write_dirs
+                .contains(&folder.join("projects").join(&name))
+        );
+        assert!(needs.write_dirs.contains(&folder.join("session-env/s-1")));
+        assert!(needs.write_dirs.contains(&folder.join("file-history/s-1")));
+    }
 }
 
 #[test]

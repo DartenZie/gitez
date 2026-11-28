@@ -10,6 +10,7 @@
 //! in the repository's git config with the git CLI. Keychain calls, agent
 //! and sandbox checks and git run off the UI thread.
 
+mod accounts;
 mod agents;
 mod edit;
 mod repository;
@@ -104,6 +105,7 @@ pub struct SettingsSheet {
     scroll: ScrollHandle,
     secrets: secrets::Secrets,
     agents: Vec<agents::AgentForm>,
+    accounts: accounts::AccountsPanel,
     sandbox: sandbox::SandboxPanel,
     limit: Entity<InputState>,
     limit_error: Option<SharedString>,
@@ -139,11 +141,13 @@ impl SettingsSheet {
         }));
         let secrets = secrets::Secrets::new(window, cx, &mut subscriptions);
         let agents = agents::AgentForm::all(&model, window, cx, &mut subscriptions);
+        let accounts = accounts::AccountsPanel::new(window, cx, &mut subscriptions);
         let mut sheet = Self {
             model,
             scroll: ScrollHandle::new(),
             secrets,
             agents,
+            accounts,
             sandbox: sandbox::SandboxPanel::default(),
             limit,
             limit_error: None,
@@ -152,6 +156,7 @@ impl SettingsSheet {
         };
         sheet.check_secrets(cx);
         sheet.check_agents(false, cx);
+        sheet.check_accounts(false, cx);
         sheet.check_sandbox(cx);
         sheet.sync_repository(window, cx);
         sheet
@@ -164,6 +169,7 @@ impl SettingsSheet {
         self.check_secrets(cx);
         self.sync_agents(window, cx);
         self.check_agents(false, cx);
+        self.check_accounts(false, cx);
         let limit = self.model.read(cx).settings().threads.max_running;
         let typed = self.limit.read(cx).value().trim().parse::<u32>().ok();
         if typed != Some(limit) && !is_focused(&self.limit, window, cx) {

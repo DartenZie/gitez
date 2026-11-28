@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use common::{EXAMPLE, Fixture, at, branch_of, worktree_of};
 use gitez_agent_thread::{
-    AgentThreadId, Error, Index, IndexedRepository, Mode, RunHeader, State, Store, Timestamp,
-    TurnKind, repository_key,
+    Account, AgentThreadId, Error, Index, IndexedRepository, Mode, RunHeader, State, Store,
+    Timestamp, TurnKind, repository_key,
 };
 use gitez_sandbox::NetworkProfile;
 
@@ -92,23 +92,111 @@ fn an_update_that_changes_nothing_writes_nothing() {
 fn a_newer_version_is_refused_and_kept() {
     let (_dir, store, id) = example_store();
     let path = store.thread_dir(&id).join("thread.json");
-    let newer = EXAMPLE.replace("\"version\": 1", "\"version\": 2");
+    let newer = EXAMPLE.replace("\"version\": 1", "\"version\": 3");
     fs::write(&path, &newer).expect("write");
     assert!(matches!(
         store.load(&id),
-        Err(Error::TooNew { version: 2, .. })
+        Err(Error::TooNew { version: 3, .. })
     ));
     assert!(matches!(
         store.update(&id, |thread| {
             thread.title = "Changed".to_owned();
             Ok(())
         }),
-        Err(Error::TooNew { version: 2, .. })
+        Err(Error::TooNew { version: 3, .. })
     ));
     assert_eq!(fs::read_to_string(&path).expect("read"), newer);
     let (threads, errors) = store.load_all();
     assert!(threads.is_empty());
     assert!(matches!(errors.as_slice(), [(listed, Error::TooNew { .. })] if *listed == id));
+}
+
+#[test]
+fn a_record_from_before_accounts_loads_and_stays_version_1() {
+    let (_dir, store, id) = example_store();
+    let thread = store.load(&id).expect("load");
+    assert_eq!(thread.account, None);
+    let path = store.thread_dir(&id).join("thread.json");
+    let default = Account {
+        name: Account::DEFAULT_NAME.to_owned(),
+        folder: None,
+    };
+    store
+        .update(&id, |thread| {
+            thread.account = Some(default.clone());
+            Ok(())
+        })
+        .expect("update");
+    let text = fs::read_to_string(&path).expect("read");
+    assert!(text.starts_with("{\n  \"version\": 1,"), "{text}");
+    assert_eq!(store.load(&id).expect("load").account, Some(default));
+}
+
+#[test]
+fn a_record_naming_an_account_is_written_as_version_2() {
+    let (_dir, store, id) = example_store();
+    let path = store.thread_dir(&id).join("thread.json");
+    // A trailing slash is part of the folder: it names another login.
+    let work = Account {
+        name: "Work".to_owned(),
+        folder: Some("/Users/me/.claude-work/".into()),
+    };
+    store
+        .update(&id, |thread| {
+            thread.account = Some(work.clone());
+            Ok(())
+        })
+        .expect("update");
+    let text = fs::read_to_string(&path).expect("read");
+    assert!(text.starts_with("{\n  \"version\": 2,"), "{text}");
+    let written: serde_json::Value = serde_json::from_str(&text).expect("parses");
+    assert_eq!(
+        written["account"],
+        serde_json::json!({"name": "Work", "folder": "/Users/me/.claude-work/"})
+    );
+    let thread = store.load(&id).expect("load");
+    assert_eq!(thread.account, Some(work));
+    assert_eq!(thread.format_version(), 2);
+
+    // Back on the default account, older GitEZ may read it again.
+    store
+        .update(&id, |thread| {
+            thread.account = Some(Account {
+                name: Account::DEFAULT_NAME.to_owned(),
+                folder: Some("/Users/me/.config/claude".into()),
+            });
+            Ok(())
+        })
+        .expect("update");
+    let text = fs::read_to_string(&path).expect("read");
+    assert!(text.starts_with("{\n  \"version\": 1,"), "{text}");
+}
+
+#[test]
+fn a_new_thread_records_its_account() {
+    let fixture = Fixture::new();
+    let mut new = fixture.new_thread("Fix the build");
+    new.account = Some(Account {
+        name: "Work".to_owned(),
+        folder: Some("/Users/me/.claude-work".into()),
+    });
+    let thread = fixture
+        .store()
+        .create(
+            new,
+            &fixture.data_dir,
+            "my repo",
+            |_| false,
+            Timestamp::now(),
+        )
+        .expect("create thread");
+    assert_eq!(
+        thread.account.as_ref().map(|account| account.name.as_str()),
+        Some("Work")
+    );
+    let text = fs::read_to_string(fixture.store().thread_dir(&thread.id).join("thread.json"))
+        .expect("read");
+    assert!(text.starts_with("{\n  \"version\": 2,"), "{text}");
 }
 
 #[test]

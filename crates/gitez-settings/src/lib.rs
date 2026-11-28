@@ -15,10 +15,15 @@ use std::path::PathBuf;
 
 pub use data_dir::{DATA_DIR_ENV, data_dir, data_dir_from};
 pub use settings::{
-    AgentEntry, DEFAULT_HIDDEN_PATHS, DEFAULT_MAX_RUNNING, DEFAULT_PACKAGE_HOSTS, Loaded,
-    MIN_SECRET_LEN, SandboxSettings, SecretEntry, SecretScope, Settings, ThreadSettings,
-    is_env_name, secret_value_problem,
+    AccountEntry, AgentEntry, DEFAULT_HIDDEN_PATHS, DEFAULT_MAX_RUNNING, DEFAULT_PACKAGE_HOSTS,
+    Loaded, MIN_SECRET_LEN, SandboxSettings, SecretEntry, SecretScope, Settings, ThreadSettings,
+    accounts_problem, is_env_name, secret_value_problem,
 };
+
+/// The key in a repository's git config that names the Claude account
+/// its agents run with ([`Settings::account_for`]). Agents cannot write the
+/// repository's config, so a thread cannot change its own account.
+pub const ACCOUNT_KEY: &str = "gitez.agentAccount";
 
 /// The newest `settings.json` format this crate reads and writes.
 pub const VERSION: u32 = 1;

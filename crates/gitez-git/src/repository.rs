@@ -70,6 +70,26 @@ impl Repository {
         (!value.is_empty()).then_some(value)
     }
 
+    /// [`Repository::config_string`], and whether the repository's own
+    /// configuration (its `config` or its worktree's `config.worktree`,
+    /// with what they include) sets it, rather than only the user's or the
+    /// system's (an `includeIf "gitdir:…"` rule in `~/.gitconfig`, say).
+    pub fn config_string_with_origin(&self, key: &str) -> Option<(String, bool)> {
+        let value = self.config_string(key)?;
+        let repo = self.local();
+        let config = repo.config_snapshot();
+        let own = config
+            .plumbing()
+            .string_filter(key, |meta| {
+                matches!(
+                    meta.source,
+                    gix::config::Source::Local | gix::config::Source::Worktree
+                )
+            })
+            .is_some_and(|own| !own.to_str_lossy().trim().is_empty());
+        Some((value, own))
+    }
+
     /// The names of the configured remotes, sorted.
     pub fn remote_names(&self) -> Vec<String> {
         self.local()
